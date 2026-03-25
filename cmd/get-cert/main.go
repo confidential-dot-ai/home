@@ -22,13 +22,14 @@ import (
 
 // Config holds all CLI configuration for get-cert.
 type Config struct {
-	AssamURL              string
-	AttestationServiceURL string
-	OutPath               string
-	KeyPath               string
-	KeyOutPath            string
-	SAN                   string
-	Verbose               bool
+	AssamURL                 string
+	AttestationServiceURL    string
+	AttestationServiceAPIKey string
+	OutPath                  string
+	KeyPath                  string
+	KeyOutPath               string
+	SAN                      string
+	Verbose                  bool
 }
 
 func main() {
@@ -56,6 +57,7 @@ load balancer (e.g. nginx) that terminates TLS with the obtained certificate.`,
 	flags := rootCmd.Flags()
 	flags.StringVar(&cfg.AssamURL, "assam-url", "", "URL of the assam service (e.g. http://assam:8080)")
 	flags.StringVar(&cfg.AttestationServiceURL, "attestation-service-url", "", "URL of the local attestation service (e.g. http://localhost:8400)")
+	flags.StringVar(&cfg.AttestationServiceAPIKey, "attestation-service-api-key", "", "API key for the attestation service (required when running in remote mode)")
 	flags.StringVarP(&cfg.OutPath, "out", "o", "", "Path to write the signed certificate PEM (prints to stdout if omitted)")
 	flags.StringVar(&cfg.KeyPath, "key", "", "Path to a PEM private key to use for the CSR (generates an ephemeral key if omitted)")
 	flags.StringVar(&cfg.KeyOutPath, "key-out", "", "Path to write the generated private key PEM (only used with ephemeral keys)")
@@ -104,7 +106,7 @@ func run(cfg Config) error {
 	}
 
 	slog.Info("requesting certificate from assam", "assam_url", cfg.AssamURL, "san", cfg.SAN)
-	client := attestclient.NewClient(cfg.AssamURL)
+	client := attestclient.NewClientWithAPIKey(cfg.AssamURL, cfg.AttestationServiceAPIKey)
 	certPEM, err := client.ObtainCertificate(cfg.AttestationServiceURL, string(csrPEM))
 	if err != nil {
 		return fmt.Errorf("attestation failed: %w", err)

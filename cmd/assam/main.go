@@ -25,17 +25,18 @@ import (
 
 func main() {
 	var (
-		host               string
-		port               int
-		attestationSvcURL  string
-		certIssuerURL      string
-		earKeyPath         string
-		earIssuerName      string
-		certTTL            time.Duration
-		challengeTTL       time.Duration
-		readinessInterval  time.Duration
-		whitelistDB        string
-		whitelistAdminPass string
+		host                 string
+		port                 int
+		attestationSvcURL    string
+		attestationSvcAPIKey string
+		certIssuerURL        string
+		earKeyPath           string
+		earIssuerName        string
+		certTTL              time.Duration
+		challengeTTL         time.Duration
+		readinessInterval    time.Duration
+		whitelistDB          string
+		whitelistAdminPass   string
 	)
 
 	rootCmd := &cobra.Command{
@@ -43,17 +44,18 @@ func main() {
 		Short: "A key broker service for confidential computing",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return run(config{
-				host:               host,
-				port:               port,
-				attestationSvcURL:  attestationSvcURL,
-				certIssuerURL:      certIssuerURL,
-				earKeyPath:         earKeyPath,
-				earIssuerName:      earIssuerName,
-				certTTL:            certTTL,
-				challengeTTL:       challengeTTL,
-				readinessInterval:  readinessInterval,
-				whitelistDB:        whitelistDB,
-				whitelistAdminPass: whitelistAdminPass,
+				host:                 host,
+				port:                 port,
+				attestationSvcURL:    attestationSvcURL,
+				attestationSvcAPIKey: attestationSvcAPIKey,
+				certIssuerURL:        certIssuerURL,
+				earKeyPath:           earKeyPath,
+				earIssuerName:        earIssuerName,
+				certTTL:              certTTL,
+				challengeTTL:         challengeTTL,
+				readinessInterval:    readinessInterval,
+				whitelistDB:          whitelistDB,
+				whitelistAdminPass:   whitelistAdminPass,
 			})
 		},
 	}
@@ -62,6 +64,7 @@ func main() {
 	flags.StringVar(&host, "host", "0.0.0.0", "Host address to bind to")
 	flags.IntVarP(&port, "port", "p", 8080, "Port to listen on")
 	flags.StringVar(&attestationSvcURL, "attestation-service-url", "", "URL of the attestation service")
+	flags.StringVar(&attestationSvcAPIKey, "attestation-service-api-key", "", "API key for the attestation service (required when running in remote mode)")
 	flags.StringVar(&certIssuerURL, "cert-issuer-url", "", "URL of the kbs-cert-issuer service")
 	flags.StringVar(&earKeyPath, "ear-key", "", "Path to the EC private key PEM for EAR tokens")
 	flags.StringVar(&earIssuerName, "ear-issuer", "assam", "Issuer name for EAR tokens")
@@ -83,17 +86,18 @@ func main() {
 }
 
 type config struct {
-	host               string
-	port               int
-	attestationSvcURL  string
-	certIssuerURL      string
-	earKeyPath         string
-	earIssuerName      string
-	certTTL            time.Duration
-	challengeTTL       time.Duration
-	readinessInterval  time.Duration
-	whitelistDB        string
-	whitelistAdminPass string
+	host                 string
+	port                 int
+	attestationSvcURL    string
+	attestationSvcAPIKey string
+	certIssuerURL        string
+	earKeyPath           string
+	earIssuerName        string
+	certTTL              time.Duration
+	challengeTTL         time.Duration
+	readinessInterval    time.Duration
+	whitelistDB          string
+	whitelistAdminPass   string
 }
 
 func run(cfg config) error {
@@ -118,14 +122,14 @@ func run(cfg config) error {
 		return err
 	}
 
-	asClient := attestationclient.NewClient(cfg.attestationSvcURL)
+	asClient := attestationclient.NewClientWithAPIKey(cfg.attestationSvcURL, cfg.attestationSvcAPIKey)
 	ciClient := certissuer.NewClient(cfg.certIssuerURL)
 
 	challengeStore := attestation.NewChallengeStore(cfg.challengeTTL)
 
 	// Readiness checker (only checks attestation service health)
 	checker := readiness.NewChecker(
-		attestationclient.NewClient(cfg.attestationSvcURL),
+		attestationclient.NewClientWithAPIKey(cfg.attestationSvcURL, cfg.attestationSvcAPIKey),
 		cfg.readinessInterval,
 	)
 

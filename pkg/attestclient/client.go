@@ -17,8 +17,9 @@ import (
 // Client is a high-level client for the assam attestation flow.
 // It handles the full challenge-attest-certify flow in a single call.
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL                  string
+	httpClient               *http.Client
+	attestationServiceAPIKey string
 }
 
 // NewClient creates a new attestation flow client.
@@ -29,11 +30,29 @@ func NewClient(baseURL string) Client {
 	}
 }
 
+// NewClientWithAPIKey creates a new client that passes an API key to the attestation service.
+func NewClientWithAPIKey(baseURL, attestationServiceAPIKey string) Client {
+	return Client{
+		baseURL:                  strings.TrimRight(baseURL, "/"),
+		httpClient:               http.DefaultClient,
+		attestationServiceAPIKey: attestationServiceAPIKey,
+	}
+}
+
 // NewClientWithHTTP creates a new client with a custom HTTP client.
 func NewClientWithHTTP(baseURL string, httpClient *http.Client) Client {
 	return Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		httpClient: httpClient,
+	}
+}
+
+// NewClientWithHTTPAndAPIKey creates a new client with a custom HTTP client and attestation service API key.
+func NewClientWithHTTPAndAPIKey(baseURL string, httpClient *http.Client, attestationServiceAPIKey string) Client {
+	return Client{
+		baseURL:                  strings.TrimRight(baseURL, "/"),
+		httpClient:               httpClient,
+		attestationServiceAPIKey: attestationServiceAPIKey,
 	}
 }
 
@@ -57,7 +76,7 @@ func (c Client) ObtainCertificate(attestationServiceURL, csrPEM string) (string,
 		return "", fmt.Errorf("invalid base64 in challenge: %w", err)
 	}
 
-	asClient := attestationclient.NewClientWithHTTP(attestationServiceURL, c.httpClient)
+	asClient := attestationclient.NewClientWithHTTPAndAPIKey(attestationServiceURL, c.httpClient, c.attestationServiceAPIKey)
 	asReq := types.AttestRequest{
 		ReportData: types.NewBase64Bytes(challengeBytes),
 		Platform:   types.PlatformAuto,

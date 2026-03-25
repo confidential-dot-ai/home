@@ -146,6 +146,50 @@ func TestVerifyUnexpectedError(t *testing.T) {
 	}
 }
 
+func TestAPIKeySentAsBearer(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get("Authorization")
+		if got != "Bearer test-key-123" {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte("bad auth"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(types.HealthResponse{Status: "ok"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewClientWithHTTPAndAPIKey(srv.URL, srv.Client(), "test-key-123")
+	resp, err := c.Health(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Fatalf("expected status ok, got %q", resp.Status)
+	}
+}
+
+func TestNoAuthHeaderWhenAPIKeyEmpty(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			t.Errorf("expected no Authorization header, got %q", auth)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(types.HealthResponse{Status: "ok"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewClientWithHTTP(srv.URL, srv.Client())
+	_, err := c.Health(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestVerifyRequestError(t *testing.T) {
 	c := NewClient("http://127.0.0.1:0/not-a-real-server")
 	_, err := c.Verify(context.Background(), types.VerifyRequest{})
