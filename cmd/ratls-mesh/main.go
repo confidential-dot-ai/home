@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -19,7 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	"github.com/lunal-dev/c8s/pkg/attestationclient"
+	"github.com/lunal-dev/c8s/pkg/attestclient"
 	"github.com/lunal-dev/c8s/pkg/certutil"
 	"github.com/lunal-dev/c8s/pkg/ratls"
 	"github.com/lunal-dev/c8s/pkg/ratls/assamclient"
@@ -125,10 +126,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	asClient := attestationclient.NewClientWithHTTPAndAPIKey(*attestationServiceURL, &http.Client{
+	asClient := attestclient.NewClientWithHTTPAndAPIKey("", &http.Client{
 		Timeout: durOrDefault(*rotationTimeout, 30*time.Second),
 	}, *attestationServiceAPIKey)
-	attestFunc := makeAttestFunc(asClient)
+	attestFunc := makeAttestFunc(asClient, *attestationServiceURL)
 
 	meshPolicy := &ratls.VerifyPolicy{}
 	if *measurements != "" {
@@ -494,51 +495,69 @@ func validateConfig(attestationServiceURL string, outboundPort, inboundPort int,
 	return nil
 }
 
-// snpEvidence is the inner evidence structure returned by the attestation
-// service for SEV-SNP. The attestation_report field is a base64-encoded
-// raw 1184-byte SNP report.
-type snpEvidence struct {
+// attestEvidence holds the fields we need from attestation evidence.
+// Bare-metal SNP uses attestation_report (standard base64).
+// vTPM (az-snp, az-tdx) uses hcl_report (URL-safe base64, no padding).
+type attestEvidence struct {
 	AttestationReport string `json:"attestation_report"`
+	HCLReport         string `json:"hcl_report"`
 }
 
 // makeAttestFunc returns an AttestFunc that calls the attestation service
-// HTTP API. Used for RA-TLS self-signed certificates.
+// via attestclient. Used for RA-TLS self-signed certificates.
 //
-// The attestation service POST /attest returns structured JSON evidence.
-// For SEV-SNP, the inner evidence contains attestation_report (base64-encoded
-// raw 1184-byte SNP report). This function extracts and decodes it to match
-// the raw-bytes contract expected by SelfSignedProvider.
-func makeAttestFunc(client attestationclient.Client) func(context.Context, string) (string, error) {
+// The attestation service POST /attest returns structured JSON evidence
+// whose format varies by platform. This function extracts the raw SNP
+// report bytes from the platform-specific envelope.
+func makeAttestFunc(client attestclient.Client, attestationServiceURL string) func(context.Context, string) (string, error) {
 	return func(ctx context.Context, customData string) (string, error) {
-		// customData is hex-encoded REPORTDATA (e.g. SHA-384 of pubkey).
+		// customData is hex-encoded REPORTDATA (e.g. SHA-384 of pubkey,
+		// zero-padded to 64 bytes for the SNP REPORTDATA field).
 		reportDataBytes, err := hex.DecodeString(customData)
 		if err != nil {
 			return "", fmt.Errorf("decode report data hex: %w", err)
 		}
 
-		resp, err := client.Attest(ctx, types.AttestRequest{
-			ReportData: types.NewBase64Bytes(reportDataBytes),
-			Platform:   types.PlatformAuto,
-		})
+		// Strip SNP REPORTDATA zero-padding before sending to the attestation
+		// service. Bare-metal SNP pads server-side; vTPM passes the data as
+		// the TPM2_Quote nonce (TPM2B_DATA) which has a smaller max size than
+		// 64 bytes, so sending the full padded array causes TPM_RC_SIZE.
+		reportDataBytes = reportDataBytes[:sha512.Size384]
+
+		resp, err := client.GenerateEvidence(attestationServiceURL, reportDataBytes)
 		if err != nil {
 			return "", fmt.Errorf("attestation service: %w", err)
 		}
 
-		// The inner evidence for SNP contains {"attestation_report": "<base64>", ...}.
-		// Extract the raw report bytes.
-		var evidence snpEvidence
-		if err := json.Unmarshal(resp.Evidence.Evidence, &evidence); err != nil {
-			return "", fmt.Errorf("parse attestation evidence: %w", err)
-		}
-		if evidence.AttestationReport == "" {
-			return "", fmt.Errorf("attestation service returned empty attestation_report")
-		}
+		return extractSNPReport(resp)
+	}
+}
 
+// extractSNPReport extracts the raw 1184-byte SNP report from attestation
+// evidence. Handles both bare-metal SNP (attestation_report field, standard
+// base64) and vTPM/Azure (hcl_report field, URL-safe base64 no padding).
+func extractSNPReport(resp types.AttestResponse) (string, error) {
+	var evidence attestEvidence
+	if err := json.Unmarshal(resp.Evidence.Evidence, &evidence); err != nil {
+		return "", fmt.Errorf("parse attestation evidence: %w", err)
+	}
+
+	switch {
+	case evidence.AttestationReport != "":
 		rawReport, err := base64.StdEncoding.DecodeString(evidence.AttestationReport)
 		if err != nil {
-			return "", fmt.Errorf("decode attestation_report base64: %w", err)
+			return "", fmt.Errorf("decode attestation_report: %w", err)
 		}
-
 		return string(rawReport), nil
+
+	case evidence.HCLReport != "":
+		rawReport, err := base64.RawURLEncoding.DecodeString(evidence.HCLReport)
+		if err != nil {
+			return "", fmt.Errorf("decode hcl_report: %w", err)
+		}
+		return string(rawReport), nil
+
+	default:
+		return "", fmt.Errorf("attestation evidence contains neither attestation_report nor hcl_report (platform: %s)", resp.Platform)
 	}
 }

@@ -56,6 +56,18 @@ func NewClientWithHTTPAndAPIKey(baseURL string, httpClient *http.Client, attesta
 	}
 }
 
+// GenerateEvidence calls the local attestation service to generate TEE evidence
+// for the given report data. This is the same attestation service call used
+// internally by ObtainCertificate, exposed for callers that need evidence
+// without the full assam challenge-attest-certify flow.
+func (c Client) GenerateEvidence(attestationServiceURL string, reportData []byte) (types.AttestResponse, error) {
+	asClient := attestationclient.NewClientWithHTTPAndAPIKey(attestationServiceURL, c.httpClient, c.attestationServiceAPIKey)
+	return asClient.Attest(c.ctx(), types.AttestRequest{
+		ReportData: types.NewBase64Bytes(reportData),
+		Platform:   types.PlatformAuto,
+	})
+}
+
 // ObtainCertificate performs the full attestation flow and returns a signed certificate.
 //
 // It:
@@ -76,12 +88,7 @@ func (c Client) ObtainCertificate(attestationServiceURL, csrPEM string) (string,
 		return "", fmt.Errorf("invalid base64 in challenge: %w", err)
 	}
 
-	asClient := attestationclient.NewClientWithHTTPAndAPIKey(attestationServiceURL, c.httpClient, c.attestationServiceAPIKey)
-	asReq := types.AttestRequest{
-		ReportData: types.NewBase64Bytes(challengeBytes),
-		Platform:   types.PlatformAuto,
-	}
-	asResp, err := asClient.Attest(c.ctx(), asReq)
+	asResp, err := c.GenerateEvidence(attestationServiceURL, challengeBytes)
 	if err != nil {
 		return "", fmt.Errorf("attestation service: %w", err)
 	}
