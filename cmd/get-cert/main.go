@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -11,9 +12,13 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -30,6 +35,7 @@ type Config struct {
 	KeyOutPath               string
 	SAN                      string
 	Verbose                  bool
+	RenewInterval            time.Duration
 }
 
 func main() {
@@ -63,6 +69,7 @@ load balancer (e.g. nginx) that terminates TLS with the obtained certificate.`,
 	flags.StringVar(&cfg.KeyOutPath, "key-out", "", "Path to write the generated private key PEM (only used with ephemeral keys)")
 	flags.StringVar(&cfg.SAN, "san", "", "Subject Alternative Name for the certificate (IP address or hostname)")
 	flags.BoolVarP(&cfg.Verbose, "verbose", "v", false, "Enable debug logging")
+	flags.DurationVar(&cfg.RenewInterval, "renew-interval", 0, "Re-obtain the certificate at this interval and SIGHUP nginx (0 = run once and exit)")
 
 	rootCmd.MarkFlagRequired("assam-url")
 	rootCmd.MarkFlagRequired("attestation-service-url")
@@ -89,12 +96,47 @@ func run(cfg Config) error {
 		return err
 	}
 
-	// Validate output paths are writable before doing any real work.
 	if err := validateOutputPaths(cfg.OutPath, cfg.KeyOutPath); err != nil {
 		return err
 	}
 	slog.Debug("output paths validated")
 
+	client := attestclient.NewClientWithAPIKey(cfg.AssamURL, cfg.AttestationServiceAPIKey)
+
+	if err := obtainCert(cfg, client); err != nil {
+		return err
+	}
+
+	if cfg.RenewInterval <= 0 {
+		return nil
+	}
+
+	// Daemon mode: renew certificate periodically with graceful shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	slog.Info("entering renewal loop", "interval", cfg.RenewInterval)
+	ticker := time.NewTicker(cfg.RenewInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("shutting down cert renewer")
+			return nil
+		case <-ticker.C:
+			if err := obtainCert(cfg, client); err != nil {
+				slog.Error("certificate renewal failed, will retry next interval", "error", err)
+				continue
+			}
+			if err := reloadNginx(); err != nil {
+				slog.Warn("certificate renewed but nginx reload failed", "error", err)
+			}
+		}
+	}
+}
+
+func obtainCert(cfg Config, client attestclient.Client) error {
 	privateKey, keyPEM, err := loadOrGenerateKey(cfg.KeyPath)
 	if err != nil {
 		return err
@@ -106,14 +148,39 @@ func run(cfg Config) error {
 	}
 
 	slog.Info("requesting certificate from assam", "assam_url", cfg.AssamURL, "san", cfg.SAN)
-	client := attestclient.NewClientWithAPIKey(cfg.AssamURL, cfg.AttestationServiceAPIKey)
 	certPEM, err := client.ObtainCertificate(cfg.AttestationServiceURL, string(csrPEM))
 	if err != nil {
 		return fmt.Errorf("attestation failed: %w", err)
 	}
-	slog.Info("certificate obtained successfully")
+	slog.Info("certificate obtained")
 
 	return writeOutputs(cfg, keyPEM, certPEM)
+}
+
+// reloadNginx sends SIGHUP to the nginx master process to reload certs.
+// Requires shareProcessNamespace: true in the pod spec.
+func reloadNginx() error {
+	out, err := exec.Command("pgrep", "-f", "nginx: master").Output()
+	if err != nil {
+		return fmt.Errorf("pgrep nginx: %w", err)
+	}
+	pidStr := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+	if pidStr == "" {
+		return fmt.Errorf("no nginx master process found")
+	}
+	var pid int
+	if _, err := fmt.Sscanf(pidStr, "%d", &pid); err != nil {
+		return fmt.Errorf("parse nginx PID %q: %w", pidStr, err)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("find process %d: %w", pid, err)
+	}
+	if err := proc.Signal(syscall.SIGHUP); err != nil {
+		return fmt.Errorf("SIGHUP nginx (pid %d): %w", pid, err)
+	}
+	slog.Info("sent SIGHUP to nginx", "pid", pid)
+	return nil
 }
 
 // validateConfig checks that all required configuration is valid.
