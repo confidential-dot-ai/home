@@ -12,10 +12,10 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -158,19 +158,12 @@ func obtainCert(cfg Config, client attestclient.Client) error {
 }
 
 // reloadNginx sends SIGHUP to the nginx master process to reload certs.
-// Requires shareProcessNamespace: true in the pod spec.
+// Requires shareProcessNamespace: true in the pod spec. Walks /proc directly
+// instead of shelling out to pgrep so this works in distroless images.
 func reloadNginx() error {
-	out, err := exec.Command("pgrep", "-f", "nginx: master").Output()
+	pid, err := findNginxMasterPID()
 	if err != nil {
-		return fmt.Errorf("pgrep nginx: %w", err)
-	}
-	pidStr := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
-	if pidStr == "" {
-		return fmt.Errorf("no nginx master process found")
-	}
-	var pid int
-	if _, err := fmt.Sscanf(pidStr, "%d", &pid); err != nil {
-		return fmt.Errorf("parse nginx PID %q: %w", pidStr, err)
+		return err
 	}
 	proc, err := os.FindProcess(pid)
 	if err != nil {
@@ -181,6 +174,39 @@ func reloadNginx() error {
 	}
 	slog.Info("sent SIGHUP to nginx", "pid", pid)
 	return nil
+}
+
+// findNginxMasterPID scans /proc for the nginx master process.
+// Match: /proc/<pid>/comm == "nginx" AND cmdline contains "master".
+func findNginxMasterPID() (int, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, fmt.Errorf("read /proc: %w", err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		comm, err := os.ReadFile("/proc/" + e.Name() + "/comm")
+		if err != nil || strings.TrimSpace(string(comm)) != "nginx" {
+			continue
+		}
+		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+		if err != nil {
+			continue
+		}
+		// /proc/<pid>/cmdline is NUL-separated; nginx master argv[0] is
+		// "nginx: master process ...".
+		if !strings.Contains(string(cmdline), "master") {
+			continue
+		}
+		return pid, nil
+	}
+	return 0, fmt.Errorf("no nginx master process found")
 }
 
 // validateConfig checks that all required configuration is valid.
