@@ -62,6 +62,11 @@ func main() {
 		minCAValidity     = flag.Duration("min-ca-validity", 1*time.Hour, "minimum remaining CA cert validity for readiness")
 		maxRequestSize    = flag.Int64("max-request-size", 65536, "maximum request body size in bytes")
 		certWatchDebounce = flag.Duration("cert-watch-debounce", 2*time.Second, "debounce delay for certificate file watcher")
+
+		// JWKS mode: verify EAR tokens via a remote JWKS endpoint instead of
+		// the mounted token-signer cert. When set, --token-cert is ignored.
+		jwksURL      = flag.String("jwks-url", "", "JWKS endpoint URL for EAR token verification (empty = use --token-cert)")
+		jwksCacheTTL = flag.Duration("jwks-cache-ttl", 5*time.Minute, "how long to cache the JWKS before re-fetching")
 	)
 	flag.Parse()
 
@@ -89,10 +94,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	tokenSignerCert, err := certutil.LoadCertificateFile(*tokenCert)
-	if err != nil {
-		logger.Error("failed to load token-signer certificate", "error", err)
-		os.Exit(1)
+	// Set up the key provider for EAR token verification.
+	var kp KeyProvider
+	if *jwksURL != "" {
+		kp = newJWKSKeyProvider(*jwksURL, *jwksCacheTTL, logger)
+		logger.Info("JWKS verification mode", "url", *jwksURL, "cache_ttl", *jwksCacheTTL)
+	} else {
+		tokenSignerCert, err := certutil.LoadCertificateFile(*tokenCert)
+		if err != nil {
+			logger.Error("failed to load token-signer certificate", "error", err)
+			os.Exit(1)
+		}
+		kp, err = newCertKeyProvider(tokenSignerCert)
+		if err != nil {
+			logger.Error("invalid token-signer certificate", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	var parentCert *x509.Certificate
@@ -150,6 +167,7 @@ func main() {
 	}
 
 	iss := &Issuer{
+		keyProvider:          kp,
 		MaxTTL:               *maxTTLF,
 		SANValidation:        *sanValidation,
 		DNSSANPattern:        compiledDNSSANPattern,
@@ -175,10 +193,9 @@ func main() {
 		logger.Info("measurement pinning enabled for /v1/ca", "count", len(iss.CAMeasurements))
 	}
 	iss.bundle.Store(&certBundle{
-		caCert:          caCert,
-		caKey:           caKey,
-		tokenSignerCert: tokenSignerCert,
-		parentCert:      parentCert,
+		caCert:     caCert,
+		caKey:      caKey,
+		parentCert: parentCert,
 	})
 
 	// Set initial CA fingerprint metric.
@@ -231,7 +248,7 @@ func main() {
 				return
 			}
 			token := authHeader[7:]
-			claims, err := validateEARToken(token, b.tokenSignerCert, iss.ExpectedIssuer, iss.JWTClockSkew)
+			claims, err := validateEARToken(token, iss.keyProvider, iss.ExpectedIssuer, iss.JWTClockSkew)
 			if err != nil {
 				var tve *TokenValidationError
 				if errors.As(err, &tve) {
@@ -333,7 +350,9 @@ func certExpiryUpdater(ctx context.Context, iss *Issuer, interval time.Duration)
 		}
 		now := time.Now()
 		caCertExpirySeconds.Set(b.caCert.NotAfter.Sub(now).Seconds())
-		tokenCertExpirySeconds.Set(b.tokenSignerCert.NotAfter.Sub(now).Seconds())
+		if b.tokenSignerCert != nil {
+			tokenCertExpirySeconds.Set(b.tokenSignerCert.NotAfter.Sub(now).Seconds())
+		}
 	}
 	update()
 	ticker := time.NewTicker(interval)

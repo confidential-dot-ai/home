@@ -66,7 +66,7 @@ func (rh *rotateHandler) HandleRotateCA(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Validate EAR JWT (same validation as sign-csr).
-	claims, err := validateEARToken(req.EAR, b.tokenSignerCert, rh.issuer.ExpectedIssuer, rh.issuer.JWTClockSkew)
+	claims, err := validateEARToken(req.EAR, rh.issuer.keyProvider, rh.issuer.ExpectedIssuer, rh.issuer.JWTClockSkew)
 	if err != nil {
 		rh.issuer.Logger.Warn("rotate-ca: EAR token validation failed", "error", err)
 		var tve *TokenValidationError

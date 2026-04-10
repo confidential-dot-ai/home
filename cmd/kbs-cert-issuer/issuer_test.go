@@ -67,6 +67,7 @@ func testIssuer(t *testing.T) (*Issuer, *ecdsa.PrivateKey) {
 	tokenCert := selfSignedLeaf(t, tokenKey, "KBS Token Signer")
 
 	iss := &Issuer{
+		keyProvider:   mustCertKeyProvider(t, tokenCert),
 		MaxTTL:        24 * time.Hour,
 		JWTClockSkew:  30,
 		MinCAValidity: time.Hour,
@@ -80,6 +81,15 @@ func testIssuer(t *testing.T) (*Issuer, *ecdsa.PrivateKey) {
 	})
 
 	return iss, tokenKey
+}
+
+func mustCertKeyProvider(t *testing.T, cert *x509.Certificate) *certKeyProvider {
+	t.Helper()
+	p, err := newCertKeyProvider(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 func selfSignedCA(t *testing.T, key *ecdsa.PrivateKey, cn string) *x509.Certificate {
@@ -505,6 +515,7 @@ func TestHandleSignCSR_ES384(t *testing.T) {
 	caCert := selfSignedCA(t, caKey, "Test Mesh CA")
 
 	iss := &Issuer{
+		keyProvider:   mustCertKeyProvider(t, tokenCert384),
 		MaxTTL:        24 * time.Hour,
 		JWTClockSkew:  30,
 		MinCAValidity: time.Hour,
@@ -764,7 +775,7 @@ func TestSignCSR_ReturnsSerial(t *testing.T) {
 		"submods":    "test-evidence",
 		"tee-pubkey": teePubKeyB64(t, csrKey),
 	})
-	claims, err := validateEARToken(ear, iss.getBundle().tokenSignerCert, "", 30)
+	claims, err := validateEARToken(ear, mustCertKeyProvider(t, iss.getBundle().tokenSignerCert), "", 30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -860,7 +871,7 @@ func TestTokenValidationError_Typed(t *testing.T) {
 	iss, _ := testIssuer(t)
 
 	// Completely garbage JWT.
-	_, err := validateEARToken("not.a.jwt", iss.getBundle().tokenSignerCert, "", 30)
+	_, err := validateEARToken("not.a.jwt", mustCertKeyProvider(t, iss.getBundle().tokenSignerCert), "", 30)
 	if err == nil {
 		t.Fatal("expected error for garbage JWT")
 	}

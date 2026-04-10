@@ -50,6 +50,7 @@ type certBundle struct {
 // Issuer validates EAR JWT tokens from KBS and signs CSRs with its CA key.
 type Issuer struct {
 	bundle           atomic.Pointer[certBundle]
+	keyProvider      KeyProvider
 	MaxTTL           time.Duration
 	SANValidation    bool           // When true, CSR IP SANs must match the request source IP.
 	DNSSANPattern    *regexp.Regexp // When set, DNS SANs matching this pattern are allowed. Nil = reject all DNS SANs.
@@ -141,7 +142,7 @@ func (iss *Issuer) HandleSignCSR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate EAR JWT token.
-	claims, err := validateEARToken(req.EAR, b.tokenSignerCert, iss.ExpectedIssuer, iss.JWTClockSkew)
+	claims, err := validateEARToken(req.EAR, iss.keyProvider, iss.ExpectedIssuer, iss.JWTClockSkew)
 	if err != nil {
 		iss.Logger.Warn("EAR token validation failed", "error", err)
 		var tve *TokenValidationError
@@ -369,8 +370,8 @@ type EARClaims struct {
 }
 
 // validateEARToken validates the EAR JWT signature, claims, and issuer (1.5).
-func validateEARToken(tokenStr string, signerCert *x509.Certificate, expectedIssuer string, clockSkew int64) (*EARClaims, error) {
-	claims, err := parseAndVerifyJWT(tokenStr, signerCert)
+func validateEARToken(tokenStr string, provider KeyProvider, expectedIssuer string, clockSkew int64) (*EARClaims, error) {
+	claims, err := parseAndVerifyJWT(tokenStr, provider)
 	if err != nil {
 		return nil, err
 	}
@@ -610,7 +611,7 @@ func capTTL(d time.Duration, maxTTL time.Duration) time.Duration {
 }
 
 // parseAndVerifyJWT is a minimal JWT parser for ES256/ES384 tokens.
-func parseAndVerifyJWT(tokenStr string, signerCert *x509.Certificate) (*EARClaims, error) {
+func parseAndVerifyJWT(tokenStr string, provider KeyProvider) (*EARClaims, error) {
 	parts := strings.SplitN(tokenStr, ".", 3)
 	if len(parts) != 3 {
 		return nil, &TokenValidationError{
@@ -629,6 +630,7 @@ func parseAndVerifyJWT(tokenStr string, signerCert *x509.Certificate) (*EARClaim
 	}
 	var header struct {
 		Alg string `json:"alg"`
+		Kid string `json:"kid"`
 	}
 	if err := json.Unmarshal(headerBytes, &header); err != nil {
 		return nil, &TokenValidationError{
@@ -654,18 +656,18 @@ func parseAndVerifyJWT(tokenStr string, signerCert *x509.Certificate) (*EARClaim
 		}
 	}
 
-	// Extract ECDSA public key from signer certificate.
-	ecPub, ok := signerCert.PublicKey.(*ecdsa.PublicKey)
-	if !ok {
+	// Resolve ECDSA public key via the provider (JWKS or cert-based).
+	ecPub, err := provider.PublicKey(header.Kid)
+	if err != nil {
 		return nil, &TokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("token-signer cert has non-ECDSA key: %T", signerCert.PublicKey),
+			Reason: "invalid_signature",
+			Err:    fmt.Errorf("resolve signing key: %w", err),
 		}
 	}
 	if ecPub.Curve != curve {
 		return nil, &TokenValidationError{
 			Reason: "malformed",
-			Err:    fmt.Errorf("token-signer curve %s doesn't match JWT alg %s", ecPub.Curve.Params().Name, header.Alg),
+			Err:    fmt.Errorf("signing key curve %s doesn't match JWT alg %s", ecPub.Curve.Params().Name, header.Alg),
 		}
 	}
 
