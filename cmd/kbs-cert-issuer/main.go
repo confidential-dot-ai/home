@@ -77,8 +77,12 @@ func main() {
 		logger.Info("KBS mode enabled: /v1/rotate-ca and JWT-gated /v1/ca active")
 	}
 
-	if *caKeyF == "" || *caCertF == "" || *tokenCert == "" {
-		logger.Error("--ca-key, --ca-cert, and --token-cert are all required")
+	if *caKeyF == "" || *caCertF == "" {
+		logger.Error("--ca-key and --ca-cert are required")
+		os.Exit(1)
+	}
+	if *tokenCert == "" && *jwksURL == "" {
+		logger.Error("either --token-cert or --jwks-url is required")
 		os.Exit(1)
 	}
 
