@@ -46,12 +46,10 @@ func (cr *certReloader) run(ctx context.Context) error {
 
 	// Watch parent directories (K8s secret mounts use symlink swaps on parent dir).
 	var paths []string
-	if cr.caKeyPath != "" {
-		paths = append(paths, cr.caKeyPath)
-	}
-	paths = append(paths, cr.caCertPath, cr.tokenCertPath)
-	if cr.parentCertPath != "" {
-		paths = append(paths, cr.parentCertPath)
+	for _, p := range []string{cr.caKeyPath, cr.caCertPath, cr.tokenCertPath, cr.parentCertPath} {
+		if p != "" {
+			paths = append(paths, p)
+		}
 	}
 	dirs := uniqueDirs(paths...)
 	for _, d := range dirs {
