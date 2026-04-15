@@ -100,7 +100,8 @@ func testApp(attestationURL, certIssuerURL string) http.Handler {
 			Store:            &whitelistStore,
 			AdminPasswordB64: base64.StdEncoding.EncodeToString([]byte("test-password")),
 		},
-		ReadyFn: func() bool { return false },
+		ReadyFn:   func() bool { return false },
+		EarIssuer: earIssuer,
 	}
 
 	return server.NewRouter(deps)

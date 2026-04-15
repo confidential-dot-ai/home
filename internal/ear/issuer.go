@@ -2,13 +2,14 @@ package ear
 
 import (
 	"crypto/ecdsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/lunal-dev/c8s/pkg/certutil"
+	"github.com/lunal-dev/c8s/pkg/jwks"
 )
 
 // Version is set at build time via ldflags.
@@ -24,29 +25,36 @@ const statusAffirming = 2
 // conforming to draft-ietf-rats-ear.
 type Issuer struct {
 	signingKey *ecdsa.PrivateKey
+	kid        string
 	issuer     string
 	lifetime   time.Duration
 }
 
+// PublicKey returns a copy of the public half of the signing key, or nil if
+// no key is set.
+func (iss Issuer) PublicKey() *ecdsa.PublicKey {
+	if iss.signingKey == nil {
+		return nil
+	}
+	pub := iss.signingKey.PublicKey
+	return &pub
+}
+
 // NewIssuer creates an EAR issuer from a PEM-encoded EC private key (P-256/ES256).
 func NewIssuer(keyPEM []byte, issuer string, lifetime time.Duration) (Issuer, error) {
-	block, _ := pem.Decode(keyPEM)
-	if block == nil {
-		return Issuer{}, fmt.Errorf("invalid EAR signing key: no PEM block found")
-	}
-
-	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	ecKey, err := certutil.ParseECPrivateKey(keyPEM)
 	if err != nil {
 		return Issuer{}, fmt.Errorf("invalid EAR signing key: %w", err)
 	}
 
-	ecKey, ok := key.(*ecdsa.PrivateKey)
-	if !ok {
-		return Issuer{}, fmt.Errorf("invalid EAR signing key: not an EC key")
+	kid, err := jwks.Thumbprint(&ecKey.PublicKey)
+	if err != nil {
+		return Issuer{}, fmt.Errorf("compute EAR key thumbprint: %w", err)
 	}
 
 	return Issuer{
 		signingKey: ecKey,
+		kid:        kid,
 		issuer:     issuer,
 		lifetime:   lifetime,
 	}, nil
@@ -78,6 +86,7 @@ func (iss Issuer) Issue(submodsEvidence json.RawMessage) (string, error) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	token.Header["kid"] = iss.kid
 	signed, err := token.SignedString(iss.signingKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign EAR token: %w", err)

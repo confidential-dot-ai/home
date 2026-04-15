@@ -6,6 +6,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/lunal-dev/c8s/internal/attestation"
+	"github.com/lunal-dev/c8s/internal/ear"
 	"github.com/lunal-dev/c8s/internal/whitelist"
 )
 
@@ -14,6 +15,7 @@ type Dependencies struct {
 	AttestationHandler attestation.Handler
 	WhitelistHandler   whitelist.Handler
 	ReadyFn            attestation.ReadinessFunc
+	EarIssuer          ear.Issuer
 }
 
 // NewRouter builds the chi router with all routes wired up.
@@ -26,6 +28,7 @@ func NewRouter(deps Dependencies) http.Handler {
 	})
 
 	r.Get("/readyz", attestation.HandleReadyz(deps.ReadyFn))
+	r.Get("/.well-known/jwks.json", HandleJWKS(deps.EarIssuer))
 
 	r.Post("/authenticate", deps.AttestationHandler.HandleAuthenticate)
 	r.Post("/attest", deps.AttestationHandler.HandleAttest)

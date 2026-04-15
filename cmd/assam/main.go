@@ -154,7 +154,8 @@ func run(cfg config) error {
 			Store:            &whitelistStore,
 			AdminPasswordB64: base64.StdEncoding.EncodeToString([]byte(cfg.whitelistAdminPass)),
 		},
-		ReadyFn: checker.Ready,
+		ReadyFn:   checker.Ready,
+		EarIssuer: earIssuer,
 	}
 
 	router := server.NewRouter(deps)
