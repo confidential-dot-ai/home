@@ -120,11 +120,14 @@ func (cr *certReloader) reload() {
 		return
 	}
 
-	tokenCert, err := certutil.LoadCertificateFile(cr.tokenCertPath)
-	if err != nil {
-		cr.logger.Error("cert reload failed: token cert", "error", err)
-		certReloadFailuresTotal.Inc()
-		return
+	var tokenCert *x509.Certificate
+	if cr.tokenCertPath != "" {
+		tokenCert, err = certutil.LoadCertificateFile(cr.tokenCertPath)
+		if err != nil {
+			cr.logger.Error("cert reload failed: token cert", "error", err)
+			certReloadFailuresTotal.Inc()
+			return
+		}
 	}
 
 	var parentCert *x509.Certificate
