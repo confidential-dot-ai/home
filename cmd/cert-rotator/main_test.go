@@ -183,12 +183,12 @@ func TestVerifyCertIssuerReload_Success(t *testing.T) {
 	expectedFP := "abc123"
 	// Mock metrics server returning incremented counter and matching fingerprint.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `# HELP kbs_cert_issuer_cert_reloads_total Total successful certificate reloads.
-# TYPE kbs_cert_issuer_cert_reloads_total counter
-kbs_cert_issuer_cert_reloads_total 5
-# HELP kbs_cert_issuer_ca_cert_fingerprint_info Info metric
-# TYPE kbs_cert_issuer_ca_cert_fingerprint_info gauge
-kbs_cert_issuer_ca_cert_fingerprint_info{fingerprint="%s"} 1
+		fmt.Fprintf(w, `# HELP cert_issuer_cert_reloads_total Total successful certificate reloads.
+# TYPE cert_issuer_cert_reloads_total counter
+cert_issuer_cert_reloads_total 5
+# HELP cert_issuer_ca_cert_fingerprint_info Info metric
+# TYPE cert_issuer_ca_cert_fingerprint_info gauge
+cert_issuer_ca_cert_fingerprint_info{fingerprint="%s"} 1
 `, expectedFP)
 	}))
 	defer srv.Close()
@@ -206,8 +206,8 @@ func TestVerifyCertIssuerReload_Timeout(t *testing.T) {
 
 	// Mock server that never returns the expected fingerprint.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `kbs_cert_issuer_cert_reloads_total 1
-kbs_cert_issuer_ca_cert_fingerprint_info{fingerprint="wrong"} 1
+		fmt.Fprintf(w, `cert_issuer_cert_reloads_total 1
+cert_issuer_ca_cert_fingerprint_info{fingerprint="wrong"} 1
 `)
 	}))
 	defer srv.Close()
@@ -267,17 +267,17 @@ func TestTrimExpiredCerts(t *testing.T) {
 }
 
 func TestParseMetricValue(t *testing.T) {
-	body := `# HELP kbs_cert_issuer_cert_reloads_total Total reloads
-# TYPE kbs_cert_issuer_cert_reloads_total counter
-kbs_cert_issuer_cert_reloads_total 42
-kbs_cert_issuer_ca_cert_fingerprint_info{fingerprint="abc123"} 1
+	body := `# HELP cert_issuer_cert_reloads_total Total reloads
+# TYPE cert_issuer_cert_reloads_total counter
+cert_issuer_cert_reloads_total 42
+cert_issuer_ca_cert_fingerprint_info{fingerprint="abc123"} 1
 `
-	v := parseMetricValue(body, "kbs_cert_issuer_cert_reloads_total")
+	v := parseMetricValue(body, "cert_issuer_cert_reloads_total")
 	if v != 42 {
 		t.Errorf("parseMetricValue = %v, want 42", v)
 	}
 
-	fp := parseMetricLabel(body, "kbs_cert_issuer_ca_cert_fingerprint_info", "fingerprint")
+	fp := parseMetricLabel(body, "cert_issuer_ca_cert_fingerprint_info", "fingerprint")
 	if fp != "abc123" {
 		t.Errorf("parseMetricLabel = %q, want %q", fp, "abc123")
 	}

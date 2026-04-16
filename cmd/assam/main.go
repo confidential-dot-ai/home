@@ -78,7 +78,7 @@ func main() {
 	flags.IntVarP(&port, "port", "p", 8080, "Port to listen on")
 	flags.StringVar(&attestationSvcURL, "attestation-service-url", "", "URL of the attestation service")
 	flags.StringVar(&attestationSvcAPIKey, "attestation-service-api-key", "", "API key for the attestation service (required when running in remote mode)")
-	flags.StringVar(&certIssuerURL, "cert-issuer-url", "", "URL of the kbs-cert-issuer service")
+	flags.StringVar(&certIssuerURL, "cert-issuer-url", "", "URL of the cert-issuer service")
 	flags.StringVar(&earKeyPath, "ear-key", "", "Path to the EC private key PEM for EAR tokens")
 	flags.StringVar(&earIssuerName, "ear-issuer", "assam", "Issuer name for EAR tokens")
 	flags.DurationVar(&certTTL, "cert-ttl", 24*time.Hour, "TTL for issued certificates")

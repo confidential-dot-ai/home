@@ -9,7 +9,7 @@ Confidential computing infrastructure for Kubernetes. Provides TEE attestation, 
 | [`cmd/assam`](cmd/assam/) | Key Broker Service - verifies TEE attestation evidence and issues signed X.509 certificates | [README](cmd/assam/README.md) |
 | [`cmd/get-cert`](cmd/get-cert/) | CLI tool and init-container for TEE-attested certificate provisioning | [README](cmd/get-cert/README.md) |
 | [`cmd/ratls-mesh`](cmd/ratls-mesh/) | Transparent L4 proxy wrapping inter-node K8s traffic in RA-TLS | [README](cmd/ratls-mesh/README.md) |
-| [`cmd/kbs-cert-issuer`](cmd/kbs-cert-issuer/) | Certificate issuer sidecar for KBS | [README](cmd/kbs-cert-issuer/README.md) |
+| [`cmd/cert-issuer`](cmd/cert-issuer/) | Certificate issuer sidecar | [README](cmd/cert-issuer/README.md) |
 | [`cmd/cert-rotator`](cmd/cert-rotator/) | Kubernetes cert rotation controller | [README](cmd/cert-rotator/README.md) |
 | [`cmd/nri-image-policy`](cmd/nri-image-policy/) | NRI plugin enforcing container image digest whitelists | - |
 | [`cmd/node-container-whitelist`](cmd/node-container-whitelist/) | HTTP server fetching and serving the container whitelist | - |
@@ -35,13 +35,13 @@ cmd/
   assam/                   KBS server binary
   get-cert/                TEE-attested cert provisioning CLI/init-container
   ratls-mesh/              Transparent L4 RA-TLS proxy (DaemonSet)
-  kbs-cert-issuer/         Certificate issuer sidecar
+  cert-issuer/             Certificate issuer sidecar
   cert-rotator/            Kubernetes cert rotation controller
   nri-image-policy/        NRI container image policy plugin
   node-container-whitelist/ Whitelist HTTP server
 internal/
   attestation/             Attestation handlers and challenge store
-  certissuer/              HTTP client for kbs-cert-issuer
+  certissuer/              HTTP client for cert-issuer
   ear/                     EAR JWT token issuer (ES256)
   readiness/               Background health checker
   server/                  Chi router and middleware
@@ -95,7 +95,7 @@ All images are published to GHCR on push to `main` and `feat/**` branches:
 |---|---|---|
 | `ghcr.io/lunal-dev/assam` | distroless | |
 | `ghcr.io/lunal-dev/get-cert` | distroless | |
-| `ghcr.io/lunal-dev/kbs-cert-issuer` | distroless | |
+| `ghcr.io/lunal-dev/cert-issuer` | distroless | |
 | `ghcr.io/lunal-dev/ratls-mesh` | debian-slim | Needs iptables + attestation binaries |
 | `ghcr.io/lunal-dev/cert-rotator` | distroless | Includes attestation binaries |
 | `ghcr.io/lunal-dev/nri-image-policy` | debian-slim | Needs TSS2 libs + attestation binaries |

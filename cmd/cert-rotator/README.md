@@ -1,6 +1,6 @@
 # cert-rotator
 
-Rotates token-signer and mesh CA keypairs for the KBS cert-issuer. Generates new certificates, updates Kubernetes Secrets and ConfigMaps with CA bundles, and verifies cert-issuer hot-reload via metrics polling.
+Rotates token-signer and mesh CA keypairs for the cert-issuer. Generates new certificates, updates Kubernetes Secrets and ConfigMaps with CA bundles, and verifies cert-issuer hot-reload via metrics polling.
 
 Deployed as a Kubernetes CronJob via the `trustee_kbs` Ansible role.
 

@@ -1,13 +1,13 @@
 # assam
 
-The main key broker service binary. Assam verifies TEE attestation evidence via an external attestation service and issues signed X.509 certificates via kbs-cert-issuer.
+The main key broker service binary. Assam verifies TEE attestation evidence via an external attestation service and issues signed X.509 certificates via cert-issuer.
 
 ## Usage
 
 ```bash
 assam \
   --attestation-service-url http://attestation-service:8400 \
-  --cert-issuer-url http://kbs-cert-issuer:8090 \
+  --cert-issuer-url http://cert-issuer:8090 \
   --ear-key /secrets/ear-signing-key.pem \
   --whitelist-db /data/whitelist.db \
   --whitelist-admin-password secret
@@ -20,7 +20,7 @@ assam \
 | `--host` | | `0.0.0.0` | Host address to bind to |
 | `--port` | `-p` | `8080` | Port to listen on |
 | `--attestation-service-url` | | *(required)* | URL of the attestation service |
-| `--cert-issuer-url` | | *(required)* | URL of the kbs-cert-issuer service |
+| `--cert-issuer-url` | | *(required)* | URL of the cert-issuer service |
 | `--ear-key` | | *(required)* | Path to EC private key PEM for signing EAR tokens |
 | `--ear-issuer` | | `assam` | Issuer name for EAR tokens |
 | `--cert-ttl` | | `24h` | TTL for issued certificates |

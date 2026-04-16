@@ -333,7 +333,7 @@ func main() {
 		srv.Shutdown(shutdownCtx)
 	}()
 
-	logger.Info("kbs-cert-issuer starting", "address", ln.Addr().String())
+	logger.Info("cert-issuer starting", "address", ln.Addr().String())
 	if err := srv.Serve(ln); err != http.ErrServerClosed {
 		logger.Error("server error", "error", err)
 		os.Exit(1)

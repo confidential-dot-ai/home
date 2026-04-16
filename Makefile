@@ -1,4 +1,4 @@
-.PHONY: build build-assam build-get-cert build-ratls-mesh build-kbs-cert-issuer build-cert-rotator \
+.PHONY: build build-assam build-get-cert build-ratls-mesh build-cert-issuer build-cert-rotator \
        build-nri-image-policy build-node-container-whitelist \
        test test-integration vet fmt lint clean
 
@@ -8,7 +8,7 @@ MODULE     = github.com/lunal-dev/c8s
 
 # --- All binaries ---
 
-build: build-assam build-get-cert build-ratls-mesh build-kbs-cert-issuer build-cert-rotator \
+build: build-assam build-get-cert build-ratls-mesh build-cert-issuer build-cert-rotator \
        build-nri-image-policy build-node-container-whitelist
 
 # --- Assam ---
@@ -38,14 +38,14 @@ build-ratls-mesh:
 		-o $(BUILD_DIR)/ratls-mesh ./cmd/ratls-mesh
 	@echo "Built $(BUILD_DIR)/ratls-mesh"
 
-# --- KBS Cert Issuer ---
+# --- Cert Issuer ---
 
-build-kbs-cert-issuer:
+build-cert-issuer:
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 		go build -ldflags="-s -w" \
-		-o $(BUILD_DIR)/kbs-cert-issuer ./cmd/kbs-cert-issuer
-	@echo "Built $(BUILD_DIR)/kbs-cert-issuer"
+		-o $(BUILD_DIR)/cert-issuer ./cmd/cert-issuer
+	@echo "Built $(BUILD_DIR)/cert-issuer"
 
 # --- Cert Rotator ---
 

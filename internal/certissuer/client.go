@@ -12,7 +12,7 @@ import (
 	"github.com/lunal-dev/c8s/pkg/types"
 )
 
-// Client is an HTTP client for the kbs-cert-issuer service.
+// Client is an HTTP client for the cert-issuer service.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client

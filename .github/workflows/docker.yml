@@ -79,9 +79,9 @@ jobs:
             image: ghcr.io/lunal-dev/ratls-mesh
             dockerfile: cmd/ratls-mesh/Dockerfile
             needs-attestation: true
-          - binary: kbs-cert-issuer
-            image: ghcr.io/lunal-dev/kbs-cert-issuer
-            dockerfile: cmd/kbs-cert-issuer/Dockerfile
+          - binary: cert-issuer
+            image: ghcr.io/lunal-dev/cert-issuer
+            dockerfile: cmd/cert-issuer/Dockerfile
             needs-attestation: false
           - binary: cert-rotator
             image: ghcr.io/lunal-dev/cert-rotator

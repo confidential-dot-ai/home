@@ -1,4 +1,4 @@
-# kbs-cert-issuer
+# cert-issuer
 
 Sidecar binary that runs alongside KBS (Key Broker Service) to issue CA-signed certificates for ratls-mesh nodes. It validates EAR (Entity Attestation Result) JWT tokens produced by KBS after successful TEE attestation and signs Certificate Signing Requests (CSRs) with a mesh CA key. Applications use the issued certificates for hardware-attested mTLS within the ratls-mesh.
 
@@ -10,7 +10,7 @@ Sidecar binary that runs alongside KBS (Key Broker Service) to issue CA-signed c
           │                                         │
           │  ┌─────────┐       ┌────────────────┐   │
    TEE    │  │         │  EAR  │                │   │
- evidence │  │   KBS   │──JWT──▶ kbs-cert-issuer│   │
+ evidence │  │   KBS   │──JWT──▶ cert-issuer│   │
 ──────────▶  │         │       │                │   │
           │  └─────────┘       └───────┬────────┘   │
           │   Verifies TEE              │            │
@@ -25,7 +25,7 @@ Sidecar binary that runs alongside KBS (Key Broker Service) to issue CA-signed c
                          └─────────────────────┘
 ```
 
-**Trust model:** kbs-cert-issuer does NOT talk to AMD KDS or verify attestation evidence directly. It trusts that KBS has already performed hardware attestation and expresses the result as a signed EAR JWT. The sidecar validates only the JWT signature against the KBS token-signer certificate.
+**Trust model:** cert-issuer does NOT talk to AMD KDS or verify attestation evidence directly. It trusts that KBS has already performed hardware attestation and expresses the result as a signed EAR JWT. The sidecar validates only the JWT signature against the KBS token-signer certificate.
 
 **Enabled via:** `trustee_mesh_ca_enabled: true` in Ansible.
 
@@ -34,13 +34,13 @@ Sidecar binary that runs alongside KBS (Key Broker Service) to issue CA-signed c
 ## Build
 
 ```bash
-make build-kbs-cert-issuer
+make build-cert-issuer
 ```
 
 ## Usage
 
 ```bash
-kbs-cert-issuer \
+cert-issuer \
   --ca-key /secrets/mesh-ca.key \
   --ca-cert /secrets/mesh-ca.crt \
   --token-cert /secrets/kbs-token-signer.crt \
@@ -119,19 +119,19 @@ Returns Prometheus-format metrics. Key metrics:
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `kbs_cert_issuer_sign_requests_total{result}` | Counter | Requests by result: success, bad_request, unauthorized, forbidden, error |
-| `kbs_cert_issuer_sign_latency_seconds` | Histogram | Signing request latency |
-| `kbs_cert_issuer_certificates_issued_total` | Counter | Successfully issued certificates |
-| `kbs_cert_issuer_token_validation_failures_total{reason}` | Counter | Token failures: expired, invalid_signature, key_binding, malformed |
-| `kbs_cert_issuer_active_requests` | Gauge | In-flight sign-csr requests |
-| `kbs_cert_issuer_ca_cert_expiry_seconds` | Gauge | Seconds until CA cert expires |
-| `kbs_cert_issuer_token_cert_expiry_seconds` | Gauge | Seconds until token-signer cert expires |
-| `kbs_cert_issuer_rate_limit_rejections_total` | Counter | Rate-limited requests |
-| `kbs_cert_issuer_cert_reloads_total` | Counter | Successful certificate hot-reloads |
-| `kbs_cert_issuer_cert_reload_failures_total` | Counter | Failed hot-reload attempts |
-| `kbs_cert_issuer_ca_cert_fingerprint_info` | Gauge | Current CA cert SHA-256 fingerprint (label: `fingerprint`) |
-| `kbs_cert_issuer_dns_san_validation_failures_total` | Counter | DNS SAN validation rejections |
-| `kbs_cert_issuer_rate_limiter_entries` | Gauge | Current per-IP rate limiter entries |
+| `cert_issuer_sign_requests_total{result}` | Counter | Requests by result: success, bad_request, unauthorized, forbidden, error |
+| `cert_issuer_sign_latency_seconds` | Histogram | Signing request latency |
+| `cert_issuer_certificates_issued_total` | Counter | Successfully issued certificates |
+| `cert_issuer_token_validation_failures_total{reason}` | Counter | Token failures: expired, invalid_signature, key_binding, malformed |
+| `cert_issuer_active_requests` | Gauge | In-flight sign-csr requests |
+| `cert_issuer_ca_cert_expiry_seconds` | Gauge | Seconds until CA cert expires |
+| `cert_issuer_token_cert_expiry_seconds` | Gauge | Seconds until token-signer cert expires |
+| `cert_issuer_rate_limit_rejections_total` | Counter | Rate-limited requests |
+| `cert_issuer_cert_reloads_total` | Counter | Successful certificate hot-reloads |
+| `cert_issuer_cert_reload_failures_total` | Counter | Failed hot-reload attempts |
+| `cert_issuer_ca_cert_fingerprint_info` | Gauge | Current CA cert SHA-256 fingerprint (label: `fingerprint`) |
+| `cert_issuer_dns_san_validation_failures_total` | Counter | DNS SAN validation rejections |
+| `cert_issuer_rate_limiter_entries` | Gauge | Current per-IP rate limiter entries |
 
 ### `GET /live` -- Liveness probe
 
@@ -199,7 +199,7 @@ cert-issuer watches its certificate files for changes using fsnotify, enabling z
 - **File watching**: Monitors parent directories of cert files (handles Kubernetes Secret/ConfigMap symlink swaps correctly)
 - **Debounce**: 2-second debounce window coalesces rapid filesystem events
 - **Chain validation**: On reload, `validateChain()` verifies the intermediate→root chain if `--parent-cert` is set
-- **Failure handling**: Failed reloads increment `kbs_cert_issuer_cert_reload_failures_total`; the previous certificate bundle is preserved
+- **Failure handling**: Failed reloads increment `cert_issuer_cert_reload_failures_total`; the previous certificate bundle is preserved
 - **Atomic swap**: New certificates are swapped in via `atomic.Pointer[certBundle]` — in-flight requests see a consistent bundle
 
 ## Audit Logging
@@ -247,13 +247,13 @@ trustee_cert_issuer_replicas: 2  # optional
 
 ```bash
 # Unit tests with race detector
-go test -race -count=1 -timeout=60s -v ./cmd/kbs-cert-issuer/...
+go test -race -count=1 -timeout=60s -v ./cmd/cert-issuer/...
 ```
 
 Tests use generated ephemeral CA and token-signer keypairs -- no KBS or TEE hardware required. Covers: full sign-CSR flow with certificate chain verification, expired token rejection, invalid JWT signature rejection, TTL capping, CA endpoint, TTL parsing, liveness probe, ES384 algorithm, key binding mismatch, attestation digest extension, missing TEE pubkey, future IAT rejection, serial number return, metrics instrumentation, rate limiting, and typed token validation errors.
 
 ## Security
 
-- [Threat Model](../../docs/SECURITY/THREAT_MODEL.md) — Threats [T9](../../docs/SECURITY/THREAT_MODEL.md#t9-kbs-ear-token-replay-kbs-mode), [T12](../../docs/SECURITY/THREAT_MODEL.md#t12-kbs-cert-issuer-compromise-kbs-mode), [T15](../../docs/SECURITY/THREAT_MODEL.md#t15-standalone-cert-issuer-network-exposure), [T17](../../docs/SECURITY/THREAT_MODEL.md#t17-hot-reload-toctou-cert-issuer)
+- [Threat Model](../../docs/SECURITY/THREAT_MODEL.md) — Threats [T9](../../docs/SECURITY/THREAT_MODEL.md#t9-kbs-ear-token-replay-kbs-mode), [T12](../../docs/SECURITY/THREAT_MODEL.md#t12-cert-issuer-compromise-kbs-mode), [T15](../../docs/SECURITY/THREAT_MODEL.md#t15-standalone-cert-issuer-network-exposure), [T17](../../docs/SECURITY/THREAT_MODEL.md#t17-hot-reload-toctou-cert-issuer)
 - [Certificate Lifecycle](../../docs/SECURITY/CERT_LIFECYCLE.md) — CA management, issuance flow, hot-reload
 - [Production Hardening](../../docs/SECURITY/PRODUCTION_HARDENING.md) — Hardening checklist for cert-issuer deployment

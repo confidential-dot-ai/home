@@ -274,8 +274,8 @@ func captureBaselineMetrics(ctx context.Context, httpClient *http.Client, metric
 	body, _ := io.ReadAll(resp.Body)
 	bodyStr := string(body)
 
-	reloadsTotal = parseMetricValue(bodyStr, `kbs_cert_issuer_cert_reloads_total`)
-	fingerprint = parseMetricLabel(bodyStr, `kbs_cert_issuer_ca_cert_fingerprint_info`, "fingerprint")
+	reloadsTotal = parseMetricValue(bodyStr, `cert_issuer_cert_reloads_total`)
+	fingerprint = parseMetricLabel(bodyStr, `cert_issuer_ca_cert_fingerprint_info`, "fingerprint")
 
 	return reloadsTotal, fingerprint, nil
 }
@@ -307,8 +307,8 @@ func verifyCertIssuerReload(ctx context.Context, httpClient *http.Client, metric
 		resp.Body.Close()
 		bodyStr := string(body)
 
-		currentReloads := parseMetricValue(bodyStr, `kbs_cert_issuer_cert_reloads_total`)
-		currentFingerprint := parseMetricLabel(bodyStr, `kbs_cert_issuer_ca_cert_fingerprint_info`, "fingerprint")
+		currentReloads := parseMetricValue(bodyStr, `cert_issuer_cert_reloads_total`)
+		currentFingerprint := parseMetricLabel(bodyStr, `cert_issuer_ca_cert_fingerprint_info`, "fingerprint")
 
 		// When we know the expected fingerprint, it is authoritative: a matching
 		// fingerprint proves the right cert is loaded even if the cert-issuer pod

@@ -55,7 +55,7 @@ type jwksKeyProvider struct {
 }
 
 var jwksRefreshesTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "kbs_cert_issuer_jwks_refreshes_total",
+	Name: "cert_issuer_jwks_refreshes_total",
 	Help: "Total JWKS endpoint refreshes.",
 })
 
