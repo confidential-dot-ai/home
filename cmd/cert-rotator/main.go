@@ -310,10 +310,18 @@ func verifyCertIssuerReload(ctx context.Context, httpClient *http.Client, metric
 		currentReloads := parseMetricValue(bodyStr, `kbs_cert_issuer_cert_reloads_total`)
 		currentFingerprint := parseMetricLabel(bodyStr, `kbs_cert_issuer_ca_cert_fingerprint_info`, "fingerprint")
 
-		reloaded := currentReloads > baselineReloads
-		fingerprintMatch := expectedFingerprint == "" || currentFingerprint == expectedFingerprint
+		// When we know the expected fingerprint, it is authoritative: a matching
+		// fingerprint proves the right cert is loaded even if the cert-issuer pod
+		// restarted during rotation (which resets the reload counter to 0). Only
+		// fall back to the counter when no expected fingerprint is known.
+		var verified bool
+		if expectedFingerprint != "" {
+			verified = currentFingerprint == expectedFingerprint
+		} else {
+			verified = currentReloads > baselineReloads
+		}
 
-		if reloaded && fingerprintMatch {
+		if verified {
 			logger.Info("cert-issuer reload verified",
 				"reloads_total", currentReloads,
 				"fingerprint", currentFingerprint,
