@@ -32,10 +32,7 @@ func TestMakeAttestFunc_ReportDataSize(t *testing.T) {
 		fakeReport := make([]byte, 1184)
 		json.NewEncoder(w).Encode(map[string]any{
 			"platform": "snp",
-			"evidence": map[string]any{
-				"platform": "snp",
-				"evidence": map[string]string{"attestation_report": base64.StdEncoding.EncodeToString(fakeReport)},
-			},
+			"evidence": map[string]string{"attestation_report": base64.StdEncoding.EncodeToString(fakeReport)},
 		})
 	}))
 	defer srv.Close()
@@ -70,10 +67,7 @@ func TestExtractSNPReport_BareMetal(t *testing.T) {
 
 	resp := types.AttestResponse{
 		Platform: "snp",
-		Evidence: types.AttestationEvidence{
-			Platform: "snp",
-			Evidence: evidenceJSON,
-		},
+		Evidence: evidenceJSON,
 	}
 
 	report, err := extractSNPReport(resp)
@@ -106,10 +100,7 @@ func TestExtractSNPReport_VTPM(t *testing.T) {
 
 	resp := types.AttestResponse{
 		Platform: "az-snp",
-		Evidence: types.AttestationEvidence{
-			Platform: "az-snp",
-			Evidence: evidenceJSON,
-		},
+		Evidence: evidenceJSON,
 	}
 
 	report, err := extractSNPReport(resp)
@@ -127,10 +118,7 @@ func TestExtractSNPReport_NoReport(t *testing.T) {
 
 	resp := types.AttestResponse{
 		Platform: "unknown",
-		Evidence: types.AttestationEvidence{
-			Platform: "unknown",
-			Evidence: evidenceJSON,
-		},
+		Evidence: evidenceJSON,
 	}
 
 	_, err := extractSNPReport(resp)
@@ -151,11 +139,8 @@ func TestMakeAttestFunc_ReportDataNotZeroPadded(t *testing.T) {
 		fakeReport := make([]byte, 1184)
 		json.NewEncoder(w).Encode(map[string]any{
 			"platform": "snp",
-			"evidence": map[string]any{
-				"platform": "snp",
-				"evidence": map[string]string{
-					"attestation_report": base64.StdEncoding.EncodeToString(fakeReport),
-				},
+			"evidence": map[string]string{
+				"attestation_report": base64.StdEncoding.EncodeToString(fakeReport),
 			},
 		})
 	}))

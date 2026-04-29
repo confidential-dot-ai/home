@@ -32,10 +32,7 @@ func mockServers(t *testing.T, caKey *ecdsa.PrivateKey, caCert *x509.Certificate
 		}
 		json.NewEncoder(w).Encode(types.AttestResponse{
 			Platform: "snp",
-			Evidence: types.AttestationEvidence{
-				Platform: "snp",
-				Evidence: json.RawMessage(`{"mock":"evidence"}`),
-			},
+			Evidence: json.RawMessage(`{"mock":"evidence"}`),
 		})
 	}))
 

@@ -76,9 +76,14 @@ type AttestRequest struct {
 }
 
 // AttestResponse is the response from the attestation service POST /attest.
+//
+// Evidence is the platform-specific evidence object (e.g. SnpEvidence,
+// TdxEvidence) emitted directly by the attestation service. Callers that
+// need to forward evidence to /verify must wrap it in an AttestationEvidence
+// envelope keyed by Platform.
 type AttestResponse struct {
-	Platform string              `json:"platform"`
-	Evidence AttestationEvidence `json:"evidence"`
+	Platform string          `json:"platform"`
+	Evidence json.RawMessage `json:"evidence"`
 }
 
 // VerifyRequest is sent to the attestation service POST /verify.

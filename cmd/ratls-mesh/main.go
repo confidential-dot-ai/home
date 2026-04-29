@@ -538,7 +538,7 @@ func makeAttestFunc(client attestclient.Client, attestationServiceURL string) fu
 // base64) and vTPM/Azure (hcl_report field, URL-safe base64 no padding).
 func extractSNPReport(resp types.AttestResponse) (string, error) {
 	var evidence attestEvidence
-	if err := json.Unmarshal(resp.Evidence.Evidence, &evidence); err != nil {
+	if err := json.Unmarshal(resp.Evidence, &evidence); err != nil {
 		return "", fmt.Errorf("parse attestation evidence: %w", err)
 	}
 

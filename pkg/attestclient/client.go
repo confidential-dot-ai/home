@@ -93,12 +93,15 @@ func (c Client) ObtainCertificate(attestationServiceURL, csrPEM string) (string,
 		return "", fmt.Errorf("attestation service: %w", err)
 	}
 
-	// Step 3: submit evidence + CSR to assam for verification and cert issuance
+	// Step 3: submit evidence + CSR to assam for verification and cert issuance.
+	// asResp.Evidence is the platform-specific evidence object as emitted by
+	// /attest; assam's /attest expects it wrapped in an AttestationEvidence
+	// envelope keyed by Platform.
 	attestReq := attestRequest{
 		Challenge: challengeResp.Challenge,
 		Evidence: attestEvidence{
-			Platform: asResp.Evidence.Platform,
-			Evidence: asResp.Evidence.Evidence,
+			Platform: asResp.Platform,
+			Evidence: asResp.Evidence,
 		},
 		CSR: csrPEM,
 	}
