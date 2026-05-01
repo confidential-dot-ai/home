@@ -1,0 +1,26 @@
+{{- if and (eq .Values.policy.mode "fail-closed") (not .Values.bootstrapWhitelist.digests) -}}
+{{- fail "policy.mode=fail-closed requires bootstrapWhitelist.digests to be non-empty. The plugin enforces fail-closed at every container create; an empty bootstrap means cluster bring-up wedges before assam can be reached. Populate it (typically via the c8s-fleet whitelist-sync workflow) or set policy.mode=audit to deploy without enforcement." -}}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nri-image-policy.fullname" . }}-bootstrap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nri-image-policy.labels" . | nindent 4 }}
+data:
+  # The install-DaemonSet copies this file to {{ include "nri-image-policy.hostBootstrapPath" . }}.
+  # The host plugin loads it on every startup, before any successful assam
+  # refresh, so the union of (bootstrap, cached signed whitelist) is what
+  # gates container creation during cold boot. Membership is computed by
+  # the c8s-fleet whitelist-sync workflow.
+  bootstrap.yaml: |
+    version: "1.0"
+    {{- if .Values.bootstrapWhitelist.digests }}
+    digests:
+      {{- range $digest, $image := .Values.bootstrapWhitelist.digests }}
+      {{ $digest | quote }}: {{ $image | quote }}
+      {{- end }}
+    {{- else }}
+    digests: {}
+    {{- end }}

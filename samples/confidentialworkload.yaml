@@ -1,0 +1,13 @@
+apiVersion: confidential.ai/v1alpha2
+kind: ConfidentialWorkload
+metadata:
+  name: demo-nginx
+  namespace: default
+spec:
+  trustDomainRef:
+    name: default
+  workloadRef:
+    kind: Deployment
+    name: demo-nginx
+  mesh:
+    enabled: true

@@ -47,6 +47,7 @@ spec:
           args:
             - operator
             - --leader-election-namespace={{ .Release.Namespace }}
+            - --status-mirror-enabled={{ .Values.statusMirror.enabled }}
             {{- if .Values.webhook.enabled }}
             - --operator-image={{ include "c8s.image" . }}
             - --assam-url={{ include "c8s.assamURL" . }}

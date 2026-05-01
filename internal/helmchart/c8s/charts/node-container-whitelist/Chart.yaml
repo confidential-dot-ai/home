@@ -1,0 +1,12 @@
+apiVersion: v2
+name: node-container-whitelist
+description: Serves NRI image whitelist as an HTTP endpoint, fetched from KBS via TEE attestation
+type: application
+version: 0.1.0
+home: https://github.com/lunal-dev/c8s-charts
+maintainers:
+  - name: lunal
+dependencies:
+  - name: c8s-common
+    version: 0.1.0
+    repository: file://../c8s-common

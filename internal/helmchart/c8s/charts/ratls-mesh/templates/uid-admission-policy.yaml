@@ -1,0 +1,55 @@
+{{- if .Values.uidAdmissionPolicy.enabled }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: deny-ratls-mesh-uid
+  labels:
+    {{- include "ratls-mesh.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - {{ .Release.Namespace }}
+            - kube-system
+  validations:
+    - expression: >-
+        !has(object.spec.securityContext) ||
+        !has(object.spec.securityContext.runAsUser) ||
+        object.spec.securityContext.runAsUser != {{ .Values.uid }}
+      message: "Pod-level runAsUser {{ .Values.uid }} is reserved for the ratls-mesh proxy and would bypass the service mesh."
+    - expression: >-
+        object.spec.containers.all(c,
+          !has(c.securityContext) ||
+          !has(c.securityContext.runAsUser) ||
+          c.securityContext.runAsUser != {{ .Values.uid }}
+        )
+      message: "Container runAsUser {{ .Values.uid }} is reserved for the ratls-mesh proxy and would bypass the service mesh."
+    - expression: >-
+        !has(object.spec.initContainers) ||
+        object.spec.initContainers.all(c,
+          !has(c.securityContext) ||
+          !has(c.securityContext.runAsUser) ||
+          c.securityContext.runAsUser != {{ .Values.uid }}
+        )
+      message: "Init container runAsUser {{ .Values.uid }} is reserved for the ratls-mesh proxy and would bypass the service mesh."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: deny-ratls-mesh-uid
+  labels:
+    {{- include "ratls-mesh.labels" . | nindent 4 }}
+spec:
+  policyName: deny-ratls-mesh-uid
+  validationActions:
+    - Deny
+{{- end }}

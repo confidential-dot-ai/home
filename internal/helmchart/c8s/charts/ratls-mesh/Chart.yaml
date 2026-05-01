@@ -1,0 +1,12 @@
+apiVersion: v2
+name: ratls-mesh
+description: RA-TLS service mesh — transparent L4 proxy with hardware-attested mTLS via AMD SEV-SNP/TDX
+type: application
+version: 0.1.0
+home: https://github.com/lunal-dev/c8s-charts
+maintainers:
+  - name: lunal
+dependencies:
+  - name: c8s-common
+    version: 0.1.0
+    repository: file://../c8s-common

@@ -1,0 +1,63 @@
+{{- if .Values.router.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tee-proxy.fullname" . }}-router
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tee-proxy.labels" . | nindent 4 }}
+data:
+  nginx.conf: |
+    worker_processes 1;
+    error_log /dev/stderr warn;
+    pid /tmp/nginx.pid;
+
+    events {
+        worker_connections 4096;
+    }
+
+    http {
+        access_log /dev/stdout;
+        client_body_temp_path /tmp/client_temp;
+        proxy_temp_path /tmp/proxy_temp;
+        fastcgi_temp_path /tmp/fastcgi_temp;
+        uwsgi_temp_path /tmp/uwsgi_temp;
+        scgi_temp_path /tmp/scgi_temp;
+
+        resolver {{ .Values.router.resolver }} valid=30s;
+        resolver_timeout 5s;
+
+        proxy_connect_timeout {{ .Values.router.proxyConnectTimeout }}s;
+        proxy_read_timeout {{ .Values.router.proxyReadTimeout }}s;
+        proxy_send_timeout {{ .Values.router.proxyReadTimeout }}s;
+
+        server {
+            listen {{ .Values.router.port }};
+
+            {{- range $i, $route := .Values.router.routes }}
+            # Route: {{ $route.path }} -> {{ $route.upstream }}
+            location {{ $route.path }} {
+                set $upstream_{{ $i }} "{{ $route.upstream }}";
+                proxy_pass $upstream_{{ $i }};
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+
+            {{- end }}
+            # Default: all other traffic -> upstream
+            location / {
+                set $upstream_default "http://{{ .Values.upstream }}";
+                proxy_pass $upstream_default;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+
+            location /nginx-health {
+                return 200 '{"status":"ok"}';
+                add_header Content-Type application/json;
+            }
+        }
+    }
+{{- end }}

@@ -1,0 +1,173 @@
+{{- $attestationURL := default (printf "http://%s-attestation-service.%s.svc:8400" .Release.Name .Release.Namespace) .Values.attestationURL -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tee-proxy.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tee-proxy.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  replicas: {{ .Values.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "tee-proxy.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tee-proxy.selectorLabels" . | nindent 8 }}
+      {{- if .Values.router.enabled }}
+      annotations:
+        checksum/router-config: {{ include (print $.Template.BasePath "/configmap-router.yaml") . | sha256sum }}
+      {{- end }}
+    spec:
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+        supplementalGroups: {{ .Values.tpm.supplementalGroups | toJson }}
+        sysctls:
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
+      {{- if gt (int .Values.replicas) 1 }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "tee-proxy.selectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: proxy
+          image: {{ include "tee-proxy.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --host
+            - {{ .Values.domain | quote }}
+            - --upstream
+            {{- if .Values.router.enabled }}
+            - "http://127.0.0.1:{{ .Values.router.port }}"
+            {{- else }}
+            - "http://{{ .Values.upstream }}"
+            {{- end }}
+            - --platform
+            - {{ .Values.platform | quote }}
+            - --header-name
+            - {{ .Values.headerName | quote }}
+            {{- if $attestationURL }}
+            - --attestation-url
+            - {{ $attestationURL | quote }}
+            {{- end }}
+          ports:
+            - name: https
+              containerPort: {{ .Values.ports.https }}
+              hostPort: {{ .Values.ports.https }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.ports.http }}
+              hostPort: {{ .Values.ports.http }}
+              protocol: TCP
+          workingDir: /tmp
+          env:
+            - name: AUTOCERT_DIR
+              value: /app/certs
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: autocert-cache
+              mountPath: /app/certs
+          resources:
+            requests:
+              {{- toYaml .Values.resources.requests | nindent 14 }}
+            limits:
+              {{- toYaml .Values.resources.limits | nindent 14 }}
+              {{- if .Values.tpm.enabled }}
+              {{ .Values.tpm.resource }}: 1
+              {{- end }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.ports.http }}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.ports.http }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+        {{- if .Values.router.enabled }}
+        - name: edge-router
+          image: {{ include "c8s-common.image" .Values.router.image }}
+          imagePullPolicy: {{ .Values.router.image.pullPolicy }}
+          ports:
+            - name: router
+              containerPort: {{ .Values.router.port }}
+              protocol: TCP
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 101
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml .Values.router.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /nginx-health
+              port: {{ .Values.router.port }}
+            initialDelaySeconds: {{ .Values.router.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.router.probes.readiness.periodSeconds }}
+          livenessProbe:
+            httpGet:
+              path: /nginx-health
+              port: {{ .Values.router.port }}
+            initialDelaySeconds: {{ .Values.router.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.router.probes.liveness.periodSeconds }}
+          volumeMounts:
+            - name: router-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: router-tmp
+              mountPath: /tmp
+            - name: router-cache
+              mountPath: /var/cache/nginx
+        {{- end }}
+      volumes:
+        - name: autocert-cache
+          persistentVolumeClaim:
+            claimName: {{ include "tee-proxy.fullname" . }}-certs
+        {{- if .Values.router.enabled }}
+        - name: router-config
+          configMap:
+            name: {{ include "tee-proxy.fullname" . }}-router
+        - name: router-tmp
+          emptyDir: {}
+        - name: router-cache
+          emptyDir: {}
+        {{- end }}
+      nodeSelector:
+        kubernetes.io/os: linux
+        {{- with .Values.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

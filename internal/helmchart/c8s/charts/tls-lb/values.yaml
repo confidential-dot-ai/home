@@ -1,0 +1,59 @@
+# -- Subject Alternative Name for the TLS certificate (IP address or hostname).
+san: "example.com"
+
+# -- URL of the assam key broker service.
+assamURL: "http://assam.default.svc.cluster.local:8080"
+
+# -- URL of the local attestation service (typically a DaemonSet on each node).
+attestationServiceURL: "http://attestation-service.default.svc.cluster.local:8400"
+
+# -- Upstream backend service to proxy traffic to.
+upstream:
+  # -- Host and port of the upstream service.
+  address: "vllm:8000"
+  # -- Protocol for the upstream connection (http or https).
+  protocol: "http"
+
+imagePullSecrets:
+  - name: ghcr-secret
+
+initContainer:
+  image:
+    repository: ghcr.io/lunal-dev/get-cert
+    # -- Image tag or sha-prefixed digest. Required: the chart does not pin a
+    #    default tag — the consumer (fleet HelmRelease or cluster overlay)
+    #    must set this so the running image is explicit.
+    tag: ""
+    pullPolicy: IfNotPresent
+  # -- Enable verbose (debug) logging for the init container.
+  verbose: false
+  # -- How often to renew the TLS certificate. get-cert runs as a native sidecar
+  #    and SIGHUPs nginx after each renewal. Must be shorter than the cert TTL
+  #    issued by assam (currently ~4h).
+  renewInterval: "1h"
+  # -- API key for authenticating with the attestation service (hosted mode).
+  attestationServiceApiKey: "28950a6a10bc4bfe991e7b51edeb0233891b62550abf7c3d331f512e9d2d83ad"
+
+nginx:
+  image:
+    repository: nginxinc/nginx-unprivileged
+    # -- Required: consumer must set tag or digest.
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  # -- Number of nginx replicas.
+  replicas: 1
+  # -- HTTPS port nginx listens on.
+  httpsPort: 443
+  resources: {}
+
+service:
+  type: ClusterIP
+  port: 443
+  # -- Optional annotations on the Service (e.g. cloud LB / static IP hints).
+  annotations: {}
+  # -- Optional pre-allocated static load balancer IP. Cloud-provider specific.
+  loadBalancerIP: ""
+
+# -- Volume mount path for TLS certificate and key shared between init and nginx.
+tlsMountPath: "/tls"

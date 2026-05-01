@@ -1,0 +1,9 @@
+apiVersion: v2
+name: tls-lb
+description: TLS-terminating load balancer with TEE-attested certificate provisioning
+type: application
+version: 0.4.0
+dependencies:
+  - name: c8s-common
+    version: 0.1.0
+    repository: file://../c8s-common

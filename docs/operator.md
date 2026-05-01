@@ -16,7 +16,8 @@ The operator tree is built around these pieces:
   and shells out to `helm upgrade --install`.
 - `internal/helmchart/c8s` installs the operator Deployment and Service, the
   CRDs, RBAC, optional webhook configuration, and an attestation-service
-  DaemonSet. It can also install Assam when `assam.enabled=true`.
+  DaemonSet. It can also install Assam and cert-issuer when
+  `assam.enabled=true` and `certIssuer.enabled=true`.
 - `internal/webhook` injects an init container into opted-in pods so each
   workload can fetch a leaf certificate through Assam.
 
@@ -37,6 +38,8 @@ prerequisites:
 - if chart-managed Assam is enabled, a cert-issuer URL, whitelist storage and
   admin secret handling, and an explicit decision about whether this deployment
   is inside the production trust boundary;
+- if chart-managed cert-issuer is enabled, a Secret-backed mesh CA bootstrap
+  and an explicit decision that this is acceptable for the environment;
 - nodes with the expected TEE device access for attestation-service;
 - permission for Helm to create workload auth Secrets in any namespaces listed
   under `webhook.apiKeySecret.createInNamespaces`;
@@ -68,16 +71,24 @@ The chart is intentionally conservative by default:
 - If the webhook is enabled, either `assam.url` or `assam.enabled=true` is
   required at template time.
 - The chart deploys the attestation-service DaemonSet, but it does not deploy
-  Assam unless `assam.enabled=true`.
+  Assam unless `assam.enabled=true`, and it does not deploy cert-issuer unless
+  `certIssuer.enabled=true`.
 - `image.tag` or `image.digest`, `attestationService.image.tag` or
   `attestationService.image.digest`, and, when enabled, `assam.image.tag` or
-  `assam.image.digest` are required; the CLI passes its build version when
-  running `c8s install`.
+  `assam.image.digest` and `certIssuer.image.tag` or
+  `certIssuer.image.digest` are required; the CLI passes its build version when
+  running `c8s install`. Unstamped local builds report version `dev`, and the
+  install CLI maps that to the `latest` image tag because CI does not publish
+  `dev`.
 
 This means a default platform install creates the operator, CRDs, RBAC, and
-attestation-service without mutating application workloads. Injection is an
-explicit platform follow-up after Assam is reachable. Once injection is enabled,
-application teams can opt workloads in by annotation.
+attestation-service without mutating application workloads. `c8s install
+--install-crds=false` passes Helm's `--skip-crds`; CRDs are advisory and not
+required for pod injection. That path also disables the CRD-backed status
+mirror controller; if CRDs are absent at runtime, the operator skips that
+controller rather than failing startup. Injection is an explicit platform
+follow-up after Assam is reachable. Once injection is enabled, application teams
+can opt workloads in by annotation.
 
 Enable injection with Helm values:
 
@@ -125,7 +136,7 @@ guarantees, Assam/CDS must run inside the attested trust boundary; whitelist
 state, signing material, admin credentials, and recovery procedures must not
 depend only on ordinary Kubernetes Secret/PV confidentiality.
 
-Minimal chart-managed Assam values:
+Minimal chart-managed Assam + cert-issuer values:
 
 ```yaml
 webhook:
@@ -133,7 +144,9 @@ webhook:
 
 assam:
   enabled: true
-  certIssuerURL: http://cert-issuer.c8s-system.svc:8090
+
+certIssuer:
+  enabled: true
 ```
 
 Equivalent install CLI:
@@ -141,14 +154,41 @@ Equivalent install CLI:
 ```bash
 c8s install \
   --enable-webhook \
-  --install-assam \
-  --assam-cert-issuer-url http://cert-issuer.c8s-system.svc:8090
+  --install-assam
 ```
+
+When `--install-assam` is used without `--assam-cert-issuer-url`, the install
+CLI also enables chart-managed cert-issuer and bootstraps a mesh CA Secret.
+Set `--assam-cert-issuer-url` to use an external cert-issuer instead.
 
 The chart-managed Assam manifest deliberately injects
 `C8S_ATTESTATION_SERVICE_API_KEY` and
 `C8S_ASSAM_WHITELIST_ADMIN_PASSWORD` from Secrets instead of serializing those
 values as process arguments.
+
+## Chart-managed cert-issuer
+
+`certIssuer.enabled` defaults to `false`. When enabled with chart-managed Assam,
+cert-issuer validates EAR JWTs through Assam's JWKS endpoint:
+
+```yaml
+assam:
+  enabled: true
+
+certIssuer:
+  enabled: true
+```
+
+The chart creates or reuses a mesh CA Secret with `mesh-ca.crt` and
+`mesh-ca.key`, plus a ConfigMap containing `ca.pem`. The generated key is ECDSA
+so it matches cert-issuer's key loader. Existing Secrets are reused on Helm
+upgrades via `lookup`; fresh keys are generated only when no existing Secret or
+explicit `certIssuer.ca.certPEM` / `certIssuer.ca.keyPEM` values are present.
+
+This is a bootstrap/demo path. The mesh CA key is readable by cluster-admins
+and any principal granted read access to that Secret. The production direction
+is the CDS-shaped in-CVM key model described in `docs/THREAT_MODEL.md` and
+`docs/GAPS.md`.
 
 ## Injection contract
 
@@ -297,9 +337,9 @@ Run Helm lint:
 
 ```bash
 helm lint internal/helmchart/c8s \
-  --set image.tag=dev \
-  --set attestationService.image.tag=dev \
-  --set assam.image.tag=dev
+  --set image.tag=latest \
+  --set attestationService.image.tag=latest \
+  --set assam.image.tag=latest
 ```
 
 Render the chart defaults. The output should not include a
@@ -309,9 +349,9 @@ Render the chart defaults. The output should not include a
 ```bash
 helm template c8s internal/helmchart/c8s \
   --namespace c8s-system \
-  --set image.tag=dev \
-  --set attestationService.image.tag=dev \
-  --set assam.image.tag=dev
+  --set image.tag=latest \
+  --set attestationService.image.tag=latest \
+  --set assam.image.tag=latest
 ```
 
 Verify webhook enablement requires Assam:
@@ -319,9 +359,9 @@ Verify webhook enablement requires Assam:
 ```bash
 helm template c8s internal/helmchart/c8s \
   --namespace c8s-system \
-  --set image.tag=dev \
-  --set attestationService.image.tag=dev \
-  --set assam.image.tag=dev \
+  --set image.tag=latest \
+  --set attestationService.image.tag=latest \
+  --set assam.image.tag=latest \
   --set webhook.enabled=true
 ```
 
@@ -336,9 +376,9 @@ Render enabled injection with chart-managed Assam:
 ```bash
 helm template c8s internal/helmchart/c8s \
   --namespace c8s-system \
-  --set image.tag=dev \
-  --set attestationService.image.tag=dev \
-  --set assam.image.tag=dev \
+  --set image.tag=latest \
+  --set attestationService.image.tag=latest \
+  --set assam.image.tag=latest \
   --set webhook.enabled=true \
   --set assam.enabled=true \
   --set-string assam.certIssuerURL=http://cert-issuer.c8s-system.svc:8090
@@ -358,9 +398,9 @@ Render enabled injection with scoped workload auth:
 ```bash
 helm template c8s internal/helmchart/c8s \
   --namespace c8s-system \
-  --set image.tag=dev \
-  --set attestationService.image.tag=dev \
-  --set assam.image.tag=dev \
+  --set image.tag=latest \
+  --set attestationService.image.tag=latest \
+  --set assam.image.tag=latest \
   --set webhook.enabled=true \
   --set-string assam.url=http://assam.c8s-system.svc:8080 \
   --set-string webhook.apiKeySecret.name=c8s-workload-attestation \

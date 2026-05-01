@@ -1,0 +1,189 @@
+{{- if .Values.certIssuer.enabled -}}
+{{- $caSecretName := include "c8s.certIssuerCASecretName" . -}}
+{{- $caConfigMapName := include "c8s.certIssuerCAConfigMapName" . -}}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace $caSecretName) -}}
+{{- $caCert := .Values.certIssuer.ca.certPEM -}}
+{{- $caKey := .Values.certIssuer.ca.keyPEM -}}
+{{- if and (not $caCert) $existing (index $existing.data "mesh-ca.crt") -}}
+  {{- $caCert = (b64dec (index $existing.data "mesh-ca.crt")) -}}
+{{- end -}}
+{{- if and (not $caKey) $existing (index $existing.data "mesh-ca.key") -}}
+  {{- $caKey = (b64dec (index $existing.data "mesh-ca.key")) -}}
+{{- end -}}
+{{- if and .Values.certIssuer.ca.create (or (not $caCert) (not $caKey)) -}}
+  {{- $key := genPrivateKey "ecdsa" -}}
+  {{- $ca := genCAWithKey .Values.certIssuer.ca.commonName (int .Values.certIssuer.ca.validityDays) $key -}}
+  {{- $caCert = $ca.Cert -}}
+  {{- $caKey = $ca.Key -}}
+{{- end -}}
+{{- if and .Values.certIssuer.ca.create (or (not $caCert) (not $caKey)) -}}
+  {{- fail "certIssuer.ca.create=true requires generated, existing, or explicit certIssuer.ca.certPEM/keyPEM material" -}}
+{{- end -}}
+{{- if .Values.certIssuer.ca.create }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $caSecretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: cert-issuer
+  annotations:
+    confidential.ai/trust-boundary-warning: "chart-managed mesh CA is bootstrap convenience; production CDS should keep signing keys in attested CVM memory"
+type: Opaque
+stringData:
+  mesh-ca.crt: {{ $caCert | quote }}
+  mesh-ca.key: {{ $caKey | quote }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $caConfigMapName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: cert-issuer
+data:
+  ca.pem: {{ $caCert | quote }}
+---
+{{- end }}
+{{- if .Values.certIssuer.resourceMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "c8s.certIssuerResourceMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: cert-issuer
+data:
+  resource-map.json: |
+{{ toPrettyJson .Values.certIssuer.resourceMap | indent 4 }}
+---
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "c8s.certIssuerName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: cert-issuer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "c8s.certIssuerName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: cert-issuer
+  annotations:
+    confidential.ai/trust-boundary-warning: "chart-managed cert-issuer uses a Kubernetes Secret-backed mesh CA until the CDS-shaped in-CVM key model replaces it"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: c8s-operator
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: cert-issuer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: c8s-operator
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: cert-issuer
+      annotations:
+        confidential.ai/trust-boundary-warning: "chart-managed cert-issuer uses a Kubernetes Secret-backed mesh CA until the CDS-shaped in-CVM key model replaces it"
+    spec:
+      serviceAccountName: {{ include "c8s.certIssuerName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+{{ toYaml .Values.podSecurityContext | indent 8 }}
+      containers:
+        - name: cert-issuer
+          image: {{ include "c8s.certIssuerImage" . }}
+          imagePullPolicy: {{ .Values.certIssuer.image.pullPolicy }}
+          args:
+            - --listen=:{{ .Values.certIssuer.port }}
+            - --ca-cert=/etc/mesh-ca/mesh-ca.crt
+            - --ca-key=/etc/mesh-ca/mesh-ca.key
+            - --jwks-url={{ include "c8s.certIssuerJWKSURL" . }}
+            - --jwks-cache-ttl={{ .Values.certIssuer.jwksCacheTTL }}
+            - --expected-issuer={{ .Values.certIssuer.expectedIssuer }}
+            - --max-ttl={{ .Values.certIssuer.ca.maxTTL }}
+            - --min-ca-validity={{ .Values.certIssuer.ca.minValidity }}
+            - --ca-cert-validity={{ .Values.certIssuer.ca.certValidity }}
+            - --rate-limit={{ .Values.certIssuer.rateLimit }}
+            - --rate-burst={{ .Values.certIssuer.rateBurst }}
+            - --log-level={{ .Values.certIssuer.logLevel }}
+            - --san-validation={{ .Values.certIssuer.sanValidation }}
+            {{- if .Values.certIssuer.resourceMap }}
+            - --resource-map=/etc/cert-issuer/resource-map.json
+            {{- end }}
+            {{- if .Values.certIssuer.dnsSanPattern }}
+            - --dns-san-pattern={{ .Values.certIssuer.dnsSanPattern }}
+            {{- end }}
+            {{- if .Values.certIssuer.cnPattern }}
+            - --allowed-cn-pattern={{ .Values.certIssuer.cnPattern }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.certIssuer.port }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            periodSeconds: 30
+          resources:
+{{ toYaml .Values.certIssuer.resources | indent 12 }}
+          volumeMounts:
+            - name: mesh-ca
+              mountPath: /etc/mesh-ca
+              readOnly: true
+            {{- if .Values.certIssuer.resourceMap }}
+            - name: resource-map
+              mountPath: /etc/cert-issuer
+              readOnly: true
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: mesh-ca
+          secret:
+            secretName: {{ $caSecretName }}
+        {{- if .Values.certIssuer.resourceMap }}
+        - name: resource-map
+          configMap:
+            name: {{ include "c8s.certIssuerResourceMapName" . }}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "c8s.certIssuerName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: cert-issuer
+spec:
+  selector:
+    app.kubernetes.io/name: c8s-operator
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: cert-issuer
+  ports:
+    - name: http
+      port: {{ .Values.certIssuer.port }}
+      targetPort: http
+{{- end }}

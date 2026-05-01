@@ -23,11 +23,16 @@ operator:
   podAnnotations: {}
   extraArgs: []
 
+## CRD-backed status mirror for `kubectl get cwl` UX. Disable this when CRDs
+## are intentionally not installed; pod injection does not depend on it.
+statusMirror:
+  enabled: true
+
 ## Mutating admission webhook that injects the init-container into pods
-## annotated with confidential.ai/cw. Disabled by default because injection
-## requires an Assam endpoint.
+## annotated with confidential.ai/cw. Enabled by default because this chart
+## also deploys Assam/cert-issuer by default.
 webhook:
-  enabled: false
+  enabled: true
   caBundle: ""
   service:
     port: 443
@@ -54,13 +59,12 @@ webhook:
 ## Assam is the key broker / certificate broker that the c8s-init-cert
 ## container talks to through its get-cert subcommand.
 ##
-## Chart-managed Assam is disabled by default. Enabling it is useful for
-## bootstrap/dev and for platforms that deliberately operate Assam inside the
-## same trust boundary as the rest of c8s. For the whitepaper production
-## security model, Assam/CDS must run inside the attested trust boundary and
-## its state/secrets must not rely only on Kubernetes control-plane secrecy.
+## Chart-managed Assam is enabled by default so this chart can replace the
+## standalone assam release. For the whitepaper production security model,
+## Assam/CDS must run inside the attested trust boundary and its state/secrets
+## must not rely only on Kubernetes control-plane secrecy.
 assam:
-  enabled: false
+  enabled: true
   ## External Assam URL. If empty and assam.enabled=true, the webhook uses the
   ## chart-managed Assam Service URL. Required for webhook.enabled=true when
   ## assam.enabled=false.
@@ -71,7 +75,12 @@ assam:
     digest: ""
     pullPolicy: IfNotPresent
   port: 8080
-  ## Required when assam.enabled=true. This chart does not install cert-issuer.
+  service:
+    type: NodePort
+    nodePort: 30808
+  ## External cert-issuer URL. If empty and certIssuer.enabled=true, Assam uses
+  ## the chart-managed cert-issuer Service URL. Required when assam.enabled=true
+  ## and certIssuer.enabled=false.
   certIssuerURL: ""
   whitelistDB: /data/whitelist.db
   ## Optional explicit admin password. Empty means the chart creates/reuses a
@@ -89,6 +98,54 @@ assam:
     enabled: false
     size: 1Gi
     storageClassName: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+## Chart-managed cert-issuer. This completes the bootstrap/dev certificate
+## path when paired with chart-managed Assam. It deliberately uses a Kubernetes
+## Secret-backed mesh CA as an interim install convenience; the whitepaper
+## production model replaces this with an in-CVM signing key and attested
+## replica handoff.
+certIssuer:
+  enabled: true
+  image:
+    repository: ghcr.io/lunal-dev/cert-issuer
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  port: 8090
+  ## External Assam JWKS URL. If empty and assam.enabled=true, cert-issuer uses
+  ## the chart-managed Assam JWKS endpoint.
+  jwksURL: ""
+  jwksCacheTTL: 5m
+  expectedIssuer: assam
+  rateLimit: 10
+  rateBurst: 20
+  logLevel: info
+  sanValidation: true
+  dnsSanPattern: ""
+  cnPattern: ""
+  ## Optional cert-issuer resource map:
+  ##   <measurement>: ["cert-issuer/sign-csr", "cert-issuer/ca"]
+  ## Empty means cert-issuer accepts any valid EAR signed by Assam.
+  resourceMap: {}
+  ca:
+    create: true
+    ## Empty defaults to <release>-cert-issuer-mesh-ca.
+    secretName: ""
+    configMapName: ""
+    commonName: c8s Mesh CA
+    validityDays: 365
+    certPEM: ""
+    keyPEM: ""
+    maxTTL: 24h
+    minValidity: 1h
+    certValidity: 8760h
   resources:
     requests:
       cpu: 50m
@@ -133,6 +190,91 @@ attestationService:
     limits:
       cpu: 500m
       memory: 256Mi
+
+## Vendored component charts from lunal-dev/c8s-charts. They are enabled by
+## default so c8s can replace the previous per-component HelmReleases.
+ratls-mesh:
+  enabled: true
+  image:
+    repository: ghcr.io/lunal-dev/ratls-mesh
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  certMode: assam
+  attestationService:
+    url: ""
+    apiKey: ""
+  assam:
+    url: ""
+    certIssuerUrl: ""
+
+nri-image-policy:
+  enabled: true
+  image:
+    repository: ghcr.io/lunal-dev/nri-image-policy
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  policy:
+    mode: audit
+    exemptNamespaces:
+      - kube-system
+  seeder:
+    image:
+      repository: docker.io/curlimages/curl
+      digest: "sha256:d94d07ba9e7d6de898b6d96c1a072f6f8266c687af78a74f380087a0addf5d17"
+    adminPasswordSecretName: ""
+    adminPasswordSecretKey: ""
+    assamURL: ""
+
+node-container-whitelist:
+  enabled: true
+  image:
+    repository: ghcr.io/lunal-dev/node-container-whitelist
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  whitelistURL: ""
+
+tee-proxy:
+  enabled: true
+  upstream: vllm-router-service.vllm.svc.cluster.local
+  image:
+    repository: ghcr.io/lunal-dev/tee-proxy
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  attestationURL: ""
+  router:
+    routes:
+      - path: /whitelist
+        upstream: http://c8s-node-container-whitelist:8000
+    image:
+      repository: docker.io/library/nginx
+      digest: "sha256:1eff5a5f3fcf8431a0abb7eddf5471fec24e5e1905a2581aeacdb07a4479b92b"
+
+tls-lb:
+  enabled: true
+  assamURL: ""
+  attestationServiceURL: ""
+  initContainer:
+    attestationServiceApiKey: ""
+    image:
+      repository: ghcr.io/lunal-dev/get-cert
+      tag: ""
+      digest: ""
+      pullPolicy: IfNotPresent
+  nginx:
+    image:
+      repository: nginxinc/nginx-unprivileged
+      digest: "sha256:4359d693e04e2384cafa10a0fcdca850767dcf541457470124542356a9852c3f"
+  upstream:
+    address: c8s-tee-proxy:80
+    protocol: http
 
 ## Common pod-level security knobs.
 podSecurityContext:

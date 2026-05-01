@@ -43,7 +43,13 @@ jobs:
           helm lint "$CHART_DIR" \
             --set image.tag=ci \
             --set attestationService.image.tag=ci \
-            --set assam.image.tag=ci
+            --set assam.image.tag=ci \
+            --set certIssuer.image.tag=ci \
+            --set ratls-mesh.image.tag=ci \
+            --set nri-image-policy.image.tag=ci \
+            --set node-container-whitelist.image.tag=ci \
+            --set tee-proxy.image.tag=ci \
+            --set tls-lb.initContainer.image.tag=ci
 
       - name: Helm template
         run: |
@@ -52,6 +58,12 @@ jobs:
             --set image.tag=ci \
             --set attestationService.image.tag=ci \
             --set assam.image.tag=ci \
+            --set certIssuer.image.tag=ci \
+            --set ratls-mesh.image.tag=ci \
+            --set nri-image-policy.image.tag=ci \
+            --set node-container-whitelist.image.tag=ci \
+            --set tee-proxy.image.tag=ci \
+            --set tls-lb.initContainer.image.tag=ci \
             > /dev/null
 
       - name: Helm template with chart-managed Assam
@@ -61,9 +73,15 @@ jobs:
             --set image.tag=ci \
             --set attestationService.image.tag=ci \
             --set assam.image.tag=ci \
+            --set certIssuer.image.tag=ci \
+            --set ratls-mesh.image.tag=ci \
+            --set nri-image-policy.image.tag=ci \
+            --set node-container-whitelist.image.tag=ci \
+            --set tee-proxy.image.tag=ci \
+            --set tls-lb.initContainer.image.tag=ci \
             --set webhook.enabled=true \
             --set assam.enabled=true \
-            --set-string assam.certIssuerURL=http://cert-issuer.c8s-system.svc:8090 \
+            --set certIssuer.enabled=true \
             > /dev/null
 
       - name: Helm package

@@ -1,0 +1,10 @@
+apiVersion: confidential.ai/v1alpha2
+kind: TrustDomain
+metadata:
+  name: default
+spec:
+  attestationServiceRef:
+    name: c8s-attestation-service
+    namespace: c8s-system
+  leafDefaults:
+    ttl: 24h

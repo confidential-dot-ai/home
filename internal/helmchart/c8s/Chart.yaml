@@ -2,8 +2,9 @@ apiVersion: v2
 name: c8s
 description: |
   Confidential Kubernetes platform. Installs the c8s Deployment
-  (admission webhook + status-mirror controllers), CRDs, node-labeler
-  DaemonSet, the attestation-service DaemonSet, and optional Assam.
+  (admission webhook + status-mirror controllers), CRDs, the
+  attestation-service DaemonSet, chart-managed Assam/cert-issuer, and the
+  default c8s component charts.
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
@@ -16,3 +17,24 @@ keywords:
 maintainers:
   - name: lunal-dev
 home: https://github.com/lunal-dev
+dependencies:
+  - name: ratls-mesh
+    version: 0.1.0
+    repository: file://charts/ratls-mesh
+    condition: ratls-mesh.enabled
+  - name: nri-image-policy
+    version: 0.2.0
+    repository: file://charts/nri-image-policy
+    condition: nri-image-policy.enabled
+  - name: node-container-whitelist
+    version: 0.1.0
+    repository: file://charts/node-container-whitelist
+    condition: node-container-whitelist.enabled
+  - name: tee-proxy
+    version: 0.1.0
+    repository: file://charts/tee-proxy
+    condition: tee-proxy.enabled
+  - name: tls-lb
+    version: 0.4.0
+    repository: file://charts/tls-lb
+    condition: tls-lb.enabled

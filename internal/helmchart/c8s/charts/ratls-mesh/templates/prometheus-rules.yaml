@@ -1,0 +1,109 @@
+{{- if .Values.prometheusRules.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "ratls-mesh.fullname" . }}-alerts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ratls-mesh.labels" . | nindent 4 }}
+    app.kubernetes.io/component: alerting
+spec:
+  groups:
+    - name: ratls-mesh.rules
+      rules:
+        - alert: RATLSMeshResolverStale
+          expr: |
+            (time() - ratls_mesh_resolver_last_event_timestamp_seconds) > 300
+            and ratls_mesh_resolver_last_event_timestamp_seconds > 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh resolver cache stale on {{`{{ $labels.instance }}`}}"
+            description: >-
+              The K8s pod informer has not received events for over 5 minutes.
+              Pod-to-node routing may be stale.
+
+        - alert: RATLSMeshNoMeasurementPinning
+          expr: ratls_mesh_measurement_pinning == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh on {{`{{ $labels.instance }}`}} has no measurement pinning"
+            description: >-
+              --measurements is not set. Any TEE attestation will be accepted.
+
+        - alert: RATLSMeshConnectionLimitRejections
+          expr: rate(ratls_mesh_connection_limit_rejected_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh on {{`{{ $labels.instance }}`}} is rejecting connections"
+            description: >-
+              Global connection limit reached. Investigate potential DoS.
+
+        - alert: RATLSMeshCertModeMismatch
+          expr: ratls_mesh_cert_mode_mismatch == 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh cert mode mismatch on {{`{{ $labels.instance }}`}}"
+            description: >-
+              KBS certificate upgrade may be stuck. Check KBS and cert-issuer.
+
+        - alert: RATLSMeshAttestationFailures
+          expr: rate(ratls_mesh_attestation_failures_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "RA-TLS attestation failures on {{`{{ $labels.instance }}`}}"
+            description: >-
+              Peer attestation verification is failing. A non-TEE node may be connecting.
+
+        - alert: RATLSMeshCertPipelineUnhealthy
+          expr: ratls_mesh_cert_pipeline_healthy == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh cert pipeline unhealthy on {{`{{ $labels.instance }}`}}"
+            description: >-
+              cert-issuer unreachable for over 10 minutes. Certificate renewal will fail.
+
+        - alert: RATLSMeshAcceptLoopDegraded
+          expr: ratls_mesh_accept_consecutive_errors > 5
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "RA-TLS mesh accept loop degraded on {{`{{ $labels.instance }}`}}"
+            description: >-
+              Accept loop has hit consecutive errors. Listener may be failing.
+
+        - alert: RATLSMeshHighTLSHandshakeFailures
+          expr: rate(ratls_mesh_tls_dial_failures_total[5m]) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh high TLS handshake failure rate on {{`{{ $labels.instance }}`}}"
+            description: >-
+              Sustained RA-TLS handshake failures. Possible measurement mismatch or misconfigured peer.
+
+        - alert: RATLSMeshHighMemory
+          expr: |
+            container_memory_working_set_bytes{namespace="{{ .Release.Namespace }}", container="ratls-mesh"}
+            / container_spec_memory_limit_bytes{namespace="{{ .Release.Namespace }}", container="ratls-mesh"}
+            > 0.85
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh memory usage > 85% on {{`{{ $labels.instance }}`}}"
+            description: >-
+              Container memory above 85% of limit. Risk of OOMKill.
+{{- end }}

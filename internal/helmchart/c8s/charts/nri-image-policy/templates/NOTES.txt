@@ -1,0 +1,20 @@
+{{ include "nri-image-policy.fullname" . }} installed in namespace {{ .Release.Namespace }}.
+
+Plugin name (must match required_plugins): {{ .Values.pluginName }}
+Mode:                                     {{ .Values.policy.mode }}
+Bootstrap digests:                        {{ len (default dict .Values.bootstrapWhitelist.digests) }}
+Restart command:                          {{ .Values.containerd.restartCommand }}
+
+Verify the install rolled out cleanly:
+
+    kubectl -n {{ .Release.Namespace }} rollout status ds/{{ include "nri-image-policy.fullname" . }} --timeout=5m
+
+Confirm the host plugin is running on a node:
+
+    NODE=$(kubectl -n {{ .Release.Namespace }} get pod -l app.kubernetes.io/instance={{ .Release.Name }} -o jsonpath='{.items[0].spec.nodeName}')
+    kubectl debug node/$NODE -it --image=busybox -- ls -la /host{{ .Values.hostPaths.pluginDir }} /host{{ .Values.hostPaths.configDir }}
+
+Read the chart README.md before upgrading, uninstalling, or changing the
+install image. It documents the whitelist ordering, cleanup behavior,
+first-install trust boundary, plugin-source contract, and node distro
+compatibility constraints.

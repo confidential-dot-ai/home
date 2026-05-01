@@ -6,8 +6,11 @@ import (
 	"context"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -28,6 +31,10 @@ type Options struct {
 	LeaderElection   bool
 	LeaderElectionID string
 	LeaderElectionNS string
+
+	// DisableStatusMirror skips the CRD-backed ConfidentialWorkload status
+	// mirror controller. Pod injection does not depend on CRDs.
+	DisableStatusMirror bool
 
 	// OperatorImage is the c8s multi-mode binary image the admission
 	// webhook injects as the init-cert container. Empty disables pod
@@ -72,7 +79,8 @@ func Run(ctx context.Context, opts Options) error {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(false)))
 	logger := ctrl.Log.WithName("c8s-operator")
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	config := ctrl.GetConfigOrDie()
+	mgr, err := ctrl.NewManager(config, ctrl.Options{
 		Scheme:                  scheme,
 		Metrics:                 metricsserver.Options{BindAddress: opts.MetricsAddr},
 		HealthProbeBindAddress:  opts.HealthAddr,
@@ -84,11 +92,27 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("create manager: %w", err)
 	}
 
-	// ConfidentialWorkload status-mirror controller.
-	if err := (&ConfidentialWorkloadReconciler{
-		Client: mgr.GetClient(),
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("setup ConfidentialWorkload reconciler: %w", err)
+	if opts.DisableStatusMirror {
+		logger.Info("status-mirror controller disabled by configuration")
+	} else {
+		dc, err := discovery.NewDiscoveryClientForConfig(config)
+		if err != nil {
+			return fmt.Errorf("create discovery client: %w", err)
+		}
+		available, err := confidentialWorkloadCRDAvailable(dc)
+		if err != nil {
+			return fmt.Errorf("discover ConfidentialWorkload CRD: %w", err)
+		}
+		if available {
+			if err := (&ConfidentialWorkloadReconciler{
+				Client: mgr.GetClient(),
+			}).SetupWithManager(mgr); err != nil {
+				return fmt.Errorf("setup ConfidentialWorkload reconciler: %w", err)
+			}
+			logger.Info("status-mirror controller enabled")
+		} else {
+			logger.Info("status-mirror controller disabled; ConfidentialWorkload CRD not found")
+		}
 	}
 
 	// Admission webhook — injects init-container into annotated pods.
@@ -131,6 +155,29 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("manager exited: %w", err)
 	}
 	return nil
+}
+
+type serverResourcesForGroupVersion interface {
+	ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error)
+}
+
+func confidentialWorkloadCRDAvailable(dc serverResourcesForGroupVersion) (bool, error) {
+	resources, err := dc.ServerResourcesForGroupVersion(v1alpha2.GroupVersion.String())
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if resources == nil {
+		return false, nil
+	}
+	for _, resource := range resources.APIResources {
+		if resource.Name == "confidentialworkloads" && resource.Kind == "ConfidentialWorkload" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // bootstrapWebhookPKI mints a fresh CA + serving cert for the admission

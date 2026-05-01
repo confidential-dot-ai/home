@@ -6,26 +6,53 @@ import (
 	"testing"
 )
 
-func TestChartDefaultDoesNotRenderWebhookInjection(t *testing.T) {
+func TestChartDefaultRendersReplacementStack(t *testing.T) {
 	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	for _, unexpected := range []string{
+	for _, want := range []string{
 		"kind: MutatingWebhookConfiguration",
 		"--operator-image=",
-		"--assam-url=",
-		"C8S_ATTESTATION_SERVICE_API_KEY",
+		"--assam-url=http://c8s-assam.c8s-system.svc:8080",
 		"app.kubernetes.io/component: assam",
+		"app.kubernetes.io/component: cert-issuer",
+		"app.kubernetes.io/name: ratls-mesh",
+		"app.kubernetes.io/name: nri-image-policy",
+		"app.kubernetes.io/name: node-container-whitelist",
+		"app.kubernetes.io/name: tee-proxy",
+		"app.kubernetes.io/name: tls-lb",
 	} {
-		if strings.Contains(out, unexpected) {
-			t.Fatalf("default chart rendered %q\n%s", unexpected, out)
+		if !strings.Contains(out, want) {
+			t.Fatalf("default chart missing %q\n%s", want, out)
 		}
 	}
 }
 
+func TestChartCanDisableStatusMirror(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "--status-mirror-enabled=true") {
+		t.Fatalf("default chart should enable status mirror\n%s", out)
+	}
+
+	out, err = helmTemplate(t, "--set", "statusMirror.enabled=false")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "--status-mirror-enabled=false") {
+		t.Fatalf("statusMirror.enabled=false should disable status mirror\n%s", out)
+	}
+}
+
 func TestChartWebhookRequiresAssamURL(t *testing.T) {
-	out, err := helmTemplate(t, "--set", "webhook.enabled=true")
+	out, err := helmTemplate(t,
+		"--set", "webhook.enabled=true",
+		"--set", "assam.enabled=false",
+		"--set", "certIssuer.enabled=false",
+	)
 	if err == nil {
 		t.Fatalf("helm template succeeded, want assam.url failure\n%s", out)
 	}
@@ -35,7 +62,10 @@ func TestChartWebhookRequiresAssamURL(t *testing.T) {
 }
 
 func TestChartAssamRequiresCertIssuerURL(t *testing.T) {
-	out, err := helmTemplate(t, "--set", "assam.enabled=true")
+	out, err := helmTemplate(t,
+		"--set", "assam.enabled=true",
+		"--set", "certIssuer.enabled=false",
+	)
 	if err == nil {
 		t.Fatalf("helm template succeeded, want assam.certIssuerURL failure\n%s", out)
 	}
@@ -84,6 +114,30 @@ func TestChartManagedAssamSatisfiesWebhookAssamURL(t *testing.T) {
 	}
 }
 
+func TestChartManagedAssamAndCertIssuerWireTogether(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set", "webhook.enabled=true",
+		"--set", "assam.enabled=true",
+		"--set", "certIssuer.enabled=true",
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"app.kubernetes.io/component: cert-issuer",
+		"name: c8s-cert-issuer-mesh-ca",
+		"mesh-ca.key:",
+		"image: ghcr.io/lunal-dev/cert-issuer:dev",
+		"--cert-issuer-url=http://c8s-cert-issuer.c8s-system.svc:8090",
+		"--jwks-url=http://c8s-assam.c8s-system.svc:8080/.well-known/jwks.json",
+		"chart-managed mesh CA is bootstrap convenience",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("render missing %q\n%s", want, out)
+		}
+	}
+}
+
 func TestChartWebhookRendersSecretRefAuthAndSecurityKnobs(t *testing.T) {
 	out, err := helmTemplate(t,
 		"--set", "webhook.enabled=true",
@@ -95,6 +149,13 @@ func TestChartWebhookRendersSecretRefAuthAndSecurityKnobs(t *testing.T) {
 		"--set", "webhook.initContainer.runAsUser=0",
 		"--set", "webhook.initContainer.runAsGroup=0",
 		"--set", "webhook.initContainer.runAsNonRoot=false",
+		"--set", "assam.enabled=false",
+		"--set", "certIssuer.enabled=false",
+		"--set", "ratls-mesh.enabled=false",
+		"--set", "nri-image-policy.enabled=false",
+		"--set", "node-container-whitelist.enabled=false",
+		"--set", "tee-proxy.enabled=false",
+		"--set", "tls-lb.enabled=false",
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
@@ -130,7 +191,7 @@ func TestChartRejectsOperatorReplicaOverride(t *testing.T) {
 }
 
 func TestChartOperatorRBACIsScoped(t *testing.T) {
-	out, err := helmTemplate(t)
+	out, err := helmTemplate(t, "--set", "webhook.enabled=false")
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
@@ -216,6 +277,12 @@ func helmTemplate(t *testing.T, args ...string) (string, error) {
 		"--set", "image.tag=dev",
 		"--set", "attestationService.image.tag=dev",
 		"--set", "assam.image.tag=dev",
+		"--set", "certIssuer.image.tag=dev",
+		"--set", "ratls-mesh.image.tag=dev",
+		"--set", "nri-image-policy.image.tag=dev",
+		"--set", "node-container-whitelist.image.tag=dev",
+		"--set", "tee-proxy.image.tag=dev",
+		"--set", "tls-lb.initContainer.image.tag=dev",
 	}
 	cmd := exec.Command("helm", append(base, args...)...)
 	cmd.Dir = "."

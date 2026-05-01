@@ -94,12 +94,24 @@ make lint
 make clean
 ```
 
+## Install and demos
+
+- [Quickstart](docs/QUICKSTART.md) is the supported install entry point.
+- [Demo](docs/DEMO.md) shows the self-contained chart-managed Assam +
+  cert-issuer path.
+- [Threat model](docs/THREAT_MODEL.md) documents what is enforced today and
+  what chart-managed bootstrap means.
+- [Gaps](docs/GAPS.md) tracks the CDS-shaped follow-up work.
+
 ## Docker images
 
 All images are published to GHCR on push to `main` and `feat/**` branches:
+per-role image names remain stable, but each image copies the same multi-mode
+`c8s` binary and sets an appropriate entrypoint.
 
 | Image | Base | Notes |
 |---|---|---|
+| `ghcr.io/lunal-dev/c8s-operator` | distroless | Multi-mode `c8s` binary for operator/install and non-node roles |
 | `ghcr.io/lunal-dev/assam` | distroless | |
 | `ghcr.io/lunal-dev/get-cert` | distroless | |
 | `ghcr.io/lunal-dev/cert-issuer` | distroless | |

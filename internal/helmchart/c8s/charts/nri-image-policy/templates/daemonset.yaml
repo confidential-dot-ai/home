@@ -1,0 +1,264 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "nri-image-policy.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nri-image-policy.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nri-installer
+spec:
+  selector:
+    matchLabels:
+      {{- include "nri-image-policy.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: nri-installer
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        {{- include "nri-image-policy.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: nri-installer
+      annotations:
+        sidecar.istio.io/inject: "false"
+        # Re-roll the install pod when either rendered config changes.
+        checksum/runtime-config: {{ include (print $.Template.BasePath "/runtime-configmap.yaml") . | sha256sum }}
+        checksum/bootstrap-config: {{ include (print $.Template.BasePath "/bootstrap-configmap.yaml") . | sha256sum }}
+    spec:
+      hostPID: true
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      tolerations:
+        - operator: "Exists"
+          effect: "NoExecute"
+        - operator: "Exists"
+          effect: "NoSchedule"
+      initContainers:
+        - name: install
+          image: {{ include "nri-image-policy.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          env:
+            - name: HOST_PLUGIN_PATH
+              value: {{ include "nri-image-policy.hostPluginPath" . | quote }}
+            - name: HOST_BOOTSTRAP_PATH
+              value: {{ include "nri-image-policy.hostBootstrapPath" . | quote }}
+            - name: HOST_CONFIG_PATH
+              value: {{ include "nri-image-policy.hostConfigPath" . | quote }}
+            - name: HOST_CONTAINERD_CONFIG
+              value: {{ .Values.containerd.configPath | quote }}
+            - name: HOST_HEALTH_SOCKET
+              value: {{ include "nri-image-policy.hostHealthSocket" . | quote }}
+            - name: PLUGIN_DIR
+              value: {{ .Values.hostPaths.pluginDir | quote }}
+            - name: CONFIG_DIR
+              value: {{ .Values.hostPaths.configDir | quote }}
+            - name: PLUGIN_NAME
+              value: {{ .Values.pluginName | quote }}
+            - name: RESTART_COMMAND
+              value: {{ .Values.containerd.restartCommand | quote }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+
+              echo "==> nri-image-policy installer starting"
+
+              install_file() {
+                src=$1; dst=$2; mode=$3
+                mkdir -p "$(dirname "$dst")"
+                if cmp -s "$src" "$dst" 2>/dev/null; then
+                  return 1
+                fi
+                install -m "$mode" "$src" "$dst.tmp"
+                mv -f "$dst.tmp" "$dst"
+                return 0
+              }
+
+              # 1. Plugin binary. Atomic install so containerd never sees a
+              #    half-written file. Image must ship the binary at this path.
+              binary_changed=0
+              if install_file /usr/local/bin/nri-image-policy "/host${HOST_PLUGIN_PATH}" 0755; then
+                binary_changed=1
+                echo "plugin binary updated at ${HOST_PLUGIN_PATH}"
+              fi
+
+              # 2. Plugin runtime config + bootstrap allowlist.
+              config_changed=0
+              if install_file /configs/bootstrap.yaml "/host${HOST_BOOTSTRAP_PATH}" 0644; then
+                config_changed=1
+                echo "bootstrap allowlist updated at ${HOST_BOOTSTRAP_PATH}"
+              fi
+              if install_file /configs/image-policy.yaml "/host${HOST_CONFIG_PATH}" 0644; then
+                config_changed=1
+                echo "plugin runtime config updated at ${HOST_CONFIG_PATH}"
+              fi
+
+              # 3. Containerd config patch. Idempotent block delimited by
+              #    sentinel markers; we only own what's between them.
+              CONFIG=/host${HOST_CONTAINERD_CONFIG}
+              MARK_BEGIN='# BEGIN c8s-nri-image-policy (managed)'
+              MARK_END='# END c8s-nri-image-policy (managed)'
+
+              read_managed_block() {
+                awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+                  $0==b { in_block=1 }
+                  in_block { print }
+                  $0==e { in_block=0 }
+                ' "$CONFIG" 2>/dev/null || true
+              }
+
+              render_managed_block() {
+                cat <<EOF
+              ${MARK_BEGIN}
+              [plugins."io.containerd.nri.v1.nri"]
+                disable = false
+                plugin_path = "${PLUGIN_DIR}"
+                plugin_config_path = "${CONFIG_DIR}"
+                plugin_registration_timeout = "10s"
+                plugin_request_timeout = "2s"
+                socket_path = "/var/run/nri/nri.sock"
+              [plugins."io.containerd.nri.v1.nri.default_validator"]
+                enable = true
+                required_plugins = ["${PLUGIN_NAME}"]
+              ${MARK_END}
+              EOF
+              }
+
+              containerd_changed=0
+              current=$(read_managed_block)
+              desired=$(render_managed_block)
+              if [ "$current" != "$desired" ]; then
+                containerd_changed=1
+                # Strip any prior block, then append the desired one.
+                if [ -f "$CONFIG" ]; then
+                  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+                    $0==b { skip=1; next }
+                    $0==e { skip=0; next }
+                    !skip { print }
+                  ' "$CONFIG" > "$CONFIG.tmp"
+                else
+                  : > "$CONFIG.tmp"
+                fi
+                printf '\n%s\n' "$desired" >> "$CONFIG.tmp"
+                mv -f "$CONFIG.tmp" "$CONFIG"
+                echo "containerd config patched at ${HOST_CONTAINERD_CONFIG}"
+              fi
+
+              # 4. Reload. NRI does not respawn pre-registered plugins from
+              #    plugin_path on exit (only at containerd startup), so any
+              #    binary or config change requires a containerd restart.
+              #    Shims survive the restart, so this pod survives too.
+              if [ "$containerd_changed" = "1" ] || [ "$binary_changed" = "1" ]; then
+                echo "restarting containerd: ${RESTART_COMMAND}"
+                # shellcheck disable=SC2086
+                nsenter -t 1 -m -u -i -n -p -- sh -c "${RESTART_COMMAND}"
+              fi
+
+              # 5. Wait for the plugin to come up healthy. Probe the host's
+              #    unix socket (mounted into the pod) — no hostNetwork needed.
+              #    Failure here surfaces as pod failure via `kubectl get pods`.
+              i=0
+              until curl --unix-socket "/host${HOST_HEALTH_SOCKET}" --silent --fail \
+                  --max-time 2 http://localhost/healthz >/dev/null 2>&1; do
+                i=$((i + 1))
+                if [ "$i" -gt 60 ]; then
+                  echo "ERROR: plugin not healthy after 60s" >&2
+                  exit 1
+                fi
+                sleep 1
+              done
+              echo "==> nri-image-policy installer finished; plugin healthy"
+          volumeMounts:
+            - name: host-plugin-dir
+              mountPath: /host{{ .Values.hostPaths.pluginDir }}
+            - name: host-config-dir
+              mountPath: /host{{ .Values.hostPaths.configDir }}
+            - name: host-containerd-config
+              mountPath: /host{{ dir .Values.containerd.configPath }}
+            - name: host-cache-dir
+              mountPath: /host{{ .Values.hostPaths.cacheDir }}
+            - name: host-runtime-dir
+              mountPath: /host{{ .Values.hostPaths.runtimeDir }}
+            - name: rendered-configs
+              mountPath: /configs
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      containers:
+        # Long-running pause so the DaemonSet pod stays Ready and operators
+        # can observe install state via `kubectl get pods`. The pod is NOT
+        # the plugin's lifecycle owner — containerd owns the plugin
+        # process and respawns it independently of this pod.
+        - name: pause
+          image: {{ include "nri-image-policy.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values:
+                      - linux
+                  {{- range .Values.nodeAffinity.excludeLabels }}
+                  - key: {{ .key }}
+                    operator: NotIn
+                    values:
+                      {{- toYaml .values | nindent 22 }}
+                  {{- end }}
+      volumes:
+        - name: host-plugin-dir
+          hostPath:
+            path: {{ .Values.hostPaths.pluginDir }}
+            type: DirectoryOrCreate
+        - name: host-config-dir
+          hostPath:
+            path: {{ .Values.hostPaths.configDir }}
+            type: DirectoryOrCreate
+        - name: host-containerd-config
+          hostPath:
+            path: {{ dir .Values.containerd.configPath }}
+            type: Directory
+        - name: host-cache-dir
+          hostPath:
+            path: {{ .Values.hostPaths.cacheDir }}
+            type: DirectoryOrCreate
+        - name: host-runtime-dir
+          hostPath:
+            path: {{ .Values.hostPaths.runtimeDir }}
+            type: DirectoryOrCreate
+        - name: rendered-configs
+          projected:
+            sources:
+              - configMap:
+                  name: {{ include "nri-image-policy.fullname" . }}-runtime
+                  items:
+                    - key: image-policy.yaml
+                      path: image-policy.yaml
+              - configMap:
+                  name: {{ include "nri-image-policy.fullname" . }}-bootstrap
+                  items:
+                    - key: bootstrap.yaml
+                      path: bootstrap.yaml

@@ -100,6 +100,10 @@ func Run(args []string) error {
 	if err := validateConfig(*attestationServiceURL, *outboundPort, *inboundPort, *certTTL); err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
+	apiKey := *attestationServiceAPIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("C8S_ATTESTATION_SERVICE_API_KEY")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -119,7 +123,7 @@ func Run(args []string) error {
 
 	asClient := attestclient.NewClientWithHTTPAndAPIKey("", &http.Client{
 		Timeout: durOrDefault(*rotationTimeout, 30*time.Second),
-	}, *attestationServiceAPIKey)
+	}, apiKey)
 	attestFunc := makeAttestFunc(asClient, *attestationServiceURL)
 
 	meshPolicy := &ratls.VerifyPolicy{}
@@ -316,7 +320,7 @@ func Run(args []string) error {
 		assamCfg = &assamclient.Config{
 			AssamURL:                 *assamURL,
 			AttestationServiceURL:    *attestationServiceURL,
-			AttestationServiceAPIKey: *attestationServiceAPIKey,
+			AttestationServiceAPIKey: apiKey,
 			CertIssuerURL:            *certIssuerURL,
 			NodeIP:                   *nodeIP,
 		}

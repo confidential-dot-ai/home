@@ -2,7 +2,7 @@
 {{- if not .Values.attestationService.enabled -}}
 {{- fail "assam.enabled requires attestationService.enabled=true so Assam can verify evidence" -}}
 {{- end -}}
-{{- $certIssuerURL := required "assam.certIssuerURL must be set when assam.enabled=true" .Values.assam.certIssuerURL -}}
+{{- $certIssuerURL := include "c8s.certIssuerURL" . -}}
 {{- $adminSecretName := printf "%s-admin" (include "c8s.assamName" .) -}}
 {{- $existing := (lookup "v1" "Secret" .Release.Namespace $adminSecretName) -}}
 {{- $adminPassword := .Values.assam.whitelistAdminPassword -}}
@@ -34,6 +34,7 @@ metadata:
 type: Opaque
 stringData:
   whitelistAdminPassword: {{ $adminPassword | quote }}
+  admin-password: {{ $adminPassword | quote }}
 ---
 {{- if .Values.assam.persistence.enabled }}
 apiVersion: v1
@@ -155,6 +156,7 @@ metadata:
 {{ include "c8s.commonLabels" . | indent 4 }}
     app.kubernetes.io/component: assam
 spec:
+  type: {{ .Values.assam.service.type }}
   selector:
     app.kubernetes.io/name: c8s-operator
     app.kubernetes.io/instance: {{ .Release.Name }}
@@ -163,4 +165,7 @@ spec:
     - name: http
       port: {{ .Values.assam.port }}
       targetPort: http
+      {{- if and (eq .Values.assam.service.type "NodePort") .Values.assam.service.nodePort }}
+      nodePort: {{ .Values.assam.service.nodePort }}
+      {{- end }}
 {{- end }}

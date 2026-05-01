@@ -1,0 +1,148 @@
+{{- $assamURL := default (printf "http://%s-assam.%s.svc:8080" .Release.Name .Release.Namespace) .Values.assamURL -}}
+{{- $attestationServiceURL := default (printf "http://%s-attestation-service.%s.svc:8400" .Release.Name .Release.Namespace) .Values.attestationServiceURL -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tls-lb.fullname" . }}
+  labels:
+    {{- include "tls-lb.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.nginx.replicas }}
+  selector:
+    matchLabels:
+      {{- include "tls-lb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tls-lb.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      shareProcessNamespace: true
+      initContainers:
+        # One-shot init: fetch the first cert synchronously so nginx has
+        # something to load when it starts.
+        - name: get-cert-init
+          image: {{ include "c8s-common.image" .Values.initContainer.image }}
+          imagePullPolicy: {{ .Values.initContainer.image.pullPolicy }}
+          securityContext:
+            runAsUser: 101
+            allowPrivilegeEscalation: false
+          args:
+            - --assam-url={{ $assamURL }}
+            - --attestation-service-url={{ $attestationServiceURL }}
+            {{- if .Values.initContainer.attestationServiceApiKey }}
+            - --attestation-service-api-key={{ .Values.initContainer.attestationServiceApiKey }}
+            {{- end }}
+            - --san={{ required "san is required - set it to the domain name for the TLS certificate" .Values.san }}
+            - --out={{ .Values.tlsMountPath }}/cert.pem
+            - --key-out={{ .Values.tlsMountPath }}/key.pem
+            {{- if .Values.initContainer.verbose }}
+            - --verbose
+            {{- end }}
+          {{- if not .Values.initContainer.attestationServiceApiKey }}
+          env:
+            - name: C8S_ATTESTATION_SERVICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-attestation-service-api-key
+                  key: apiKey
+          {{- end }}
+          volumeMounts:
+            - name: tls-certs
+              mountPath: {{ .Values.tlsMountPath }}
+        # Native sidecar: keeps running to renew the cert and SIGHUP nginx.
+        - name: get-cert
+          image: {{ include "c8s-common.image" .Values.initContainer.image }}
+          imagePullPolicy: {{ .Values.initContainer.image.pullPolicy }}
+          restartPolicy: Always
+          securityContext:
+            runAsUser: 101
+            allowPrivilegeEscalation: false
+          args:
+            - --assam-url={{ $assamURL }}
+            - --attestation-service-url={{ $attestationServiceURL }}
+            {{- if .Values.initContainer.attestationServiceApiKey }}
+            - --attestation-service-api-key={{ .Values.initContainer.attestationServiceApiKey }}
+            {{- end }}
+            - --san={{ required "san is required - set it to the domain name for the TLS certificate" .Values.san }}
+            - --out={{ .Values.tlsMountPath }}/cert.pem
+            - --key-out={{ .Values.tlsMountPath }}/key.pem
+            - --renew-interval={{ .Values.initContainer.renewInterval }}
+            {{- if .Values.initContainer.verbose }}
+            - --verbose
+            {{- end }}
+          {{- if not .Values.initContainer.attestationServiceApiKey }}
+          env:
+            - name: C8S_ATTESTATION_SERVICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-attestation-service-api-key
+                  key: apiKey
+          {{- end }}
+          volumeMounts:
+            - name: tls-certs
+              mountPath: {{ .Values.tlsMountPath }}
+      containers:
+        - name: nginx
+          image: {{ include "c8s-common.image" .Values.nginx.image }}
+          imagePullPolicy: {{ .Values.nginx.image.pullPolicy }}
+          ports:
+            - name: https
+              containerPort: {{ .Values.nginx.httpsPort }}
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - name: tls-certs
+              mountPath: {{ .Values.tlsMountPath }}
+              readOnly: true
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-tmp
+              mountPath: /tmp
+          {{- with .Values.nginx.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: tls-certs
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-tmp
+          emptyDir: {}
+        - name: nginx-config
+          configMap:
+            name: {{ include "tls-lb.fullname" . }}-nginx
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault

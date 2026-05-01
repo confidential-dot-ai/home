@@ -1,0 +1,281 @@
+{{- $attestationServiceURL := default (printf "http://%s-attestation-service.%s.svc:8400" .Release.Name .Release.Namespace) .Values.attestationService.url -}}
+{{- $assamURL := default (printf "http://%s-assam.%s.svc:8080" .Release.Name .Release.Namespace) .Values.assam.url -}}
+{{- $certIssuerURL := default (printf "http://%s-cert-issuer.%s.svc:8090" .Release.Name .Release.Namespace) .Values.assam.certIssuerUrl -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "ratls-mesh.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ratls-mesh.labels" . | nindent 4 }}
+    app.kubernetes.io/component: service-mesh
+spec:
+  selector:
+    matchLabels:
+      {{- include "ratls-mesh.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "ratls-mesh.selectorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.ports.health | quote }}
+        prometheus.io/path: "/metrics"
+    spec:
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      serviceAccountName: {{ include "ratls-mesh.fullname" . }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        {{- if .Values.tpm.enabled }}
+        supplementalGroups: {{ .Values.tpm.supplementalGroups | toJson }}
+        {{- end }}
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      tolerations:
+        - operator: "Exists"
+          effect: "NoExecute"
+        - operator: "Exists"
+          effect: "NoSchedule"
+      volumes:
+        - name: xtables-lock
+          hostPath:
+            path: {{ .Values.xtablesLockPath }}
+            type: FileOrCreate
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        {{- if and (ne .Values.certMode "self-signed") (not .Values.assam.caUrl) }}
+        - name: mesh-ca-cert
+          configMap:
+            name: {{ default (printf "%s-cert-issuer-mesh-ca" .Release.Name) .Values.assam.caConfigMapName }}
+        {{- end }}
+      initContainers:
+        - name: iptables-setup
+          image: {{ include "ratls-mesh.image" . }}
+          securityContext:
+            runAsNonRoot: false
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - NET_ADMIN
+              drop:
+                - ALL
+          volumeMounts:
+            - name: xtables-lock
+              mountPath: /run/xtables.lock
+          command:
+            - /app/c8s
+            - ratls-mesh
+            - iptables-setup
+            - --outbound-port
+            - {{ .Values.ports.outbound | quote }}
+            - --inbound-port
+            - {{ .Values.ports.inbound | quote }}
+            - --uid
+            - {{ .Values.uid | quote }}
+            - --exclude-uids
+            - {{ .Values.excludeUids | quote }}
+        # Native sidecar (K8s 1.28+): iptables cleanup on shutdown
+        - name: iptables-cleanup
+          restartPolicy: Always
+          image: {{ include "ratls-mesh.image" . }}
+          securityContext:
+            runAsNonRoot: false
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - NET_ADMIN
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: xtables-lock
+              mountPath: /run/xtables.lock
+          command:
+            - /bin/sh
+            - -c
+            - "trap 'exit 0' TERM; while true; do sleep 3600 & wait $!; done"
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    /app/c8s ratls-mesh iptables-cleanup \
+                      --outbound-port {{ .Values.ports.outbound }} \
+                      --inbound-port {{ .Values.ports.inbound }} \
+                      --uid {{ .Values.uid }} \
+                      --exclude-uids {{ .Values.excludeUids }}
+                    sleep 5
+          resources:
+            {{- toYaml .Values.iptablesCleanup.resources | nindent 12 }}
+      containers:
+        - name: ratls-mesh
+          image: {{ include "ratls-mesh.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          workingDir: /tmp
+          securityContext:
+            runAsUser: {{ .Values.uid }}
+            runAsGroup: {{ .Values.uid }}
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if and (ne .Values.certMode "self-signed") (not .Values.assam.caUrl) }}
+            - name: mesh-ca-cert
+              mountPath: /etc/mesh-ca
+              readOnly: true
+            {{- end }}
+          args:
+            - --platform
+            - {{ .Values.platform | quote }}
+            {{- if .Values.attestationService.enabled }}
+            - --attestation-service-url
+            - {{ $attestationServiceURL | quote }}
+            {{- if .Values.attestationService.apiKey }}
+            - --attestation-service-api-key
+            - {{ .Values.attestationService.apiKey | quote }}
+            {{- end }}
+            {{- else if .Values.attestCmd }}
+            - --attest-cmd
+            - {{ .Values.attestCmd | quote }}
+            {{- end }}
+            - --inbound-port
+            - {{ .Values.ports.inbound | quote }}
+            - --health-port
+            - {{ .Values.ports.health | quote }}
+            - --log-level
+            - {{ .Values.logLevel | quote }}
+            {{- if ne .Values.certTtl "4h" }}
+            - --cert-ttl
+            - {{ .Values.certTtl | quote }}
+            {{- end }}
+            {{- if ne .Values.rotationTimeout "30s" }}
+            - --rotation-timeout
+            - {{ .Values.rotationTimeout | quote }}
+            {{- end }}
+            {{- if .Values.measurements }}
+            - --measurements
+            - {{ .Values.measurements | join "," | quote }}
+            {{- end }}
+            {{- if gt (int .Values.maxConns) 0 }}
+            - --max-conns
+            - {{ .Values.maxConns | quote }}
+            {{- end }}
+            {{- if gt (int .Values.maxConnsPerSource) 0 }}
+            - --max-conns-per-source
+            - {{ .Values.maxConnsPerSource | quote }}
+            {{- end }}
+            {{- if .Values.idleTimeout }}
+            - --idle-timeout
+            - {{ .Values.idleTimeout | quote }}
+            {{- end }}
+            {{- if ne (int .Values.sessionCacheSize) 64 }}
+            - --session-cache-size
+            - {{ .Values.sessionCacheSize | quote }}
+            {{- end }}
+            {{- if ne .Values.certMode "self-signed" }}
+            - --cert-mode
+            - {{ .Values.certMode | quote }}
+            - --assam-url
+            - {{ $assamURL | quote }}
+            - --cert-issuer-url
+            - {{ $certIssuerURL | quote }}
+            {{- if .Values.assam.caUrl }}
+            - --ca-url
+            - {{ .Values.assam.caUrl | quote }}
+            - --ca-poll-interval
+            - {{ .Values.assam.caPollInterval | quote }}
+            {{- else }}
+            - --ca-cert
+            - /etc/mesh-ca/ca.pem
+            {{- end }}
+            {{- end }}
+          env:
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            {{- if and .Values.attestationService.enabled (not .Values.attestationService.apiKey) }}
+            - name: C8S_ATTESTATION_SERVICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-attestation-service-api-key
+                  key: apiKey
+            {{- end }}
+          ports:
+            - name: outbound
+              containerPort: {{ .Values.ports.outbound }}
+              hostPort: {{ .Values.ports.outbound }}
+              protocol: TCP
+            - name: inbound
+              containerPort: {{ .Values.ports.inbound }}
+              hostPort: {{ .Values.ports.inbound }}
+              protocol: TCP
+            - name: health
+              containerPort: {{ .Values.ports.health }}
+              hostPort: {{ .Values.ports.health }}
+              protocol: TCP
+          resources:
+            requests:
+              {{- toYaml .Values.resources.requests | nindent 14 }}
+            limits:
+              {{- toYaml .Values.resources.limits | nindent 14 }}
+              {{- if .Values.tpm.enabled }}
+              {{ .Values.tpm.resource }}: 1
+              {{- end }}
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: {{ .Values.ports.health }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: {{ .Values.ports.health }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: {{ .Values.ports.health }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values:
+                      - linux

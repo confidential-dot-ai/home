@@ -20,11 +20,14 @@ var (
 	installRelease   string
 	installValues    []string
 	installWait      bool
+	installCRDs      bool
 
 	installEnableWebhook         bool
 	installAssam                 bool
 	installAssamURL              string
 	installAssamCertIssuerURL    string
+	installCertIssuer            bool
+	installCertIssuerJWKSURL     string
 	installAttestationSecretName string
 	installAttestationSecretKey  string
 	installWorkloadNamespaces    []string
@@ -37,7 +40,7 @@ var (
 
 var installCmd = &cobra.Command{
 	Use:   "install",
-	Short: "Install the c8s operator, CRDs, node-labeler, attestation-service, and optional Assam via Helm",
+	Short: "Install the c8s operator, CRDs, attestation-service, and component charts via Helm",
 	Long: `Extracts the bundled c8s Helm chart and runs
 'helm upgrade --install' against the current kubeconfig context. Deploys:
 
@@ -45,7 +48,8 @@ var installCmd = &cobra.Command{
   - the TrustDomain and ConfidentialWorkload CRDs
   - the mutating admission webhook configuration
   - the attestation-service DaemonSet (per-node /attest + /verify)
-  - optional chart-managed Assam when --install-assam is set
+  - chart-managed Assam, cert-issuer, and bootstrap mesh CA
+  - vendored component charts from lunal-dev/c8s-charts
 
 Requires the 'helm' CLI to be on PATH.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -60,27 +64,42 @@ Requires the 'helm' CLI to be on PATH.`,
 		defer os.RemoveAll(dir)
 
 		chartPath := filepath.Join(dir, helmchart.ChartRoot)
+		imageTag := defaultInstallImageTag(version.Version)
 		helmArgs := []string{
 			"upgrade", "--install", installRelease, chartPath,
 			"--namespace", installNamespace, "--create-namespace",
 			// Chart has no default image tags; chart images are released
-			// in lockstep with the CLI, so pass the CLI's build Version.
-			// Overridable via -f.
-			"--set", "image.tag=" + version.Version,
-			"--set", "attestationService.image.tag=" + version.Version,
-			"--set", "assam.image.tag=" + version.Version,
+			// in lockstep with the CLI, so pass the CLI's build version.
+			// Unstamped local builds report "dev"; use latest for that
+			// bootstrap path because CI does not publish a dev tag.
+			"--set", "image.tag=" + imageTag,
+			"--set", "attestationService.image.tag=" + imageTag,
+			"--set", "assam.image.tag=" + imageTag,
+			"--set", "certIssuer.image.tag=" + imageTag,
+			"--set", "ratls-mesh.image.tag=" + imageTag,
+			"--set", "nri-image-policy.image.tag=" + imageTag,
+			"--set", "node-container-whitelist.image.tag=" + imageTag,
+			"--set", "tee-proxy.image.tag=" + imageTag,
+			"--set", "tls-lb.initContainer.image.tag=" + imageTag,
 		}
+		helmArgs = appendInstallCRDArgs(helmArgs, installCRDs)
 		if installEnableWebhook {
 			helmArgs = append(helmArgs, "--set", "webhook.enabled=true")
 		}
 		if installAssam {
 			helmArgs = append(helmArgs, "--set", "assam.enabled=true")
 		}
+		if installCertIssuer || (installAssam && installAssamCertIssuerURL == "") {
+			helmArgs = append(helmArgs, "--set", "certIssuer.enabled=true")
+		}
 		if installAssamURL != "" {
 			helmArgs = append(helmArgs, "--set-string", "assam.url="+installAssamURL)
 		}
 		if installAssamCertIssuerURL != "" {
 			helmArgs = append(helmArgs, "--set-string", "assam.certIssuerURL="+installAssamCertIssuerURL)
+		}
+		if installCertIssuerJWKSURL != "" {
+			helmArgs = append(helmArgs, "--set-string", "certIssuer.jwksURL="+installCertIssuerJWKSURL)
 		}
 		if installAttestationSecretName != "" {
 			helmArgs = append(helmArgs, "--set-string", "webhook.apiKeySecret.name="+installAttestationSecretName)
@@ -135,21 +154,36 @@ func extractChart() (string, error) {
 	return dir, nil
 }
 
+func defaultInstallImageTag(buildVersion string) string {
+	if buildVersion == "" || buildVersion == "dev" {
+		return "latest"
+	}
+	return buildVersion
+}
+
+func appendInstallCRDArgs(helmArgs []string, installCRDs bool) []string {
+	if installCRDs {
+		return helmArgs
+	}
+	return append(helmArgs, "--skip-crds", "--set", "statusMirror.enabled=false")
+}
+
 const installNextSteps = `Next steps:
 
-  1. Create a TrustDomain (if not using the default):
+  1. CRDs are optional demo/status UX. If installed, create a TrustDomain
+     only when you need to override chart defaults:
 
-       kubectl apply -f config/samples/confidential.ai_v1alpha2_trustdomain.yaml
+       kubectl apply -f samples/trustdomain.yaml
 
-  2. Enable pod injection only after Assam is installed and reachable.
-     Use an external assam.url, or enable chart-managed Assam with
-     assam.enabled=true and assam.certIssuerURL. Chart-managed Assam is
-     bootstrap/dev convenience unless it is deployed as attested
-     trust-boundary infrastructure.
+  2. Enable pod injection only after Assam and cert-issuer are reachable.
+     Use an external assam.url/cert issuer pair, or enable chart-managed
+     Assam and cert-issuer together. Chart-managed Assam/cert-issuer are
+     bootstrap/dev convenience unless deployed as attested trust-boundary
+     infrastructure.
 
   3. (Optional) Mirror status with a ConfidentialWorkload CR:
 
-       kubectl apply -f config/samples/confidential.ai_v1alpha2_confidentialworkload.yaml
+       kubectl apply -f samples/confidentialworkload.yaml
 
      When injection is enabled, annotate your workload's pod template:
        confidential.ai/cw: <workload-id>
@@ -164,10 +198,13 @@ func init() {
 	installCmd.Flags().StringVar(&installRelease, "release", "c8s", "Helm release name")
 	installCmd.Flags().StringSliceVarP(&installValues, "values", "f", nil, "values files (repeatable)")
 	installCmd.Flags().BoolVar(&installWait, "wait", true, "wait for the release to become ready (helm --wait)")
-	installCmd.Flags().BoolVar(&installEnableWebhook, "enable-webhook", false, "enable pod injection webhook (requires --assam-url or --install-assam with --assam-cert-issuer-url)")
+	installCmd.Flags().BoolVar(&installCRDs, "install-crds", true, "install chart CRDs (false passes helm --skip-crds)")
+	installCmd.Flags().BoolVar(&installEnableWebhook, "enable-webhook", false, "enable pod injection webhook (requires --assam-url or --install-assam)")
 	installCmd.Flags().BoolVar(&installAssam, "install-assam", false, "install chart-managed Assam (bootstrap/dev unless deployed as attested trust-boundary infrastructure)")
 	installCmd.Flags().StringVar(&installAssamURL, "assam-url", "", "assam URL for injected get-cert containers")
-	installCmd.Flags().StringVar(&installAssamCertIssuerURL, "assam-cert-issuer-url", "", "cert-issuer URL for chart-managed Assam (required with --install-assam)")
+	installCmd.Flags().StringVar(&installAssamCertIssuerURL, "assam-cert-issuer-url", "", "external cert-issuer URL for chart-managed Assam (empty installs chart-managed cert-issuer with --install-assam)")
+	installCmd.Flags().BoolVar(&installCertIssuer, "install-cert-issuer", false, "install chart-managed cert-issuer and bootstrap mesh CA Secret")
+	installCmd.Flags().StringVar(&installCertIssuerJWKSURL, "cert-issuer-jwks-url", "", "JWKS URL for chart-managed cert-issuer (empty uses chart-managed Assam when enabled)")
 	installCmd.Flags().StringVar(&installAttestationSecretName, "attestation-secret-name", "", "workload-namespace Secret name injected for attestation-service auth")
 	installCmd.Flags().StringVar(&installAttestationSecretKey, "attestation-secret-key", "apiKey", "Secret key injected for attestation-service auth")
 	installCmd.Flags().StringArrayVar(&installWorkloadNamespaces, "workload-namespace", nil, "namespace where the chart should create a workload auth Secret (repeatable)")

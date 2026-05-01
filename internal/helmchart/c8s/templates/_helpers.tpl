@@ -19,8 +19,8 @@
 {{- printf "%s-assam" .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "c8s.nodeLabelerName" -}}
-{{- printf "%s-node-labeler" .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- define "c8s.certIssuerName" -}}
+{{- printf "%s-cert-issuer" .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/*
@@ -60,6 +60,16 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "c8s.certIssuerImage" -}}
+{{- if .Values.certIssuer.image.digest -}}
+{{ .Values.certIssuer.image.repository }}@{{ .Values.certIssuer.image.digest }}
+{{- else if .Values.certIssuer.image.tag -}}
+{{ .Values.certIssuer.image.repository }}:{{ .Values.certIssuer.image.tag }}
+{{- else -}}
+{{ fail "certIssuer.image.tag or certIssuer.image.digest must be set when certIssuer.enabled=true" }}
+{{- end -}}
+{{- end -}}
+
 {{- define "c8s.attestationServiceURL" -}}
 http://{{ include "c8s.attestationServiceName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.attestationService.port }}
 {{- end -}}
@@ -72,6 +82,38 @@ http://{{ include "c8s.assamName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.a
 {{- else -}}
 {{- required "assam.url must be set when webhook.enabled=true unless assam.enabled=true" .Values.assam.url -}}
 {{- end -}}
+{{- end -}}
+
+{{- define "c8s.certIssuerURL" -}}
+{{- if .Values.assam.certIssuerURL -}}
+{{- .Values.assam.certIssuerURL -}}
+{{- else if .Values.certIssuer.enabled -}}
+http://{{ include "c8s.certIssuerName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.certIssuer.port }}
+{{- else -}}
+{{- required "assam.certIssuerURL must be set when assam.enabled=true unless certIssuer.enabled=true" .Values.assam.certIssuerURL -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "c8s.certIssuerJWKSURL" -}}
+{{- if .Values.certIssuer.jwksURL -}}
+{{- .Values.certIssuer.jwksURL -}}
+{{- else if .Values.assam.enabled -}}
+http://{{ include "c8s.assamName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.assam.port }}/.well-known/jwks.json
+{{- else -}}
+{{- required "certIssuer.jwksURL must be set when certIssuer.enabled=true unless assam.enabled=true" .Values.certIssuer.jwksURL -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "c8s.certIssuerCASecretName" -}}
+{{- default (printf "%s-mesh-ca" (include "c8s.certIssuerName" .)) .Values.certIssuer.ca.secretName -}}
+{{- end -}}
+
+{{- define "c8s.certIssuerCAConfigMapName" -}}
+{{- default (printf "%s-mesh-ca" (include "c8s.certIssuerName" .)) .Values.certIssuer.ca.configMapName -}}
+{{- end -}}
+
+{{- define "c8s.certIssuerResourceMapName" -}}
+{{- printf "%s-resource-map" (include "c8s.certIssuerName" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{- define "c8s.workloadAPIKeySecretName" -}}

@@ -9,6 +9,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -24,7 +26,7 @@ attestation, and day-2 operations.
 
 Typical bootstrap flow on a fresh cluster:
 
-    c8s install             # deploy operator + CRDs + node-labeler
+    c8s install             # deploy operator + CRDs + component charts
     kubectl apply -f cwl.yaml
 
 See 'c8s <subcommand> --help' for details.`,
@@ -34,8 +36,29 @@ See 'c8s <subcommand> --help' for details.`,
 }
 
 func main() {
+	normalizeArgvAlias()
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+}
+
+func normalizeArgvAlias() {
+	base := filepath.Base(os.Args[0])
+	for _, alias := range []string{
+		"assam",
+		"cert-issuer",
+		"cert-rotator",
+		"get-cert",
+		"node-container-whitelist",
+		"nri-image-policy",
+		"ratls-mesh",
+	} {
+		if base == alias || strings.HasSuffix(base, "-"+alias) {
+			if len(os.Args) < 2 || os.Args[1] != alias {
+				os.Args = append([]string{os.Args[0], alias}, os.Args[1:]...)
+			}
+			return
+		}
 	}
 }

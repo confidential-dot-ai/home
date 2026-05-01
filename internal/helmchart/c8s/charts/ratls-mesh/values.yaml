@@ -1,0 +1,126 @@
+image:
+  repository: ghcr.io/lunal-dev/ratls-mesh
+  # -- Image tag. Required: the chart does not pin a default; the consumer
+  #    (HelmRelease values or cluster overlay) must set tag or digest.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ghcr-secret
+
+# TEE platform: sev-snp or tdx
+platform: sev-snp
+
+attestationService:
+  enabled: true
+  url: "http://attestation-service:8400"
+  apiKey: "28950a6a10bc4bfe991e7b51edeb0233891b62550abf7c3d331f512e9d2d83ad"
+
+# Host path for iptables lock (k3s: /run/k3s/agent/xtables.lock)
+xtablesLockPath: /run/xtables.lock
+
+# Mesh ports
+ports:
+  outbound: 15001
+  inbound: 15006
+  health: 15021
+
+# UID for the ratls-mesh process (iptables excludes this UID)
+uid: 1337
+
+# UIDs excluded from iptables redirect (comma-separated)
+excludeUids: "0"
+
+# Certificate settings
+certMode: self-signed  # self-signed | assam
+certTtl: "4h"
+rotationTimeout: "30s"
+
+# Assam integration (used when certMode=assam)
+assam:
+  url: ""
+  certIssuerUrl: ""
+  caUrl: ""
+  caPollInterval: "5m"
+
+# Expected launch digests for measurement pinning (empty = accept any)
+measurements: []
+
+# Connection limits
+maxConns: 10000
+maxConnsPerSource: 0
+idleTimeout: ""
+
+# TLS session cache
+sessionCacheSize: 64
+
+# Logging
+logLevel: info
+
+# TPM device plugin
+tpm:
+  enabled: true
+  resource: "lunal.dev/tpm"
+  supplementalGroups:
+    - 0
+    - 111
+
+# Node placement
+nodeSelector: {}
+
+# Resources
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi
+
+# Iptables cleanup sidecar resources
+iptablesCleanup:
+  resources:
+    requests:
+      cpu: 1m
+      memory: 8Mi
+    limits:
+      cpu: 10m
+      memory: 16Mi
+
+# Probe timings
+probes:
+  startup:
+    periodSeconds: 2
+    failureThreshold: 60
+  readiness:
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# --- Policies ---
+
+networkPolicy:
+  enabled: true
+  monitoringNamespace: monitoring
+
+# TCP-only egress policy for application namespaces
+tcpEgressPolicy:
+  enabled: false
+  namespaces: []
+
+# ValidatingAdmissionPolicy to prevent pods from running as mesh UID
+uidAdmissionPolicy:
+  enabled: true
+
+# PrometheusRule for threat model alerting
+prometheusRules:
+  enabled: false
+
+# Priority class for pod scheduling
+priorityClassName: system-node-critical

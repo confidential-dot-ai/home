@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nri-image-policy.fullname" . }}-runtime
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nri-image-policy.labels" . | nindent 4 }}
+data:
+  # The install-DaemonSet copies this file to {{ include "nri-image-policy.hostConfigPath" . }}.
+  # The host plugin reads it at startup; it does not contain whitelist data.
+  image-policy.yaml: |
+    plugin:
+      name: {{ .Values.pluginName | quote }}
+      health_addr: {{ printf "unix://%s" (include "nri-image-policy.hostHealthSocket" .) | quote }}
+
+    whitelist:
+      bootstrap_path: {{ include "nri-image-policy.hostBootstrapPath" . | quote }}
+      cache_path: {{ printf "%s/whitelist.json" .Values.hostPaths.cacheDir | quote }}
+      assam_url: {{ printf "http://127.0.0.1:%d" (int .Values.assam.nodePort) | quote }}
+      refresh_interval: {{ .Values.refresh.interval | quote }}
+      stale_ttl: {{ .Values.refresh.staleTTL | quote }}
+
+    containerd:
+      socket: {{ .Values.containerd.socket | quote }}
+      namespace: {{ .Values.containerd.namespace | quote }}
+
+    policy:
+      mode: {{ .Values.policy.mode | quote }}
+      enforce_existing: {{ .Values.policy.enforceExisting }}
+      deny_missing_annotation: {{ .Values.policy.denyMissingAnnotation }}
+      {{- if .Values.policy.exemptNamespaces }}
+      exempt_namespaces:
+        {{- range .Values.policy.exemptNamespaces }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- else }}
+      exempt_namespaces: []
+      {{- end }}
+      {{- if .Values.policy.labelRules }}
+      label_rules:
+        {{- toYaml .Values.policy.labelRules | nindent 8 }}
+      {{- else }}
+      label_rules: []
+      {{- end }}
+
+    logging:
+      level: {{ .Values.logLevel | quote }}

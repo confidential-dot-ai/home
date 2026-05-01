@@ -25,6 +25,7 @@ by this command.`,
 			LeaderElection:                     leaderElection,
 			LeaderElectionID:                   "c8s-operator.confidential.ai",
 			LeaderElectionNS:                   leaderElectionNS,
+			DisableStatusMirror:                !statusMirrorEnabled,
 			OperatorImage:                      operatorImage,
 			AssamURL:                           assamURL,
 			AttestationServiceURL:              attestationServiceURL,
@@ -47,6 +48,7 @@ var (
 	healthAddr                         string
 	leaderElection                     bool
 	leaderElectionNS                   string
+	statusMirrorEnabled                bool
 	operatorImage                      string
 	assamURL                           string
 	attestationServiceURL              string
@@ -67,6 +69,7 @@ func init() {
 	operatorCmd.Flags().StringVar(&healthAddr, "health-probe-bind-address", ":8081", "address for health/readyz probes")
 	operatorCmd.Flags().BoolVar(&leaderElection, "leader-elect", true, "enable leader election for HA")
 	operatorCmd.Flags().StringVar(&leaderElectionNS, "leader-election-namespace", "c8s-system", "namespace holding the leader-election Lease")
+	operatorCmd.Flags().BoolVar(&statusMirrorEnabled, "status-mirror-enabled", true, "enable CRD-backed ConfidentialWorkload status mirror controller")
 	operatorCmd.Flags().StringVar(&operatorImage, "operator-image", "", "image reference the admission webhook injects for init-container (empty = webhook disabled)")
 	operatorCmd.Flags().StringVar(&assamURL, "assam-url", "", "assam Service URL the injected init container POSTs to")
 	operatorCmd.Flags().StringVar(&attestationServiceURL, "attestation-service-url", "", "attestation-service endpoint (empty = no verification)")

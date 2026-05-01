@@ -1,0 +1,165 @@
+image:
+  repository: ghcr.io/lunal-dev/nri-image-policy
+  # -- Image tag. Required: the chart does not pin a default; the consumer
+  #    (HelmRelease values or cluster overlay) must set tag or digest. The
+  #    image must contain both the host plugin binary at
+  #    /usr/local/bin/nri-image-policy and the install scripts the
+  #    DaemonSet executes (install-host-plugin.sh, patch-containerd.sh).
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ghcr-secret
+
+# Pin this DaemonSet to a subset of nodes. Empty (default) installs on all
+# nodes the existing nodeAffinity allows.
+nodeSelector: {}
+
+# Plugin name. Must match the name the host binary registers with at the NRI
+# socket and the entry written to containerd's default_validator.required_plugins.
+# Renaming this is a coordinated change — once a cluster has required_plugins
+# set, the new name must be deployed before old nodes restart, or the
+# default_validator will reject all container creates.
+pluginName: nri-image-policy
+
+# Host paths the install DaemonSet writes to. These are the paths containerd
+# reads at runtime; changing them requires a coordinated containerd config
+# update.
+hostPaths:
+  # Where the install-DaemonSet drops the plugin binary. Containerd's
+  # plugin_path must match.
+  pluginDir: /opt/nri/plugins
+  # Where bootstrap.yaml and image-policy.yaml are written. Containerd's
+  # plugin_config_path must match.
+  configDir: /etc/nri/conf.d
+  # Where the plugin caches the signed whitelist between refreshes.
+  cacheDir: /var/lib/nri-image-policy
+  # Where the plugin's health unix socket is created. The install-DaemonSet
+  # mounts this so it can probe the plugin without hostNetwork.
+  runtimeDir: /var/run/nri-image-policy
+
+# Plugin filename inside hostPaths.pluginDir. The "10-" prefix sets sort order
+# relative to other NRI plugins.
+pluginFilename: 10-nri-image-policy
+
+# Containerd configuration the install DaemonSet patches.
+containerd:
+  configPath: /etc/containerd/config.toml
+  # Host path to the containerd socket (k3s: /run/k3s/containerd/containerd.sock)
+  socket: /run/containerd/containerd.sock
+  namespace: k8s.io
+  # Command the install pod runs (via nsenter into PID 1) to make
+  # containerd re-read its config and (re-)launch the plugin from
+  # plugin_path. NRI does not auto-respawn pre-registered plugins on
+  # exit, so any binary or config change requires this restart.
+  #
+  # Defaults assume systemd + a containerd.service unit. Override on:
+  #   - k3s   →  "systemctl restart k3s"
+  #   - k0s   →  "systemctl restart k0scontroller"  (or k0sworker)
+  #   - rke2  →  "systemctl restart rke2-agent"
+  restartCommand: "systemctl restart containerd"
+
+# Policy enforcement applied by the plugin.
+policy:
+  mode: fail-closed  # audit | fail-closed
+  enforceExisting: true
+  denyMissingAnnotation: true
+  exemptNamespaces: []
+  # labelRules: Kubernetes-style label selectors evaluated against pod
+  # labels at container creation time. With the host-process model there
+  # is one plugin per node, so these rules apply globally on each node;
+  # multi-tenant isolation needs node-level (not pod-label) partitioning
+  # plus per-node values. Leaving empty disables label-based filtering.
+  labelRules: []
+
+# Logging
+logLevel: info
+
+# --- Whitelist delivery ---
+# The host plugin reads its policy data from disk and refreshes from assam
+# via NodePort (see assam.nodePort below). The control plane is not in the
+# trust path: the install-DaemonSet writes bootstrap.yaml at install time;
+# the plugin process — running outside kubelet's reach — owns refreshes.
+assam:
+  # NodePort that the assam Service exposes on every node. The plugin
+  # connects to 127.0.0.1:<nodePort>; kube-proxy iptables rules route to an
+  # assam pod. The assam chart must be deployed with serviceType=NodePort
+  # and a matching nodePort value.
+  nodePort: 30808
+
+refresh:
+  # How often the plugin pulls the current whitelist from assam.
+  interval: 30s
+  # Maximum age of the on-disk cache before the plugin fails closed for any
+  # image not in the bootstrap allowlist. Sustained assam unreachability is
+  # treated as suspicious past this point.
+  staleTTL: 1h
+
+# --- Bootstrap allowlist ---
+# Digests that must be allowed for the cluster to bring itself up before
+# assam is reachable (assam itself, kube-proxy, coredns, kubelet static
+# pods, this chart's install-DaemonSet image, the plugin image).
+#
+# Populated by the c8s-fleet whitelist-sync workflow, which resolves digests
+# via crane and writes them into the per-cluster HelmRelease values.
+#
+# Format: map of "sha256:<hex>" -> "<image reference>"
+bootstrapWhitelist:
+  digests: {}
+  # sha256:abc123...: "ghcr.io/lunal-dev/assam:v0.1.0"
+
+# --- Whitelist seeder ---
+# Helm hook that pre-populates assam with the runtime whitelist. The plugin
+# will pull this same content via assam at runtime. Unrelated to the
+# bootstrap allowlist above.
+whitelist:
+  digests: {}
+
+# --- Uninstall hook ---
+# Pre-delete DaemonSet that reverts the containerd config patch and removes
+# host artifacts. Helm waits for the DS to be Ready before continuing the
+# uninstall, so cleanup is observable. Disable to leave host artifacts in
+# place (rare; mostly forensic use).
+uninstall:
+  enabled: true
+
+seeder:
+  enabled: true
+  image:
+    repository: curlimages/curl
+    # -- Required: consumer must set tag or digest.
+    tag: ""
+    digest: ""
+  # Secret containing admin-password key for assam whitelist mutations
+  adminPasswordSecretName: assam-whitelist-admin
+  # URL the seeder uses to talk to assam. Distinct from the runtime
+  # NodePort path — the seeder runs as a K8s pod and uses cluster DNS.
+  assamURL: "http://assam:8080"
+
+# Node affinity — exclude edge nodes by default
+nodeAffinity:
+  excludeLabels: []
+
+# Resources for the install-DaemonSet pod itself (init container that
+# copies files and patches containerd, then sleeps idle). Not the host
+# plugin process, which runs outside K8s and has no resource limits.
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    cpu: 200m
+    memory: 64Mi
+
+# Priority class for the install-DaemonSet pod.
+priorityClassName: system-node-critical
+
+# Health probe socket on the host. The host plugin listens on this unix
+# domain socket inside hostPaths.runtimeDir; the install-DaemonSet probes
+# it after install to verify the plugin came up. Unix socket avoids
+# hostNetwork and the port-conflict surface that comes with it.
+#
+# The plugin source must support binding to a unix socket via the
+# plugin.health_addr config field (rendered as "unix://<path>").
+healthSocket: health.sock

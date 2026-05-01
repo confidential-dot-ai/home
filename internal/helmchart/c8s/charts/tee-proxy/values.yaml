@@ -1,0 +1,110 @@
+image:
+  repository: ghcr.io/lunal-dev/tee-proxy
+  # -- Image tag. Required: the chart does not pin a default; the consumer
+  #    (HelmRelease values or cluster overlay) must set tag or digest.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ghcr-secret
+
+replicas: 1
+
+# TEE platform: sev-snp or tdx
+platform: sev-snp
+
+# Domain for autocert TLS
+domain: ""
+
+# Upstream service to proxy to
+upstream: ""
+
+# Attestation header name
+headerName: "Attestation-Report"
+
+# Remote attestation service URL (required for new tee-proxy versions)
+attestationURL: ""
+
+# Listening ports
+ports:
+  https: 443
+  http: 80
+
+# TPM device plugin resource
+tpm:
+  enabled: true
+  resource: "lunal.dev/tpm"
+  supplementalGroups:
+    - 0
+    - 111
+
+# Node placement
+nodeSelector: {}
+tolerations: []
+
+# Resources
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi
+
+# Autocert PVC
+persistence:
+  storageClass: ""
+  size: 1Gi
+
+# --- Edge Router (nginx sidecar) ---
+router:
+  enabled: true
+  image:
+    repository: nginx
+    # -- Required: consumer must set tag or digest.
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  port: 8080
+
+  # Additional route backends (path prefix -> upstream URL)
+  # Default route (/) always goes to .upstream
+  routes: []
+  #  - path: /whitelist
+  #    upstream: "http://node-container-whitelist.tee-attestation.svc.cluster.local:8000"
+
+  # DNS resolver for nginx dynamic upstream resolution
+  resolver: "kube-dns.kube-system.svc.cluster.local"
+
+  # Proxy timeouts (seconds)
+  proxyReadTimeout: 120
+  proxyConnectTimeout: 10
+
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+  probes:
+    readiness:
+      initialDelaySeconds: 2
+      periodSeconds: 10
+    liveness:
+      initialDelaySeconds: 5
+      periodSeconds: 30
+
+# Probe timings
+probes:
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 30
+
+# Priority class for pod scheduling
+priorityClassName: system-node-critical

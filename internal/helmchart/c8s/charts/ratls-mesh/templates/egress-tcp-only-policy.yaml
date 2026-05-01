@@ -1,0 +1,29 @@
+{{- if and .Values.tcpEgressPolicy.enabled .Values.tcpEgressPolicy.namespaces }}
+{{- range .Values.tcpEgressPolicy.namespaces }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ratls-mesh-tcp-only-egress
+  namespace: {{ . }}
+  labels:
+    {{- include "ratls-mesh.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: egress-policy
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    # Allow all TCP egress (intercepted by ratls-mesh)
+    - ports:
+        - protocol: TCP
+    # Allow DNS over UDP (required for service discovery)
+    - ports:
+        - protocol: UDP
+          port: 53
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+{{- end }}
+{{- end }}
