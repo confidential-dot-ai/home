@@ -1,0 +1,87 @@
+name: Chart
+
+on:
+  push:
+    branches: [main, "feat/**"]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, "feat/**"]
+
+env:
+  REGISTRY: ghcr.io
+  CHART_REPO: ghcr.io/lunal-dev/charts
+  CHART_DIR: internal/helmchart/c8s
+
+jobs:
+  package:
+    name: Lint, package & push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.14.4
+
+      - name: Determine chart version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF#refs/tags/v}"
+          else
+            base=$(grep -E '^version:' "$CHART_DIR/Chart.yaml" | awk '{print $2}' | tr -d '"')
+            v="${base}-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Helm lint
+        run: |
+          helm lint "$CHART_DIR" \
+            --set image.tag=ci \
+            --set attestationService.image.tag=ci \
+            --set assam.image.tag=ci
+
+      - name: Helm template
+        run: |
+          helm template c8s "$CHART_DIR" \
+            --namespace c8s-system \
+            --set image.tag=ci \
+            --set attestationService.image.tag=ci \
+            --set assam.image.tag=ci \
+            > /dev/null
+
+      - name: Helm template with chart-managed Assam
+        run: |
+          helm template c8s "$CHART_DIR" \
+            --namespace c8s-system \
+            --set image.tag=ci \
+            --set attestationService.image.tag=ci \
+            --set assam.image.tag=ci \
+            --set webhook.enabled=true \
+            --set assam.enabled=true \
+            --set-string assam.certIssuerURL=http://cert-issuer.c8s-system.svc:8090 \
+            > /dev/null
+
+      - name: Helm package
+        run: |
+          mkdir -p dist
+          helm package "$CHART_DIR" \
+            --version "${{ steps.ver.outputs.version }}" \
+            --app-version "${{ steps.ver.outputs.version }}" \
+            -d dist/
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+
+      - name: Helm push
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        run: |
+          helm push "dist/c8s-${{ steps.ver.outputs.version }}.tgz" \
+            "oci://$CHART_REPO"

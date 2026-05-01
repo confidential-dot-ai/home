@@ -5,7 +5,7 @@ on:
     branches: [main, "feat/**"]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [main, "feat/**"]
 
 env:
   GO_VERSION: "1.26.1"
@@ -31,6 +31,12 @@ jobs:
 
       - name: Vet
         run: make vet
+
+      - name: Install controller-gen
+        run: make install-controller-gen
+
+      - name: Check chart CRDs
+        run: make check-crd-chart
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
