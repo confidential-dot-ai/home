@@ -1,5 +1,5 @@
 FROM gcr.io/distroless/static:nonroot
 
-COPY build/cert-issuer /cert-issuer
+COPY build/c8s /c8s
 
-ENTRYPOINT ["/cert-issuer"]
+ENTRYPOINT ["/c8s", "cert-issuer"]

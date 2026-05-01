@@ -1,3 +1,5 @@
+//go:build !c8s_node
+
 package main
 
 import (
@@ -10,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/lunal-dev/c8s/internal/helmchart"
+	"github.com/lunal-dev/c8s/internal/version"
 )
 
 var (
@@ -63,9 +66,9 @@ Requires the 'helm' CLI to be on PATH.`,
 			// Chart has no default image tags; chart images are released
 			// in lockstep with the CLI, so pass the CLI's build Version.
 			// Overridable via -f.
-			"--set", "image.tag=" + Version,
-			"--set", "attestationService.image.tag=" + Version,
-			"--set", "assam.image.tag=" + Version,
+			"--set", "image.tag=" + version.Version,
+			"--set", "attestationService.image.tag=" + version.Version,
+			"--set", "assam.image.tag=" + version.Version,
 		}
 		if installEnableWebhook {
 			helmArgs = append(helmArgs, "--set", "webhook.enabled=true")

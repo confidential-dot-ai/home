@@ -9,12 +9,10 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
+	"github.com/lunal-dev/c8s/internal/version"
 	"github.com/lunal-dev/c8s/pkg/certutil"
 	"github.com/lunal-dev/c8s/pkg/jwks"
 )
-
-// Version is set at build time via ldflags.
-var Version = "dev"
 
 const earProfile = "tag:ietf.org,2026:rats/ear#03"
 
@@ -107,7 +105,7 @@ func (iss Issuer) Issue(submodsEvidence json.RawMessage) (string, error) {
 		"exp":         now + int64(iss.lifetime.Seconds()),
 		"ear_verifier_id": map[string]string{
 			"developer": iss.issuer,
-			"build":     Version,
+			"build":     version.Version,
 		},
 		"submods": map[string]any{
 			"attester": map[string]any{

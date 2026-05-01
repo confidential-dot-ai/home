@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/lunal-dev/c8s/internal/certissuer"
+	"github.com/lunal-dev/c8s/internal/certissuerclient"
 	"github.com/lunal-dev/c8s/internal/ear"
 	"github.com/lunal-dev/c8s/pkg/attestationclient"
 	"github.com/lunal-dev/c8s/pkg/types"
@@ -18,7 +18,7 @@ import (
 type Handler struct {
 	Challenges        *ChallengeStore
 	AttestationClient attestationclient.Client
-	CertIssuer        certissuer.Client
+	CertIssuer        certissuerclient.Client
 	CertTTL           string
 	EarIssuer         ear.Issuer
 }
@@ -142,7 +142,7 @@ func (h Handler) handleAttestationError(w http.ResponseWriter, err error) {
 }
 
 func (h Handler) handleCertIssuerError(w http.ResponseWriter, err error) {
-	var apiErr *certissuer.APIError
+	var apiErr *certissuerclient.APIError
 	if errors.As(err, &apiErr) {
 		slog.Warn("cert-issuer returned error",
 			"status", apiErr.Status, "body", apiErr.Body)

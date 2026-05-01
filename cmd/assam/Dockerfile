@@ -1,8 +1,8 @@
 FROM gcr.io/distroless/static-debian12
 
-COPY build/assam /assam
+COPY build/c8s /c8s
 
 EXPOSE 8080
 VOLUME ["/data"]
 
-ENTRYPOINT ["/assam"]
+ENTRYPOINT ["/c8s", "assam"]

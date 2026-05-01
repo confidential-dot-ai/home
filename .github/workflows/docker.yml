@@ -71,6 +71,10 @@ jobs:
             image: ghcr.io/lunal-dev/assam
             dockerfile: cmd/assam/Dockerfile
             needs-attestation: false
+          - binary: c8s
+            image: ghcr.io/lunal-dev/c8s-operator
+            dockerfile: cmd/c8s/Dockerfile
+            needs-attestation: false
           - binary: get-cert
             image: ghcr.io/lunal-dev/get-cert
             dockerfile: cmd/get-cert/Dockerfile
@@ -104,7 +108,7 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Build Go binary
-        run: make build-${{ matrix.binary }}
+        run: make build-c8s
 
       - name: Download attestation binaries
         if: matrix.needs-attestation

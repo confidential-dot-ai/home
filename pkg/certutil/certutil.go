@@ -154,6 +154,20 @@ func ParsePEMCertificates(data []byte) ([]*x509.Certificate, error) {
 	return certs, nil
 }
 
+// TrimExpiredCABundle returns the subset of certs whose NotAfter is after
+// cutoff. The dropped certs are returned in dropped — callers typically log
+// their fingerprints. Order is preserved relative to the input.
+func TrimExpiredCABundle(certs []*x509.Certificate, cutoff time.Time) (kept, dropped []*x509.Certificate) {
+	for _, cert := range certs {
+		if cert.NotAfter.Before(cutoff) {
+			dropped = append(dropped, cert)
+			continue
+		}
+		kept = append(kept, cert)
+	}
+	return kept, dropped
+}
+
 // LoadPEMCertificatesFile reads a PEM file and parses all CERTIFICATE blocks.
 func LoadPEMCertificatesFile(path string) ([]*x509.Certificate, error) {
 	data, err := os.ReadFile(path)

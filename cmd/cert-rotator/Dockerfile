@@ -1,7 +1,7 @@
 FROM gcr.io/distroless/static:nonroot
 
-COPY build/cert-rotator /cert-rotator
+COPY build/c8s /c8s
 COPY build/attest-sev-snp /attest-sev-snp
 COPY build/attest-tdx /attest-tdx
 
-ENTRYPOINT ["/cert-rotator"]
+ENTRYPOINT ["/c8s", "cert-rotator"]

@@ -1,4 +1,4 @@
-.PHONY: build build-assam build-get-cert build-ratls-mesh build-cert-issuer build-cert-rotator \
+.PHONY: build build-c8s build-c8s-node build-assam build-get-cert build-ratls-mesh build-cert-issuer build-cert-rotator \
        build-nri-image-policy build-node-container-whitelist \
        test test-integration vet fmt lint clean \
        manifests generate require-controller-gen
@@ -14,15 +14,35 @@ MODULE     = github.com/lunal-dev/c8s
 
 # --- All binaries ---
 
-build: build-assam build-get-cert build-ratls-mesh build-cert-issuer build-cert-rotator \
-       build-nri-image-policy build-node-container-whitelist
+build: build-c8s
+
+# --- c8s multi-mode binary (the canonical artifact each per-role image
+# COPYs in). Per-role Dockerfiles set ENTRYPOINT ["/c8s", "<name>"].
+
+build-c8s:
+	@mkdir -p $(BUILD_DIR)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
+		-o $(BUILD_DIR)/c8s ./cmd/c8s
+	@echo "Built $(BUILD_DIR)/c8s"
+
+# Slim variant for node-side images (nri-image-policy, node-container-whitelist,
+# ratls-mesh, get-cert): omits 'operator' and 'install' subcommands so the
+# binary doesn't pull controller-runtime or the embedded helm chart.
+build-c8s-node:
+	@mkdir -p $(BUILD_DIR)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+		go build -tags c8s_node \
+		-ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
+		-o $(BUILD_DIR)/c8s-node ./cmd/c8s
+	@echo "Built $(BUILD_DIR)/c8s-node"
 
 # --- Assam ---
 
 build-assam:
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w -X $(MODULE)/internal/ear.Version=$(VERSION)" \
+		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
 		-o $(BUILD_DIR)/assam ./cmd/assam
 	@echo "Built $(BUILD_DIR)/assam"
 
@@ -31,7 +51,7 @@ build-assam:
 build-get-cert:
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w" \
+		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
 		-o $(BUILD_DIR)/get-cert ./cmd/get-cert
 	@echo "Built $(BUILD_DIR)/get-cert"
 
@@ -40,7 +60,7 @@ build-get-cert:
 build-ratls-mesh:
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w" \
+		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
 		-o $(BUILD_DIR)/ratls-mesh ./cmd/ratls-mesh
 	@echo "Built $(BUILD_DIR)/ratls-mesh"
 
@@ -49,7 +69,7 @@ build-ratls-mesh:
 build-cert-issuer:
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w" \
+		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
 		-o $(BUILD_DIR)/cert-issuer ./cmd/cert-issuer
 	@echo "Built $(BUILD_DIR)/cert-issuer"
 
@@ -58,7 +78,7 @@ build-cert-issuer:
 build-cert-rotator:
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w" \
+		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
 		-o $(BUILD_DIR)/cert-rotator ./cmd/cert-rotator
 	@echo "Built $(BUILD_DIR)/cert-rotator"
 
@@ -67,7 +87,7 @@ build-cert-rotator:
 build-nri-image-policy:
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w -X main.version=$(VERSION)" \
+		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
 		-o $(BUILD_DIR)/nri-image-policy ./cmd/nri-image-policy
 	@echo "Built $(BUILD_DIR)/nri-image-policy"
 
@@ -76,7 +96,7 @@ build-nri-image-policy:
 build-node-container-whitelist:
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w -X main.version=$(VERSION)" \
+		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
 		-o $(BUILD_DIR)/node-container-whitelist ./cmd/node-container-whitelist
 	@echo "Built $(BUILD_DIR)/node-container-whitelist"
 

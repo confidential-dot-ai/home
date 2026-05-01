@@ -3,6 +3,7 @@
 //
 //   - c8s operator    — controller-manager + admission webhook
 //   - c8s install     — client-side: helm install c8s + CRDs
+//   - c8s get-cert    — init-container certificate bootstrap
 package main
 
 import (
@@ -10,10 +11,9 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-)
 
-// Version is injected at build time via -ldflags.
-var Version = "dev"
+	"github.com/lunal-dev/c8s/internal/version"
+)
 
 var rootCmd = &cobra.Command{
 	Use:   "c8s",
@@ -28,7 +28,9 @@ Typical bootstrap flow on a fresh cluster:
     kubectl apply -f cwl.yaml
 
 See 'c8s <subcommand> --help' for details.`,
-	Version: Version,
+	Version:       version.Version,
+	SilenceUsage:  true,
+	SilenceErrors: true,
 }
 
 func main() {

@@ -10,8 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN mkdir -p /app /opt/lunal-services
 
-COPY build/ratls-mesh /app/ratls-mesh
+COPY build/c8s /app/c8s
 COPY build/attest-sev-snp /opt/lunal-services/attest-sev-snp
-RUN chmod +x /app/ratls-mesh /opt/lunal-services/attest-sev-snp
+RUN chmod +x /app/c8s /opt/lunal-services/attest-sev-snp
 
-ENTRYPOINT ["/app/ratls-mesh"]
+ENTRYPOINT ["/app/c8s", "ratls-mesh"]

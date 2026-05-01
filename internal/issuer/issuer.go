@@ -51,6 +51,12 @@ type CA struct {
 
 // NewCA generates a fresh self-signed ECDSA P-256 CA.
 func NewCA(commonName string, validity time.Duration) (*CA, error) {
+	return NewCAWithCurve(commonName, validity, elliptic.P256())
+}
+
+// NewCAWithCurve generates a fresh self-signed ECDSA CA on the given curve.
+// Use NewCA for the default P-256 mesh CA.
+func NewCAWithCurve(commonName string, validity time.Duration, curve elliptic.Curve) (*CA, error) {
 	if commonName == "" {
 		commonName = DefaultCACommonName
 	}
@@ -58,7 +64,7 @@ func NewCA(commonName string, validity time.Duration) (*CA, error) {
 		validity = DefaultCAValidity
 	}
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err := ecdsa.GenerateKey(curve, rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate ca key: %w", err)
 	}
@@ -113,72 +119,13 @@ type Request struct {
 	AttestationDigest []byte
 }
 
-// CSRRequest is a leaf issuance request where the caller supplies the
-// keypair (via CSR). Used by the KBS when signing attested CSRs from
-// init-containers — the private key never leaves the TEE.
-type CSRRequest struct {
-	CSR               *x509.CertificateRequest
-	CommonName        string // overrides CSR.Subject.CommonName
-	DNSNames          []string
-	TTL               time.Duration
-	AttestationDigest []byte
-}
-
-// Result is a newly issued leaf certificate. KeyPEM is empty when the caller
-// supplied the keypair via CSR.
+// Result is a newly issued leaf certificate.
 type Result struct {
 	CertPEM    []byte
 	KeyPEM     []byte
 	CAChainPEM []byte
 	NotBefore  time.Time
 	NotAfter   time.Time
-}
-
-// IssueCSR signs a caller-supplied CSR. The CSR's signature is verified
-// against its embedded public key before signing, guaranteeing the key-
-// possession property TEE attestation binds to. No keypair is generated
-// server-side — the private key never leaves the caller.
-func (c *CA) IssueCSR(req CSRRequest) (*Result, error) {
-	if req.CSR == nil {
-		return nil, fmt.Errorf("IssueCSR: CSR required")
-	}
-	if err := req.CSR.CheckSignature(); err != nil {
-		return nil, fmt.Errorf("CSR signature invalid: %w", err)
-	}
-	cn := req.CommonName
-	if cn == "" {
-		cn = req.CSR.Subject.CommonName
-	}
-	if cn == "" {
-		return nil, fmt.Errorf("IssueCSR: CommonName required")
-	}
-	if req.TTL <= 0 {
-		req.TTL = DefaultLeafTTL
-	}
-
-	tmpl, err := certutil.NewLeafTemplate(cn, req.TTL)
-	if err != nil {
-		return nil, err
-	}
-	tmpl.DNSNames = req.DNSNames
-	if len(tmpl.DNSNames) == 0 {
-		tmpl.DNSNames = req.CSR.DNSNames
-	}
-	tmpl.IPAddresses = req.CSR.IPAddresses
-	if err := certutil.AppendAttestationDigest(tmpl, req.AttestationDigest); err != nil {
-		return nil, err
-	}
-
-	leafDER, err := x509.CreateCertificate(rand.Reader, tmpl, c.Cert, req.CSR.PublicKey, c.Key)
-	if err != nil {
-		return nil, fmt.Errorf("sign leaf: %w", err)
-	}
-	return &Result{
-		CertPEM:    certutil.EncodeCertPEM(leafDER),
-		CAChainPEM: certutil.EncodeCertPEM(c.Cert.Raw),
-		NotBefore:  tmpl.NotBefore,
-		NotAfter:   tmpl.NotAfter,
-	}, nil
 }
 
 // Issue generates a fresh ECDSA P-256 keypair and signs a leaf certificate

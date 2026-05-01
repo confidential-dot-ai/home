@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/lunal-dev/c8s/internal/attestation"
-	"github.com/lunal-dev/c8s/internal/certissuer"
+	"github.com/lunal-dev/c8s/internal/certissuerclient"
 	"github.com/lunal-dev/c8s/internal/ear"
 	"github.com/lunal-dev/c8s/internal/server"
 	"github.com/lunal-dev/c8s/internal/whitelist"
@@ -81,7 +81,7 @@ func testApp(attestationURL, certIssuerURL string) http.Handler {
 	}
 
 	asClient := attestationclient.NewClient(attestationURL)
-	ciClient := certissuer.NewClient(certIssuerURL)
+	ciClient := certissuerclient.NewClient(certIssuerURL)
 
 	whitelistStore, err := whitelist.OpenInMemory()
 	if err != nil {

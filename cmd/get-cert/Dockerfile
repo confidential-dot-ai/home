@@ -1,5 +1,5 @@
 FROM gcr.io/distroless/static-debian12
 
-COPY build/get-cert /get-cert
+COPY build/c8s /c8s
 
-ENTRYPOINT ["/get-cert"]
+ENTRYPOINT ["/c8s", "get-cert"]
