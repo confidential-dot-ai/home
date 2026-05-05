@@ -160,8 +160,11 @@ spec:
               # 4. Reload. NRI does not respawn pre-registered plugins from
               #    plugin_path on exit (only at containerd startup), so any
               #    binary or config change requires a containerd restart.
+              #    A runtime config change also requires it: the plugin reads
+              #    its config file once at startup, so the running process
+              #    won't pick up updates without a fresh launch.
               #    Shims survive the restart, so this pod survives too.
-              if [ "$containerd_changed" = "1" ] || [ "$binary_changed" = "1" ]; then
+              if [ "$containerd_changed" = "1" ] || [ "$binary_changed" = "1" ] || [ "$config_changed" = "1" ]; then
                 echo "restarting containerd: ${RESTART_COMMAND}"
                 # shellcheck disable=SC2086
                 nsenter -t 1 -m -u -i -n -p -- sh -c "${RESTART_COMMAND}"

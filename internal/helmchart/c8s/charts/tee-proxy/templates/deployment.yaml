@@ -80,7 +80,7 @@ spec:
           env:
             - name: AUTOCERT_DIR
               value: /app/certs
-            - name: ATTESTATION_SERVICE_API_KEY
+            - name: C8S_ATTESTATION_SERVICE_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Release.Name }}-attestation-service-api-key
