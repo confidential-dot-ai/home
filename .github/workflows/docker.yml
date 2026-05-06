@@ -95,10 +95,6 @@ jobs:
             image: ghcr.io/lunal-dev/nri-image-policy
             dockerfile: cmd/nri-image-policy/Dockerfile
             needs-attestation: true
-          - binary: node-container-whitelist
-            image: ghcr.io/lunal-dev/node-container-whitelist
-            dockerfile: cmd/node-container-whitelist/Dockerfile
-            needs-attestation: true
     steps:
       - uses: actions/checkout@v4
 

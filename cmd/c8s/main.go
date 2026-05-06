@@ -50,7 +50,6 @@ func normalizeArgvAlias() {
 		"cert-issuer",
 		"cert-rotator",
 		"get-cert",
-		"node-container-whitelist",
 		"nri-image-policy",
 		"ratls-mesh",
 	} {

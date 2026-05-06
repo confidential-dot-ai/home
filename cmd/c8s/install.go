@@ -78,7 +78,6 @@ Requires the 'helm' CLI to be on PATH.`,
 			"--set", "certIssuer.image.tag=" + imageTag,
 			"--set", "ratls-mesh.image.tag=" + imageTag,
 			"--set", "nri-image-policy.image.tag=" + imageTag,
-			"--set", "node-container-whitelist.image.tag=" + imageTag,
 			"--set", "tee-proxy.image.tag=" + imageTag,
 			"--set", "tls-lb.initContainer.image.tag=" + imageTag,
 		}

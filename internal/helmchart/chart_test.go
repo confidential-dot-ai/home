@@ -19,7 +19,6 @@ func TestChartDefaultRendersReplacementStack(t *testing.T) {
 		"app.kubernetes.io/component: cert-issuer",
 		"app.kubernetes.io/name: ratls-mesh",
 		"app.kubernetes.io/name: nri-image-policy",
-		"app.kubernetes.io/name: node-container-whitelist",
 		"app.kubernetes.io/name: tee-proxy",
 		"app.kubernetes.io/name: tls-lb",
 	} {
@@ -153,7 +152,6 @@ func TestChartWebhookRendersSecretRefAuthAndSecurityKnobs(t *testing.T) {
 		"--set", "certIssuer.enabled=false",
 		"--set", "ratls-mesh.enabled=false",
 		"--set", "nri-image-policy.enabled=false",
-		"--set", "node-container-whitelist.enabled=false",
 		"--set", "tee-proxy.enabled=false",
 		"--set", "tls-lb.enabled=false",
 	)
@@ -278,7 +276,6 @@ func helmTemplate(t *testing.T, args ...string) (string, error) {
 		"--set", "certIssuer.image.tag=dev",
 		"--set", "ratls-mesh.image.tag=dev",
 		"--set", "nri-image-policy.image.tag=dev",
-		"--set", "node-container-whitelist.image.tag=dev",
 		"--set", "tee-proxy.image.tag=dev",
 		"--set", "tls-lb.initContainer.image.tag=dev",
 	}

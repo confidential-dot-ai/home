@@ -26,10 +26,6 @@ dependencies:
     version: 0.2.0
     repository: file://charts/nri-image-policy
     condition: nri-image-policy.enabled
-  - name: node-container-whitelist
-    version: 0.1.0
-    repository: file://charts/node-container-whitelist
-    condition: node-container-whitelist.enabled
   - name: tee-proxy
     version: 0.1.0
     repository: file://charts/tee-proxy

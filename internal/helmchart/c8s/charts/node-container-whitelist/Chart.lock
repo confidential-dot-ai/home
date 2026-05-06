@@ -1,6 +1,0 @@
-dependencies:
-- name: c8s-common
-  repository: file://../c8s-common
-  version: 0.1.0
-digest: sha256:785c9bc9209dee54ef546244a673efc58642d2d95738458e3d7faf6162648948
-generated: "2026-03-14T11:39:38.951597Z"

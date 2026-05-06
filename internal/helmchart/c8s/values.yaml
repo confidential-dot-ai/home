@@ -229,16 +229,6 @@ nri-image-policy:
     adminPasswordSecretKey: ""
     assamURL: ""
 
-node-container-whitelist:
-  enabled: true
-  image:
-    repository: ghcr.io/lunal-dev/node-container-whitelist
-    tag: ""
-    digest: ""
-    pullPolicy: IfNotPresent
-  imagePullSecrets: []
-  whitelistURL: ""
-
 tee-proxy:
   enabled: true
   upstream: vllm-router-service.vllm.svc.cluster.local
@@ -252,7 +242,7 @@ tee-proxy:
   router:
     routes:
       - path: /whitelist
-        upstream: http://c8s-node-container-whitelist:8000
+        upstream: http://c8s-assam.tee-attestation.svc:8080
     image:
       repository: docker.io/library/nginx
       digest: "sha256:1eff5a5f3fcf8431a0abb7eddf5471fec24e5e1905a2581aeacdb07a4479b92b"

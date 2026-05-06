@@ -72,7 +72,7 @@ router:
   # Default route (/) always goes to .upstream
   routes: []
   #  - path: /whitelist
-  #    upstream: "http://node-container-whitelist.tee-attestation.svc.cluster.local:8000"
+  #    upstream: "http://assam.tee-attestation.svc.cluster.local:8080"
 
   # DNS resolver for nginx dynamic upstream resolution
   resolver: "kube-dns.kube-system.svc.cluster.local"

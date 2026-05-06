@@ -1,5 +1,5 @@
 .PHONY: build build-c8s build-c8s-node build-assam build-get-cert build-ratls-mesh build-cert-issuer build-cert-rotator \
-       build-nri-image-policy build-node-container-whitelist \
+       build-nri-image-policy \
        test test-integration vet fmt lint clean \
        manifests generate check-crd-chart install-controller-gen require-controller-gen
 
@@ -27,8 +27,8 @@ build-c8s:
 		-o $(BUILD_DIR)/c8s ./cmd/c8s
 	@echo "Built $(BUILD_DIR)/c8s"
 
-# Slim variant for node-side images (nri-image-policy, node-container-whitelist,
-# ratls-mesh, get-cert): omits 'operator' and 'install' subcommands so the
+# Slim variant for node-side images (nri-image-policy, ratls-mesh, get-cert):
+# omits 'operator' and 'install' subcommands so the
 # binary doesn't pull controller-runtime or the embedded helm chart.
 build-c8s-node:
 	@mkdir -p $(BUILD_DIR)
@@ -91,15 +91,6 @@ build-nri-image-policy:
 		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
 		-o $(BUILD_DIR)/nri-image-policy ./cmd/nri-image-policy
 	@echo "Built $(BUILD_DIR)/nri-image-policy"
-
-# --- Node Container Whitelist ---
-
-build-node-container-whitelist:
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
-		-o $(BUILD_DIR)/node-container-whitelist ./cmd/node-container-whitelist
-	@echo "Built $(BUILD_DIR)/node-container-whitelist"
 
 # --- Tests ---
 

@@ -13,7 +13,6 @@ Confidential computing infrastructure for Kubernetes. Provides TEE attestation, 
 | [`cmd/cert-issuer`](cmd/cert-issuer/) | Certificate issuer sidecar | [README](cmd/cert-issuer/README.md) |
 | [`cmd/cert-rotator`](cmd/cert-rotator/) | Kubernetes cert rotation controller | [README](cmd/cert-rotator/README.md) |
 | [`cmd/nri-image-policy`](cmd/nri-image-policy/) | NRI plugin enforcing container image digest whitelists | - |
-| [`cmd/node-container-whitelist`](cmd/node-container-whitelist/) | HTTP server fetching and serving the container whitelist | - |
 
 ## Libraries
 
@@ -41,7 +40,6 @@ cmd/
   cert-issuer/             Certificate issuer sidecar
   cert-rotator/            Kubernetes cert rotation controller
   nri-image-policy/        NRI container image policy plugin
-  node-container-whitelist/ Whitelist HTTP server
 internal/
   attestation/             Attestation handlers and challenge store
   certissuer/              HTTP client for cert-issuer
@@ -118,7 +116,6 @@ per-role image names remain stable, but each image copies the same multi-mode
 | `ghcr.io/lunal-dev/ratls-mesh` | debian-slim | Needs iptables + attestation binaries |
 | `ghcr.io/lunal-dev/cert-rotator` | distroless | Includes attestation binaries |
 | `ghcr.io/lunal-dev/nri-image-policy` | debian-slim | Needs TSS2 libs + attestation binaries |
-| `ghcr.io/lunal-dev/node-container-whitelist` | debian-slim | Needs TSS2 libs + attestation binaries |
 
 ## Related repos
 
