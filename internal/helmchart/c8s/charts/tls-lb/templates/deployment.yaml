@@ -31,6 +31,8 @@ spec:
     metadata:
       labels:
         {{- include "tls-lb.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/nginx-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

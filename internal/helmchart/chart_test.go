@@ -572,6 +572,28 @@ func TestTLSLBDiscoveryReportsCDSModeWithoutPublicTLSSecret(t *testing.T) {
 	}
 }
 
+func TestTLSLBRollsOnNginxConfigChange(t *testing.T) {
+	defaultOut, err := helmTemplateTLSLB(t)
+	if err != nil {
+		t.Fatalf("helm template default config: %v\n%s", err, defaultOut)
+	}
+	defaultChecksum := renderedValue(t, defaultOut, "checksum/nginx-config")
+	if defaultChecksum == "" {
+		t.Fatalf("default checksum/nginx-config is empty\n%s", defaultOut)
+	}
+
+	changedOut, err := helmTemplateTLSLB(t,
+		"--set-string", "upstream.address=other-upstream:8080",
+	)
+	if err != nil {
+		t.Fatalf("helm template changed config: %v\n%s", err, changedOut)
+	}
+	changedChecksum := renderedValue(t, changedOut, "checksum/nginx-config")
+	if changedChecksum == defaultChecksum {
+		t.Fatalf("checksum/nginx-config did not change after changing upstream: %s", defaultChecksum)
+	}
+}
+
 func TestChartOperatorRBACIsScoped(t *testing.T) {
 	out, err := helmTemplate(t, "--set", "webhook.enabled=false")
 	if err != nil {
