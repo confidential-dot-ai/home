@@ -1,4 +1,4 @@
-name: Scan for 
+name: Scan for vulnerabilities
 
 on:
   workflow_dispatch:
