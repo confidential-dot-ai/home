@@ -19,10 +19,14 @@ spec:
           labels:
             severity: warning
           annotations:
-            summary: "RA-TLS mesh resolver cache stale on {{`{{ $labels.instance }}`}}"
+            summary: "RA-TLS mesh resolver watch stream stale on {{`{{ $labels.instance }}`}}"
             description: >-
-              The K8s pod informer has not received events for over 5 minutes.
-              Pod-to-node routing may be stale.
+              The K8s pod informer has not received any event for over
+              5 minutes. This is a watch-stream liveness signal — the
+              gauge advances on every event including pending-phase
+              pods that don't mutate the cache, so absence over 5m
+              means the watch itself is wedged, not that the cache is
+              merely quiet.
 
         - alert: RATLSMeshNoMeasurementPinning
           expr: ratls_mesh_measurement_pinning == 0
@@ -93,6 +97,82 @@ spec:
             summary: "RA-TLS mesh high TLS handshake failure rate on {{`{{ $labels.instance }}`}}"
             description: >-
               Sustained RA-TLS handshake failures. Possible measurement mismatch or misconfigured peer.
+
+        - alert: RATLSMeshLocalCIDRDiscoveryFailed
+          expr: ratls_mesh_resolver_local_cidrs == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "RA-TLS mesh local CIDR discovery failed on {{`{{ $labels.instance }}`}}"
+            description: >-
+              ValidateLocalDest has no host-discovered pod-network CIDRs.
+              Inbound pod delivery fails closed until the resolver refresh
+              discovers at least one local pod-network interface. Check CNI
+              bridge/interface state and ratls-mesh logs.
+
+        - alert: RATLSMeshIptablesSyncWedged
+          expr: |
+            ratls_mesh_iptables_metrics_file_updated_at_seconds > 0
+            and (time() - ratls_mesh_iptables_metrics_file_updated_at_seconds) > 90
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh iptables-sync stale on {{`{{ $labels.instance }}`}}"
+            description: >-
+              The iptables-sync sidecar's in-process counters
+              (jump-position, ipset overflow) cannot signal a wedge after
+              they stop being published; this alert catches that case via
+              the freshness gauge. Pod-IP ipsets may be stale and new pod
+              IPs may not be intercepted. Threshold is 3 × the default
+              --resync-period (30s). Check container logs and
+              kube_pod_container_status_restarts_total for the
+              iptables-sync container.
+
+        - alert: RATLSMeshOutboundDirectDial
+          expr: rate(ratls_mesh_outbound_dest_rejected_total{reason="host_addr"}[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh observed direct dials to :15001 on {{`{{ $labels.instance }}`}}"
+            description: >-
+              Something reached the host-network outbound listener with
+              the node IP or loopback as the original destination — only
+              possible by dialing :15001 outside the iptables REDIRECT
+              path. There is no legitimate cause. This is split from
+              reason="unknown_pod" so the informer-skew baseline does
+              not drown the security signal.
+
+        - alert: RATLSMeshIptablesIPSetOverflow
+          expr: rate(ratls_mesh_iptables_ipset_overflow_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh iptables ipset overflow on {{`{{ $labels.instance }}`}}"
+            description: >-
+              Pod count exceeded --ipset-maxelem; the reconcile rejected
+              the restore and the live ipset is stale. New pod IPs will
+              not be intercepted until the operator bumps
+              iptablesSync.ipsetMaxElem and the DaemonSet rolls.
+
+        - alert: RATLSMeshJumpPositionViolations
+          expr: rate(ratls_mesh_iptables_jump_position_violations_total[5m]) > (1/60)
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh jump-position contention on {{`{{ $labels.instance }}`}}"
+            description: >-
+              The watchdog has been reasserting our PREROUTING/OUTPUT
+              jump at position 1 more than once per minute for 10
+              minutes — typically kube-proxy reinserting KUBE-SERVICES
+              ahead of us. Tune iptablesSync.watchdogPeriod downward if
+              necessary. Distinct from
+              ratls_mesh_iptables_jump_position_check_errors_total
+              which signals environmental noise (xtables.lock).
 
         - alert: RATLSMeshHighMemory
           expr: |

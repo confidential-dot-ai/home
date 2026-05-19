@@ -1,3 +1,5 @@
+//go:build linux
+
 package ratlsmesh
 
 import (
@@ -18,15 +20,20 @@ import (
 
 // Resolver maps pod IPs to node IPs for routing RA-TLS connections.
 type Resolver interface {
-	Resolve(podIP string) (nodeIP string, local bool, err error)
+	Resolve(podIP string) (nodeIP string, local bool)
+	// ValidateOutboundDest reports whether ip is a known pod destination
+	// allowed to enter the outbound proxy through iptables REDIRECT. When
+	// false, reason is a short label suitable for the outbound-reject
+	// metric (host_addr / unknown_pod).
+	ValidateOutboundDest(ip string) (ok bool, reason string)
 	// ValidateLocalDest returns true if ip is a valid destination for
 	// inbound traffic on this node (i.e. a pod running here).
 	ValidateLocalDest(ip string) bool
 }
 
-// Proxy is a transparent L4 TCP proxy that wraps inter-node traffic in RA-TLS
+// Proxy is a transparent L4 TCP proxy that wraps pod traffic in RA-TLS
 // mTLS. Outbound (:15001) intercepts app traffic and initiates RA-TLS to the
-// remote node. Inbound (:15006) accepts RA-TLS from remote nodes and delivers
+// destination node. Inbound (:15006) accepts RA-TLS from peer nodes and delivers
 // to the local pod.
 type Proxy struct {
 	outboundAddr string
@@ -79,10 +86,10 @@ func intOrDefault(v, fallback int) int {
 // accessLogEntry holds flat fields for a structured per-connection access log.
 type accessLogEntry struct {
 	connID       uint64
-	dir          string // "inbound", "outbound", "outbound_local"
+	dir          string // "inbound", "outbound", "outbound_same_node"
 	src          string
 	dst          string
-	node         string // remote node address (outbound-ratls only)
+	node         string // destination node address (outbound-ratls only)
 	local        string // local listener address
 	bytesFwd     int64
 	bytesRev     int64
@@ -134,31 +141,6 @@ func (p *Proxy) certModeStr() string {
 		return "assam"
 	}
 	return "self-signed"
-}
-
-// histLabels returns the pre-formatted label string for histogram observation.
-// The full label set is enumerable (3 directions × 2 cert modes), so each
-// branch returns a constant — no allocation in the per-connection hot path.
-func histLabels(dir, certMode string) string {
-	assam := certMode == "assam"
-	switch dir {
-	case "outbound":
-		if assam {
-			return `direction="outbound",cert_mode="assam"`
-		}
-		return `direction="outbound",cert_mode="self-signed"`
-	case "outbound_local":
-		if assam {
-			return `direction="outbound_local",cert_mode="assam"`
-		}
-		return `direction="outbound_local",cert_mode="self-signed"`
-	case "inbound":
-		if assam {
-			return `direction="inbound",cert_mode="assam"`
-		}
-		return `direction="inbound",cert_mode="self-signed"`
-	}
-	return fmt.Sprintf(`direction="%s",cert_mode="%s"`, dir, certMode)
 }
 
 // Run starts both listeners and blocks until ctx is cancelled. On shutdown it
@@ -247,7 +229,7 @@ func (p *Proxy) serve(ctx context.Context, addr string, tlsCfg *tls.Config, hand
 				return nil
 			}
 			n := consecutiveErrors.Add(1)
-			p.metrics.acceptErrors.Add(1)
+			p.metrics.acceptErrors.Inc()
 			p.logger.Warn("accept error", "addr", addr, "error", err, "consecutive", n)
 
 			// Exponential backoff: 5ms, 10ms, 20ms, … capped at 640ms.
@@ -269,7 +251,7 @@ func (p *Proxy) serve(ctx context.Context, addr string, tlsCfg *tls.Config, hand
 			select {
 			case p.connSem <- struct{}{}:
 			default:
-				p.metrics.connLimitRejected.Add(1)
+				p.metrics.connLimitRejected.Inc()
 				p.logger.Warn("connection limit reached", "addr", addr)
 				conn.Close()
 				continue
@@ -288,7 +270,7 @@ func (p *Proxy) serve(ctx context.Context, addr string, tlsCfg *tls.Config, hand
 			}
 			cnt, ok := p.tryAcquireSrc(srcKey)
 			if !ok {
-				p.metrics.connLimitPerSourceRejected.Add(1)
+				p.metrics.connLimitPerSourceRejected.Inc()
 				p.logger.Warn("per-source connection limit reached", "src", srcKey, "addr", addr)
 				if p.connSem != nil {
 					<-p.connSem
@@ -317,8 +299,8 @@ func (p *Proxy) serve(ctx context.Context, addr string, tlsCfg *tls.Config, hand
 
 func (p *Proxy) handleOutbound(ctx context.Context, downstream net.Conn) {
 	defer downstream.Close()
-	p.metrics.activeOutbound.Add(1)
-	defer p.metrics.activeOutbound.Add(-1)
+	p.metrics.activeConnections.WithLabelValues("outbound").Inc()
+	defer p.metrics.activeConnections.WithLabelValues("outbound").Dec()
 	connID := p.nextConnID.Add(1)
 	log := p.logger.With("conn", connID)
 	start := time.Now()
@@ -333,14 +315,13 @@ func (p *Proxy) handleOutbound(ctx context.Context, downstream net.Conn) {
 	}
 	defer func() {
 		entry.dur = time.Since(start)
-		labels := histLabels(entry.dir, cm)
-		p.metrics.connectionDuration.Observe(labels, entry.dur.Seconds())
+		p.metrics.connectionDuration.WithLabelValues(entry.dir, cm).Observe(entry.dur.Seconds())
 		entry.logTo(log, p.accessLog)
 	}()
 
 	origDst, err := p.origDstFunc(downstream)
 	if err != nil {
-		p.metrics.routeErrors.Add(1)
+		p.metrics.routeErrors.Inc()
 		entry.dir = "outbound"
 		entry.result = "route_error"
 		entry.err = err.Error()
@@ -351,45 +332,34 @@ func (p *Proxy) handleOutbound(ctx context.Context, downstream net.Conn) {
 
 	host, _, err := net.SplitHostPort(origDst)
 	if err != nil {
-		p.metrics.routeErrors.Add(1)
+		p.metrics.routeErrors.Inc()
 		entry.dir = "outbound"
 		entry.result = "route_error"
 		entry.err = err.Error()
 		log.Warn("invalid original destination", "dst", origDst, "error", err)
 		return
 	}
-
-	nodeIP, local, err := p.resolver.Resolve(host)
-	if err != nil {
-		p.metrics.routeErrors.Add(1)
+	if ok, reason := p.resolver.ValidateOutboundDest(host); !ok {
+		p.metrics.recordOutboundDestRejected(reason)
 		entry.dir = "outbound"
-		entry.result = "route_error"
-		entry.err = err.Error()
-		log.Warn("resolve failed", "podIP", host, "error", err)
+		entry.result = "dest_rejected"
+		entry.err = "destination is not a known pod IP"
+		log.Warn("outbound destination rejected: not a known pod IP", "dst", origDst, "reason", reason)
 		return
 	}
 
-	if local {
-		entry.dir = "outbound_local"
-		pipeStart := time.Now()
-		fwd, rev := p.dialAndPipe(ctx, downstream, origDst, log)
-		entry.ttfb = pipeStart.Sub(start)
-		entry.bytesFwd = fwd.N
-		entry.bytesRev = rev.N
-		if fwd.Err != nil || rev.Err != nil {
-			entry.result = "dial_error"
-			if fwd.Err != nil {
-				entry.err = fwd.Err.Error()
-			} else {
-				entry.err = rev.Err.Error()
-			}
-		}
-		p.metrics.timeToFirstByte.Observe(histLabels("outbound_local", cm), entry.ttfb.Seconds())
-		p.recordOutbound(fwd, rev, true)
-		return
-	}
+	nodeIP, local := p.resolver.Resolve(host)
 
 	entry.dir = "outbound"
+	if local {
+		entry.dir = "outbound_same_node"
+	}
+	// Even on the same-node path we dial nodeIP (not 127.0.0.1): the inbound
+	// listener binds the host netns under hostNetwork: true, the dial reaches
+	// it via the kernel's local-routing path, and the RA-TLS handshake stays
+	// uniform across local/remote so attestation is the only thing that gates
+	// byte relay. The old plaintext same-node shortcut is gone — see
+	// DESIGN.md "Local vs remote path".
 	remoteAddr := net.JoinHostPort(nodeIP, strconv.Itoa(p.inboundPort))
 	entry.node = remoteAddr
 	pipeStart := time.Now()
@@ -410,29 +380,11 @@ func (p *Proxy) handleOutbound(ctx context.Context, downstream net.Conn) {
 			entry.err = rev.Err.Error()
 		}
 	}
-	labels := histLabels("outbound", cm)
 	if tlsDur > 0 {
-		p.metrics.tlsHandshakeDuration.Observe(labels, tlsDur.Seconds())
+		p.metrics.tlsHandshakeDuration.WithLabelValues(entry.dir, cm).Observe(tlsDur.Seconds())
 	}
-	p.metrics.timeToFirstByte.Observe(labels, entry.ttfb.Seconds())
-	p.recordOutbound(fwd, rev, false)
-}
-
-// dialAndPipe dials addr over plain TCP and pipes bytes to/from downstream.
-func (p *Proxy) dialAndPipe(ctx context.Context, downstream net.Conn, addr string, log *slog.Logger) (fwd, rev pipeResult) {
-	upstream, err := (&net.Dialer{
-		Timeout:   durOrDefault(p.dialTimeout, 5*time.Second),
-		KeepAlive: durOrDefault(p.keepAlive, 30*time.Second),
-	}).DialContext(ctx, "tcp", addr)
-	if err != nil {
-		p.metrics.dialFailures.Add(1)
-		log.Warn("dial failed", "addr", addr, "error", err)
-		fwd.Err = err
-		rev.Err = err
-		return
-	}
-	defer upstream.Close()
-	return p.pipe(p.wrapIdle(downstream), p.wrapIdle(upstream))
+	p.metrics.timeToFirstByte.WithLabelValues(entry.dir, cm).Observe(entry.ttfb.Seconds())
+	p.recordOutbound(fwd, rev, local)
 }
 
 // dialAndPipeRATLS dials via RA-TLS, sends the destination header, then pipes.
@@ -447,7 +399,7 @@ func (p *Proxy) dialAndPipeRATLS(ctx context.Context, downstream net.Conn, remot
 		},
 	}).DialContext(ctx, "tcp", remoteAddr)
 	if err != nil {
-		p.metrics.tlsDialFailures.Add(1)
+		p.metrics.tlsDialFailures.Inc()
 		log.Warn("RA-TLS dial failed", "node", remoteAddr, "error", err)
 		fwd.Err = err
 		rev.Err = err
@@ -457,11 +409,11 @@ func (p *Proxy) dialAndPipeRATLS(ctx context.Context, downstream net.Conn, remot
 	defer upstream.Close()
 
 	if tlsConn, ok := upstream.(*tls.Conn); ok && tlsConn.ConnectionState().DidResume {
-		p.metrics.tlsSessionResumptions.Add(1)
+		p.metrics.tlsSessionResumptions.Inc()
 	}
 
 	if _, err := fmt.Fprintf(upstream, "%s\n", destHeader); err != nil {
-		p.metrics.destHeaderWriteErrors.Add(1)
+		p.metrics.destHeaderErrors.WithLabelValues("write").Inc()
 		log.Warn("destination header write failed", "error", err)
 		fwd.Err = err
 		rev.Err = err
@@ -474,8 +426,8 @@ func (p *Proxy) dialAndPipeRATLS(ctx context.Context, downstream net.Conn, remot
 
 func (p *Proxy) handleInbound(ctx context.Context, downstream net.Conn) {
 	defer downstream.Close()
-	p.metrics.activeInbound.Add(1)
-	defer p.metrics.activeInbound.Add(-1)
+	p.metrics.activeConnections.WithLabelValues("inbound").Inc()
+	defer p.metrics.activeConnections.WithLabelValues("inbound").Dec()
 	connID := p.nextConnID.Add(1)
 	log := p.logger.With("conn", connID)
 	start := time.Now()
@@ -491,8 +443,7 @@ func (p *Proxy) handleInbound(ctx context.Context, downstream net.Conn) {
 	}
 	defer func() {
 		entry.dur = time.Since(start)
-		labels := histLabels("inbound", cm)
-		p.metrics.connectionDuration.Observe(labels, entry.dur.Seconds())
+		p.metrics.connectionDuration.WithLabelValues("inbound", cm).Observe(entry.dur.Seconds())
 		entry.logTo(log, p.accessLog)
 	}()
 
@@ -511,7 +462,7 @@ func (p *Proxy) handleInbound(ctx context.Context, downstream net.Conn) {
 	reader := bufio.NewReader(lr)
 	dstLine, err := reader.ReadString('\n')
 	if err != nil {
-		p.metrics.destHeaderReadErrors.Add(1)
+		p.metrics.destHeaderErrors.WithLabelValues("read").Inc()
 		log.Warn("failed to read destination header", "error", err)
 		entry.result = "header_error"
 		entry.err = err.Error()
@@ -519,7 +470,7 @@ func (p *Proxy) handleInbound(ctx context.Context, downstream net.Conn) {
 	}
 
 	if len(dstLine) > maxHeader {
-		p.metrics.destHeaderReadErrors.Add(1)
+		p.metrics.destHeaderErrors.WithLabelValues("read").Inc()
 		log.Warn("destination header too large", "size", len(dstLine))
 		entry.result = "header_error"
 		entry.err = "header too large"
@@ -542,7 +493,7 @@ func (p *Proxy) handleInbound(ctx context.Context, downstream net.Conn) {
 	entry.dst = dst
 	host, _, err := net.SplitHostPort(dst)
 	if err != nil {
-		p.metrics.destHeaderReadErrors.Add(1)
+		p.metrics.destHeaderErrors.WithLabelValues("read").Inc()
 		log.Warn("invalid destination header", "dst", dst, "error", err)
 		entry.result = "header_error"
 		entry.err = err.Error()
@@ -550,7 +501,7 @@ func (p *Proxy) handleInbound(ctx context.Context, downstream net.Conn) {
 	}
 
 	if !p.resolver.ValidateLocalDest(host) {
-		p.metrics.inboundDestRejected.Add(1)
+		p.metrics.inboundDestRejected.Inc()
 		log.Warn("inbound destination rejected: not a local pod", "dst", dst)
 		entry.result = "dest_rejected"
 		return
@@ -562,7 +513,7 @@ func (p *Proxy) handleInbound(ctx context.Context, downstream net.Conn) {
 		KeepAlive: durOrDefault(p.keepAlive, 30*time.Second),
 	}).DialContext(ctx, "tcp", dst)
 	if err != nil {
-		p.metrics.dialFailures.Add(1)
+		p.metrics.dialFailures.Inc()
 		log.Warn("local pod dial failed", "dst", dst, "error", err)
 		entry.result = "dial_error"
 		entry.err = err.Error()
@@ -571,8 +522,7 @@ func (p *Proxy) handleInbound(ctx context.Context, downstream net.Conn) {
 	defer upstream.Close()
 
 	entry.ttfb = pipeStart.Sub(start)
-	labels := histLabels("inbound", cm)
-	p.metrics.timeToFirstByte.Observe(labels, entry.ttfb.Seconds())
+	p.metrics.timeToFirstByte.WithLabelValues("inbound", cm).Observe(entry.ttfb.Seconds())
 
 	fwd, rev := p.pipe(p.wrapIdle(&bufferedConn{downstream, reader}), p.wrapIdle(upstream))
 	entry.bytesFwd = fwd.N
@@ -589,30 +539,30 @@ func (p *Proxy) handleInbound(ctx context.Context, downstream net.Conn) {
 }
 
 func (p *Proxy) recordOutbound(fwd, rev pipeResult, local bool) {
-	p.metrics.bytesOutboundFwd.Add(fwd.N)
-	p.metrics.bytesOutboundRev.Add(rev.N)
+	p.metrics.bytesTotal.WithLabelValues("outbound", "forward").Add(float64(fwd.N))
+	p.metrics.bytesTotal.WithLabelValues("outbound", "reverse").Add(float64(rev.N))
 	if local {
 		if fwd.Err != nil || rev.Err != nil {
-			p.metrics.connErrorLocal.Add(1)
+			p.metrics.connectionsTotal.WithLabelValues("outbound_same_node", "error").Inc()
 		} else {
-			p.metrics.connSuccessLocal.Add(1)
+			p.metrics.connectionsTotal.WithLabelValues("outbound_same_node", "success").Inc()
 		}
 		return
 	}
 	if fwd.Err != nil || rev.Err != nil {
-		p.metrics.connErrorOutbound.Add(1)
+		p.metrics.connectionsTotal.WithLabelValues("outbound", "error").Inc()
 	} else {
-		p.metrics.connSuccessOutbound.Add(1)
+		p.metrics.connectionsTotal.WithLabelValues("outbound", "success").Inc()
 	}
 }
 
 func (p *Proxy) recordInbound(fwd, rev pipeResult) {
-	p.metrics.bytesInboundFwd.Add(fwd.N)
-	p.metrics.bytesInboundRev.Add(rev.N)
+	p.metrics.bytesTotal.WithLabelValues("inbound", "forward").Add(float64(fwd.N))
+	p.metrics.bytesTotal.WithLabelValues("inbound", "reverse").Add(float64(rev.N))
 	if fwd.Err != nil || rev.Err != nil {
-		p.metrics.connErrorInbound.Add(1)
+		p.metrics.connectionsTotal.WithLabelValues("inbound", "error").Inc()
 	} else {
-		p.metrics.connSuccessInbound.Add(1)
+		p.metrics.connectionsTotal.WithLabelValues("inbound", "success").Inc()
 	}
 }
 

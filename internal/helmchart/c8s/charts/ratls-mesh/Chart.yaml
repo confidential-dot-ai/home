@@ -3,6 +3,9 @@ name: ratls-mesh
 description: RA-TLS service mesh — transparent L4 proxy with hardware-attested mTLS via AMD SEV-SNP/TDX
 type: application
 version: 0.1.0
+# Required for native-sidecar initContainers (KEP-753) with the
+# SidecarContainers feature gate enabled by default; see README.
+kubeVersion: ">=1.29.0-0"
 home: https://github.com/lunal-dev/c8s-charts
 maintainers:
   - name: lunal

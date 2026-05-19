@@ -1,6 +1,6 @@
 # ratls-mesh
 
-Transparent L4 TCP proxy that wraps inter-node Kubernetes traffic in RA-TLS (Remote Attestation TLS). Each node runs one DaemonSet pod that intercepts all outbound TCP via iptables, establishes hardware-attested mTLS to remote nodes, and delivers traffic to local pods on the inbound side. Applications require zero modification.
+Transparent L4 TCP proxy that wraps pod-to-pod Kubernetes traffic in RA-TLS (Remote Attestation TLS). Each node runs one DaemonSet pod that intercepts TCP flows whose source and destination are known pod IPs, establishes hardware-attested mTLS to the destination node, and delivers traffic to local pods on the inbound side. Applications require zero modification.
 
 See [DESIGN.md](DESIGN.md) for architecture, trust model, and design decisions.
 
@@ -20,7 +20,6 @@ ratls-mesh \
   --attestation-service-url http://localhost:8400 \
   --outbound-port 15001 \
   --inbound-port 15006 \
-  --resolver k8s \
   --health-port 15021
 ```
 
@@ -29,39 +28,82 @@ Node IP is auto-detected from the `NODE_IP` environment variable (Kubernetes dow
 ### Subcommands
 
 ```bash
-# Set up iptables NAT rules (runs as init container)
-ratls-mesh iptables-setup --outbound-port 15001 --inbound-port 15006 --uid 1337
+# Watch Kubernetes pods and keep iptables/ipset routing current
+ratls-mesh iptables-sync --outbound-port 15001 --uid 1337
 
-# Remove iptables NAT rules (runs as preStop hook)
-ratls-mesh iptables-cleanup --outbound-port 15001 --inbound-port 15006 --uid 1337
+# Remove iptables NAT rules and ipsets (runs as preStop hook)
+ratls-mesh iptables-cleanup
 ```
 
-## Flags
+## Routing Model
+
+In the Helm chart, "known pod IP" means a non-hostNetwork Pod IP observed from
+the Kubernetes API. `iptables-sync` maintains separate IPv4/IPv6 ipsets for all
+known pods and for pods scheduled on the current node.
+
+| Flow | Intercepted? | Why |
+|------|--------------|-----|
+| Same-node pod TCP to a known pod IP | Yes | Host `PREROUTING` matches source in the local-pod ipset (pods scheduled on this node) and destination in the all-pod ipset. |
+| Host process TCP to a known pod IP | Yes, unless its UID is excluded | Host `OUTPUT` matches destination in the all-pod ipset and skips the mesh UID plus `--exclude-uids`. |
+| Mesh proxy TCP to a destination node inbound port | No | The destination is a node IP, not a pod IP, and the mesh UID is excluded from `OUTPUT`. |
+| ClusterIP Services, kube API, metadata, and public egress | No | The destination is not a pod IP when the mesh chains run, so these flows fall through without static pod CIDRs. |
+| External or ingress TCP directly to a pod IP | No | The source is not in the local-pod ipset. |
+
+The outbound listener also validates the original destination before proxying:
+direct connections to the host-network listener are rejected unless the original
+destination is a known pod IP. The inbound listener only forwards to local
+non-hostNetwork pod IPs.
+
+## Common Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--platform` | `sev-snp` | TEE platform: `sev-snp` or `tdx` |
 | `--attestation-service-url` | (required) | URL of the local attestation service (e.g. `http://localhost:8400`) |
 | `--outbound-port` | `15001` | Outbound listener port (iptables redirect target) |
-| `--inbound-port` | `15006` | Inbound listener port (RA-TLS from remote nodes) |
+| `--inbound-port` | `15006` | Inbound listener port (RA-TLS from peer nodes) |
 | `--node-ip` | `$NODE_IP` | This node's IP address |
-| `--resolver` | `static` | Resolver type: `static` or `k8s` |
 | `--health-port` | `15021` | Health/metrics HTTP port |
+| `--iptables-metrics-file` | `/tmp/ratls-iptables-metrics.json` | Shared file read from the `iptables-sync` sidecar for iptables/ipset counters |
 | `--max-conns` | `0` | Max concurrent connections (0 = unlimited) |
+| `--max-conns-per-source` | `0` | Max concurrent connections per source IP (0 = unlimited) |
 | `--idle-timeout` | `0` | Close connections idle longer than this (0 = disabled) |
 | `--keepalive` | `30s` | TCP keepalive interval (0 = disabled) |
 | `--dial-timeout` | `5s` | Plain TCP dial timeout |
 | `--tls-dial-timeout` | `10s` | RA-TLS dial timeout |
 | `--dest-header-timeout` | `5s` | Inbound destination header read timeout |
 | `--drain-timeout` | `30s` | Graceful shutdown drain timeout |
+| `--local-cidr-boot-timeout` | `1s` | Synchronous retry budget at startup for host pod-network CIDR discovery; past this we fall through to the async refresh loop and `ValidateLocalDest` fails closed until it recovers |
 | `--measurements` | `""` | Comma-separated hex SHA-384 launch measurements (empty = accept any TEE, warns) |
 | `--cert-mode` | `self-signed` | Certificate mode: `self-signed` or `assam` |
 | `--assam-url` | `""` | Assam service URL for attestation (required for `assam` cert mode) |
 | `--attestation-service-url` | (required) | Local attestation service URL (required for `assam` cert mode) |
 | `--cert-issuer-url` | `""` | Cert-issuer URL for CA bundle refresh after authenticated provisioning (required for `assam` cert mode) |
+| `--assam-measurements` | `""` | Comma-separated SHA-384 hex launch measurements that Assam's RA-TLS peer cert must match. Empty = accept any (UNSAFE outside development) |
 | `--ca-cert` | `""` | Path to CA certificate PEM for X.509 chain verification |
+| `--ca-url` | `""` | Cert-issuer `/v1/ca` URL for periodic CA bundle refresh |
+| `--ca-poll-interval` | `5m` | Interval for polling `--ca-url` |
 | `--cert-ttl` | `24h` | Certificate lifetime; rotates at 50% of TTL |
 | `--rotation-timeout` | `30s` | Max time for background certificate rotation |
+| `--session-cache-size` | `64` | TLS session cache size per node (0 = disabled) |
+| `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+
+### iptables sync flags
+
+See "Routing Model" above for what `iptables-sync` watches and which flows
+it intercepts. The flags below tune that loop.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--outbound-port` | `15001` | Outbound listener port used as the REDIRECT target |
+| `--uid` | `1337` | Mesh proxy UID to exclude from redirect |
+| `--exclude-uids` | `0` | Comma-separated extra UIDs to skip, e.g. host root daemons |
+| `--node-ip` | `$NODE_IP` | Local node IP used to maintain local pod source ipsets |
+| `--resync-period` | `30s` | Periodic full ipset reconciliation interval |
+| `--watchdog-period` | `2s` | Interval for re-asserting base-chain jumps at position 1 |
+| `--ipset-maxelem` | `262144` | Maximum members per managed ipset |
+| `--ready-file` | `""` | Path written after the first successful pod cache, ipset, and iptables sync |
+| `--iptables-metrics-file` | `/tmp/ratls-iptables-metrics.json` | Shared file where `iptables-sync` publishes iptables/ipset counters for the proxy `/metrics` endpoint |
 | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 
 ## Certificate Modes
@@ -84,6 +126,13 @@ The `--cert-mode` flag controls how ratls-mesh obtains TLS certificates:
 
 This design ensures zero-downtime upgrades — nodes can be upgraded from self-signed to assam-issued certificates without service interruption.
 
+**CA bundle wiring.** Assam mode needs a CA trust root from cert-issuer.
+Set either `assam.caUrl` (in the chart) / `--ca-url` (CLI) for dynamic
+periodic refresh, *or* mount a static CA configMap — the chart references
+`{release}-cert-issuer-mesh-ca` by default and mounts it at
+`/etc/mesh-ca` when `assam.caUrl` is empty. With neither set, the pod
+fails to schedule with a "configmap not found" error at install time.
+
 ### Dual verification
 
 When `--ca-cert` is provided, the mesh accepts peers verified via either:
@@ -94,30 +143,32 @@ This enables rolling upgrades where some nodes have assam-issued certificates an
 
 ## Deployment
 
-Deployed as a Kubernetes DaemonSet via the `ratls_mesh` Ansible role:
+The supported chart path is `internal/helmchart/c8s/charts/ratls-mesh`, included
+by the top-level `internal/helmchart/c8s` chart. The chart renders the proxy as
+a DaemonSet and uses Kubernetes 1.29+ native sidecar init containers for iptables
+synchronization and cleanup.
 
-```
-ansible_collections/lunal/kubernetes/roles/ratls_mesh/
-```
+**Kubernetes version requirement.** The chart's `Chart.yaml` declares
+`kubeVersion: ">=1.29.0-0"`. `iptables-cleanup` runs as a native sidecar
+(`restartPolicy: Always` on an `initContainer`) so its `preStop` hook fires
+last during shutdown and reliably tears down the managed chains/ipsets.
+Kubernetes 1.28 exposed this behind the `SidecarContainers` feature gate, but
+1.29 is the first release where the gate is enabled by default. Helm blocks the
+install on older clusters via the `kubeVersion` constraint; do not bypass it.
 
-Key Ansible variables (in `defaults/main.yml`):
+The chart always renders `hostNetwork: true` and `dnsPolicy: ClusterFirstWithHostNet`; `iptables-sync` must run in the host network namespace to manage node-level pod traffic, so the value is not exposed.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ratls_mesh_namespace` | `ratls-mesh-system` | Kubernetes namespace |
-| `ratls_mesh_platform` | `{{ tee_platform }}` | TEE platform |
-| `ratls_mesh_resolver` | `k8s` | Resolver type |
-| `ratls_mesh_health_port` | `15021` | Health port |
-| `ratls_mesh_max_conns` | `0` | Connection limit |
-| `ratls_mesh_idle_timeout` | `""` | Idle timeout |
-| `ratls_mesh_log_level` | `info` | Log level |
-| `ratls_mesh_uid` | `1337` | Mesh process UID |
-| `ratls_mesh_resources` | `k8s_resources.small` | CPU/memory limits |
-| `ratls_mesh_node_selector` | `{}` | Optional node selector |
-| `ratls_mesh_cert_mode` | `self-signed` | Certificate mode |
-| `ratls_mesh_assam_url` | `""` | Assam URL for attestation |
-| `ratls_mesh_attestation_service_url` | `""` | Attestation service URL |
-| `ratls_mesh_cert_issuer_url` | `""` | Cert-issuer URL for CA bundle refresh |
+Reviewer-relevant defaults:
+
+| Value | Default | Effect |
+|-------|---------|--------|
+| `ports.inbound` | `15006` | Exposed as `hostPort` so peer nodes can establish RA-TLS sessions. |
+| `ports.outbound` | `15001` | Container listener and REDIRECT target only; not exposed as `hostPort`. |
+| `iptablesSync.resyncPeriod` | `30s` | Periodic reconciliation of pod ipsets and iptables rules. |
+| `iptablesSync.ipsetMaxElem` | `262144` | Maximum size for each managed ipset. |
+| `excludeUids` | `"0"` | Excludes root-owned host daemon traffic from `OUTPUT` redirect in addition to the mesh UID. |
+| `assam.caPollInterval` | `5m` | Interval for polling cert-issuer `/ca` for CA bundle refresh after authenticated provisioning. |
+| `assam.measurements` | `[]` | SHA-384 hex launch digests that Assam's RA-TLS peer cert must match; empty accepts any (UNSAFE outside dev). |
 
 ## Observability
 
@@ -138,9 +189,26 @@ All metrics are prefixed with `ratls_mesh_`. Key metrics:
 - `ratls_mesh_bytes_total{direction,side}` — bytes transferred
 - `ratls_mesh_tls_dial_failures_total` — RA-TLS failures
 - `ratls_mesh_route_errors_total` — routing failures
-- `ratls_mesh_process_goroutines` — goroutine count
-- `ratls_mesh_cert_mode` — current certificate mode gauge (0=self-signed, 1=assam)
-- `ratls_mesh_process_heap_alloc_bytes` — heap usage
+- `ratls_mesh_cert_mode{mode}` — active certificate mode (label-keyed; the configured-mode value is 1)
+- Go runtime metrics (`go_goroutines`, `go_memstats_*`) and process metrics are exposed via the standard prometheus client collectors
+
+Routing-path counters and gauges worth alerting on are documented in
+"Recommended alerts" below.
+
+### Recommended alerts
+
+The signals below govern the security-relevant routing path. The thresholds
+are starting points; tune to your scrape interval and pod churn.
+
+| Signal | What it means | Suggested rule |
+|--------|---------------|----------------|
+| `ratls_mesh_resolver_local_cidrs == 0` | `ValidateLocalDest` has no host pod-network CIDRs to cross-check against, so inbound pod delivery fails closed. Expected briefly at startup; persistent zero means CNI bridge discovery is broken. | `avg_over_time(ratls_mesh_resolver_local_cidrs[2m]) == 0` — page after 2× `--resync-period` (default 60s). |
+| `rate(ratls_mesh_iptables_ipset_overflow_total[5m]) > 0` | Pod count exceeded `--ipset-maxelem`; the reconcile rejected the restore and the live ipset is stale. New pod IPs will not be intercepted until the operator bumps `iptablesSync.ipsetMaxElem`. | Page on any non-zero rate for 5+ minutes. |
+| `rate(ratls_mesh_iptables_jump_position_violations_total[5m])` | Watchdog confirmed our PREROUTING/OUTPUT jump was demoted out of position 1 — typically kube-proxy reinserting `KUBE-SERVICES` ahead of us. Occasional events are normal; a steady positive rate indicates a fight with kube-proxy. | Warn when rate > 1/min sustained for 10 min; tune `--watchdog-period` (default 2s) downward if necessary. |
+| `rate(ratls_mesh_iptables_jump_position_check_errors_total[5m])` | `iptables -S` failed during a watchdog tick. Watchdog reinserts defensively, so this is environmental noise, not a kube-proxy race. | Warn at a sustained rate to flag a stuck or busy `xtables.lock`. |
+| `rate(ratls_mesh_outbound_dest_rejected_total{reason="host_addr"}[5m])` | The host-network listener was reached with the node IP or loopback as the original destination — only possible by dialing `:15001` outside the iptables REDIRECT path. This is the security signal; there is no legitimate cause. | Warn on any sustained rate. |
+| `rate(ratls_mesh_outbound_dest_rejected_total{reason="unknown_pod"}[5m])` | The outbound listener saw a destination that is not in the resolver's podMap — usually informer skew during pod churn, or a kube-proxy DNAT race after jump demotion. A small steady rate is normal. | Warn only on sustained spikes correlated with pod churn or `iptables_jump_position_violations_total`. |
+| `time() - ratls_mesh_iptables_metrics_file_updated_at_seconds` | Seconds since the proxy last read a fresh snapshot from the iptables-sync sidecar. The sidecar's own watchdog/violation counters cannot signal a wedge after they stop being published; this gauge does. Gauge stays at 0 until the first successful read so cold-start alerts can filter on `> 0`. | Warn when `gauge > 0 and time() - gauge > 3 * <resync-period>` (default `> 90s`). |
 
 ### Logs
 
@@ -153,15 +221,17 @@ JSON structured logs to stdout. Each connection gets a unique `conn` ID:
 ## Testing
 
 ```bash
-# Unit tests with race detector
-go test -race -count=1 -timeout=60s -v ./...
+# Focused unit and chart tests for this routing path
+go test ./internal/cmds/ratlsmesh ./internal/helmchart ./cmd/c8s
 
-# Cross-compile for Linux (production target)
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./...
+# Compile Linux-only ratls-mesh tests that exercise iptables/ipset code
+GOOS=linux GOARCH=amd64 go test -c -o /tmp/ratlsmesh-linux.test ./internal/cmds/ratlsmesh
 ```
 
-Tests use fake SNP attestation reports — no AMD hardware required. 27 tests covering:
-proxy data flow, RA-TLS end-to-end, concurrent connections, graceful drain, connection limits, idle timeout, resolver logic, health endpoints, metrics accounting, iptables rule generation.
+Tests use fake SNP attestation reports, so no AMD hardware is required. Coverage
+includes proxy data flow, RA-TLS handshakes, connection limits and drain,
+resolver validation, health endpoints, metrics, iptables/ipset rule generation,
+and Helm rendering for `hostNetwork`, `iptables-sync`, and hostPort behavior.
 
 ## Security
 

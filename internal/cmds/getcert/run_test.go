@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lunal-dev/c8s/internal/fileutil"
 	"github.com/lunal-dev/c8s/pkg/attestclient"
 )
 
@@ -173,8 +174,8 @@ func TestWriteFileAtomicReplacesFileAndCleansTemp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := writeFileAtomic(path, []byte("new"), 0644); err != nil {
-		t.Fatalf("writeFileAtomic: %v", err)
+	if err := fileutil.WriteAtomic(path, []byte("new"), 0644); err != nil {
+		t.Fatalf("fileutil.WriteAtomic: %v", err)
 	}
 
 	data, err := os.ReadFile(path)
@@ -213,8 +214,8 @@ func TestReloadWatchChangedDetectsFileReplacement(t *testing.T) {
 		t.Fatalf("snapshotReloadWatchPaths: %v", err)
 	}
 
-	if err := writeFileAtomic(path, []byte("new certificate"), 0644); err != nil {
-		t.Fatalf("writeFileAtomic: %v", err)
+	if err := fileutil.WriteAtomic(path, []byte("new certificate"), 0644); err != nil {
+		t.Fatalf("fileutil.WriteAtomic: %v", err)
 	}
 	changed, next, err := reloadWatchChanged(previous, []string{path})
 	if err != nil {

@@ -1,3 +1,5 @@
+//go:build linux
+
 package ratlsmesh
 
 import (
@@ -14,6 +16,7 @@ func TestValidateConfig(t *testing.T) {
 		attestationServiceURL string
 		outboundPort          int
 		inboundPort           int
+		healthPort            int
 		certTTL               time.Duration
 		wantErr               string // substring match; "" means no error
 	}{
@@ -22,6 +25,7 @@ func TestValidateConfig(t *testing.T) {
 			attestationServiceURL: "http://localhost:8400",
 			outboundPort:          15001,
 			inboundPort:           15006,
+			healthPort:            15021,
 			certTTL:               24 * time.Hour,
 		},
 		{
@@ -29,6 +33,7 @@ func TestValidateConfig(t *testing.T) {
 			attestationServiceURL: "https://attestation.svc:8400",
 			outboundPort:          15001,
 			inboundPort:           15006,
+			healthPort:            15021,
 			certTTL:               24 * time.Hour,
 		},
 		{
@@ -36,6 +41,7 @@ func TestValidateConfig(t *testing.T) {
 			attestationServiceURL: "",
 			outboundPort:          15001,
 			inboundPort:           15006,
+			healthPort:            15021,
 			certTTL:               24 * time.Hour,
 			wantErr:               "--attestation-service-url is required",
 		},
@@ -44,22 +50,70 @@ func TestValidateConfig(t *testing.T) {
 			attestationServiceURL: "localhost:8400",
 			outboundPort:          15001,
 			inboundPort:           15006,
+			healthPort:            15021,
 			certTTL:               24 * time.Hour,
 			wantErr:               "must start with http:// or https://",
 		},
 		{
-			name:                  "same ports",
+			name:                  "outbound == inbound",
 			attestationServiceURL: "http://localhost:8400",
 			outboundPort:          15001,
 			inboundPort:           15001,
+			healthPort:            15021,
 			certTTL:               24 * time.Hour,
-			wantErr:               "must differ",
+			wantErr:               "--outbound-port and --inbound-port must differ",
+		},
+		{
+			name:                  "outbound == health",
+			attestationServiceURL: "http://localhost:8400",
+			outboundPort:          15001,
+			inboundPort:           15006,
+			healthPort:            15001,
+			certTTL:               24 * time.Hour,
+			wantErr:               "--outbound-port and --health-port must differ",
+		},
+		{
+			name:                  "inbound == health",
+			attestationServiceURL: "http://localhost:8400",
+			outboundPort:          15001,
+			inboundPort:           15006,
+			healthPort:            15006,
+			certTTL:               24 * time.Hour,
+			wantErr:               "--inbound-port and --health-port must differ",
+		},
+		{
+			name:                  "outbound port below range",
+			attestationServiceURL: "http://localhost:8400",
+			outboundPort:          0,
+			inboundPort:           15006,
+			healthPort:            15021,
+			certTTL:               24 * time.Hour,
+			wantErr:               "out of range",
+		},
+		{
+			name:                  "inbound port above range",
+			attestationServiceURL: "http://localhost:8400",
+			outboundPort:          15001,
+			inboundPort:           70000,
+			healthPort:            15021,
+			certTTL:               24 * time.Hour,
+			wantErr:               "out of range",
+		},
+		{
+			name:                  "health port out of range",
+			attestationServiceURL: "http://localhost:8400",
+			outboundPort:          15001,
+			inboundPort:           15006,
+			healthPort:            -1,
+			certTTL:               24 * time.Hour,
+			wantErr:               "out of range",
 		},
 		{
 			name:                  "cert-ttl too short",
 			attestationServiceURL: "http://localhost:8400",
 			outboundPort:          15001,
 			inboundPort:           15006,
+			healthPort:            15021,
 			certTTL:               1 * time.Millisecond,
 			wantErr:               "too short",
 		},
@@ -68,13 +122,14 @@ func TestValidateConfig(t *testing.T) {
 			attestationServiceURL: "http://localhost:8400",
 			outboundPort:          15001,
 			inboundPort:           15006,
+			healthPort:            15021,
 			certTTL:               1 * time.Minute,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateConfig(tt.attestationServiceURL, tt.outboundPort, tt.inboundPort, tt.certTTL)
+			err := validateConfig(tt.attestationServiceURL, tt.outboundPort, tt.inboundPort, tt.healthPort, tt.certTTL)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Errorf("unexpected error: %v", err)

@@ -2,6 +2,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        ipset \
         iptables \
         libssl3 \
         libtss2-esys-3.0.2-0 \

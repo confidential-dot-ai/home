@@ -1,3 +1,5 @@
+//go:build linux
+
 package ratlsmesh
 
 import (
@@ -6,125 +8,184 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
-	"flag"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	"github.com/lunal-dev/c8s/internal/cmds/cmdsutil"
 	"github.com/lunal-dev/c8s/pkg/attestclient"
 	"github.com/lunal-dev/c8s/pkg/certutil"
 	"github.com/lunal-dev/c8s/pkg/ratls"
 	"github.com/lunal-dev/c8s/pkg/ratls/assamclient"
 )
 
-// Run executes the ratls-mesh binary. args is the slice of CLI args after
-// the program name. The first arg may be `iptables-setup` or
-// `iptables-cleanup` to run a side-effect-only iptables operation; all
-// other args go through the flag set.
+// Run dispatches ratls-mesh CLI args via cobra. Signal handling is wired
+// at the root so subcommand RunE bodies read cmd.Context() instead of
+// reinstalling their own NotifyContext.
 func Run(args []string) error {
-	if len(args) > 0 {
-		switch args[0] {
-		case "iptables-setup":
-			return iptablesSetup(args[1:])
-		case "iptables-cleanup":
-			return iptablesCleanup(args[1:])
-		}
-	}
-
-	fs := flag.NewFlagSet("ratls-mesh", flag.ContinueOnError)
-	platform := fs.String("platform", "sev-snp", "TEE platform: sev-snp, tdx")
-	attestationServiceURL := fs.String("attestation-service-url", "", "URL of the local attestation service (e.g. http://localhost:8400)")
-	outboundPort := fs.Int("outbound-port", 15001, "outbound listener port (intercepted app traffic)")
-	inboundPort := fs.Int("inbound-port", 15006, "inbound listener port (RA-TLS from remote nodes)")
-	nodeIP := fs.String("node-ip", "", "this node's IP (auto-detected from NODE_IP env if unset)")
-	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
-	dialTimeout := fs.Duration("dial-timeout", 5*time.Second, "plain TCP dial timeout")
-	tlsDialTimeout := fs.Duration("tls-dial-timeout", 10*time.Second, "RA-TLS dial timeout")
-	destHeaderTimeout := fs.Duration("dest-header-timeout", 5*time.Second, "inbound destination header read timeout")
-	drainTimeout := fs.Duration("drain-timeout", 30*time.Second, "graceful shutdown drain timeout")
-	keepAlive := fs.Duration("keepalive", 30*time.Second, "TCP keepalive interval (0 to disable)")
-	idleTimeout := fs.Duration("idle-timeout", 0, "close connections idle longer than this (0=disabled)")
-	maxConns := fs.Int("max-conns", 0, "max concurrent connections (0=unlimited)")
-	maxConnsPerSource := fs.Int("max-conns-per-source", 0, "max concurrent connections per source IP (0=unlimited)")
-	healthPort := fs.Int("health-port", 15021, "health/metrics HTTP port")
-	measurements := fs.String("measurements", "", "comma-separated hex SHA-384 launch measurements (empty = accept any TEE)")
-	certTTL := fs.Duration("cert-ttl", 24*time.Hour, "RA-TLS certificate lifetime (rotates at 50%)")
-	rotationTimeout := fs.Duration("rotation-timeout", 30*time.Second, "max time for background certificate rotation")
-
-	certMode := fs.String("cert-mode", "self-signed", "certificate mode: self-signed (default), assam (boots self-signed, upgrades to assam-issued in background)")
-	assamURL := fs.String("assam-url", "", "assam service URL for attestation (required for assam mode)")
-	certIssuerURL := fs.String("cert-issuer-url", "", "cert-issuer URL for CA bundle refresh after authenticated provisioning (required for assam mode)")
-	caCertPath := fs.String("ca-cert", "", "path to CA certificate file for peer verification")
-	caURL := fs.String("ca-url", "", "cert-issuer /ca URL for periodic CA bundle refresh (assam mode)")
-	caPollInterval := fs.Duration("ca-poll-interval", 5*time.Minute, "interval to poll cert-issuer /ca for CA bundle updates")
-	assamMeasurements := fs.String("assam-measurements", "", "comma-separated SHA-384 hex launch measurements that Assam's RA-TLS peer cert must match. Empty = accept any (UNSAFE outside development).")
-
-	sessionCacheSize := fs.Int("session-cache-size", 64, "TLS session cache size per node (0 disables session resumption)")
-	accessLog := fs.Bool("access-log", true, "emit per-connection structured access log")
-	certPipelineProbeURL := fs.String("cert-pipeline-probe-url", "", "cert-issuer /ready URL for pipeline health probing (empty = disabled)")
-
-	assamRetryBackoff := fs.Duration("assam-retry-backoff", 2*time.Second, "initial backoff duration for assam certificate upgrade retries")
-	assamRetryMaxBackoff := fs.Duration("assam-retry-max-backoff", 60*time.Second, "maximum backoff duration for assam certificate upgrade retries")
-
-	maxDestHeaderSize := fs.Int("max-dest-header-size", 256, "maximum destination header size in bytes")
-	pipeBufferSize := fs.Int("pipe-buffer-size", 32768, "buffer size for TCP pipe forwarding")
-	acceptErrThreshold := fs.Int64("accept-error-threshold", 10, "consecutive accept errors before marking unhealthy")
-	healthReadTimeout := fs.Duration("health-read-timeout", 5*time.Second, "health server read timeout")
-	healthWriteTimeout := fs.Duration("health-write-timeout", 10*time.Second, "health server write timeout")
-
-	metricsUpdateInterval := fs.Duration("metrics-update-interval", 10*time.Second, "interval for resolver cache and cert expiry metric updates")
-	assamOpTimeout := fs.Duration("assam-op-timeout", 30*time.Second, "per-operation timeout for assam certificate upgrade and CA bundle refresh")
-	certPipelineProbeTimeout := fs.Duration("cert-pipeline-probe-timeout", 5*time.Second, "HTTP client timeout for cert pipeline health probe requests")
-	certPipelineProbeInterval := fs.Duration("cert-pipeline-probe-interval", 60*time.Second, "interval between cert pipeline health probe requests")
-	if err := cmdsutil.ParseFlags(fs, args); err != nil {
-		return err
-	}
-
-	logger := certutil.NewJSONLogger(*logLevel)
-
-	if *nodeIP == "" {
-		*nodeIP = os.Getenv("NODE_IP")
-	}
-	if *nodeIP == "" {
-		return fmt.Errorf("node IP required: set --node-ip or NODE_IP env var")
-	}
-
-	if err := validateConfig(*attestationServiceURL, *outboundPort, *inboundPort, *certTTL); err != nil {
-		return fmt.Errorf("invalid configuration: %w", err)
-	}
+	cmd := newRatlsMeshCommand()
+	cmd.SetArgs(args)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+	return cmd.ExecuteContext(ctx)
+}
 
-	config, err := rest.InClusterConfig()
+func newRatlsMeshCommand() *cobra.Command {
+	var cfg proxyConfig
+	cmd := &cobra.Command{
+		Use:           "ratls-mesh",
+		Short:         "RA-TLS L4 mesh proxy",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runProxy(cmd.Context(), &cfg)
+		},
+	}
+	bindProxyFlags(cmd.Flags(), &cfg)
+	cmd.AddCommand(newIptablesSyncCommand())
+	cmd.AddCommand(newIptablesCleanupCommand())
+	return cmd
+}
+
+type proxyConfig struct {
+	platform                  string
+	attestationServiceURL     string
+	outboundPort              int
+	inboundPort               int
+	nodeIP                    string
+	logLevel                  string
+	dialTimeout               time.Duration
+	tlsDialTimeout            time.Duration
+	destHeaderTimeout         time.Duration
+	drainTimeout              time.Duration
+	keepAlive                 time.Duration
+	idleTimeout               time.Duration
+	maxConns                  int
+	maxConnsPerSource         int
+	healthPort                int
+	measurements              string
+	certTTL                   time.Duration
+	rotationTimeout           time.Duration
+	certMode                  string
+	assamURL                  string
+	certIssuerURL             string
+	caCertPath                string
+	caURL                     string
+	caPollInterval            time.Duration
+	assamMeasurements         string
+	sessionCacheSize          int
+	accessLog                 bool
+	certPipelineProbeURL      string
+	assamRetryBackoff         time.Duration
+	assamRetryMaxBackoff      time.Duration
+	maxDestHeaderSize         int
+	pipeBufferSize            int
+	acceptErrThreshold        int64
+	healthReadTimeout         time.Duration
+	healthWriteTimeout        time.Duration
+	metricsUpdateInterval     time.Duration
+	localCIDRBootTimeout      time.Duration
+	iptablesMetricsFile       string
+	assamOpTimeout            time.Duration
+	certPipelineProbeTimeout  time.Duration
+	certPipelineProbeInterval time.Duration
+}
+
+func bindProxyFlags(fs *pflag.FlagSet, c *proxyConfig) {
+	fs.StringVar(&c.platform, "platform", "sev-snp", "TEE platform: sev-snp, tdx")
+	fs.StringVar(&c.attestationServiceURL, "attestation-service-url", "", "URL of the local attestation service (e.g. http://localhost:8400)")
+	fs.IntVar(&c.outboundPort, "outbound-port", 15001, "outbound listener port (intercepted app traffic)")
+	fs.IntVar(&c.inboundPort, "inbound-port", 15006, "inbound listener port (RA-TLS from peer nodes)")
+	fs.StringVar(&c.nodeIP, "node-ip", "", "this node's IP (auto-detected from NODE_IP env if unset)")
+	fs.StringVar(&c.logLevel, "log-level", "info", "log level: debug, info, warn, error")
+	fs.DurationVar(&c.dialTimeout, "dial-timeout", 5*time.Second, "plain TCP dial timeout")
+	fs.DurationVar(&c.tlsDialTimeout, "tls-dial-timeout", 10*time.Second, "RA-TLS dial timeout")
+	fs.DurationVar(&c.destHeaderTimeout, "dest-header-timeout", 5*time.Second, "inbound destination header read timeout")
+	fs.DurationVar(&c.drainTimeout, "drain-timeout", 30*time.Second, "graceful shutdown drain timeout")
+	fs.DurationVar(&c.keepAlive, "keepalive", 30*time.Second, "TCP keepalive interval (0 to disable)")
+	fs.DurationVar(&c.idleTimeout, "idle-timeout", 0, "close connections idle longer than this (0=disabled)")
+	fs.IntVar(&c.maxConns, "max-conns", 0, "max concurrent connections (0=unlimited)")
+	fs.IntVar(&c.maxConnsPerSource, "max-conns-per-source", 0, "max concurrent connections per source IP (0=unlimited)")
+	fs.IntVar(&c.healthPort, "health-port", 15021, "health/metrics HTTP port")
+	fs.StringVar(&c.measurements, "measurements", "", "comma-separated hex SHA-384 launch measurements (empty = accept any TEE)")
+	fs.DurationVar(&c.certTTL, "cert-ttl", 24*time.Hour, "RA-TLS certificate lifetime (rotates at 50%)")
+	fs.DurationVar(&c.rotationTimeout, "rotation-timeout", 30*time.Second, "max time for background certificate rotation")
+	fs.StringVar(&c.certMode, "cert-mode", "self-signed", "certificate mode: self-signed (default), assam (boots self-signed, upgrades to assam-issued in background)")
+	fs.StringVar(&c.assamURL, "assam-url", "", "assam service URL for attestation (required for assam mode)")
+	fs.StringVar(&c.certIssuerURL, "cert-issuer-url", "", "cert-issuer URL for CA bundle retrieval (required for assam mode)")
+	fs.StringVar(&c.caCertPath, "ca-cert", "", "path to CA certificate file for peer verification")
+	fs.StringVar(&c.caURL, "ca-url", "", "cert-issuer /ca URL for periodic CA bundle refresh (assam mode); empty derives from --cert-issuer-url")
+	fs.DurationVar(&c.caPollInterval, "ca-poll-interval", 5*time.Minute, "interval to poll cert-issuer /ca for CA bundle updates")
+	fs.StringVar(&c.assamMeasurements, "assam-measurements", "", "comma-separated SHA-384 hex launch measurements that Assam's RA-TLS peer cert must match. Empty = accept any (UNSAFE outside development).")
+	fs.IntVar(&c.sessionCacheSize, "session-cache-size", 64, "TLS session cache size per node (0 disables session resumption)")
+	fs.BoolVar(&c.accessLog, "access-log", true, "emit per-connection structured access log")
+	fs.StringVar(&c.certPipelineProbeURL, "cert-pipeline-probe-url", "", "cert-issuer /ready URL for pipeline health probing (empty = disabled)")
+	fs.DurationVar(&c.assamRetryBackoff, "assam-retry-backoff", 2*time.Second, "initial backoff duration for assam certificate upgrade retries")
+	fs.DurationVar(&c.assamRetryMaxBackoff, "assam-retry-max-backoff", 60*time.Second, "maximum backoff duration for assam certificate upgrade retries")
+	fs.IntVar(&c.maxDestHeaderSize, "max-dest-header-size", 256, "maximum destination header size in bytes")
+	fs.IntVar(&c.pipeBufferSize, "pipe-buffer-size", 32768, "buffer size for TCP pipe forwarding")
+	fs.Int64Var(&c.acceptErrThreshold, "accept-error-threshold", 10, "consecutive accept errors before marking unhealthy")
+	fs.DurationVar(&c.healthReadTimeout, "health-read-timeout", 5*time.Second, "health server read timeout")
+	fs.DurationVar(&c.healthWriteTimeout, "health-write-timeout", 10*time.Second, "health server write timeout")
+	fs.DurationVar(&c.metricsUpdateInterval, "metrics-update-interval", 10*time.Second, "interval for resolver cache and cert expiry metric updates")
+	fs.DurationVar(&c.localCIDRBootTimeout, "local-cidr-boot-timeout", time.Second, "synchronous retry budget at startup for host pod-network CIDR discovery; past this we fall through to the async refresh loop and ValidateLocalDest fails closed until it recovers")
+	fs.StringVar(&c.iptablesMetricsFile, "iptables-metrics-file", defaultIptablesMetricsFile, "shared file where iptables-sync publishes counters (empty disables)")
+	fs.DurationVar(&c.assamOpTimeout, "assam-op-timeout", 30*time.Second, "per-operation timeout for assam certificate upgrade and CA bundle refresh")
+	fs.DurationVar(&c.certPipelineProbeTimeout, "cert-pipeline-probe-timeout", 5*time.Second, "HTTP client timeout for cert pipeline health probe requests")
+	fs.DurationVar(&c.certPipelineProbeInterval, "cert-pipeline-probe-interval", 60*time.Second, "interval between cert pipeline health probe requests")
+}
+
+func runProxy(ctx context.Context, c *proxyConfig) error {
+	logger := certutil.NewJSONLogger(c.logLevel)
+
+	if c.nodeIP == "" {
+		c.nodeIP = os.Getenv("NODE_IP")
+	}
+	if c.nodeIP == "" {
+		return fmt.Errorf("node IP required: set --node-ip or NODE_IP env var")
+	}
+	canonicalNodeIP := normalizeIP(c.nodeIP)
+	if canonicalNodeIP == "" {
+		return fmt.Errorf("--node-ip %q must be a valid IP address", c.nodeIP)
+	}
+	c.nodeIP = canonicalNodeIP
+
+	if err := validateConfig(c.attestationServiceURL, c.outboundPort, c.inboundPort, c.healthPort, c.certTTL); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+
+	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("k8s in-cluster config: %w", err)
 	}
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
 		return fmt.Errorf("k8s clientset: %w", err)
 	}
-	resolver, err := newK8sResolver(ctx, clientset, *nodeIP, logger)
+	resolver, err := newK8sResolver(ctx, clientset, c.nodeIP, c.localCIDRBootTimeout, logger)
 	if err != nil {
 		return fmt.Errorf("k8s resolver: %w", err)
 	}
 
 	asClient := attestclient.NewClientWithHTTP("", &http.Client{
-		Timeout: durOrDefault(*rotationTimeout, 30*time.Second),
+		Timeout: c.rotationTimeout,
 	})
-	attestFunc := makeAttestFunc(asClient, *attestationServiceURL)
+	attestFunc := makeAttestFunc(asClient, c.attestationServiceURL)
 
 	meshPolicy := &ratls.VerifyPolicy{}
-	if *measurements != "" {
-		for _, h := range strings.Split(*measurements, ",") {
+	if c.measurements != "" {
+		for _, h := range strings.Split(c.measurements, ",") {
 			h = strings.TrimSpace(h)
 			b, err := hex.DecodeString(h)
 			if err != nil {
@@ -142,40 +203,47 @@ func Run(args []string) error {
 	}
 
 	var caCerts []*x509.Certificate
-	if *caCertPath != "" {
+	if c.caCertPath != "" {
 		var caErr error
-		caCerts, caErr = certutil.LoadPEMCertificatesFile(*caCertPath)
+		caCerts, caErr = certutil.LoadPEMCertificatesFile(c.caCertPath)
 		if caErr != nil {
-			return fmt.Errorf("load CA certificate(s) from %q: %w", *caCertPath, caErr)
+			return fmt.Errorf("load CA certificate(s) from %q: %w", c.caCertPath, caErr)
 		}
 		names := make([]string, len(caCerts))
-		for i, c := range caCerts {
-			names[i] = c.Subject.CommonName
+		for i, cert := range caCerts {
+			names[i] = cert.Subject.CommonName
 		}
 		logger.Info("CA certificate(s) loaded for dual-mode verification", "count", len(caCerts), "subjects", names)
 	}
 
-	if *certMode != "self-signed" && *certMode != "assam" {
-		return fmt.Errorf("invalid --cert-mode %q (valid: self-signed, assam)", *certMode)
+	if c.certMode != "self-signed" && c.certMode != "assam" {
+		return fmt.Errorf("invalid --cert-mode %q (valid: self-signed, assam)", c.certMode)
 	}
-	if *certMode == "assam" && (*assamURL == "" || *attestationServiceURL == "" || *certIssuerURL == "") {
+	if c.certMode == "assam" && (c.assamURL == "" || c.attestationServiceURL == "" || c.certIssuerURL == "") {
 		return fmt.Errorf("--assam-url, --attestation-service-url, and --cert-issuer-url are required for --cert-mode assam")
 	}
-	teeType, err := ratlsTEEType(*platform)
+	teeType, err := ratlsTEEType(c.platform)
 	if err != nil {
 		return err
 	}
-	effectiveCAURL := effectiveAssamCAURL(*certMode, *certIssuerURL, *caURL)
+	effectiveCAURL := effectiveAssamCAURL(c.certMode, c.certIssuerURL, c.caURL)
+	assamMeasurements, err := parseHexMeasurements(c.assamMeasurements)
+	if err != nil {
+		return fmt.Errorf("--assam-measurements: %w", err)
+	}
+	if c.certMode == "assam" && len(assamMeasurements) == 0 {
+		logger.Warn("--assam-measurements not set; the RA-TLS handshake will accept any Assam measurement. Set this to the chart-distributed launch digest of Assam to close bootstrap MITM.")
+	}
 
 	serverTLS, serverCertMgr, err := ratls.NewServerTLSConfig(&ratls.ServerConfig{
-		Platform:        *platform,
+		Platform:        c.platform,
 		AttestFunc:      attestFunc,
-		DNSNames:        []string{*nodeIP},
-		CertTTL:         *certTTL,
+		DNSNames:        []string{c.nodeIP},
+		CertTTL:         c.certTTL,
 		ClientPolicy:    meshPolicy,
 		CACert:          caCerts,
 		DynamicCACert:   effectiveCAURL != "",
-		RotationTimeout: *rotationTimeout,
+		RotationTimeout: c.rotationTimeout,
 		Logger:          logger,
 	})
 	if err != nil {
@@ -184,28 +252,28 @@ func Run(args []string) error {
 
 	clientTLS, clientCertMgr, err := ratls.NewClientTLSConfig(&ratls.ClientConfig{
 		Policy:          meshPolicy,
-		Platform:        *platform,
+		Platform:        c.platform,
 		AttestFunc:      attestFunc,
 		CACert:          caCerts,
 		DynamicCACert:   effectiveCAURL != "",
-		CertTTL:         *certTTL,
-		RotationTimeout: *rotationTimeout,
+		CertTTL:         c.certTTL,
+		RotationTimeout: c.rotationTimeout,
 		Logger:          logger,
 	})
 	if err != nil {
 		return fmt.Errorf("create client TLS config: %w", err)
 	}
 
-	if *sessionCacheSize > 0 {
-		clientTLS.ClientSessionCache = tls.NewLRUClientSessionCache(*sessionCacheSize)
+	if c.sessionCacheSize > 0 {
+		clientTLS.ClientSessionCache = tls.NewLRUClientSessionCache(c.sessionCacheSize)
 	}
 
 	m := newMetrics()
-	if *certMode == "assam" {
-		m.certModeExpected.Store(1)
+	if c.certMode == "assam" {
+		m.certModeConfigured.Store(1)
 	}
 	if len(meshPolicy.Measurements) > 0 {
-		m.measurementPinning.Store(1)
+		m.measurementPinning.Set(1)
 	}
 
 	// Wire attestation failure counter into TLS peer verification callbacks.
@@ -216,7 +284,7 @@ func Run(args []string) error {
 		return func(rawCerts [][]byte, chains [][]*x509.Certificate) error {
 			err := orig(rawCerts, chains)
 			if err != nil {
-				m.attestationFailures.Add(1)
+				m.attestationFailures.Inc()
 			}
 			return err
 		}
@@ -225,46 +293,46 @@ func Run(args []string) error {
 	clientTLS.VerifyPeerCertificate = wrapVerify(clientTLS.VerifyPeerCertificate)
 
 	// Wire rotation failure metrics.
-	serverCertMgr.SetOnRotationFail(func() { m.certRotationFailures.Add(1) })
+	serverCertMgr.SetOnRotationFail(func() { m.certRotationFailures.Inc() })
 	if clientCertMgr != nil {
-		clientCertMgr.SetOnRotationFail(func() { m.certRotationFailures.Add(1) })
+		clientCertMgr.SetOnRotationFail(func() { m.certRotationFailures.Inc() })
 	}
 
-	health := newHealthServer(m, serverCertMgr, clientCertMgr, *acceptErrThreshold, *healthReadTimeout, *healthWriteTimeout)
+	health := newHealthServer(m, serverCertMgr, clientCertMgr, c.acceptErrThreshold, c.healthReadTimeout, c.healthWriteTimeout)
 
 	var connSem chan struct{}
-	if *maxConns > 0 {
-		connSem = make(chan struct{}, *maxConns)
+	if c.maxConns > 0 {
+		connSem = make(chan struct{}, c.maxConns)
 	}
 
 	proxy := &Proxy{
-		outboundAddr:      fmt.Sprintf(":%d", *outboundPort),
-		inboundAddr:       fmt.Sprintf(":%d", *inboundPort),
+		outboundAddr:      fmt.Sprintf(":%d", c.outboundPort),
+		inboundAddr:       fmt.Sprintf(":%d", c.inboundPort),
 		serverTLS:         serverTLS,
 		clientTLS:         clientTLS,
-		nodeIP:            *nodeIP,
-		inboundPort:       *inboundPort,
+		nodeIP:            c.nodeIP,
+		inboundPort:       c.inboundPort,
 		resolver:          resolver,
 		origDstFunc:       defaultOrigDstFunc,
 		logger:            logger,
 		metrics:           m,
-		accessLog:         *accessLog,
-		dialTimeout:       *dialTimeout,
-		tlsDialTimeout:    *tlsDialTimeout,
-		destHeaderTimeout: *destHeaderTimeout,
-		drainTimeout:      *drainTimeout,
-		keepAlive:         *keepAlive,
-		idleTimeout:       *idleTimeout,
-		maxDestHeaderSize: *maxDestHeaderSize,
-		pipeBufferSize:    *pipeBufferSize,
-		bufPool:           newBufPool(*pipeBufferSize),
+		accessLog:         c.accessLog,
+		dialTimeout:       c.dialTimeout,
+		tlsDialTimeout:    c.tlsDialTimeout,
+		destHeaderTimeout: c.destHeaderTimeout,
+		drainTimeout:      c.drainTimeout,
+		keepAlive:         c.keepAlive,
+		idleTimeout:       c.idleTimeout,
+		maxDestHeaderSize: c.maxDestHeaderSize,
+		pipeBufferSize:    c.pipeBufferSize,
+		bufPool:           newBufPool(c.pipeBufferSize),
 		connSem:           connSem,
-		maxConnsPerSrc:    *maxConnsPerSource,
+		maxConnsPerSrc:    c.maxConnsPerSource,
 		onReady: func() {
 			// Eagerly provision certificates before marking ready.
 			// Bound the warm-up so a hanging attestation binary (missing
 			// /dev/sev, TPM not loaded) doesn't block readiness forever.
-			warmupTimeout := 2 * durOrDefault(*rotationTimeout, 30*time.Second)
+			warmupTimeout := 2 * c.rotationTimeout
 			warmupCtx, warmupCancel := context.WithTimeout(ctx, warmupTimeout)
 			defer warmupCancel()
 
@@ -283,29 +351,43 @@ func Run(args []string) error {
 
 	// Start health/metrics server.
 	go func() {
-		if err := health.serve(ctx, fmt.Sprintf(":%d", *healthPort)); err != nil {
+		if err := health.serve(ctx, fmt.Sprintf(":%d", c.healthPort)); err != nil {
 			logger.Error("health server error", "error", err)
 		}
 	}()
 
 	// Periodically update resolver cache and cert expiry metrics.
 	go func() {
-		t := time.NewTicker(*metricsUpdateInterval)
+		t := time.NewTicker(c.metricsUpdateInterval)
 		defer t.Stop()
+		// iptablesMetricsSeen flips true on the first successful read of the
+		// sidecar metrics file. Before that, ENOENT is the cold-start path
+		// and stays at Debug; after, every read failure (including ENOENT)
+		// is escalated to Warn because something stopped writing.
+		var iptablesMetricsSeen bool
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				m.resolverCacheSize.Store(int64(resolver.CacheSize()))
-				m.resolverLastEventTime.Store(resolver.LastEventTime())
+				m.resolverCacheSize.Set(float64(resolver.CacheSize()))
+				m.resolverLocalCIDRs.Set(float64(resolver.LocalCIDRCount()))
+				m.resolverLastEvent.Set(float64(resolver.LastEventTime()))
+				switch err := m.refreshIptablesMetrics(c.iptablesMetricsFile); {
+				case err == nil:
+					iptablesMetricsSeen = true
+				case iptablesMetricsSeen:
+					logger.Warn("read iptables metrics file failed after prior success; sidecar may be wedged", "path", c.iptablesMetricsFile, "error", err)
+				case !errors.Is(err, fs.ErrNotExist):
+					logger.Debug("read iptables metrics file failed", "path", c.iptablesMetricsFile, "error", err)
+				}
 
 				if exp := serverCertMgr.CertExpiry(); !exp.IsZero() {
-					m.certExpiryServer.Store(exp.Unix())
+					m.certExpiry.WithLabelValues("server").Set(float64(exp.Unix()))
 				}
 				if clientCertMgr != nil {
 					if exp := clientCertMgr.CertExpiry(); !exp.IsZero() {
-						m.certExpiryClient.Store(exp.Unix())
+						m.certExpiry.WithLabelValues("client").Set(float64(exp.Unix()))
 					}
 				}
 			}
@@ -314,169 +396,127 @@ func Run(args []string) error {
 
 	// Assam certificate upgrade: after self-signed RA-TLS boot, a background
 	// goroutine contacts assam, gets CA-signed certs, and hot-swaps them via
-	// CertManager.SwapProvider.
-	if *certMode == "assam" {
-		measurements, err := parseHexMeasurements(*assamMeasurements)
-		if err != nil {
-			return fmt.Errorf("--assam-measurements: %w", err)
-		}
-		if len(measurements) == 0 {
-			logger.Warn("--assam-measurements not set; the RA-TLS handshake will accept any Assam measurement. Set this to the chart-distributed launch digest of Assam to close bootstrap MITM.")
-		}
-		assamCfg := &assamclient.Config{
-			AssamURL:              *assamURL,
-			AttestationServiceURL: *attestationServiceURL,
-			CertIssuerURL:         *certIssuerURL,
+	// CertManager.SwapProvider. The assamCfg is shared with the CA bundle
+	// refresh goroutine below.
+	var assamCfg *assamclient.Config
+	if c.certMode == "assam" {
+		assamCfg = &assamclient.Config{
+			AssamURL:              c.assamURL,
+			AttestationServiceURL: c.attestationServiceURL,
+			CertIssuerURL:         c.certIssuerURL,
 			CACertURL:             effectiveCAURL,
-			NodeIP:                *nodeIP,
+			NodeIP:                c.nodeIP,
 			TEEType:               teeType,
-			AssamMeasurements:     measurements,
+			AssamMeasurements:     assamMeasurements,
 		}
-		assamClient := assamclient.NewClient(assamCfg)
-
-		updateTrustedCABundle := func() int {
-			newCerts := assamClient.TrustedCABundle()
-			if len(newCerts) == 0 {
-				return 0
-			}
-			serverCertMgr.UpdateCACerts(newCerts)
-			if clientCertMgr != nil {
-				clientCertMgr.UpdateCACerts(newCerts)
-			}
-			return len(newCerts)
-		}
-		refreshCABundle := func(refreshCtx context.Context) (int, error) {
-			newCerts, err := assamClient.RefreshCABundle(refreshCtx)
-			if err != nil {
-				return 0, err
-			}
-			serverCertMgr.UpdateCACerts(newCerts)
-			if clientCertMgr != nil {
-				clientCertMgr.UpdateCACerts(newCerts)
-			}
-			return len(newCerts), nil
-		}
-
-		caReady := make(chan struct{})
-		var caReadyOnce sync.Once
-		markCAReady := func() {
-			caReadyOnce.Do(func() { close(caReady) })
-		}
-
 		go func() {
-			assamProvider, err := assamclient.NewProviderWithClient(assamClient, logger)
+			assamProvider, err := assamclient.NewProvider(assamCfg, logger)
 			if err != nil {
 				logger.Error("assam provider creation failed", "error", err)
 				return
 			}
 
-			// Wait for assam to become reachable. Retry with backoff.
-			backoff := *assamRetryBackoff
-			maxBackoff := *assamRetryMaxBackoff
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(backoff):
-				}
+			bo := backoff.NewExponentialBackOff()
+			bo.InitialInterval = c.assamRetryBackoff
+			bo.MaxInterval = c.assamRetryMaxBackoff
+			// MaxElapsedTime defaults to 0 (unlimited); ctx cancellation is
+			// the only exit.
 
-				upgradeCtx, cancel := context.WithTimeout(ctx, *assamOpTimeout)
-				err := serverCertMgr.SwapProvider(upgradeCtx, assamProvider)
-				cancel()
-				if err == nil {
-					logger.Info("certificate upgraded from self-signed to assam-issued (server)")
-					count := updateTrustedCABundle()
-					logger.Info("trusted CA bundle established from assam-issued certificate", "count", count)
-					markCAReady()
-					break
+			_, err = backoff.Retry(ctx, func() (struct{}, error) {
+				upgradeCtx, cancel := context.WithTimeout(ctx, c.assamOpTimeout)
+				defer cancel()
+				if err := serverCertMgr.SwapProvider(upgradeCtx, assamProvider); err != nil {
+					return struct{}{}, err
 				}
-				logger.Warn("assam certificate upgrade attempt failed (will retry)", "error", err, "backoff", backoff)
-				backoff = min(backoff*2, maxBackoff)
+				return struct{}{}, nil
+			},
+				backoff.WithBackOff(bo),
+				backoff.WithNotify(func(err error, d time.Duration) {
+					logger.Warn("assam certificate upgrade attempt failed (will retry)", "error", err, "backoff", d)
+				}),
+			)
+			if err != nil {
+				// ctx cancelled or unrecoverable error from the operation.
+				return
 			}
+			logger.Info("certificate upgraded from self-signed to assam-issued (server)")
 
 			// Upgrade client cert too.
 			if clientCertMgr != nil {
-				upgradeCtx, cancel := context.WithTimeout(ctx, *assamOpTimeout)
+				upgradeCtx, cancel := context.WithTimeout(ctx, c.assamOpTimeout)
 				if err := clientCertMgr.SwapProvider(upgradeCtx, assamProvider); err != nil {
 					logger.Warn("assam client certificate upgrade failed", "error", err)
 				} else {
 					logger.Info("certificate upgraded from self-signed to assam-issued (client)")
-					count := updateTrustedCABundle()
-					logger.Info("trusted CA bundle refreshed from assam-issued client certificate", "count", count)
 				}
 				cancel()
 			}
 
-			m.certMode.Store(1) // 1 = assam mode active
+			m.certMode.Store(1)
 		}()
+	}
 
-		// CA bundle refresh: wait until certificate provisioning has established
-		// a trusted CA, then poll cert-issuer /ca. Unauthenticated refreshes
-		// only retain/prune already trusted roots; new roots are admitted by
-		// certificate provisioning after the issued leaf verifies to them.
-		if effectiveCAURL != "" {
-			go func() {
-				refreshOnce := func(level string) {
-					refreshCtx, cancel := context.WithTimeout(ctx, *assamOpTimeout)
-					count, err := refreshCABundle(refreshCtx)
-					cancel()
-					if err != nil {
-						logger.Warn("CA bundle refresh failed", "url", effectiveCAURL, "error", err)
-						return
-					}
-					if level == "info" {
-						logger.Info("CA bundle refreshed from cert-issuer", "url", effectiveCAURL, "count", count)
-					} else {
-						logger.Debug("CA bundle refreshed from cert-issuer", "url", effectiveCAURL, "count", count)
-					}
-				}
+	// CA bundle refresh: periodically poll cert-issuer /ca for updated CA bundle.
+	if effectiveCAURL != "" && c.certMode == "assam" {
+		go func() {
+			assamClient := assamclient.NewClient(assamCfg)
 
+			ticker := time.NewTicker(c.caPollInterval)
+			defer ticker.Stop()
+
+			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-caReady:
-					refreshOnce("info")
-				}
-
-				ticker := time.NewTicker(*caPollInterval)
-				defer ticker.Stop()
-
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-ticker.C:
-						refreshOnce("debug")
+				case <-ticker.C:
+					refreshCtx, cancel := context.WithTimeout(ctx, c.assamOpTimeout)
+					newCerts, err := assamClient.RefreshCABundle(refreshCtx)
+					cancel()
+					if err != nil {
+						logger.Warn("CA bundle refresh failed", "url", effectiveCAURL, "error", err)
+						continue
 					}
+					serverCertMgr.UpdateCACerts(newCerts)
+					if clientCertMgr != nil {
+						clientCertMgr.UpdateCACerts(newCerts)
+					}
+					logger.Debug("CA bundle refreshed from cert-issuer", "count", len(newCerts))
 				}
-			}()
-			logger.Info("CA bundle refresh enabled", "url", effectiveCAURL, "interval", *caPollInterval)
-		}
+			}
+		}()
+		logger.Info("CA bundle refresh enabled", "url", effectiveCAURL, "interval", c.caPollInterval)
 	}
 
 	// Cert pipeline health probe: periodically check cert-issuer /ready.
-	if *certPipelineProbeURL != "" {
-		m.certPipelineHealthy.Store(0) // Start as unhealthy until first probe succeeds.
+	if c.certPipelineProbeURL != "" {
+		m.certPipelineHealthy.Set(0) // Start as unhealthy until first probe succeeds.
 		go func() {
-			client := &http.Client{Timeout: *certPipelineProbeTimeout}
-			ticker := time.NewTicker(*certPipelineProbeInterval)
+			client := &http.Client{Timeout: c.certPipelineProbeTimeout}
+			ticker := time.NewTicker(c.certPipelineProbeInterval)
 			defer ticker.Stop()
 
+			// lastHealth is kept goroutine-local for the transition-log gate;
+			// the metric value is whatever Set was last called with.
+			lastHealth := -1
 			probe := func() {
-				resp, err := client.Get(*certPipelineProbeURL)
+				health := 0
+				resp, err := client.Get(c.certPipelineProbeURL)
 				if err != nil || resp.StatusCode != http.StatusOK {
-					if m.certPipelineHealthy.Swap(0) != 0 {
-						logger.Warn("cert pipeline probe failed", "url", *certPipelineProbeURL, "error", err)
+					if lastHealth != 0 {
+						logger.Warn("cert pipeline probe failed", "url", c.certPipelineProbeURL, "error", err)
 					}
 					if resp != nil {
 						resp.Body.Close()
 					}
-					return
+				} else {
+					resp.Body.Close()
+					health = 1
+					if lastHealth != 1 {
+						logger.Info("cert pipeline probe healthy", "url", c.certPipelineProbeURL)
+					}
 				}
-				resp.Body.Close()
-				if m.certPipelineHealthy.Swap(1) != 1 {
-					logger.Info("cert pipeline probe healthy", "url", *certPipelineProbeURL)
-				}
+				lastHealth = health
+				m.certPipelineHealthy.Set(float64(health))
 			}
 
 			probe() // Initial probe immediately.
@@ -489,24 +529,25 @@ func Run(args []string) error {
 				}
 			}
 		}()
-		logger.Info("cert pipeline health probe enabled", "url", *certPipelineProbeURL)
-	} else {
-		m.certPipelineHealthy.Store(-1) // Not configured.
+		logger.Info("cert pipeline health probe enabled", "url", c.certPipelineProbeURL)
 	}
+	// When the probe is not configured, the gauge stays at its initial -1
+	// (set in newMetrics) — operators can branch on -1 to know it isn't a
+	// real "unhealthy" signal.
 
 	logger.Info("starting ratls-mesh",
 		"outbound", proxy.outboundAddr,
 		"inbound", proxy.inboundAddr,
-		"node", *nodeIP,
-		"platform", *platform,
-		"cert_mode", *certMode,
+		"node", c.nodeIP,
+		"platform", c.platform,
+		"cert_mode", c.certMode,
 		"resolver", "k8s",
-		"health_port", *healthPort,
-		"max_conns", *maxConns,
-		"max_conns_per_source", *maxConnsPerSource,
-		"idle_timeout", *idleTimeout,
-		"keepalive", *keepAlive,
-		"session_cache_size", *sessionCacheSize,
+		"health_port", c.healthPort,
+		"max_conns", c.maxConns,
+		"max_conns_per_source", c.maxConnsPerSource,
+		"idle_timeout", c.idleTimeout,
+		"keepalive", c.keepAlive,
+		"session_cache_size", c.sessionCacheSize,
 	)
 
 	if err := proxy.Run(ctx); err != nil {
@@ -515,17 +556,85 @@ func Run(args []string) error {
 	return nil
 }
 
+type iptablesSyncConfig struct {
+	outboundPort   int
+	uid            int
+	excludeUIDs    string
+	nodeIP         string
+	resyncPeriod   time.Duration
+	watchdogPeriod time.Duration
+	ipsetMaxElem   int
+	readyFile      string
+	metricsFile    string
+	logLevel       string
+}
+
+func newIptablesSyncCommand() *cobra.Command {
+	var cfg iptablesSyncConfig
+	cmd := &cobra.Command{
+		Use:           "iptables-sync",
+		Short:         "Watch K8s pods and keep iptables/ipset routing current",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runIptablesSync(cmd.Context(), &cfg)
+		},
+	}
+	fs := cmd.Flags()
+	fs.IntVar(&cfg.outboundPort, "outbound-port", 15001, "outbound listener port")
+	fs.IntVar(&cfg.uid, "uid", defaultProxyUID, "UID to exclude from redirect")
+	fs.StringVar(&cfg.excludeUIDs, "exclude-uids", "0", "comma-separated UIDs to skip (e.g. root=0 so kubelet/containerd can reach registries)")
+	fs.StringVar(&cfg.nodeIP, "node-ip", "", "local node IP used to maintain local pod source ipsets (defaults to NODE_IP)")
+	fs.DurationVar(&cfg.resyncPeriod, "resync-period", 30*time.Second, "periodic full ipset reconciliation interval")
+	fs.DurationVar(&cfg.watchdogPeriod, "watchdog-period", 2*time.Second, "interval at which the base-chain jump rules are re-asserted at position 1 (bounds the race window against kube-proxy reinserting KUBE-SERVICES)")
+	fs.IntVar(&cfg.ipsetMaxElem, "ipset-maxelem", defaultIPSetMaxElem, "maximum members per managed ipset")
+	fs.StringVar(&cfg.readyFile, "ready-file", "", "path to write after initial ipset and iptables sync succeeds")
+	fs.StringVar(&cfg.metricsFile, "iptables-metrics-file", defaultIptablesMetricsFile, "shared file where iptables-sync publishes counters (empty disables)")
+	fs.StringVar(&cfg.logLevel, "log-level", "info", "log level: debug, info, warn, error")
+	return cmd
+}
+
+func newIptablesCleanupCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:           "iptables-cleanup",
+		Short:         "Remove iptables NAT rules and ipsets created by the mesh",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runIptablesCleanup()
+		},
+	}
+}
+
 // validateConfig checks for misconfigurations that would cause cryptic runtime
 // failures. Called once at startup before any goroutine.
-func validateConfig(attestationServiceURL string, outboundPort, inboundPort int, certTTL time.Duration) error {
+func validateConfig(attestationServiceURL string, outboundPort, inboundPort, healthPort int, certTTL time.Duration) error {
 	if attestationServiceURL == "" {
 		return fmt.Errorf("--attestation-service-url is required")
 	}
-	if err := cmdsutil.ValidateHTTPURL("--attestation-service-url", attestationServiceURL); err != nil {
+	if !strings.HasPrefix(attestationServiceURL, "http://") && !strings.HasPrefix(attestationServiceURL, "https://") {
+		return fmt.Errorf("--attestation-service-url %q must start with http:// or https://", attestationServiceURL)
+	}
+	if err := validatePort("--outbound-port", outboundPort); err != nil {
 		return err
 	}
-	if outboundPort == inboundPort {
-		return fmt.Errorf("--outbound-port and --inbound-port must differ (both are %d)", outboundPort)
+	if err := validatePort("--inbound-port", inboundPort); err != nil {
+		return err
+	}
+	if err := validatePort("--health-port", healthPort); err != nil {
+		return err
+	}
+	for _, pair := range []struct {
+		aFlag, bFlag string
+		aPort, bPort int
+	}{
+		{"--outbound-port", "--inbound-port", outboundPort, inboundPort},
+		{"--outbound-port", "--health-port", outboundPort, healthPort},
+		{"--inbound-port", "--health-port", inboundPort, healthPort},
+	} {
+		if pair.aPort == pair.bPort {
+			return fmt.Errorf("%s and %s must differ (both are %d)", pair.aFlag, pair.bFlag, pair.aPort)
+		}
 	}
 	if certTTL < time.Minute {
 		return fmt.Errorf("--cert-ttl %s is too short (minimum 1m to avoid rotation thrashing)", certTTL)
@@ -533,52 +642,11 @@ func validateConfig(attestationServiceURL string, outboundPort, inboundPort int,
 	return nil
 }
 
-func effectiveAssamCAURL(certMode, certIssuerURL, caURL string) string {
-	caURL = strings.TrimSpace(caURL)
-	if caURL != "" || certMode != "assam" {
-		return caURL
+func validatePort(flag string, port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("%s %d out of range (1-65535)", flag, port)
 	}
-	return strings.TrimRight(certIssuerURL, "/") + "/ca"
-}
-
-func ratlsTEEType(platform string) (ratls.TEEType, error) {
-	switch strings.TrimSpace(platform) {
-	case "sev-snp":
-		return ratls.TEETypeSEVSNP, nil
-	case "":
-		return 0, fmt.Errorf("--platform is required")
-	case "tdx":
-		return 0, fmt.Errorf("ratls-mesh: TDX platform is not yet implemented (use sev-snp)")
-	default:
-		return 0, fmt.Errorf("ratls-mesh: unsupported --platform %q", platform)
-	}
-}
-
-// parseHexMeasurements parses a comma-separated list of hex-encoded SEV-SNP
-// launch digests into the byte form pkg/ratls.VerifyPolicy expects. Empty
-// input returns nil (the caller decides whether to warn).
-func parseHexMeasurements(raw string) ([][]byte, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([][]byte, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		decoded, err := hex.DecodeString(p)
-		if err != nil {
-			return nil, fmt.Errorf("invalid hex measurement %q: %w", p, err)
-		}
-		if len(decoded) != ratls.SNPMeasurementSize {
-			return nil, fmt.Errorf("measurement %q is %d bytes, want %d", p, len(decoded), ratls.SNPMeasurementSize)
-		}
-		out = append(out, decoded)
-	}
-	return out, nil
+	return nil
 }
 
 // makeAttestFunc returns an AttestFunc that calls the attestation service
@@ -605,4 +673,49 @@ func makeAttestFunc(client attestclient.Client, attestationServiceURL string) fu
 
 		return attestclient.ExtractSNPReport(resp)
 	}
+}
+
+func effectiveAssamCAURL(certMode, certIssuerURL, caURL string) string {
+	caURL = strings.TrimSpace(caURL)
+	if caURL != "" || certMode != "assam" {
+		return caURL
+	}
+	return strings.TrimRight(certIssuerURL, "/") + "/ca"
+}
+
+func ratlsTEEType(platform string) (ratls.TEEType, error) {
+	switch strings.TrimSpace(platform) {
+	case "sev-snp":
+		return ratls.TEETypeSEVSNP, nil
+	case "":
+		return 0, fmt.Errorf("--platform is required")
+	case "tdx":
+		return 0, fmt.Errorf("ratls-mesh: TDX platform is not yet implemented (use sev-snp)")
+	default:
+		return 0, fmt.Errorf("ratls-mesh: unsupported --platform %q", platform)
+	}
+}
+
+func parseHexMeasurements(raw string) ([][]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([][]byte, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		decoded, err := hex.DecodeString(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid hex measurement %q: %w", p, err)
+		}
+		if len(decoded) != ratls.SNPMeasurementSize {
+			return nil, fmt.Errorf("measurement %q is %d bytes, want %d", p, len(decoded), ratls.SNPMeasurementSize)
+		}
+		out = append(out, decoded)
+	}
+	return out, nil
 }

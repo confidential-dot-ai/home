@@ -1,3 +1,5 @@
+//go:build linux
+
 package ratlsmesh
 
 import (
@@ -89,8 +91,8 @@ func TestHealthReadyAcceptLoopDegraded(t *testing.T) {
 
 func TestMetricsEndpoint(t *testing.T) {
 	m := testMetrics()
-	m.connSuccessInbound.Store(42)
-	m.bytesInboundFwd.Store(1024)
+	m.connectionsTotal.WithLabelValues("inbound", "success").Add(42)
+	m.bytesTotal.WithLabelValues("inbound", "forward").Add(1024)
 
 	h := newHealthServer(m, nil, nil, 10, 5*time.Second, 10*time.Second)
 	req := httptest.NewRequest("GET", "/metrics", nil)
@@ -113,9 +115,9 @@ func TestMetricsEndpoint(t *testing.T) {
 		"ratls_mesh_route_errors_total",
 		"ratls_mesh_dest_header_errors_total",
 		"ratls_mesh_process_uptime_seconds",
-		"ratls_mesh_process_goroutines",
-		"ratls_mesh_process_heap_alloc_bytes",
-		"ratls_mesh_process_heap_sys_bytes",
+		"go_goroutines",
+		"go_memstats_heap_alloc_bytes",
+		"go_memstats_heap_sys_bytes",
 		"ratls_mesh_inbound_dest_rejected_total",
 		"ratls_mesh_cert_rotation_failures_total",
 		"ratls_mesh_resolver_last_event_timestamp_seconds",

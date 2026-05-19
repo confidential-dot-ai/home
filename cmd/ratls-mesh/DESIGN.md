@@ -5,40 +5,50 @@ Transparent L4 proxy that replaces Istio ambient mTLS with hardware-attested (AM
 ## Architecture
 
 ```
-Node A                                          Node B
-┌─────────────────────────────┐     ┌─────────────────────────────┐
-│  App Pod (10.244.1.5:8080)  │     │  App Pod (10.244.2.3:8080)  │
-│          │                  │     │          ▲                  │
-│  iptables NAT OUTPUT        │     │          │                  │
-│  REDIRECT → :15001          │     │          │                  │
-│          │                  │     │          │                  │
-│  ┌───────▼────────────┐    │     │  ┌───────┴────────────┐    │
-│  │ ratls-mesh          │    │     │  │ ratls-mesh          │    │
-│  │  outbound :15001    │    │     │  │  inbound :15006     │    │
-│  │  resolver: pod→node │    │     │  │  TLS server         │    │
-│  │  RA-TLS client ─────┼────┼─────┼──▶  dest header parse  │    │
-│  │                     │    │     │  │  dial local pod     │    │
-│  │  inbound  :15006    │    │     │  │  outbound :15001    │    │
-│  │  health   :15021    │    │     │  │  health   :15021    │    │
-│  └─────────────────────┘    │     │  └─────────────────────┘    │
-└─────────────────────────────┘     └─────────────────────────────┘
-          RA-TLS (TLS 1.3 + AMD SEV-SNP attestation)
+Node A                                              Node B
+┌─────────────────────────────────┐     ┌─────────────────────────────────┐
+│  App Pod (10.244.1.5:8080)      │     │  App Pod (10.244.2.3:8080)      │
+│            │                    │     │            ▲                    │
+│  iptables NAT PREROUTING        │     │            │ (plaintext, local) │
+│  REDIRECT → :15001              │     │            │                    │
+│            │                    │     │            │                    │
+│  ┌─────────▼─────────────────┐  │     │  ┌─────────┴─────────────────┐  │
+│  │ ratls-mesh sidecar        │  │     │  │ ratls-mesh sidecar        │  │
+│  │  :15001  outbound (NAT)   │  │     │  │  :15006  inbound          │  │
+│  │   1. SO_ORIGINAL_DST      │  │     │  │   1. RA-TLS terminate     │  │
+│  │   2. resolver: pod→node   │  │     │  │   2. read dest header     │  │
+│  │   3. RA-TLS client dial ──┼──┼─────┼──▶  3. validate local pod    │  │
+│  │                           │  │     │  │   4. dial local pod       │  │
+│  │  :15021  /metrics, /healthz  │     │  │  :15021  /metrics, /healthz  │
+│  └───────────────────────────┘  │     │  └───────────────────────────┘  │
+└─────────────────────────────────┘     └─────────────────────────────────┘
+              RA-TLS (TLS 1.3 + AMD SEV-SNP attestation)
 ```
+
+Each sidecar runs both listeners; the diagram shows the outbound side
+firing on Node A and the inbound side firing on Node B for clarity.
+"Dial local pod" is the inbound→pod plaintext hop over the CNI bridge —
+the only segment not protected by RA-TLS, kept fail-closed by the
+`ValidateLocalDest` checks discussed under "Local vs remote path".
 
 ### Data flow
 
 1. App sends TCP to `10.244.2.3:8080`
-2. iptables NAT OUTPUT redirects to `:15001` (outbound listener)
+2. Host iptables NAT PREROUTING redirects pod-to-pod TCP to `:15001` (outbound listener)
 3. Proxy reads original destination via `SO_ORIGINAL_DST`
 4. Resolver maps pod IP `10.244.2.3` to node IP `10.0.0.2`
-5. If local (same node): direct TCP pipe, no TLS
-6. If remote: RA-TLS dial to `10.0.0.2:15006`, send `10.244.2.3:8080\n` header
-7. Remote inbound listener reads header, dials local pod, pipes bytes
+5. Outbound proxy opens RA-TLS to the destination node's `:15006` listener, even when the destination pod is on the same node
+6. Outbound proxy sends `10.244.2.3:8080\n` as the destination header
+7. Inbound listener reads header, validates the destination, dials local pod, pipes bytes
 8. App receives response — unaware of the mesh
 
 ### Local vs remote path
 
-The resolver determines whether destination pod is on the same node. Local traffic bypasses RA-TLS entirely — it's a plain TCP pipe from `:15001` to the original destination. This avoids TLS overhead for node-internal communication where the TEE boundary already covers both pods.
+**Resolver and RA-TLS path.** The resolver maps `podIP → nodeIP`; the outbound proxy always opens RA-TLS to that node's inbound listener, even when the destination is local. Same-node traffic dials this node's own `:15006`, and a pod connecting to its own pod IP takes the same round trip (one extra handshake, no application impact — packet captures of `:15001`/`:15006` showing self-traffic are intentional, not a routing loop). The uniform path fails closed on attestation before any application bytes move, and removes a class of bug in which a "local" routing decision could be silently wrong about where the destination actually runs.
+
+**The plaintext leg.** Only the inbound→pod hop stays plain TCP, traversing the CNI bridge / pod veth from the host netns to a local pod. It never leaves the node — on a confidential VM, the packets stay inside SEV-SNP-protected memory and the hypervisor cannot observe them. The attack to defend is a forged `Pod.Status.HostIP` that claims a *remote* pod is local: the proxy would then dial it through the kernel routing table, the packets would exit the node via the CNI overlay, and a hypervisor-level observer would see plaintext. `ValidateLocalDest` blocks this with two kernel-sourced checks independent of the apiserver hint: the destination IP must fall in a host pod-network CIDR read from `net.Interfaces()`, and the kernel's best route for that IP (queried via `netlink.RouteGet`) must leave through one of the interfaces that owned a matching CIDR. The discovery filter keeps non-loopback, up, broadcast-capable interfaces and drops three classes a forged `HostIP` could otherwise hide in: any interface carrying the node IP itself (the node fabric, including dual-stack addresses on the same NIC, not the pod bridge), point-to-point interfaces (wireguard, IPIP, GRE, VPN tunnels), and link-local or /32 host routes. With no discoverable pod-network CIDR, inbound pod delivery fails closed until the refresh loop discovers one; alert on `ratls_mesh_resolver_local_cidrs == 0` so operators catch broken CNI discovery instead of silently losing the locality bound.
+
+**Host compromise.** RA-TLS binds to the SEV-SNP/TDX attestation, not host integrity inside the TEE. A principal *outside* the CVM cannot forge an attestation report, so it cannot impersonate this node to a peer or induce a peer to leak data. It can still disrupt service — a compromised API server misroutes via a fake `HostIP` (the inbound listener then rejects on `ValidateLocalDest`), the network can drop or RST packets, the hypervisor can pause the VM — but those failure modes are visible to the application (broken connection), not silent leakage. A principal *inside* the CVM with host root is already on the wrong side of the attestation boundary: it shares TEE memory with the proxy and the local pods, so sniffing `:15001`/`:15006` is no different from reading pod memory directly, and it can rewrite routes, iptables/ipsets, or the proxy pod itself. On a *legitimately attested* node, that root can issue outbound RA-TLS using the node's identity — peers verify attestation, not which principal on the node initiated the traffic. The routing defenses described above (`ValidateLocalDest`, the CIDR/route cross-check, the jump-position watchdog) target stale or adversarial Kubernetes metadata and CNI topology drift, not a sysadmin with kernel control. Keeping that root from existing post-boot is the launch policy's job (pin `--measurements`) and the platform's; this proxy does not defend against root inside the same TEE.
 
 ## Trust Model
 
@@ -60,13 +70,13 @@ The K8s informer watches Pod objects and caches `podIP → nodeIP` mappings. Thi
 
 - **Compromised API server**: Can return wrong nodeIP → proxy dials wrong node → RA-TLS handshake fails (non-TEE node can't produce valid attestation) → **DoS, not data leakage**
 - **Stale cache**: Pod deleted but IP reused → proxy dials old node → handshake fails or new pod responds → RA-TLS still validates
-- **Unknown IP** (service VIP, external): Falls through as remote → proxy dials IP directly → either connects (external endpoint) or fails
+- **Unknown IP** (service VIP, external): Does not enter the proxy by default because iptables only redirects IPs in the pod ipsets
 
 The resolver is purely advisory. RA-TLS is the actual trust anchor.
 
 ### 3. iptables interception
 
-`NET_ADMIN` iptables rules in the NAT OUTPUT chain redirect all TCP traffic through the proxy. Loop prevention via UID exclusion (mesh process UID 1337 is exempt). This ensures applications cannot bypass the mesh for TCP traffic.
+`NET_ADMIN` iptables rules in the host NAT PREROUTING chain redirect pod-to-pod TCP traffic whose source is a local pod IP and whose destination is any known pod IP. OUTPUT rules also cover host-originated traffic to pod IPs, where loop prevention via UID exclusion keeps mesh process traffic (UID 1337) out of the redirect path. ClusterIP Services, metadata, kube API, public egress, and direct external-to-pod traffic fall through because they are not local pod-to-pod egress flows. The outbound listener also rejects original destinations that are not known pod IPs, so direct connections to the host-network listener do not become plaintext proxy sessions.
 
 **Not protected by iptables**: UDP, raw sockets, and ICMP. DNS (UDP :53) is not intercepted. Kubernetes NetworkPolicy should complement iptables for non-TCP protocols. Both `iptables` (IPv4) and `ip6tables` (IPv6) rules are installed to prevent dual-stack bypass.
 
@@ -74,7 +84,8 @@ The resolver is purely advisory. RA-TLS is the actual trust anchor.
 
 | Threat | Impact | Mitigation |
 |--------|--------|------------|
-| Compromised K8s API server | Routing DoS (wrong node) | RA-TLS rejects non-TEE peers |
+| Compromised K8s API server | Routing DoS (wrong node); attempted forged-HostIP relay is rejected before the inbound→pod plaintext dial | RA-TLS rejects non-TEE peers for the outbound→inbound leg; `ValidateLocalDest` cross-checks dst against host interface CIDRs and the kernel's best route interface before dialing the local pod. |
+| Host root / rogue node administrator | Can rewrite routing, iptables/ipsets, process credentials, or mesh pods on that node; local bypass is possible and a legitimately attested node identity may still be usable | Out of scope for in-guest routing controls. Treat host root as part of the node TCB; rely on node hardening, measured boot / measurement pinning, and cluster access controls. Other nodes still require RA-TLS attestation before accepting mesh traffic. |
 | Compromised pod application | App-level data exposure | Out of scope (TEE protects transport, not app logic) |
 | Compromised control plane | Can't forge attestation | Hardware-rooted trust (AMD VCEK) |
 | Network attacker (MITM) | Can't decrypt traffic | TLS 1.3 + attestation binding |
@@ -84,20 +95,21 @@ The resolver is purely advisory. RA-TLS is the actual trust anchor.
 | ICMP reconnaissance | Network topology mapping, covert channels | Kubernetes NetworkPolicy blocking ICMP egress |
 | Raw socket bypass | Complete mesh bypass at IP layer | Drop `CAP_NET_RAW` on application pods (PodSecurity or OPA) |
 | Inbound open relay | Compromised RA-TLS peer redirects to arbitrary local services | Inbound destination validated against resolver cache (only known local pod IPs allowed) |
-| TLS cert reconnaissance | Connecting client sees server attestation report (CPU model, measurements) before client auth | Acceptable: attestation reports are designed to be public. Restrict port 15006 access via NetworkPolicy if needed. |
+| TLS cert reconnaissance | Connecting client sees server attestation report (CPU model, measurements) before client auth | Acceptable: attestation reports are designed to be public. The chart runs `hostNetwork: true`, so restrict port 15006 with host firewall, cloud security group, or CNI host-network policy controls if needed. |
+| Metrics side channel | `/metrics` on `:15021` exposes per-direction connection counts, byte totals, and handshake/duration histograms (labels are `direction=inbound\|outbound\|outbound_same_node`, no per-peer breakdown). An off-node attacker on the same network can scrape it and infer **node-level** activity volume and timing — not pod-to-pod graph, but enough for traffic-volume correlation across nodes. | The chart runs `hostNetwork: true`, so `:15021` is reachable on the node IP. The proxy does not authenticate the endpoint by design (Prometheus scrape needs reachability). Restrict via host firewall, cloud security group, or CNI host-network policy so only the scrape source can reach the port. |
 | Empty measurement policy | Any TEE-attested binary accepted (no code identity check) | Use `--measurements` flag to pin expected launch digests in production |
 
 ## Protocol
 
 ### Destination header
 
-When the outbound proxy dials a remote node's inbound port, the first data sent (before piping application bytes) is the destination header:
+When the outbound proxy dials the destination node's inbound port, the first data sent (before piping application bytes) is the destination header:
 
 ```
 <host>:<port>\n
 ```
 
-- Max size: 256 bytes (enforced by `bufio.NewReaderSize`)
+- Max size: 256 bytes (enforced by an `io.LimitedReader`)
 - Read deadline: 5 seconds (configurable via `--dest-header-timeout`)
 - Format: Standard `net.JoinHostPort` output (IPv6 addresses are bracketed: `[::1]:8080`)
 - Validation: Parsed with `net.SplitHostPort` — invalid format is rejected
@@ -116,10 +128,10 @@ After reading the destination header with `bufio.Reader`, any bytes already buff
 | RA-TLS instead of Istio mTLS | Istio trusts the control plane for identity — if istiod is compromised, all mTLS is meaningless. RA-TLS roots trust in AMD hardware, making control plane compromise a DoS issue, not a data leakage issue. | Requires AMD SEV-SNP hardware. More complex certificate handling. |
 | Node-level TEE boundary | Azure CVMs run SEV-SNP at the VM level. All pods on a node share the same TEE. Per-pod TEE would require nested virtualization (not available on Azure). | Can't distinguish between pods on the same node at the attestation level. |
 | K8s informer for pod→node mapping | O(1) lookups via in-memory cache. Alternative (per-connection API call) would be too slow and create API server hotspot. | Memory proportional to pod count. Watches all namespaces. |
-| Static resolver fallback | Single-node K3s deployments don't need K8s API access. Loopback and node IP are local; everything else is remote. | Can't detect same-node pods (always treats non-loopback as remote). |
+| Pod ipsets for interception | The chart watches Kubernetes Pods and redirects only actual non-hostNetwork pod IPs. This avoids static cluster CIDRs and adapts to new deployments and pod churn. | Requires the `ipset` binary and kernel support; a stale watch can briefly miss a new pod IP until the next resync. The managed sets are rebuilt with `ipset restore` and an explicit `maxelem` limit. |
 | UID-based iptables exclusion | Mesh process (UID 1337) must be exempt from redirect to prevent infinite loops. UID matching is the simplest Linux mechanism for this. | Fixed UID (must not collide with other processes). |
-| `hostNetwork: true` | Required for iptables rules to see all pod traffic in the host network namespace. Without hostNetwork, the proxy only sees its own pod's traffic. | Pod uses host network stack (port conflicts possible). |
-| `hostPort` on inbound only | Inbound port (15006) must be reachable from remote nodes. Outbound port (15001) is only accessed via iptables redirect (no external access needed). | Fixed port allocation per node for inbound. |
+| `hostNetwork: true` | Required for iptables rules to see all pod traffic in the host network namespace. Without hostNetwork, the proxy only sees its own pod's traffic. | Pod uses host network stack (port conflicts possible). The outbound listener rejects non-pod original destinations; Kubernetes NetworkPolicy is not relied on for host-network ingress controls, so use host/CNI-level controls where required. |
+| `hostPort` on inbound only | Inbound port (15006) must be reachable from peer nodes. Outbound port (15001) is only accessed via iptables redirect (no external access needed). | Fixed port allocation per node for inbound. |
 | Channel semaphore for connection limit | Non-blocking try-send gives O(1) admission control. Rejected connections get immediate RST (fail-fast, no queuing). | Hard limit — no backpressure or queueing. |
 | `idleConn` deadline wrapper | Per-I/O deadline reset catches zombie connections where one side stopped sending. Alternative (periodic health check per connection) would be more complex. | Extra `SetReadDeadline`/`SetWriteDeadline` syscall per I/O operation. |
 | `sync.Pool` for 32KB buffers | Reduces GC pressure under high connection churn. `*[]byte` (pointer to slice) prevents interface boxing. | Fixed buffer size. Pool may retain memory during low-traffic periods. |
@@ -128,7 +140,7 @@ After reading the destination header with `bufio.Reader`, any bytes already buff
 | `preStop` cleanup + sleep | iptables rules must be removed before pod termination to prevent traffic black-holing. The 5s sleep gives K8s time to update endpoints after cleanup. | Adds 5s to every pod termination. |
 | No retry logic | This is an L4 proxy — it doesn't understand the application protocol. Retrying at L4 would duplicate TCP streams, potentially causing data corruption. Retries belong in the application or L7 proxy. | App-visible connection failures on transient network issues. |
 | No connection pooling | Each app TCP connection maps 1:1 to a proxied connection. L4 transparency requires preserving connection boundaries. | RA-TLS handshake per connection (mitigated by cert caching). |
-| Inbound destination validation | Inbound handler validates destination IP against resolver cache (must be a known pod on this node). Prevents compromised RA-TLS peers from using the inbound listener as an open relay to localhost, metadata endpoints, or other services. | Static resolver allows all destinations (single-node dev has no cache). |
+| Inbound destination validation | Inbound handler validates destination IP against resolver cache (must be a known pod on this node) and the kernel route to that IP, both independent of `Pod.Status.HostIP`. Prevents compromised RA-TLS peers from using the inbound listener as an open relay to localhost, metadata endpoints, or other services. | Bound to the k8s resolver — there's no production static-resolver mode. |
 | Dual-stack iptables | Both `iptables` (IPv4) and `ip6tables` (IPv6) rules are installed. Prevents IPv6 traffic from bypassing the mesh on dual-stack clusters. | Requires `ip6tables` binary in container image. |
 | Measurement pinning | `--measurements` flag accepts expected SHA-384 launch digests. Without it, any valid TEE is accepted (logged as warning). | Requires redeployment when binary changes. |
 
@@ -207,41 +219,73 @@ The mesh boots with self-signed RA-TLS first, then upgrades to assam-issued cert
 
 ### Rule generation
 
-`buildRules(outboundPort, inboundPort, uid)` produces two NAT rules placed in a dedicated `RATLS-MESH` chain, applied to both `iptables` and `ip6tables` for dual-stack coverage:
+The chart runs `iptables-sync`, which watches Pods and keeps four ipsets current:
+
+- `RATLS-MESH-PODS` for IPv4 pod IPs
+- `RATLS-MESH-PODS6` for IPv6 pod IPs
+- `RATLS-MESH-LOCAL-PODS` for IPv4 pod IPs scheduled on this node
+- `RATLS-MESH-LOCAL-PODS6` for IPv6 pod IPs scheduled on this node
+
+`buildPodIPSetRules(outboundPort, uid, excludeUIDs)` produces NAT rules placed in dedicated `RATLS-MESH` and `RATLS-MESH-PREROUTING` chains, applied to `iptables` and `ip6tables` for dual-stack coverage:
 
 ```
--t nat -N RATLS-MESH                                                                    # create chain
--t nat -F RATLS-MESH                                                                    # flush stale rules
--t nat -A RATLS-MESH -p tcp -m owner ! --uid-owner 1337 --dport 1:14999     -j REDIRECT --to-port 15001
--t nat -A RATLS-MESH -p tcp -m owner ! --uid-owner 1337 --dport 15007:65535 -j REDIRECT --to-port 15001
--t nat -A OUTPUT -j RATLS-MESH                                                          # jump from OUTPUT
+-t nat -N RATLS-MESH                                                                    # create OUTPUT chain
+-t nat -N RATLS-MESH-PREROUTING                                                        # create pod veth chain
+-t nat -F RATLS-MESH                                                                    # flush stale OUTPUT rules
+-t nat -F RATLS-MESH-PREROUTING                                                        # flush stale PREROUTING rules
+-t nat -A RATLS-MESH -p tcp -m set --match-set RATLS-MESH-PODS dst -m owner ! --uid-owner 1337 --dport 1:65535 -j REDIRECT --to-port 15001
+-t nat -A RATLS-MESH-PREROUTING -p tcp -m set --match-set RATLS-MESH-LOCAL-PODS src -m set --match-set RATLS-MESH-PODS dst --dport 1:65535 -j REDIRECT --to-port 15001
+-t nat -I OUTPUT 1 -j RATLS-MESH                                                        # jump from OUTPUT before service DNAT
+-t nat -I PREROUTING 1 -j RATLS-MESH-PREROUTING                                        # jump from pod veth path before service DNAT
 ```
 
-The port range `[15000, 15006]` is excluded:
-- **15001**: Outbound listener (would cause redirect loop)
-- **15006**: Inbound listener (must receive RA-TLS connections directly)
-- **15000, 15002-15005**: Safety buffer between mesh ports
+All pod-to-pod TCP destination ports are redirected. Loop prevention comes from
+the destination pod ipsets plus mesh UID exclusion in OUTPUT; RA-TLS inbound
+connections target node IPs, not pod IPs, so they do not match the pod
+destination ipsets.
 
 ### Dedicated chain (T5 mitigation)
 
-Rules are placed in a custom `RATLS-MESH` chain instead of directly in OUTPUT. This provides atomic stale rule cleanup: on startup, the chain is flushed (`-F`) before inserting new rules, clearing any remnants from a previous crash or version change. The jump rule from OUTPUT to `RATLS-MESH` is idempotent (check before add).
+Rules are placed in custom chains instead of directly in OUTPUT or PREROUTING. This provides atomic stale rule cleanup: on startup, each chain is flushed (`-F`) before inserting new rules, clearing any remnants from a previous crash or version change. The jumps from OUTPUT to `RATLS-MESH` and PREROUTING to `RATLS-MESH-PREROUTING` are reinstalled at the head of the base chains so pod-IP matching runs before kube-proxy rewrites Service VIP traffic to endpoint PodIPs.
 
 ### Idempotent setup
 
 ```
 for each iptables binary (iptables, ip6tables):
     create chain RATLS-MESH (idempotent: -N fails if exists)
+    create chain RATLS-MESH-PREROUTING (idempotent: -N fails if exists)
     flush chain RATLS-MESH (clear stale rules)
-    add redirect rules to RATLS-MESH
-    if jump rule not in OUTPUT:
-        add jump rule to OUTPUT
+    flush chain RATLS-MESH-PREROUTING (clear stale rules)
+    add owner-aware host-originated redirect rules to RATLS-MESH
+    add pod-to-pod PREROUTING redirect rules to RATLS-MESH-PREROUTING
+    delete stale or duplicate jump rules from OUTPUT and PREROUTING
+    insert jump rules at position 1 in OUTPUT and PREROUTING
 ```
 
 Running setup N times produces exactly one copy of each rule.
 
 ### Cleanup
 
-Removes the jump from OUTPUT, flushes the chain, and deletes it (`-D`, `-F`, `-X`). If rules don't exist (already cleaned up), logs a warning but continues. The preStop hook runs cleanup followed by a 5s sleep (separated by newline, not `&&`, so sleep always runs regardless of cleanup exit code).
+Removes the jumps from OUTPUT and PREROUTING, flushes the managed chains, and deletes them (`-D`, `-F`, `-X`). If rules don't exist (already cleaned up), logs a warning but continues. The preStop hook runs cleanup followed by a 5s sleep (separated by newline, not `&&`, so sleep always runs regardless of cleanup exit code).
+
+The chart declares `iptables-cleanup` as the **first** native sidecar in `initContainers` so it starts before `iptables-sync` and the main proxy. The container itself runs only `trap 'exit 0' TERM; sleep 3600 & wait` — its sole purpose is to host the `preStop` hook. Because Kubernetes 1.29+ native sidecars stop in reverse init order by default, `iptables-cleanup`'s preStop fires **last** during pod termination, after the main proxy and `iptables-sync` have already exited. `iptables-sync` deliberately does **not** clean up its own rules on SIGTERM; cleanup is centralized here so a single chain-removal step runs once at the right moment in the shutdown sequence.
+
+### Mesh-disabled window during sidecar restart
+
+The cleanup→install boundary is a brief window in which pod-to-pod TCP on the node falls through `PREROUTING`/`OUTPUT` unintercepted. It opens when `iptables-cleanup`'s preStop removes the managed chains, ipsets, and jumps, and closes when the new `iptables-sync` finishes `installIptablesRules` after `WaitForCacheSync` and `reconcilePodIPSets`. Two paths trigger it:
+
+- **Rolling restart (normal).** Helm upgrade, image bump, or any DaemonSet rollout. The window is sub-second on a warm node but scales with image pull, scheduling delay, and informer cache sync size.
+- **`--ipset-maxelem` change after an abrupt previous shutdown.** When the new sidecar starts and finds live ipsets whose `maxelem` differs from the requested value (because the previous pod exited without firing preStop), `reconcileLiveSetMaxElem` flushes the managed chains *before* destroying the stale sets, then waits for `reconcilePodIPSets` and `installIptablesRules` to repopulate everything. The rules-empty window is folded into the same startup gap and only extends it by the destroy+rebuild cost.
+
+The fall-through is not a security regression — RA-TLS attestation remains the actual trust boundary, and apps that require it should refuse plaintext connections — but it is a soft-fail-open period rather than fail-closed. Operator implications:
+
+- Treat any `ratls-mesh` rolling update as a brief unprotected window per node. If clients cannot tolerate plaintext during that window, drain workloads off the node first.
+- Alert on the `iptables-sync` container's restart count and startupProbe failure rate (via kube-state-metrics, e.g. `kube_pod_container_status_restarts_total`); the in-process watchdog metrics (`ratls_mesh_iptables_jump_position_*`) only fire after `installIptablesRules` completes and so cannot detect a wedged startup.
+- When changing `--ipset-maxelem`, plan the upgrade as a rolling restart rather than a hot reconfigure; the destroy-then-rebuild path is intentionally cold-start-only.
+
+### Jump-position watchdog
+
+kube-proxy reconciles `nat/PREROUTING` periodically and reinserts `KUBE-SERVICES` at position 1. If our `RATLS-MESH-PREROUTING` jump is demoted below it, Service VIPs get DNAT'd to PodIPs **before** our chain runs and end up redirected through the mesh — broken Service semantics, not a security leak. iptables offers no hook priority, so true determinism is impossible; a dedicated `watchdog-period` goroutine (2s default) re-asserts the jump at position 1 and increments `ratls_mesh_iptables_jump_position_violations_total` whenever it has to act. Operators can alert on a non-zero rate to detect persistent races.
 
 ## Connection Lifecycle
 
@@ -296,24 +340,77 @@ Pod event → onPod/onDeletePod → update podMap (RWMutex-protected)
 Resolve(podIP) → RLock → lookup podMap → compare hostIP to nodeIP → local/remote
 ```
 
-Cache size is sampled every 10 seconds and exposed as a Prometheus gauge. The cache is bounded by the number of running pods (entries are deleted on pod deletion events).
+Cache size is sampled every 10 seconds and exposed as a Prometheus gauge. The cache is bounded by the number of non-hostNetwork Pod IPs reported by the API server (entries are deleted on pod deletion events).
 
 ### Resolve logic
 
 ```
 Resolve(podIP):
-    if podIP ∈ {127.0.0.1, ::1, nodeIP}:  → (nodeIP, local)
-    if podIP in podMap:                     → (hostIP, hostIP == nodeIP)
-    else:                                   → (podIP, remote)  # fallback for VIPs
+    ValidateOutboundDest(podIP):             → podIP in non-hostNetwork podMap and podIP ∉ {127.0.0.1, ::1, nodeIP}
+    Resolve(podIP):
+        if podIP ∈ {127.0.0.1, ::1, nodeIP}: → (nodeIP, local)
+        if podIP in non-hostNetwork podMap:  → (hostIP, hostIP == nodeIP)
+        else:                                → (podIP, remote)
 ```
 
-Unknown IPs (service VIPs, external addresses) fall through as remote with the original IP used as the dial target. If the target is not a mesh node, the RA-TLS handshake will fail (expected behavior).
+The outbound listener first requires `ValidateOutboundDest=true`, so direct
+connections to the host-network listener and non-pod destinations are rejected
+before `Resolve` runs. Loopback and node IP destinations are rejected even if a
+hostNetwork pod reports the node IP as its PodIP. Unknown IP fallback remains a
+defensive resolver behavior but is not part of the normal chart interception
+path.
+
+### Local CIDR discovery
+
+`ValidateLocalDest` requires the destination IP to fall within a
+host-discovered pod-network CIDR before allowing the plaintext inbound→pod
+hop, independently of `Pod.Status.HostIP`. The CIDR set comes from
+`net.Interfaces()` filtered to non-loopback, up, broadcast-capable
+interfaces (see `selectLocalPodCIDRs` in `resolver_k8s.go` and the
+"Residual gap" discussion in §"Local vs remote path"). When no CIDRs are
+discovered the function fails closed: inbound pod delivery is rejected
+until the refresh loop recovers, and the
+`RATLSMeshLocalCIDRDiscoveryFailed` alert fires after 2m.
+
+At construction, `bootstrapLocalCIDRs` polls discovery synchronously
+within a deadline (`--local-cidr-boot-timeout`, default `1s`) so a CNI
+bridge that comes up shortly after the pod starts doesn't pin
+`ValidateLocalDest` in fail-closed until the first periodic refresh
+tick (30s). The loop stops on the first non-empty result; past the
+budget we fall through to the existing async refresh path. Context
+cancellation short-circuits the wait so pod termination mid-startup is
+not delayed.
+
+### Informer skew between `iptables-sync` and the main proxy
+
+The `iptables-sync` sidecar and the main proxy run independent Pod informers,
+each consuming its own watch stream from the API server. When a Pod is added,
+the two informers see the ADD event at slightly different times: the sidecar
+may add the new pod IP to `RATLS-MESH-PODS` (so the kernel begins REDIRECTing
+traffic for it) a few hundred milliseconds before the proxy's resolver
+updates its `podMap`. During that window, the outbound listener gets a
+connection whose destination is not yet in its cache, `ValidateOutboundDest`
+returns false, and the connection is rejected with `result=dest_rejected`.
+
+This is a robustness blip, not a security gap — the failure mode is
+reject-not-relay, the caller retries, and the second attempt succeeds once
+the resolver has caught up. Operators should watch
+`rate(ratls_mesh_outbound_dest_rejected_total{reason="unknown_pod"}[5m])`
+for the skew baseline (small steady rate is normal during pod churn;
+sustained spikes mean the informer is far behind) and
+`rate(ratls_mesh_outbound_dest_rejected_total{reason="host_addr"}[5m])`
+for the direct-dial signal (any sustained rate means something reached
+`:15001` outside the iptables REDIRECT path — alert on this without the
+informer-skew noise). The metric is separate from `route_errors_total` so
+it is not confused with origDst/parse failures.
 
 ## Observability
 
 ### Metrics
 
-All atomic counters, zero external dependencies. Exposed as Prometheus text format on `GET /metrics`.
+Proxy counters live in-process. `iptables-sync` publishes its sidecar counters
+to `/tmp/ratls-iptables-metrics.json` in the shared emptyDir, and the proxy
+folds that snapshot into the same Prometheus text output on `GET /metrics`.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -325,11 +422,18 @@ All atomic counters, zero external dependencies. Exposed as Prometheus text form
 | `ratls_mesh_connection_limit_rejected_total` | counter | — | Semaphore rejections |
 | `ratls_mesh_route_errors_total` | counter | — | origDst/resolve/parse failures |
 | `ratls_mesh_dest_header_errors_total` | counter | `side` | Header read/write failures |
+| `ratls_mesh_inbound_dest_rejected_total` | counter | — | Inbound destination rejected because it is not a local pod |
+| `ratls_mesh_outbound_dest_rejected_total` | counter | `reason` | Outbound destination rejected: `host_addr` = direct dial outside REDIRECT path (security signal); `unknown_pod` = informer skew baseline |
+| `ratls_mesh_iptables_jump_position_violations_total` | counter | — | Watchdog confirmed and repaired a demoted base-chain jump |
+| `ratls_mesh_iptables_jump_position_check_errors_total` | counter | — | Watchdog could not read jump position and reinserted defensively |
+| `ratls_mesh_iptables_ipset_overflow_total` | counter | — | Reconcile saw more pod IPs than `--ipset-maxelem` and left the set stale |
+| `ratls_mesh_iptables_metrics_file_updated_at_seconds` | gauge | — | Unix-seconds timestamp of the last sidecar metrics snapshot read by the proxy |
 | `ratls_mesh_resolver_cache_entries` | gauge | — | Pod→node cache size |
+| `ratls_mesh_resolver_local_cidrs` | gauge | — | Host-discovered pod-network CIDRs guarding inbound local dials |
+| `ratls_mesh_resolver_last_event_timestamp_seconds` | gauge | — | Unix timestamp of the last informer event. "Informer alive", not "podMap mutated": advances on every ADD/UPDATE/DELETE including pending-phase pods with no HostIP/PodIPs. A stream of pending-state updates from a CrashLoopBackoff workload keeps this fresh while no routing state actually changes — `RATLSMeshResolverStale` is therefore a watch-stream liveness signal, not a cache-freshness signal. |
 | `ratls_mesh_process_uptime_seconds` | gauge | — | Seconds since start |
-| `ratls_mesh_process_goroutines` | gauge | — | Current goroutine count |
-| `ratls_mesh_process_heap_alloc_bytes` | gauge | — | Heap allocation |
-| `ratls_mesh_process_heap_sys_bytes` | gauge | — | Heap memory from OS |
+
+Go runtime and process metrics (`go_goroutines`, `go_memstats_*`, `process_resident_memory_bytes`, …) come from the standard prometheus client collectors and are exposed at the same `/metrics` endpoint.
 
 ### Health endpoints
 
@@ -364,17 +468,25 @@ onShutdown() → health.ready = false → /ready returns 503
 Listeners close → accept loops exit
     │
     ▼
-Wait for activeConns (up to drainTimeout=30s)
+Wait for activeConns (up to --drain-timeout)
     ├── All connections drained → clean exit
     └── Timeout exceeded → warn and force exit
     │
     ▼
 preStop hook (separate from Go process):
     iptables-cleanup → remove NAT rules
-    sleep 5          → allow endpoints to update
+    sleep N          → allow endpoints to update
 ```
 
-The `terminationGracePeriodSeconds: 45` on the DaemonSet gives enough time for the preStop hook (5s), the Go drain (30s), and margin.
+The chart's `terminationGracePeriod`, `drainTimeout`, and
+`iptablesCleanup.preStopSleepSeconds` (defaults: `45s`, `30s`, `5`)
+together bound the shutdown sequence. The chart fails the install when
+`drainTimeout ≥ terminationGracePeriod` (zero preStop budget) or when
+`preStopSleepSeconds > terminationGracePeriod - drainTimeout` (sleep
+would be SIGKILL'd mid-cleanup, leaking iptables chains/ipsets across
+the pod restart). Duration values use the Go single-unit form (`Ns` /
+`Nm` / `Nh`) parsed by the `ratls-mesh.durationSeconds` helper so the
+bound arithmetic stays exact.
 
 ## DaemonSet Deployment
 
@@ -440,7 +552,7 @@ When using `--cert-mode assam`, the lifecycle changes:
 | **Control plane compromise** | Full mTLS bypass | DoS only (can't forge attestation) | DoS only (CA is in-TEE sidecar) |
 | **Certificate issuance** | Centralized CA | Per-node self-signed with attestation | Per-node CA-signed after assam attestation |
 | **Protocol** | L4/L7 (ztunnel + waypoint) | L4 only | L4 only |
-| **Dependencies** | istiod, ztunnel, CNI plugin | Single binary + iptables | Single binary + iptables + assam + cert-issuer |
+| **Dependencies** | istiod, ztunnel, CNI plugin | Single binary + iptables/ipset | Single binary + iptables/ipset + assam + cert-issuer |
 | **Node-to-node encryption** | HBONE (HTTP/2 tunnel) | TLS 1.3 direct | TLS 1.3 direct |
 | **Per-pod identity** | SPIFFE identity per pod | Node-level TEE identity | Node-level TEE identity |
 | **Hardware requirement** | None | AMD SEV-SNP CVM | AMD SEV-SNP CVM + assam infrastructure |

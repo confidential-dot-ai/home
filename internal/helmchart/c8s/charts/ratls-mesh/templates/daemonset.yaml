@@ -2,6 +2,26 @@
 {{- $assamURL := printf "https://%s-assam.%s.svc:8080" .Release.Name .Release.Namespace -}}
 {{- $certIssuerURL := printf "http://%s-cert-issuer.%s.svc:8090" .Release.Name .Release.Namespace -}}
 {{- $caURL := printf "%s/ca" $certIssuerURL -}}
+{{- /*
+The iptables-cleanup preStop sleep fires last in the native-sidecar
+reverse-init order; its budget is what terminationGracePeriod leaves after
+the main proxy drain. A higher value gets SIGKILL'd mid-cleanup, leaking
+iptables chains and ipsets across pod restarts. Fail at template time so
+the misconfig is caught before the rollout starts.
+*/ -}}
+{{- $tgp := include "ratls-mesh.durationSeconds" .Values.terminationGracePeriod | int -}}
+{{- $drain := include "ratls-mesh.durationSeconds" .Values.drainTimeout | int -}}
+{{- $preStopSleep := int .Values.iptablesCleanup.preStopSleepSeconds -}}
+{{- $preStopUpperBound := sub $tgp $drain -}}
+{{- if le $tgp $drain }}
+{{- fail (printf "terminationGracePeriod (%s) must exceed drainTimeout (%s) to leave a preStop budget" .Values.terminationGracePeriod .Values.drainTimeout) }}
+{{- end }}
+{{- if lt $preStopSleep 0 }}
+{{- fail (printf "iptablesCleanup.preStopSleepSeconds must be ≥ 0, got %d" $preStopSleep) }}
+{{- end }}
+{{- if gt $preStopSleep $preStopUpperBound }}
+{{- fail (printf "iptablesCleanup.preStopSleepSeconds must be ≤ %d (terminationGracePeriod=%s minus drainTimeout=%s; higher values get SIGKILL'd mid-cleanup), got %d" $preStopUpperBound .Values.terminationGracePeriod .Values.drainTimeout $preStopSleep) }}
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -28,9 +48,13 @@ spec:
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
+      # iptables-sync must run in the host network namespace to intercept
+      # node-level pod traffic rather than only the mesh pod's own traffic.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       serviceAccountName: {{ include "ratls-mesh.fullname" . }}
       automountServiceAccountToken: true
-      terminationGracePeriodSeconds: 45
+      terminationGracePeriodSeconds: {{ $tgp }}
       securityContext:
         {{- if .Values.tpm.enabled }}
         supplementalGroups: {{ .Values.tpm.supplementalGroups | toJson }}
@@ -56,33 +80,8 @@ spec:
             medium: Memory
             sizeLimit: 1Mi
       initContainers:
-        - name: iptables-setup
-          image: {{ include "ratls-mesh.image" . }}
-          securityContext:
-            runAsNonRoot: false
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-            capabilities:
-              add:
-                - NET_ADMIN
-              drop:
-                - ALL
-          volumeMounts:
-            - name: xtables-lock
-              mountPath: /run/xtables.lock
-          command:
-            - /app/c8s
-            - ratls-mesh
-            - iptables-setup
-            - --outbound-port
-            - {{ .Values.ports.outbound | quote }}
-            - --inbound-port
-            - {{ .Values.ports.inbound | quote }}
-            - --uid
-            - {{ .Values.uid | quote }}
-            - --exclude-uids
-            - {{ .Values.excludeUids | quote }}
-        # Native sidecar (K8s 1.28+): iptables cleanup on shutdown
+        # Native sidecar (K8s 1.29+): cleanup runs last on shutdown because
+        # sidecars stop in reverse initContainer order.
         - name: iptables-cleanup
           restartPolicy: Always
           image: {{ include "ratls-mesh.image" . }}
@@ -111,14 +110,68 @@ spec:
                   - /bin/sh
                   - -c
                   - |
-                    /app/c8s ratls-mesh iptables-cleanup \
-                      --outbound-port {{ .Values.ports.outbound }} \
-                      --inbound-port {{ .Values.ports.inbound }} \
-                      --uid {{ .Values.uid }} \
-                      --exclude-uids {{ .Values.excludeUids }}
-                    sleep 5
+                    /app/c8s ratls-mesh iptables-cleanup
+                    sleep {{ .Values.iptablesCleanup.preStopSleepSeconds }}
           resources:
             {{- toYaml .Values.iptablesCleanup.resources | nindent 12 }}
+        - name: iptables-sync
+          restartPolicy: Always
+          image: {{ include "ratls-mesh.image" . }}
+          securityContext:
+            runAsNonRoot: false
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - NET_ADMIN
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: xtables-lock
+              mountPath: /run/xtables.lock
+            - name: tmp
+              mountPath: /tmp
+          command:
+            - /app/c8s
+            - ratls-mesh
+            - iptables-sync
+            - --outbound-port
+            - {{ .Values.ports.outbound | quote }}
+            - --uid
+            - {{ .Values.uid | quote }}
+            - --exclude-uids
+            - {{ .Values.excludeUids | quote }}
+            - --node-ip
+            - $(NODE_IP)
+            - --resync-period
+            - {{ .Values.iptablesSync.resyncPeriod | quote }}
+            - --watchdog-period
+            - {{ .Values.iptablesSync.watchdogPeriod | quote }}
+            - --ipset-maxelem
+            - {{ .Values.iptablesSync.ipsetMaxElem | quote }}
+            - --ready-file
+            - /tmp/ratls-iptables-ready
+            - --iptables-metrics-file
+            - /tmp/ratls-iptables-metrics.json
+            - --log-level
+            - {{ .Values.logLevel | quote }}
+          env:
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          startupProbe:
+            exec:
+              command:
+                - test
+                - -f
+                - /tmp/ratls-iptables-ready
+            periodSeconds: 1
+            failureThreshold: 60
+          resources:
+            {{- toYaml .Values.iptablesSync.resources | nindent 12 }}
       containers:
         - name: ratls-mesh
           image: {{ include "ratls-mesh.image" . }}
@@ -143,10 +196,16 @@ spec:
             - {{ .Values.platform | quote }}
             - --attestation-service-url
             - {{ $attestationServiceURL | quote }}
+            - --outbound-port
+            - {{ .Values.ports.outbound | quote }}
             - --inbound-port
             - {{ .Values.ports.inbound | quote }}
             - --health-port
             - {{ .Values.ports.health | quote }}
+            - --drain-timeout
+            - {{ .Values.drainTimeout | quote }}
+            - --iptables-metrics-file
+            - /tmp/ratls-iptables-metrics.json
             - --log-level
             - {{ .Values.logLevel | quote }}
             {{- if ne .Values.certTtl "4h" }}
@@ -201,7 +260,6 @@ spec:
           ports:
             - name: outbound
               containerPort: {{ .Values.ports.outbound }}
-              hostPort: {{ .Values.ports.outbound }}
               protocol: TCP
             - name: inbound
               containerPort: {{ .Values.ports.inbound }}
@@ -209,7 +267,6 @@ spec:
               protocol: TCP
             - name: health
               containerPort: {{ .Values.ports.health }}
-              hostPort: {{ .Values.ports.health }}
               protocol: TCP
           resources:
             requests:

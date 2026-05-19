@@ -1,3 +1,14 @@
+# --- CRITICAL OPERATIONAL REQUIREMENT ---
+# The ratls-mesh DaemonSet hardcodes hostNetwork: true and
+# dnsPolicy: ClusterFirstWithHostNet (see templates/daemonset.yaml). Both
+# are non-toggleable: iptables-sync must run in the host network namespace
+# to intercept pre-DNAT pod traffic at the node level, and the paired
+# dnsPolicy keeps in-cluster service DNS working from that netns. Removing
+# either breaks the routing model — there is no values knob because there
+# is no supported configuration without them. Confirm your cluster CNI and
+# any node-level NetworkPolicy/firewall posture is compatible before
+# deploying.
+
 image:
   repository: ghcr.io/lunal-dev/ratls-mesh
   # -- Image tag. Required: the chart does not pin a default; the consumer
@@ -43,6 +54,15 @@ assam:
 # Expected launch digests for measurement pinning (empty = accept any)
 measurements: []
 
+# Pod shutdown budget. The iptables-cleanup preStop hook fires last in the
+# native-sidecar reverse-init order, so its sleep upper bound must leave room
+# for the main proxy to drain first:
+#   preStopSleepSeconds ≤ terminationGracePeriod - drainTimeout
+# Durations use the Go single-unit form (Ns / Nm / Nh) and are parsed via
+# the ratls-mesh.durationSeconds helper for chart-bound arithmetic.
+terminationGracePeriod: "45s"
+drainTimeout: "30s"
+
 # Connection limits
 maxConns: 10000
 maxConnsPerSource: 0
@@ -77,6 +97,7 @@ resources:
 # Iptables cleanup sidecar resources
 iptablesSync:
   resyncPeriod: 30s
+  watchdogPeriod: 2s
   ipsetMaxElem: 262144
   resources:
     requests:
@@ -87,6 +108,12 @@ iptablesSync:
       memory: 128Mi
 
 iptablesCleanup:
+  # Seconds the preStop hook sleeps after running iptables-cleanup, giving
+  # kube-endpoints time to drop this node from Service backends so in-flight
+  # traffic stops landing here before the rules are gone. Bump on clusters
+  # with slow endpoint controllers; the upper bound is
+  # terminationGracePeriodSeconds (45) minus the main proxy's drain (~30s).
+  preStopSleepSeconds: 5
   resources:
     requests:
       cpu: 1m
@@ -111,10 +138,6 @@ probes:
     failureThreshold: 3
 
 # --- Policies ---
-
-networkPolicy:
-  enabled: false
-  monitoringNamespace: monitoring
 
 # TCP-only egress policy for application namespaces
 tcpEgressPolicy:

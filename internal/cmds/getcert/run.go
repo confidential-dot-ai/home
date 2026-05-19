@@ -29,6 +29,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/lunal-dev/c8s/internal/cmds/cmdsutil"
+	"github.com/lunal-dev/c8s/internal/fileutil"
 	"github.com/lunal-dev/c8s/pkg/attestclient"
 	"github.com/lunal-dev/c8s/pkg/certutil"
 )
@@ -470,7 +471,7 @@ func writeOutputs(cfg config, keyPEM []byte, result attestclient.CertificateResu
 		if err != nil {
 			return fmt.Errorf("--key-mode: %w", err)
 		}
-		if err := writeFileAtomic(cfg.KeyOutPath, keyPEM, keyMode); err != nil {
+		if err := fileutil.WriteAtomic(cfg.KeyOutPath, keyPEM, keyMode); err != nil {
 			return fmt.Errorf("failed to write key to %s: %w", cfg.KeyOutPath, err)
 		}
 		slog.Info("private key written", "path", cfg.KeyOutPath)
@@ -479,7 +480,7 @@ func writeOutputs(cfg config, keyPEM []byte, result attestclient.CertificateResu
 	}
 
 	if cfg.OutPath != "" {
-		if err := writeFileAtomic(cfg.OutPath, []byte(result.Certificate), 0644); err != nil {
+		if err := fileutil.WriteAtomic(cfg.OutPath, []byte(result.Certificate), 0644); err != nil {
 			return fmt.Errorf("failed to write cert to %s: %w", cfg.OutPath, err)
 		}
 		slog.Info("certificate written", "path", cfg.OutPath)
@@ -497,7 +498,7 @@ func writeOutputs(cfg config, keyPEM []byte, result attestclient.CertificateResu
 			return fmt.Errorf("marshal discovery metadata: %w", err)
 		}
 		data = append(data, '\n')
-		if err := writeFileAtomic(cfg.DiscoveryOutPath, data, 0644); err != nil {
+		if err := fileutil.WriteAtomic(cfg.DiscoveryOutPath, data, 0644); err != nil {
 			return fmt.Errorf("failed to write discovery metadata to %s: %w", cfg.DiscoveryOutPath, err)
 		}
 		slog.Info("discovery metadata written", "path", cfg.DiscoveryOutPath)
@@ -539,39 +540,6 @@ func discoveryPublicTLSMode(mode string) string {
 		return "cds"
 	}
 	return mode
-}
-
-func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
-	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
 }
 
 type fileSnapshot struct {

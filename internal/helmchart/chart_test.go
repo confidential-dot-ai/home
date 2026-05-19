@@ -2,19 +2,144 @@ package helmchart
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
 	webhook "github.com/lunal-dev/c8s/internal/webhook"
+	"gopkg.in/yaml.v3"
 	admissionregv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	sigsyaml "sigs.k8s.io/yaml"
 )
+
+// helmFailMessage extracts the user-visible message from a `helm template`
+// failure so tests can parse a typed value out of it instead of grepping
+// the whole stderr blob.
+var helmFailRE = regexp.MustCompile(`execution error at \([^)]+\): (.+?)\n`)
+
+func helmFailMessage(t *testing.T, out string) string {
+	t.Helper()
+	m := helmFailRE.FindStringSubmatch(out)
+	if len(m) < 2 {
+		t.Fatalf("no helm fail message in output:\n%s", out)
+	}
+	return m[1]
+}
+
+// preStopBoundFailure captures the structured shape of the daemonset
+// preStop fail-checks so tests can assert on typed fields instead of
+// substring-matching the rendered error.
+type preStopBoundFailure struct {
+	Cmp   string // "le" for "≤", "ge" for "≥"
+	Bound int
+	Got   int
+}
+
+var preStopBoundRE = regexp.MustCompile(`iptablesCleanup\.preStopSleepSeconds must be ([≤≥]) (-?\d+).*got (-?\d+)`)
+
+func parsePreStopBoundFailure(t *testing.T, out string) preStopBoundFailure {
+	t.Helper()
+	msg := helmFailMessage(t, out)
+	m := preStopBoundRE.FindStringSubmatch(msg)
+	if len(m) != 4 {
+		t.Fatalf("preStop bound regex did not match %q", msg)
+	}
+	cmp := "ge"
+	if m[1] == "≤" {
+		cmp = "le"
+	}
+	bound, err := strconv.Atoi(m[2])
+	if err != nil {
+		t.Fatalf("bound %q is not an int: %v", m[2], err)
+	}
+	got, err := strconv.Atoi(m[3])
+	if err != nil {
+		t.Fatalf("got %q is not an int: %v", m[3], err)
+	}
+	return preStopBoundFailure{Cmp: cmp, Bound: bound, Got: got}
+}
+
+// gracePeriodBudgetFailure: the durations the chart says don't leave a
+// preStop window.
+type gracePeriodBudgetFailure struct {
+	GracePeriod string
+	Drain       string
+}
+
+var gracePeriodBudgetRE = regexp.MustCompile(`terminationGracePeriod \(([^)]+)\) must exceed drainTimeout \(([^)]+)\)`)
+
+func parseGracePeriodBudgetFailure(t *testing.T, out string) gracePeriodBudgetFailure {
+	t.Helper()
+	msg := helmFailMessage(t, out)
+	m := gracePeriodBudgetRE.FindStringSubmatch(msg)
+	if len(m) != 3 {
+		t.Fatalf("grace-period budget regex did not match %q", msg)
+	}
+	return gracePeriodBudgetFailure{GracePeriod: m[1], Drain: m[2]}
+}
+
+// durationFormatFailure classifies the two distinct rejection paths in the
+// duration helper so a future refactor that conflates them flags here.
+type durationFormatFailure struct {
+	Value  string
+	Reason string // "no-unit" | "non-integer"
+}
+
+var (
+	durationNoUnitRE     = regexp.MustCompile(`duration "([^"]+)" must end with h, m, or s`)
+	durationNonIntegerRE = regexp.MustCompile(`duration "([^"]+)" must be a positive integer`)
+)
+
+func parseDurationFormatFailure(t *testing.T, out string) durationFormatFailure {
+	t.Helper()
+	msg := helmFailMessage(t, out)
+	if m := durationNoUnitRE.FindStringSubmatch(msg); len(m) == 2 {
+		return durationFormatFailure{Value: m[1], Reason: "no-unit"}
+	}
+	if m := durationNonIntegerRE.FindStringSubmatch(msg); len(m) == 2 {
+		return durationFormatFailure{Value: m[1], Reason: "non-integer"}
+	}
+	t.Fatalf("duration-format regex did not match %q", msg)
+	return durationFormatFailure{}
+}
+
+// containerArgs returns the args of the named container, searching main and
+// init containers. Fails the test if no such container exists.
+func containerArgs(t *testing.T, ds *appsv1.DaemonSet, name string) []string {
+	t.Helper()
+	for _, c := range ds.Spec.Template.Spec.Containers {
+		if c.Name == name {
+			return c.Args
+		}
+	}
+	for _, c := range ds.Spec.Template.Spec.InitContainers {
+		if c.Name == name {
+			return c.Args
+		}
+	}
+	t.Fatalf("container %q not found in DaemonSet", name)
+	return nil
+}
+
+// containerArgValue returns (value, true) for `--flag value`, or ("", false)
+// if the flag isn't present.
+func containerArgValue(args []string, flag string) (string, bool) {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1], true
+		}
+	}
+	return "", false
+}
 
 func TestChartDefaultRendersReplacementStack(t *testing.T) {
 	out, err := helmTemplate(t)
@@ -52,6 +177,565 @@ func TestChartDefaultRendersReplacementStack(t *testing.T) {
 		if !slices.Contains(args, want) {
 			t.Fatalf("operator args missing %q\n%v", want, args)
 		}
+	}
+}
+
+func TestChartRendersRATLSHostRoutingDefaults(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	ds := findRATLSMeshDaemonSet(t, out)
+
+	sync, ok := findContainer(ds.Spec.Template.Spec.InitContainers, "iptables-sync")
+	if !ok {
+		t.Fatalf("iptables-sync init container missing; have %v", containerNames(ds.Spec.Template.Spec.InitContainers))
+	}
+	for _, pair := range [][2]string{
+		{"--node-ip", "$(NODE_IP)"},
+		{"--resync-period", "30s"},
+		{"--watchdog-period", "2s"},
+		{"--ipset-maxelem", "262144"},
+		{"--ready-file", "/tmp/ratls-iptables-ready"},
+		{"--iptables-metrics-file", "/tmp/ratls-iptables-metrics.json"},
+	} {
+		if !argvContainsFlagValue(sync.Command, pair[0], pair[1]) {
+			t.Errorf("iptables-sync command missing %s %s; command=%q", pair[0], pair[1], sync.Command)
+		}
+	}
+	if slices.Contains(sync.Command, "--pod-cidrs") {
+		t.Errorf("iptables-sync must not require static --pod-cidrs; command=%q", sync.Command)
+	}
+
+	mesh, ok := findContainer(ds.Spec.Template.Spec.Containers, "ratls-mesh")
+	if !ok {
+		t.Fatalf("ratls-mesh container missing; have %v", containerNames(ds.Spec.Template.Spec.Containers))
+	}
+	if !argvContainsFlagValue(mesh.Args, "--iptables-metrics-file", "/tmp/ratls-iptables-metrics.json") {
+		t.Errorf("ratls-mesh args missing the shared iptables metrics file flag; args=%q", mesh.Args)
+	}
+
+	if hp, ok := containerHostPort(mesh, "inbound"); !ok || hp != 15006 {
+		t.Errorf("ratls-mesh inbound port must publish hostPort 15006; got %d (found=%v)", hp, ok)
+	}
+	for _, banned := range []int32{15001, 15021} {
+		if containers := containersExposingHostPort(ds, banned); len(containers) > 0 {
+			t.Errorf("hostPort %d must not be exposed; exposed by %v", banned, containers)
+		}
+	}
+
+	for _, c := range allContainers(ds) {
+		for name := range c.Resources.Requests {
+			if strings.Contains(string(name), "lunal.dev/tpm") {
+				t.Errorf("container %q requests local TPM resource %q by default", c.Name, name)
+			}
+		}
+		for name := range c.Resources.Limits {
+			if strings.Contains(string(name), "lunal.dev/tpm") {
+				t.Errorf("container %q limits local TPM resource %q by default", c.Name, name)
+			}
+		}
+	}
+
+	if kinds := renderedKinds(t, out); kinds["NetworkPolicy"] > 0 {
+		t.Errorf("ratls host routing must not render NetworkPolicy for hostNetwork pods; got %d", kinds["NetworkPolicy"])
+	}
+}
+
+// argvContainsFlagValue reports whether argv has `flag` immediately followed
+// by `value`.
+func argvContainsFlagValue(argv []string, flag, value string) bool {
+	for i, a := range argv {
+		if a == flag && i+1 < len(argv) && argv[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func containerHostPort(c corev1.Container, portName string) (int32, bool) {
+	for _, p := range c.Ports {
+		if p.Name == portName {
+			return p.HostPort, true
+		}
+	}
+	return 0, false
+}
+
+func containersExposingHostPort(ds *appsv1.DaemonSet, port int32) []string {
+	var hits []string
+	for _, c := range allContainers(ds) {
+		for _, p := range c.Ports {
+			if p.HostPort == port {
+				hits = append(hits, c.Name)
+				break
+			}
+		}
+	}
+	return hits
+}
+
+func allContainers(ds *appsv1.DaemonSet) []corev1.Container {
+	out := make([]corev1.Container, 0, len(ds.Spec.Template.Spec.InitContainers)+len(ds.Spec.Template.Spec.Containers))
+	out = append(out, ds.Spec.Template.Spec.InitContainers...)
+	out = append(out, ds.Spec.Template.Spec.Containers...)
+	return out
+}
+
+// iterateManifests calls fn for each non-nil YAML document in helmOut,
+// using yaml.NewDecoder so a "---" inside a block scalar can't fool the
+// split. The document is re-marshalled to YAML bytes so fn can pass it
+// to sigsyaml.Unmarshal for typed decoding. fn returning true stops
+// iteration.
+func iterateManifests(t *testing.T, helmOut string, fn func(doc []byte) bool) {
+	t.Helper()
+	decoder := yaml.NewDecoder(strings.NewReader(helmOut))
+	for {
+		var raw any
+		err := decoder.Decode(&raw)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			t.Fatalf("decode helm output: %v", err)
+		}
+		if raw == nil {
+			continue
+		}
+		b, err := yaml.Marshal(raw)
+		if err != nil {
+			t.Fatalf("re-marshal manifest: %v", err)
+		}
+		if fn(b) {
+			return
+		}
+	}
+}
+
+// renderedKinds counts each manifest kind across a helm template output.
+func renderedKinds(t *testing.T, helmOut string) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	iterateManifests(t, helmOut, func(doc []byte) bool {
+		var head struct {
+			Kind string `json:"kind"`
+		}
+		if err := sigsyaml.Unmarshal(doc, &head); err == nil && head.Kind != "" {
+			out[head.Kind]++
+		}
+		return false
+	})
+	return out
+}
+
+// Two silent-break risks in a daemonset.yaml refactor:
+//  1. iptables-{cleanup,sync} must stay native sidecars (restartPolicy:
+//     Always); dropping that demotes them to one-shot init containers and
+//     the cleanup preStop never fires, leaking rules across restarts.
+//  2. iptables-cleanup must be the FIRST initContainer; native sidecars
+//     terminate in reverse-init order, so a swap with iptables-sync stops
+//     cleanup before sync loses its chains.
+func TestChartRATLSNativeSidecarShape(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	ds := findRATLSMeshDaemonSet(t, out)
+
+	// hostNetwork + dnsPolicy are part of the routing contract: iptables-sync
+	// must run in the host netns to see pre-DNAT pod traffic, and the
+	// matching dnsPolicy keeps in-cluster service DNS working from that
+	// netns. A refactor that templated either to a value and accidentally
+	// toggled it via overlay defaults would still match the substring check
+	// in TestChartRendersRATLSHostRoutingDefaults; assert against the typed
+	// PodSpec so the contract is unambiguous.
+	if !ds.Spec.Template.Spec.HostNetwork {
+		t.Errorf("ratls-mesh DaemonSet must set hostNetwork: true; got %v", ds.Spec.Template.Spec.HostNetwork)
+	}
+	if got := ds.Spec.Template.Spec.DNSPolicy; got != corev1.DNSClusterFirstWithHostNet {
+		t.Errorf("ratls-mesh DaemonSet must set dnsPolicy: ClusterFirstWithHostNet (paired with hostNetwork); got %q", got)
+	}
+
+	init := ds.Spec.Template.Spec.InitContainers
+	if len(init) < 2 {
+		t.Fatalf("expected at least 2 initContainers (iptables-cleanup, iptables-sync); got %d", len(init))
+	}
+	if init[0].Name != "iptables-cleanup" {
+		t.Fatalf("first init container must be iptables-cleanup so its preStop fires last on shutdown; got %q", init[0].Name)
+	}
+
+	for _, name := range []string{"iptables-cleanup", "iptables-sync"} {
+		c, ok := findContainer(init, name)
+		if !ok {
+			t.Fatalf("init container %q not found in %v", name, containerNames(init))
+		}
+		if c.RestartPolicy == nil || *c.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+			t.Errorf("init container %q must declare restartPolicy: Always (native sidecar contract); got %v", name, c.RestartPolicy)
+		}
+		if !hasCapability(c, "NET_ADMIN") {
+			t.Errorf("init container %q must hold NET_ADMIN to manage iptables/ipset; caps=%+v", name, c.SecurityContext)
+		}
+		// The sidecars run as root for iptables/ipset but are bounded by
+		// allowPrivilegeEscalation: false and the runtime-default seccomp
+		// profile. Both are easy to omit silently in a refactor and turn the
+		// containers into a full-root attack surface; pin them.
+		sc := c.SecurityContext
+		if sc == nil || sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+			t.Errorf("init container %q must set allowPrivilegeEscalation: false; got %+v", name, sc)
+		}
+		if sc == nil || sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+			t.Errorf("init container %q must set seccompProfile.type: RuntimeDefault; got %+v", name, sc.SeccompProfile)
+		}
+	}
+
+	sync, ok := findContainer(init, "iptables-sync")
+	if !ok {
+		t.Fatalf("iptables-sync init container missing; initContainers=%v", containerNames(init))
+	}
+	if sync.StartupProbe == nil || sync.StartupProbe.Exec == nil {
+		t.Fatalf("iptables-sync must expose a startupProbe so the main proxy waits for the ready file; got %+v", sync.StartupProbe)
+	}
+	if got := strings.Join(sync.StartupProbe.Exec.Command, " "); !strings.Contains(got, "/tmp/ratls-iptables-ready") {
+		t.Errorf("iptables-sync startupProbe should check /tmp/ratls-iptables-ready; got %q", got)
+	}
+
+	// The entire teardown contract hinges on the iptables-cleanup preStop
+	// hook firing last in the reverse-init-order stop sequence. A future
+	// refactor that drops the lifecycle stanza or renames the subcommand
+	// would silently leak iptables rules and ipsets across pod restarts —
+	// catch that here instead of in production.
+	cleanup := init[0]
+	if cleanup.Lifecycle == nil || cleanup.Lifecycle.PreStop == nil || cleanup.Lifecycle.PreStop.Exec == nil {
+		t.Fatalf("iptables-cleanup must declare a preStop exec hook; got %+v", cleanup.Lifecycle)
+	}
+	preStop := strings.Join(cleanup.Lifecycle.PreStop.Exec.Command, " ")
+	if !strings.Contains(preStop, "ratls-mesh iptables-cleanup") {
+		t.Errorf("iptables-cleanup preStop must invoke 'ratls-mesh iptables-cleanup'; got %q", preStop)
+	}
+}
+
+// TestChartRATLSKubeVersionPinned guards the lower bound that makes the
+// native-sidecar contract safe by default: Kubernetes 1.28 exposed
+// restartPolicy: Always on initContainers behind the SidecarContainers
+// feature gate, while 1.29 enables that gate by default. If the gate is off,
+// iptables-cleanup is invalid as a native sidecar, its preStop cannot run,
+// and the host can leak managed chains/ipsets across pod restarts. Helm
+// rejects older clusters via the kubeVersion constraint; keep the constraint
+// pinned here so an accidental relaxation cannot slip in via Chart.yaml.
+func TestChartRATLSKubeVersionPinned(t *testing.T) {
+	const path = "c8s/charts/ratls-mesh/Chart.yaml"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var chart struct {
+		KubeVersion string `json:"kubeVersion"`
+	}
+	if err := sigsyaml.Unmarshal(raw, &chart); err != nil {
+		t.Fatalf("decode %s: %v", path, err)
+	}
+	const want = ">=1.29.0-0"
+	if chart.KubeVersion != want {
+		t.Fatalf("ratls-mesh Chart.yaml kubeVersion = %q; want %q (native sidecars require SidecarContainers default-on behavior from k8s 1.29+; relaxing this leaks iptables/ipset state across pod restarts on older clusters)", chart.KubeVersion, want)
+	}
+}
+
+func findRATLSMeshDaemonSet(t *testing.T, helmOut string) *appsv1.DaemonSet {
+	t.Helper()
+	var ds *appsv1.DaemonSet
+	iterateManifests(t, helmOut, func(doc []byte) bool {
+		var head struct {
+			Kind     string `json:"kind"`
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		}
+		if err := sigsyaml.Unmarshal(doc, &head); err != nil ||
+			head.Kind != "DaemonSet" ||
+			!strings.Contains(head.Metadata.Name, "ratls-mesh") {
+			return false
+		}
+		var decoded appsv1.DaemonSet
+		if err := sigsyaml.Unmarshal(doc, &decoded); err != nil {
+			t.Fatalf("decode ratls-mesh DaemonSet: %v\n%s", err, doc)
+		}
+		ds = &decoded
+		return true
+	})
+	if ds == nil {
+		t.Fatalf("ratls-mesh DaemonSet not found in helm template output\n%s", helmOut)
+	}
+	return ds
+}
+
+// findContainer mirrors findEnv in internal/webhook/pod_mutator_test.go:
+// return (value, ok) so callers decide how to report the miss.
+func findContainer(containers []corev1.Container, name string) (corev1.Container, bool) {
+	for _, c := range containers {
+		if c.Name == name {
+			return c, true
+		}
+	}
+	return corev1.Container{}, false
+}
+
+func containerNames(containers []corev1.Container) []string {
+	names := make([]string, 0, len(containers))
+	for _, c := range containers {
+		names = append(names, c.Name)
+	}
+	return names
+}
+
+func hasCapability(c corev1.Container, want corev1.Capability) bool {
+	if c.SecurityContext == nil || c.SecurityContext.Capabilities == nil {
+		return false
+	}
+	for _, got := range c.SecurityContext.Capabilities.Add {
+		if got == want {
+			return true
+		}
+	}
+	return false
+}
+
+// PrometheusRule's types live in a separate go module (prometheus-operator)
+// the chart does not otherwise depend on; decoding into a local typed shim
+// is enough to assert the rule contract without pulling that dep in just
+// for tests.
+type prometheusRule struct {
+	Spec struct {
+		Groups []struct {
+			Name  string `json:"name"`
+			Rules []struct {
+				Alert       string            `json:"alert"`
+				Expr        string            `json:"expr"`
+				For         string            `json:"for"`
+				Labels      map[string]string `json:"labels"`
+				Annotations map[string]string `json:"annotations"`
+			} `json:"rules"`
+		} `json:"groups"`
+	} `json:"spec"`
+}
+
+func findRATLSMeshPrometheusRule(t *testing.T, helmOut string) prometheusRule {
+	t.Helper()
+	var found prometheusRule
+	var ok bool
+	iterateManifests(t, helmOut, func(doc []byte) bool {
+		var head struct {
+			Kind     string `json:"kind"`
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		}
+		if err := sigsyaml.Unmarshal(doc, &head); err != nil ||
+			head.Kind != "PrometheusRule" ||
+			!strings.Contains(head.Metadata.Name, "ratls-mesh") {
+			return false
+		}
+		var rule prometheusRule
+		if err := sigsyaml.Unmarshal(doc, &rule); err != nil {
+			t.Fatalf("decode ratls-mesh PrometheusRule: %v\n%s", err, doc)
+		}
+		found = rule
+		ok = true
+		return true
+	})
+	if !ok {
+		t.Fatalf("ratls-mesh PrometheusRule not found in helm template output\n%s", helmOut)
+	}
+	return found
+}
+
+// TestChartRATLSRoutingAlerts pins routing-path alerts that fire on signals
+// downstream consumers should not have to reconstruct by hand: a wedged
+// iptables-sync sidecar (its in-process counters stop publishing), local CIDR
+// discovery failure (inbound pod delivery fails closed), and direct dials to
+// :15001 outside the REDIRECT path. Drop any alert and a refactor of
+// prometheus-rules.yaml could silently lose the corresponding production
+// signal.
+func TestChartRATLSRoutingAlerts(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "ratls-mesh.prometheusRules.enabled=true")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	rule := findRATLSMeshPrometheusRule(t, out)
+
+	want := map[string]string{
+		"RATLSMeshIptablesSyncWedged":       "ratls_mesh_iptables_metrics_file_updated_at_seconds",
+		"RATLSMeshLocalCIDRDiscoveryFailed": "ratls_mesh_resolver_local_cidrs == 0",
+		"RATLSMeshOutboundDirectDial":       `reason="host_addr"`,
+		"RATLSMeshIptablesIPSetOverflow":    "ratls_mesh_iptables_ipset_overflow_total",
+		"RATLSMeshJumpPositionViolations":   "ratls_mesh_iptables_jump_position_violations_total",
+	}
+	got := make(map[string]string)
+	for _, g := range rule.Spec.Groups {
+		for _, r := range g.Rules {
+			if _, ok := want[r.Alert]; ok {
+				got[r.Alert] = r.Expr
+			}
+		}
+	}
+	for alert, exprSubstr := range want {
+		expr, ok := got[alert]
+		if !ok {
+			t.Errorf("alert %q missing from rendered PrometheusRule", alert)
+			continue
+		}
+		if !strings.Contains(expr, exprSubstr) {
+			t.Errorf("alert %q expr does not reference %q: got %q", alert, exprSubstr, expr)
+		}
+	}
+}
+
+// terminationGracePeriod minus drainTimeout (both Go-style durations) is the
+// budget left for the iptables-cleanup preStop sleep. A higher value is
+// silently truncated at runtime by SIGKILL, leaking managed chains/ipsets
+// across the pod restart. The chart fails the install instead of letting
+// that misconfig ship. The bound is derived, not hardcoded, so changes to
+// either underlying value reshape it automatically.
+func TestChartRejectsExcessivePreStopSleep(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "ratls-mesh.iptablesCleanup.preStopSleepSeconds=30")
+	if err == nil {
+		t.Fatalf("helm template succeeded, want preStopSleepSeconds upper-bound failure\n%s", out)
+	}
+	failure := parsePreStopBoundFailure(t, out)
+	if want := (preStopBoundFailure{Cmp: "le", Bound: 15, Got: 30}); failure != want {
+		t.Fatalf("preStop upper-bound failure = %+v, want %+v", failure, want)
+	}
+}
+
+func TestChartRejectsNegativePreStopSleep(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "ratls-mesh.iptablesCleanup.preStopSleepSeconds=-1")
+	if err == nil {
+		t.Fatalf("helm template succeeded, want preStopSleepSeconds lower-bound failure\n%s", out)
+	}
+	failure := parsePreStopBoundFailure(t, out)
+	if want := (preStopBoundFailure{Cmp: "ge", Bound: 0, Got: -1}); failure != want {
+		t.Fatalf("preStop lower-bound failure = %+v, want %+v", failure, want)
+	}
+}
+
+func TestChartAcceptsPreStopSleepAtBoundary(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "ratls-mesh.iptablesCleanup.preStopSleepSeconds=15")
+	if err != nil {
+		t.Fatalf("helm template at boundary should succeed: %v\n%s", err, out)
+	}
+	ds := findRATLSMeshDaemonSet(t, out)
+	cleanup, ok := findContainer(ds.Spec.Template.Spec.InitContainers, "iptables-cleanup")
+	if !ok {
+		t.Fatalf("iptables-cleanup init container missing")
+	}
+	if cleanup.Lifecycle == nil || cleanup.Lifecycle.PreStop == nil || cleanup.Lifecycle.PreStop.Exec == nil {
+		t.Fatalf("iptables-cleanup preStop exec hook missing: %+v", cleanup.Lifecycle)
+	}
+	// The preStop is `/bin/sh -c "<script>"` and the script is the last
+	// element; assert the rendered sleep value matches the boundary.
+	script := cleanup.Lifecycle.PreStop.Exec.Command[len(cleanup.Lifecycle.PreStop.Exec.Command)-1]
+	if !regexp.MustCompile(`(?m)^sleep 15$`).MatchString(script) {
+		t.Fatalf("preStop script did not render `sleep 15` at the boundary:\n%s", script)
+	}
+}
+
+// Tuning terminationGracePeriod or drainTimeout must reshape the preStop
+// bound automatically — otherwise the bound goes stale silently once an
+// operator changes either knob. Exercising mixed unit forms (h, m, s) also
+// pins that the durationSeconds helper handles each correctly.
+func TestChartPreStopBoundFollowsGracePeriodAndDrain(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set-string", "ratls-mesh.terminationGracePeriod=2m",
+		"--set-string", "ratls-mesh.drainTimeout=60s",
+		"--set", "ratls-mesh.iptablesCleanup.preStopSleepSeconds=45",
+	)
+	if err != nil {
+		t.Fatalf("helm template at (tgp=2m, drain=60s, sleep=45) should succeed: %v\n%s", err, out)
+	}
+	ds := findRATLSMeshDaemonSet(t, out)
+	if ds.Spec.Template.Spec.TerminationGracePeriodSeconds == nil {
+		t.Fatalf("DaemonSet.terminationGracePeriodSeconds is nil")
+	}
+	if got := *ds.Spec.Template.Spec.TerminationGracePeriodSeconds; got != 120 {
+		t.Errorf("terminationGracePeriodSeconds = %d, want 120 (from 2m)", got)
+	}
+	args := containerArgs(t, ds, "ratls-mesh")
+	if got, ok := containerArgValue(args, "--drain-timeout"); !ok || got != "60s" {
+		t.Errorf("--drain-timeout = (%q, %v), want (\"60s\", true)", got, ok)
+	}
+
+	// Same knobs, sleep one above the derived bound — must fail.
+	out, err = helmTemplate(t,
+		"--set-string", "ratls-mesh.terminationGracePeriod=2m",
+		"--set-string", "ratls-mesh.drainTimeout=60s",
+		"--set", "ratls-mesh.iptablesCleanup.preStopSleepSeconds=61",
+	)
+	if err == nil {
+		t.Fatalf("helm template succeeded above derived bound, want failure\n%s", out)
+	}
+	failure := parsePreStopBoundFailure(t, out)
+	if want := (preStopBoundFailure{Cmp: "le", Bound: 60, Got: 61}); failure != want {
+		t.Fatalf("derived-bound failure = %+v, want %+v", failure, want)
+	}
+}
+
+// drainTimeout ≥ terminationGracePeriod leaves zero preStop budget — even a
+// 0-second sleep can race shutdown. Fail rather than render a useless
+// DaemonSet.
+func TestChartRejectsZeroPreStopBudget(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set-string", "ratls-mesh.terminationGracePeriod=30s",
+		"--set-string", "ratls-mesh.drainTimeout=30s",
+	)
+	if err == nil {
+		t.Fatalf("helm template succeeded with zero preStop budget, want failure\n%s", out)
+	}
+	failure := parseGracePeriodBudgetFailure(t, out)
+	if want := (gracePeriodBudgetFailure{GracePeriod: "30s", Drain: "30s"}); failure != want {
+		t.Fatalf("zero-budget failure = %+v, want %+v", failure, want)
+	}
+}
+
+// Reject duration formats the helper intentionally doesn't support so a
+// typo doesn't silently degrade the bound arithmetic via sprig's lenient
+// int parsing (which would otherwise read "1m30s" as 1 second).
+func TestChartRejectsCompoundDurations(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set-string", "ratls-mesh.drainTimeout=1m30s",
+	)
+	if err == nil {
+		t.Fatalf("helm template succeeded for compound duration, want failure\n%s", out)
+	}
+	failure := parseDurationFormatFailure(t, out)
+	if want := (durationFormatFailure{Value: "1m30s", Reason: "non-integer"}); failure != want {
+		t.Fatalf("compound-duration failure = %+v, want %+v", failure, want)
+	}
+}
+
+// Pin the suffix-only rejection separately so a future refactor of the
+// helper can't remove the unit check without flagging in tests.
+func TestChartRejectsUnitlessDuration(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set-string", "ratls-mesh.drainTimeout=30",
+	)
+	if err == nil {
+		t.Fatalf("helm template succeeded for unitless duration, want failure\n%s", out)
+	}
+	failure := parseDurationFormatFailure(t, out)
+	if want := (durationFormatFailure{Value: "30", Reason: "no-unit"}); failure != want {
+		t.Fatalf("unitless-duration failure = %+v, want %+v", failure, want)
+	}
+}
+
+func TestChartRendersRATLSCustomOutboundPortConsistently(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "ratls-mesh.ports.outbound=16001")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if got := strings.Count(out, "- --outbound-port\n            - \"16001\""); got != 2 {
+		t.Fatalf("expected iptables-sync and ratls-mesh to use outbound port 16001, got %d occurrences\n%s", got, out)
+	}
+	if strings.Contains(out, "- --outbound-port\n            - \"15001\"") {
+		t.Fatalf("ratls-mesh rendered the default outbound port despite override\n%s", out)
 	}
 }
 

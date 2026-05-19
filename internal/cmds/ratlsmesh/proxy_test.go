@@ -1,3 +1,5 @@
+//go:build linux
+
 package ratlsmesh
 
 import (
@@ -11,8 +13,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/lunal-dev/c8s/pkg/ratls"
 )
+
+// histogramSampleCount returns h's observation count via the dto protocol;
+// testutil.ToFloat64 doesn't work on Histograms.
+func histogramSampleCount(h prometheus.Observer) uint64 {
+	hist, ok := h.(prometheus.Histogram)
+	if !ok {
+		return 0
+	}
+	pb := &dto.Metric{}
+	if err := hist.Write(pb); err != nil {
+		return 0
+	}
+	return pb.Histogram.GetSampleCount()
+}
 
 // staticResolver treats loopback and the node's own IP as local;
 // everything else is remote (using the pod IP as the node address).
@@ -21,14 +41,23 @@ type staticResolver struct {
 	nodeIP string
 }
 
-func (r *staticResolver) Resolve(podIP string) (string, bool, error) {
+func (r *staticResolver) Resolve(podIP string) (string, bool) {
 	if podIP == r.nodeIP || podIP == "127.0.0.1" || podIP == "::1" {
-		return r.nodeIP, true, nil
+		return r.nodeIP, true
 	}
-	return podIP, false, nil
+	return podIP, false
 }
 
-func (r *staticResolver) ValidateLocalDest(ip string) bool { return true }
+func (r *staticResolver) ValidateOutboundDest(ip string) (bool, string) { return true, "" }
+func (r *staticResolver) ValidateLocalDest(ip string) bool              { return true }
+
+type fixedRemoteResolver struct {
+	nodeIP string
+}
+
+func (r *fixedRemoteResolver) Resolve(string) (string, bool)              { return r.nodeIP, false }
+func (r *fixedRemoteResolver) ValidateOutboundDest(string) (bool, string) { return true, "" }
+func (r *fixedRemoteResolver) ValidateLocalDest(string) bool              { return true }
 
 // fakeAttestFunc builds a fake SNP report from the hex-encoded REPORTDATA.
 // Suitable for TLS plumbing tests without AMD hardware.
@@ -79,6 +108,21 @@ func testLogger() *slog.Logger {
 
 func testMetrics() *metrics {
 	return newMetrics()
+}
+
+func assertEventually(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if cond() {
+		return
+	}
+	t.Fatal(msg)
 }
 
 // startBackend creates a TCP server that echoes "hello from <name>".
@@ -222,12 +266,25 @@ func TestInboundHandler(t *testing.T) {
 
 func TestOutboundLocal(t *testing.T) {
 	backend := startBackend(t, "local-pod")
+	serverTLS, clientTLS := testTLSConfigs(t)
 
 	host, _, _ := net.SplitHostPort(backend)
 
+	inboundLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inboundLn.Close()
+	inboundTLSLn := tls.NewListener(inboundLn, serverTLS)
+	_, inboundPortStr, _ := net.SplitHostPort(inboundLn.Addr().String())
+	var inboundPort int
+	fmt.Sscanf(inboundPortStr, "%d", &inboundPort)
+
 	p := &Proxy{
 		nodeIP:      host,
-		inboundPort: 15006,
+		inboundPort: inboundPort,
+		serverTLS:   serverTLS,
+		clientTLS:   clientTLS,
 		resolver:    &staticResolver{nodeIP: host},
 		origDstFunc: func(_ net.Conn) (string, error) { return backend, nil },
 		logger:      testLogger(),
@@ -236,6 +293,16 @@ func TestOutboundLocal(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	go func() {
+		for {
+			conn, err := inboundTLSLn.Accept()
+			if err != nil {
+				return
+			}
+			go p.handleInbound(ctx, conn)
+		}
+	}()
 
 	// Start outbound listener.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -271,6 +338,9 @@ func TestOutboundLocal(t *testing.T) {
 	if string(got) != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
+	assertEventually(t, time.Second, func() bool {
+		return histogramSampleCount(p.metrics.tlsHandshakeDuration.WithLabelValues("outbound_same_node", "self-signed")) > 0
+	}, "expected same-node outbound path to perform a RA-TLS handshake")
 }
 
 func TestEndToEnd(t *testing.T) {
@@ -309,17 +379,14 @@ func TestEndToEnd(t *testing.T) {
 		nodeIP:      "1.1.1.1", // Different from backend host → treated as remote.
 		inboundPort: node2Port,
 		clientTLS:   clientTLS,
-		resolver: &staticResolver{
-			nodeIP: "1.1.1.1",
-		},
+		resolver:    &fixedRemoteResolver{nodeIP: "127.0.0.1"},
 		origDstFunc: func(_ net.Conn) (string, error) { return backend, nil },
 		logger:      testLogger(),
 		metrics:     testMetrics(),
 	}
 
-	// The resolver returns backendHost as the "node IP" for the remote pod.
-	// Since backendHost != nodeIP ("1.1.1.1"), it's treated as remote.
-	// The outbound handler will dial backendHost:node2Port via RA-TLS.
+	// The resolver returns node2's listener host for the remote pod. The
+	// outbound handler will dial 127.0.0.1:node2Port via RA-TLS.
 
 	node1Ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -574,8 +641,9 @@ func TestGracefulDrain(t *testing.T) {
 	fmt.Fprintf(conn, "%s\n", backend)
 	fmt.Fprint(conn, "drain-test")
 
-	// Wait for the handler to complete the backend dial and start piping.
-	// Without this, DialContext would fail on the already-cancelled context.
+	// Sleep covers the window between accept and DialContext so cancel()
+	// doesn't race the dial; no mid-handler metric advances early enough
+	// to gate on.
 	time.Sleep(100 * time.Millisecond)
 
 	// Cancel context (simulate shutdown) while connection is active.
@@ -620,11 +688,7 @@ func TestStaticResolver(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		nodeIP, local, err := r.Resolve(tt.podIP)
-		if err != nil {
-			t.Errorf("Resolve(%q) error: %v", tt.podIP, err)
-			continue
-		}
+		nodeIP, local := r.Resolve(tt.podIP)
 		if nodeIP != tt.wantNode || local != tt.wantLocal {
 			t.Errorf("Resolve(%q) = (%q, %v), want (%q, %v)",
 				tt.podIP, nodeIP, local, tt.wantNode, tt.wantLocal)
@@ -647,7 +711,7 @@ func TestIPv6RemoteAddr(t *testing.T) {
 
 	// The staticResolver returns podIP as nodeIP for remote. With an IPv6
 	// pod IP, net.JoinHostPort must produce a bracketed address.
-	nodeIP, local, _ := p.resolver.Resolve("2001:db8::2")
+	nodeIP, local := p.resolver.Resolve("2001:db8::2")
 	if local {
 		t.Fatal("expected remote")
 	}
@@ -721,8 +785,11 @@ func TestConnectionLimit(t *testing.T) {
 	}
 	fmt.Fprintf(conn1, "%s\n", backend)
 
-	// Give the handler time to start.
-	time.Sleep(50 * time.Millisecond)
+	// Wait for the accept goroutine to claim the semaphore slot so the
+	// second connection actually races against an in-flight handler.
+	assertEventually(t, time.Second, func() bool {
+		return len(p.connSem) == cap(p.connSem)
+	}, "first connection did not consume the limit-1 semaphore slot")
 
 	// Second connection: should be rejected (limit=1, one in-flight).
 	// Server closes the raw TCP connection before TLS handshake, so
@@ -747,7 +814,7 @@ func TestConnectionLimit(t *testing.T) {
 	io.ReadAll(conn1)
 	conn1.Close()
 
-	if rejected := m.connLimitRejected.Load(); rejected == 0 {
+	if rejected := testutil.ToFloat64(m.connLimitRejected); rejected == 0 {
 		t.Error("expected connLimitRejected > 0")
 	}
 }
@@ -818,10 +885,62 @@ func TestRouteErrorMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.Close()
-	time.Sleep(50 * time.Millisecond)
 
-	if m.routeErrors.Load() == 0 {
-		t.Error("expected routeErrors > 0 after origDst failure")
+	assertEventually(t, time.Second, func() bool {
+		return testutil.ToFloat64(m.routeErrors) > 0
+	}, "routeErrors did not advance after origDst failure")
+}
+
+func TestOutboundRejectsNonPodOriginalDestination(t *testing.T) {
+	m := testMetrics()
+	p := &Proxy{
+		nodeIP:      "10.0.0.1",
+		inboundPort: 15006,
+		resolver:    &rejectResolver{},
+		origDstFunc: func(_ net.Conn) (string, error) {
+			return "10.0.0.1:15001", nil
+		},
+		logger:  testLogger(),
+		metrics: m,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go p.handleOutbound(ctx, conn)
+		}
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(conn)
+	conn.Close()
+
+	// rejectResolver returns reason=host_addr; the direct-dial counter must
+	// move, and the unknown-pod baseline counter must stay at 0 so the two
+	// reasons cannot be confused in alert rules downstream.
+	if testutil.ToFloat64(m.outboundDestRejected.WithLabelValues(outboundRejectHostAddr)) == 0 {
+		t.Error("expected outboundDestRejectedHostAddr > 0 after host-address rejection")
+	}
+	if testutil.ToFloat64(m.outboundDestRejected.WithLabelValues(outboundRejectUnknownPod)) != 0 {
+		t.Error("expected outboundDestRejectedUnknownPod == 0 for host-address rejection (label confusion would defeat the split)")
+	}
+	if testutil.ToFloat64(m.routeErrors) != 0 {
+		t.Error("non-pod destination rejection must not increment routeErrors (reserved for origDst/parse failures)")
 	}
 }
 
@@ -870,11 +989,9 @@ func TestDestHeaderReadErrorMetrics(t *testing.T) {
 	io.ReadAll(conn)
 	conn.Close()
 
-	time.Sleep(50 * time.Millisecond)
-
-	if m.destHeaderReadErrors.Load() == 0 {
-		t.Error("expected destHeaderReadErrors > 0 after invalid header")
-	}
+	assertEventually(t, time.Second, func() bool {
+		return testutil.ToFloat64(m.destHeaderErrors.WithLabelValues("read")) > 0
+	}, "destHeaderReadErrors did not advance after invalid header")
 }
 
 func TestReadinessOnShutdown(t *testing.T) {
@@ -895,16 +1012,9 @@ func TestReadinessOnShutdown(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- p.Run(ctx) }()
 
-	// Wait for ready.
-	deadline := time.After(2 * time.Second)
-	for !health.ready.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for ready")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
+	assertEventually(t, 2*time.Second, func() bool {
+		return health.ready.Load()
+	}, "health.ready never became true")
 
 	// Shutdown.
 	cancel()
@@ -962,30 +1072,20 @@ func TestMetricsAccounting(t *testing.T) {
 	io.ReadAll(conn)
 	conn.Close()
 
-	// Allow metrics to be recorded.
-	time.Sleep(50 * time.Millisecond)
-
-	if m.connSuccessInbound.Load() == 0 {
-		t.Error("expected connSuccessInbound > 0")
-	}
-	if m.bytesInboundFwd.Load() == 0 {
-		t.Error("expected bytesInboundFwd > 0")
-	}
-	if m.bytesInboundRev.Load() == 0 {
-		t.Error("expected bytesInboundRev > 0")
-	}
+	assertEventually(t, time.Second, func() bool {
+		return testutil.ToFloat64(m.connectionsTotal.WithLabelValues("inbound", "success")) > 0 &&
+			testutil.ToFloat64(m.bytesTotal.WithLabelValues("inbound", "forward")) > 0 &&
+			testutil.ToFloat64(m.bytesTotal.WithLabelValues("inbound", "reverse")) > 0
+	}, "inbound success/bytes metrics did not advance")
 }
 
-func TestDialFailureMetrics(t *testing.T) {
+func TestInboundDialFailureMetrics(t *testing.T) {
+	serverTLS, _ := testTLSConfigs(t)
+
 	m := testMetrics()
 	p := &Proxy{
-		nodeIP:      "10.0.0.1",
-		inboundPort: 15006,
-		resolver:    &staticResolver{nodeIP: "10.0.0.1"},
-		origDstFunc: func(_ net.Conn) (string, error) {
-			// Return an address that will definitely fail to dial.
-			return "127.0.0.1:1", nil
-		},
+		serverTLS:   serverTLS,
+		resolver:    &staticResolver{nodeIP: "127.0.0.1"},
 		dialTimeout: 100 * time.Millisecond,
 		logger:      testLogger(),
 		metrics:     m,
@@ -999,34 +1099,32 @@ func TestDialFailureMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
+	tlsLn := tls.NewListener(ln, serverTLS)
 
 	go func() {
 		for {
-			conn, err := ln.Accept()
+			conn, err := tlsLn.Accept()
 			if err != nil {
 				return
 			}
-			go p.handleOutbound(ctx, conn)
+			go p.handleInbound(ctx, conn)
 		}
 	}()
 
-	// Trigger an outbound connection that will fail to dial the backend.
-	conn, err := net.Dial("tcp", ln.Addr().String())
+	// Trigger an inbound connection whose destination pod dial fails.
+	conn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	fmt.Fprint(conn, "127.0.0.1:1\n")
 	conn.Close()
-	time.Sleep(200 * time.Millisecond)
 
-	if m.dialFailures.Load() == 0 {
-		t.Error("expected dialFailures > 0")
-	}
-	if m.connSuccessLocal.Load() != 0 {
-		t.Error("expected connSuccessLocal == 0 after dial failure")
-	}
-	if m.connErrorLocal.Load() == 0 {
-		t.Error("expected connErrorLocal > 0 after local dial failure")
-	}
+	assertEventually(t, 2*time.Second, func() bool {
+		return testutil.ToFloat64(m.dialFailures) > 0
+	}, "dialFailures did not advance after failed inbound dial")
 }
 
 func TestRATLSDialFailureMetrics(t *testing.T) {
@@ -1073,27 +1171,25 @@ func TestRATLSDialFailureMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.Close()
-	time.Sleep(200 * time.Millisecond)
 
-	if m.tlsDialFailures.Load() == 0 {
-		t.Error("expected tlsDialFailures > 0")
-	}
-	if m.connSuccessOutbound.Load() != 0 {
+	assertEventually(t, 2*time.Second, func() bool {
+		return testutil.ToFloat64(m.tlsDialFailures) > 0 && testutil.ToFloat64(m.connectionsTotal.WithLabelValues("outbound", "error")) > 0
+	}, "tlsDialFailures/connErrorOutbound did not advance after RA-TLS dial failure")
+
+	if testutil.ToFloat64(m.connectionsTotal.WithLabelValues("outbound", "success")) != 0 {
 		t.Error("expected connSuccessOutbound == 0 after RA-TLS dial failure")
-	}
-	if m.connErrorOutbound.Load() == 0 {
-		t.Error("expected connErrorOutbound > 0 after RA-TLS dial failure")
 	}
 }
 
 func TestAcceptLoopBackoff(t *testing.T) {
 	m := testMetrics()
+	ready := make(chan struct{})
 	p := &Proxy{
 		outboundAddr: "127.0.0.1:0",
 		inboundAddr:  "127.0.0.1:0",
 		logger:       testLogger(),
 		metrics:      m,
-		onReady:      func() {},
+		onReady:      func() { close(ready) },
 		onShutdown:   func() {},
 	}
 
@@ -1102,8 +1198,11 @@ func TestAcceptLoopBackoff(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- p.Run(ctx) }()
 
-	// Wait briefly for listeners to bind.
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("listeners did not become ready")
+	}
 
 	// Cancel to shut down. The accept loop should exit cleanly.
 	cancel()
@@ -1117,16 +1216,19 @@ func TestAcceptLoopBackoff(t *testing.T) {
 	}
 
 	// After clean shutdown, acceptErrors should be 0.
-	if got := m.acceptErrors.Load(); got != 0 {
-		t.Errorf("acceptErrors = %d after clean shutdown, want 0", got)
+	if got := testutil.ToFloat64(m.acceptErrors); got != 0 {
+		t.Errorf("acceptErrors = %v after clean shutdown, want 0", got)
 	}
 }
 
 // rejectResolver rejects all destinations as non-local.
 type rejectResolver struct{}
 
-func (r *rejectResolver) Resolve(podIP string) (string, bool, error) { return podIP, false, nil }
-func (r *rejectResolver) ValidateLocalDest(ip string) bool           { return false }
+func (r *rejectResolver) Resolve(podIP string) (string, bool) { return podIP, false }
+func (r *rejectResolver) ValidateOutboundDest(ip string) (bool, string) {
+	return false, outboundRejectHostAddr
+}
+func (r *rejectResolver) ValidateLocalDest(ip string) bool { return false }
 
 func TestInboundDestRejected(t *testing.T) {
 	serverTLS, _ := testTLSConfigs(t)
@@ -1173,12 +1275,11 @@ func TestInboundDestRejected(t *testing.T) {
 	io.ReadAll(conn)
 	conn.Close()
 
-	time.Sleep(50 * time.Millisecond)
+	assertEventually(t, time.Second, func() bool {
+		return testutil.ToFloat64(m.inboundDestRejected) > 0
+	}, "inboundDestRejected did not advance for a non-local destination")
 
-	if m.inboundDestRejected.Load() == 0 {
-		t.Error("expected inboundDestRejected > 0")
-	}
-	if m.connSuccessInbound.Load() != 0 {
+	if testutil.ToFloat64(m.connectionsTotal.WithLabelValues("inbound", "success")) != 0 {
 		t.Error("expected no successful inbound connections")
 	}
 }

@@ -1,3 +1,5 @@
+//go:build linux
+
 package ratlsmesh
 
 import (
@@ -6,6 +8,8 @@ import (
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/lunal-dev/c8s/pkg/ratls"
 )
@@ -34,7 +38,7 @@ func newHealthServer(m *metrics, serverCertMgr, clientCertMgr *ratls.CertManager
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /live", h.handleLive)
 	mux.HandleFunc("GET /ready", h.handleReady)
-	mux.HandleFunc("GET /metrics", h.handleMetrics)
+	mux.Handle("GET /metrics", promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{}))
 	h.mux = mux
 	return h
 }
@@ -66,11 +70,6 @@ func (h *healthServer) handleReady(w http.ResponseWriter, _ *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ready\n"))
-}
-
-func (h *healthServer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	h.metrics.writePrometheus(w)
 }
 
 func (h *healthServer) serve(ctx context.Context, addr string) error {
