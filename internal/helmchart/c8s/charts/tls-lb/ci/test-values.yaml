@@ -1,7 +1,4 @@
 san: ci.example.com
-initContainer:
-  image:
-    tag: ci-test
 nginx:
   image:
     tag: ci-test

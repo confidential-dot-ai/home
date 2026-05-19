@@ -4,22 +4,53 @@ TLS-terminating reverse proxy with TEE-attested certificate provisioning.
 
 ## What it does
 
-This chart deploys an nginx reverse proxy that terminates TLS in front of a backend service. By default, the TLS certificate is provisioned automatically at pod startup via a TEE (Trusted Execution Environment) attestation flow - no manual cert management or cert-manager required.
+This chart deploys an nginx reverse proxy that terminates TLS in front of a
+backend service. The chart owns nginx, the in-memory CDS certificate volume,
+public TLS Secret mounts, discovery storage, and mesh CA mounts. The c8s
+admission webhook owns certificate lifecycle by injecting get-cert containers
+from the c8s operator image.
 
-For public edge deployments, the chart can instead present a normal WebPKI certificate from a Kubernetes TLS Secret while still generating and exposing a CDS-issued certificate for client preflight/discovery.
+For public edge deployments, the chart can instead present a normal WebPKI
+certificate from a Kubernetes TLS Secret while still generating and exposing a
+CDS-issued certificate for client preflight/discovery.
 
 ### How it works
 
-1. An init container (`get-cert`) contacts the **assam** key broker service, proving the pod is running inside a genuine TEE via a local attestation service.
-2. Assam issues a CDS TLS certificate for the configured SAN (subject alternative name).
-3. The CDS cert and key are written to an in-memory volume shared with the nginx container.
-4. If `publicTLS.secretName` is set, nginx presents that Secret's WebPKI cert to clients and the `get-cert` sidecar reloads nginx when Kubernetes rotates the mounted Secret. Otherwise nginx presents the CDS cert for backwards compatibility.
-5. If `discovery.enabled=true`, `get-cert` writes JSON discovery metadata with the issued CDS certificate and attestation evidence, and nginx serves it at `discovery.path`.
-6. Nginx serves any configured `routes` first, then proxies all other traffic to the configured upstream backend. If `upstream.protocol=https`, it can present the CDS cert as its upstream client certificate and optionally verify the upstream with the mesh CA bundle.
+1. The chart annotates the nginx pod template with `confidential.ai/cw=<san>`
+   and the tls-lb cert provisioning settings.
+2. The c8s admission webhook injects `c8s-init-cert` and `c8s-renew-cert`.
+3. The init container contacts the Assam key broker configured on the c8s
+   operator, proving the pod is running inside a genuine TEE via the local
+   attestation service.
+4. Assam issues a CDS TLS certificate for the configured SAN (subject alternative name).
+5. The CDS cert and key are written to the chart-owned in-memory `tls-certs` volume shared with nginx.
+6. The native get-cert sidecar reuses that key, renews the CDS cert, and SIGHUPs nginx after each successful renewal.
+7. If `publicTLS.secretName` is set, nginx presents that Secret's WebPKI cert
+   to clients and the get-cert sidecar reloads nginx when Kubernetes rotates
+   the mounted Secret. Otherwise nginx presents the CDS cert for backwards
+   compatibility.
+8. If `discovery.enabled=true`, get-cert writes JSON discovery metadata with
+   the issued CDS certificate and attestation evidence, and nginx serves it at
+   `discovery.path`.
+9. Nginx serves any configured `routes` first, then proxies all other traffic
+   to the configured upstream backend. If `upstream.protocol=https`, it can
+   present the CDS cert as its upstream client certificate and optionally verify
+   the upstream with the mesh CA bundle.
 
-The CDS cert and key are shared between the init container and nginx via an `emptyDir` volume with `medium: Memory` - backed by tmpfs, so private keys are held in RAM only and never written to disk. Each replica gets a fresh, attested certificate on startup.
+The CDS cert and key are shared between the injected init container, injected
+renewal sidecar, and nginx via an `emptyDir` volume with `medium: Memory` -
+backed by tmpfs, so private keys are held in RAM only and never written to
+disk. Each replica gets a fresh, attested key on startup and reuses it for
+certificate renewal.
 
-When switching the chart-managed `tee-proxy` upstream to HTTPS, also set `upstream.address` to its HTTPS service port, for example `c8s-tee-proxy:443`. The default umbrella-chart address uses the HTTP port.
+The supported deployment shape is the c8s umbrella chart, or an equivalent
+install with the c8s admission webhook already running. Without the webhook,
+tls-lb renders the PKI volumes and nginx config but no get-cert containers are
+injected.
+
+When switching the chart-managed `tee-proxy` upstream to HTTPS, also set
+`upstream.address` to its HTTPS service port, for example `c8s-tee-proxy:443`.
+The default umbrella-chart address uses the HTTP port.
 
 ### Trust Notes
 
@@ -31,8 +62,6 @@ When switching the chart-managed `tee-proxy` upstream to HTTPS, also set `upstre
 ```bash
 helm install my-lb charts/tls-lb \
   --set san=api.example.com \
-  --set assamURL=http://assam:8080 \
-  --set attestationServiceURL=http://attestation-service:8400 \
   --set upstream.address=my-backend:8080
 ```
 
@@ -40,9 +69,7 @@ helm install my-lb charts/tls-lb \
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `san` | `""` | SAN for the TLS certificate (IP or hostname) |
-| `assamURL` | `http://assam:8080` | URL of the assam key broker |
-| `attestationServiceURL` | `http://attestation-service:8400` | URL of the local attestation service |
+| `san` | `""` | SAN for the CDS certificate. Empty defaults to the chart-managed Service DNS name. |
 | `upstream.address` | `backend:8080` | Host:port of the upstream service |
 | `upstream.protocol` | `http` | Protocol for upstream connection (`http` or `https`) |
 | `upstream.tls.useCDSClientCert` | `true` | Present the CDS cert to HTTPS upstreams |
@@ -58,12 +85,17 @@ helm install my-lb charts/tls-lb \
 | `discovery.path` | `/v1/discovery` | JSON discovery endpoint |
 | `discovery.cdsCertPath` | `/.well-known/cds-cert.pem` | Endpoint serving the CDS-issued cert PEM |
 | `discovery.meshCAPath` | `/.well-known/mesh-ca.pem` | Endpoint serving the mesh CA PEM |
-| `meshCA.expose` | `true` | Serve and advertise the mesh CA PEM when discovery is enabled. The mesh CA ConfigMap is required when this is true. |
+| `meshCA.expose` | `true` | Serve and advertise the mesh CA PEM when discovery is enabled. |
 | `meshCA.configMapName` | `""` | Mesh CA ConfigMap name. Empty defaults to `<release>-cert-issuer-mesh-ca`. |
+| `meshCA.optional` | `true` | Tolerate a missing mesh CA ConfigMap at pod start. Set to `false` when the ConfigMap is pre-created and missing data should fail fast. |
 | `nginx.replicas` | `1` | Number of nginx replicas |
 | `nginx.httpsPort` | `443` | HTTPS listen port |
 | `nginx.resources` | `{}` | Resource requests/limits for the nginx container |
+| `nginx.runAsUser` | `101` | UID used by nginx and the injected get-cert containers |
+| `nginx.runAsGroup` | `101` | GID used by nginx and the injected get-cert containers |
+| `nginx.runAsNonRoot` | `true` | Run nginx and injected get-cert containers as non-root |
 | `service.type` | `ClusterIP` | Kubernetes service type |
 | `service.port` | `443` | Service port |
-| `initContainer.verbose` | `false` | Enable debug logging for cert provisioning |
+| `certProvisioning.verbose` | `false` | Enable debug logging for webhook-injected cert provisioning |
+| `certProvisioning.renewInterval` | `1h` | Renewal interval passed to the webhook-injected get-cert sidecar |
 | `tlsMountPath` | `/tls` | Mount path for the shared cert volume |

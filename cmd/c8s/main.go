@@ -3,7 +3,7 @@
 //
 //   - c8s operator    — controller-manager + admission webhook
 //   - c8s install     — client-side: helm install c8s + CRDs
-//   - c8s get-cert    — init-container certificate bootstrap
+//   - c8s get-cert    — certificate bootstrap and renewal
 package main
 
 import (
@@ -21,7 +21,7 @@ var rootCmd = &cobra.Command{
 	Use:   "c8s",
 	Short: "Confidential Kubernetes operator and companion CLI",
 	Long: `c8s is a single binary that runs the confidential Kubernetes operator,
-the per-pod init-container helpers, and the client-side CLI for installation,
+the per-pod get-cert helpers, and the client-side CLI for installation,
 attestation, and day-2 operations.
 
 Typical bootstrap flow on a fresh cluster:
@@ -48,7 +48,6 @@ func normalizeArgvAlias() {
 	for _, alias := range []string{
 		"assam",
 		"cert-issuer",
-		"cert-rotator",
 		"get-cert",
 		"nri-image-policy",
 		"ratls-mesh",

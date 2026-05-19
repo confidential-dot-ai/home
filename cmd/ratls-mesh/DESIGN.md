@@ -139,36 +139,29 @@ After reading the destination header with `bufio.Reader`, any bytes already buff
 When `--cert-mode assam` is used, the mesh obtains CA-signed certificates via assam attestation instead of self-signing:
 
 ```
-                     ratls-mesh node                    Assam Pod              Attestation
-                ┌──────────────────────┐     ┌───────────────────────┐       Service
-                │                      │     │                       │     ┌──────────┐
-                │  1. Boot with        │     │  ┌───────┐ ┌────────┐ │     │          │
-                │     self-signed      │     │  │ assam  │ │ cert-  │ │     │          │
-                │     RA-TLS cert      │     │  │       │ │ issuer │ │     │          │
-                │                      │     │  └──┬────┘ └───┬────┘ │     └────┬─────┘
-                │  2. Background:      │     │     │          │      │          │
-                │     POST             │     │     │          │      │          │
-                │     /authenticate ───┼─────┼────►│          │      │          │
-                │     ◄── challenge    │     │     │          │      │          │
-                │                      │     │     │          │      │          │
-                │  3. POST /attest ────┼─────┼─────┼──────────┼──────┼─────────►│
-                │     (attestation svc)│     │     │          │      │          │
-                │     ◄── evidence     │     │     │          │      │          │
-                │                      │     │     │          │      │          │
-                │  4. POST /attest ────┼─────┼────►│          │      │          │
-                │     (evidence + CSR) │     │     │──────────┼──────┼─────────►│
-                │     ◄── CA-signed    │     │     │◄─────────┼──────┼──────────│
-                │        certificate   │     │     │──sign───►│      │          │
-                │                      │     │     │◄─cert────│      │          │
-                │                      │     │                       │
-                │  5. GET /v1/ca ──────┼─────┼────────────────►│      │
-                │     ◄── CA bundle    │     │                       │
-                │                      │     └───────────────────────┘
-                │  6. SwapProvider()   │
-                │     hot-swap to      │
-                │     CA-signed cert   │
-                │                      │
-                └──────────────────────┘
+Bootstrap (ratls-mesh dials Assam over its own self-signed RA-TLS cert):
+
+  1. ratls-mesh                       boot with self-signed RA-TLS cert
+                                      (provider = self-signed)
+
+  2. ratls-mesh -> assam              POST /authenticate
+                <- assam              challenge
+
+  3. ratls-mesh -> attestation-svc    POST /attest (challenge nonce, pubkey)
+                <- attestation-svc    SNP evidence
+
+  4. ratls-mesh -> assam              POST /attest (evidence + CSR)
+                   assam -> att-svc   verify(evidence)
+                          <- att-svc  ok
+                   assam -> ci        POST /sign-csr (CSR + EAR)
+                          <- ci       signed leaf cert
+                <- assam              leaf cert + CA bundle
+
+  5. ratls-mesh                       SwapProvider() hot-swaps the TLS
+                                      provider to the CA-signed cert
+
+  6. ratls-mesh -> cert-issuer        GET /ca (continuity-checked refresh)
+                <- cert-issuer        updated CA bundle
 ```
 
 ### CertProvider Abstraction
@@ -183,7 +176,7 @@ type CertProvider interface {
 
 Two implementations:
 - `SelfSignedProvider`: generates key, obtains hardware attestation, creates self-signed cert with attestation extension
-- `assamclient.Provider`: generates key, performs assam attestation flow, obtains CA-signed cert, fetches CA bundle from cert-issuer
+- `assamclient.Provider`: generates key, embeds a RA-TLS attestation extension in the CSR, performs assam attestation flow, obtains a CA-signed cert and authenticated CA bundle, then uses `/ca` only for later continuity-checked bundle refreshes
 
 The abstraction enables runtime provider swapping via `CertManager.SwapProvider()` — the old cert continues serving while the new one provisions.
 
@@ -196,7 +189,7 @@ With `CACert` set on `ServerConfig` or `ClientConfig`, the `dualVerifyPeerCallba
 
 This dual mode is essential for rolling upgrades:
 - T=0: All nodes self-signed → all verify via RA-TLS
-- T=1: Some nodes upgraded to CA-signed → upgraded nodes verify via CA chain, others via RA-TLS
+- T=1: Some nodes upgraded to CA-signed → upgraded nodes verify via CA chain, others can still verify the preserved RA-TLS extension
 - T=2: All nodes CA-signed → all verify via CA chain (fast path)
 
 If both verification paths fail, the error includes both failure reasons for diagnostics.
@@ -429,14 +422,15 @@ The `certState.mu` mutex serializes certificate provisioning — at most one att
 When using `--cert-mode assam`, the lifecycle changes:
 
 1. Initial boot: self-signed RA-TLS certificate (same flow as above)
-2. Background goroutine contacts assam: authenticate → attest → obtain cert, fetch CA from cert-issuer
+2. Background goroutine contacts assam: authenticate → attest → obtain cert and authenticated CA bundle
 3. `CertManager.SwapProvider()` atomically swaps the provider:
    - Acquires lock, replaces provider, clears cert cache and rotation timer
    - Releases lock, provisions new cert synchronously
    - On success: new CA-signed cert served to all subsequent handshakes
    - On failure: old self-signed cert continues serving (error logged)
-4. Rotation continues at 50% of TTL, now using the assam provider
-5. Peer verification uses `dualVerifyPeerCallback`: CA chain (fast) or RA-TLS (fallback)
+4. CA bundle polling starts only after the authenticated bundle has seeded trust, and accepts only continuity-signed updates from `/ca`
+5. Rotation continues at 50% of TTL, now using the assam provider
+6. Peer verification uses `dualVerifyPeerCallback`: CA chain (fast) or RA-TLS (fallback)
 
 ## Comparison to Alternatives
 

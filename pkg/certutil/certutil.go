@@ -187,8 +187,6 @@ func NewCATemplate(serial *big.Int, commonName string, notAfter time.Time) *x509
 		NotAfter:              notAfter,
 		IsCA:                  true,
 		BasicConstraintsValid: true,
-		MaxPathLen:            0,
-		MaxPathLenZero:        true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 	}
 }

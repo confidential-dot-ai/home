@@ -47,8 +47,7 @@ jobs:
             --set certIssuer.image.tag=ci \
             --set ratls-mesh.image.tag=ci \
             --set nri-image-policy.image.tag=ci \
-            --set tee-proxy.image.tag=ci \
-            --set tls-lb.initContainer.image.tag=ci
+            --set tee-proxy.image.tag=ci
 
       - name: Helm template
         run: |
@@ -61,7 +60,6 @@ jobs:
             --set ratls-mesh.image.tag=ci \
             --set nri-image-policy.image.tag=ci \
             --set tee-proxy.image.tag=ci \
-            --set tls-lb.initContainer.image.tag=ci \
             > /dev/null
 
       - name: Helm template with chart-managed Assam
@@ -75,7 +73,6 @@ jobs:
             --set ratls-mesh.image.tag=ci \
             --set nri-image-policy.image.tag=ci \
             --set tee-proxy.image.tag=ci \
-            --set tls-lb.initContainer.image.tag=ci \
             --set webhook.enabled=true \
             --set assam.enabled=true \
             --set certIssuer.enabled=true \

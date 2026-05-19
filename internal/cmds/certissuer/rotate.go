@@ -1,172 +1,89 @@
 package certissuer
 
 import (
-	"crypto/ecdsa"
+	"context"
 	"crypto/elliptic"
-	"encoding/json"
+	"crypto/x509"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/lunal-dev/c8s/internal/issuer"
-	"github.com/lunal-dev/c8s/pkg/certutil"
-	"github.com/lunal-dev/c8s/pkg/issuerapi"
 )
 
-// Type aliases for the shared wire types, kept for local readability.
-type RotateCARequest = issuerapi.RotateCARequest
-type RotateCAResponse = issuerapi.RotateCAResponse
+var errNoCertificateBundle = errors.New("no certificates loaded")
 
-// rotateHandler holds state for the /v1/rotate-ca endpoint.
-type rotateHandler struct {
+type caRotator struct {
+	mu             sync.Mutex
 	issuer         *Issuer
 	bundle         *bundleManager
-	caRepoDir      string // local path to CDS repository for key write-back
-	keyPath        string // resource path for CA key (e.g., "default/mesh/ca-key")
-	maxTTL         time.Duration
 	caCertValidity time.Duration
+	caCommonName   string
 }
 
-// HandleRotateCA handles POST /v1/rotate-ca.
-// Validates EAR JWT, generates new CA keypair, writes to the CDS repo, swaps bundle.
-func (rh *rotateHandler) HandleRotateCA(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	b := rh.issuer.getBundle()
-	if b == nil {
-		http.Error(w, "service unavailable: no certificates loaded", http.StatusServiceUnavailable)
-		rotateRequestsTotal.WithLabelValues("error").Inc()
+func (cr *caRotator) run(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
 		return
 	}
 
-	// Note: request body is already limited by http.MaxBytesHandler in main.go.
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		rh.issuer.Logger.Error("failed to read rotate request body", "error", err)
-		http.Error(w, "bad request: failed to read body", http.StatusBadRequest)
-		rotateRequestsTotal.WithLabelValues("bad_request").Inc()
-		return
-	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-	var req RotateCARequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, "bad request: invalid JSON", http.StatusBadRequest)
-		rotateRequestsTotal.WithLabelValues("bad_request").Inc()
-		return
-	}
-
-	if req.EAR == "" {
-		http.Error(w, "missing 'ear' field", http.StatusBadRequest)
-		rotateRequestsTotal.WithLabelValues("bad_request").Inc()
-		return
-	}
-
-	// Validate EAR JWT (same validation as sign-csr).
-	claims, err := validateEARToken(req.EAR, rh.issuer.keyProvider, rh.issuer.ExpectedIssuer, rh.issuer.JWTClockSkew)
-	if err != nil {
-		rh.issuer.Logger.Warn("rotate-ca: EAR token validation failed", "error", err)
-		var tve *tokenValidationError
-		if errors.As(err, &tve) {
-			tokenValidationFailuresTotal.WithLabelValues(tve.Reason).Inc()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			start := time.Now()
+			newCert, fingerprint, err := cr.rotateCA()
+			if err != nil {
+				cr.issuer.Logger.Error("scheduled CA rotation failed", "error", err)
+				continue
+			}
+			cr.issuer.Logger.Info("scheduled CA rotation completed",
+				"audit", true,
+				"new_fingerprint", fingerprint,
+				"not_after", newCert.NotAfter.Format(time.RFC3339),
+				"latency", time.Since(start).String(),
+			)
 		}
-		http.Error(w, "unauthorized: invalid attestation token", http.StatusUnauthorized)
-		rotateRequestsTotal.WithLabelValues("unauthorized").Inc()
-		return
+	}
+}
+
+func (cr *caRotator) rotateCA() (*x509.Certificate, string, error) {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+
+	b := cr.issuer.getBundle()
+	if b == nil {
+		return nil, "", errNoCertificateBundle
 	}
 
-	// Check measurement allowlist.
-	if err := checkMeasurement(claims, rh.issuer.RotateCAMeasurements, "rotate-ca"); err != nil {
-		rh.issuer.Logger.Warn("rotate-ca: measurement check failed", "error", err)
-		measurementDeniedTotal.WithLabelValues("rotate-ca").Inc()
-		http.Error(w, "forbidden: measurement not allowed", http.StatusForbidden)
-		rotateRequestsTotal.WithLabelValues("forbidden").Inc()
-		return
+	caCommonName := cr.caCommonName
+	if caCommonName == "" {
+		caCommonName = issuer.DefaultCACommonName
 	}
-
-	// Generate a fresh P-384 mesh CA (rotation curve is wider than the
-	// in-process operator's P-256 default).
-	ca, err := issuer.NewCAWithCurve("Mesh CA", rh.caCertValidity, elliptic.P384())
+	ca, err := issuer.NewCAWithParent(caCommonName, cr.caCertValidity, elliptic.P384(), b.caCert, b.caKey)
 	if err != nil {
-		rh.issuer.Logger.Error("rotate-ca: mint new CA", "error", err)
-		http.Error(w, "internal error: certificate creation failed", http.StatusInternalServerError)
-		rotateRequestsTotal.WithLabelValues("error").Inc()
-		return
+		return nil, "", fmt.Errorf("mint new CA: %w", err)
 	}
 	newKey, newCert := ca.Key, ca.Cert
 
-	// Write new key to the CDS repository via the shared workdir volume.
-	if err := rh.writeKeyToRepo(newKey); err != nil {
-		rh.issuer.Logger.Error("rotate-ca: failed to write key to CDS repo", "error", err)
-		http.Error(w, "internal error: key persistence failed", http.StatusInternalServerError)
-		rotateRequestsTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	// Update CA bundle (adds old cert, trims expired).
-	if rh.bundle != nil {
-		if err := rh.bundle.rotate(newCert); err != nil {
-			rh.issuer.Logger.Error("rotate-ca: bundle rotation failed", "error", err)
-			http.Error(w, "internal error: bundle update failed", http.StatusInternalServerError)
-			rotateRequestsTotal.WithLabelValues("error").Inc()
-			return
+	if cr.bundle != nil {
+		if err := cr.bundle.rotate(newCert); err != nil {
+			return nil, "", fmt.Errorf("rotate public bundle: %w", err)
 		}
 	}
 
-	// Atomic swap: update the issuer's cert bundle.
-	oldBundle := rh.issuer.getBundle()
-	rh.issuer.bundle.Store(&certBundle{
+	cr.issuer.bundle.Store(&certBundle{
 		caCert:          newCert,
 		caKey:           newKey,
-		tokenSignerCert: oldBundle.tokenSignerCert,
-		parentCert:      oldBundle.parentCert,
+		tokenSignerCert: b.tokenSignerCert,
+		parentCert:      b.caCert,
 	})
 
-	// Update metrics.
 	certReloadsTotal.Inc()
 	fingerprint := updateCACertFingerprint(newCert.Raw)
-
-	resp := RotateCAResponse{
-		CACertificate: issuerapi.NewPEMDataFromDER("CERTIFICATE", newCert.Raw),
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		rh.issuer.Logger.Error("failed to encode rotate-ca response", "error", err)
-		return
-	}
-
-	rotateRequestsTotal.WithLabelValues("success").Inc()
-	rh.issuer.Logger.Info("CA rotated via /v1/rotate-ca",
-		"audit", true,
-		"new_fingerprint", fingerprint,
-		"not_after", newCert.NotAfter.Format(time.RFC3339),
-		"latency", time.Since(start).String(),
-	)
-}
-
-// writeKeyToRepo writes the CA private key to the CDS repository directory.
-func (rh *rotateHandler) writeKeyToRepo(key *ecdsa.PrivateKey) error {
-	if rh.caRepoDir == "" {
-		return nil
-	}
-
-	keyPEM, err := certutil.MarshalECKeyPEM(key)
-	if err != nil {
-		return err
-	}
-
-	keyFile := filepath.Join(rh.caRepoDir, rh.keyPath)
-	dir := filepath.Dir(keyFile)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", dir, err)
-	}
-
-	if err := os.WriteFile(keyFile, keyPEM, 0600); err != nil {
-		return fmt.Errorf("write key: %w", err)
-	}
-
-	return nil
+	return newCert, fingerprint, nil
 }

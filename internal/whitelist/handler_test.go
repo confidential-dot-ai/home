@@ -1,7 +1,6 @@
 package whitelist_test
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,30 +10,65 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/lunal-dev/c8s/internal/attestation"
+	"github.com/lunal-dev/c8s/internal/ear"
+	"github.com/lunal-dev/c8s/internal/earclaims"
 	"github.com/lunal-dev/c8s/internal/readiness"
 	"github.com/lunal-dev/c8s/internal/server"
 	"github.com/lunal-dev/c8s/internal/whitelist"
 	"github.com/lunal-dev/c8s/pkg/attestationclient"
+	"github.com/lunal-dev/c8s/pkg/certutil"
+	"github.com/lunal-dev/c8s/pkg/earsigner"
 	"github.com/lunal-dev/c8s/pkg/types"
 )
 
 const (
 	digestA       = "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 	digestMissing = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-	testPassword  = "test-password"
+	testIssuer    = "assam"
+	measurementA  = "allowed-launch-digest"
 )
 
-var adminPasswordB64 = base64.StdEncoding.EncodeToString([]byte(testPassword))
-
-func authHeader() string {
-	return "Basic " + base64.StdEncoding.EncodeToString([]byte(testPassword))
+// authHeader issues an EAR bound to body via the pbh claim and returns it as
+// a Bearer header value. Callers MUST pass the exact bytes the server will
+// receive — any difference (whitespace, key ordering) breaks verification.
+func authHeader(t *testing.T, issuer ear.Issuer, measurement string, body []byte) string {
+	t.Helper()
+	token, err := issuer.IssueForRequestBody(json.RawMessage(`{"test":"evidence"}`), measurement, body)
+	if err != nil {
+		t.Fatalf("issue EAR: %v", err)
+	}
+	return "Bearer " + token
 }
 
-func testWhitelistApp() (http.Handler, *readiness.Checker) {
+func signedEAR(t *testing.T, keyPEM []byte, claims jwt.MapClaims) string {
+	t.Helper()
+	key, err := certutil.ParseECPrivateKey(keyPEM)
+	if err != nil {
+		t.Fatalf("parse EAR key: %v", err)
+	}
+	token, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(key)
+	if err != nil {
+		t.Fatalf("sign EAR: %v", err)
+	}
+	return token
+}
+
+func testWhitelistApp(t *testing.T) (http.Handler, *readiness.Checker, ear.Issuer) {
+	t.Helper()
 	store, err := whitelist.OpenInMemory()
 	if err != nil {
-		panic(err)
+		t.Fatalf("open in-memory store: %v", err)
+	}
+
+	keyPEM, err := earsigner.Generate()
+	if err != nil {
+		t.Fatalf("generate EAR key: %v", err)
+	}
+	issuer, err := ear.NewIssuer(keyPEM, testIssuer, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("new EAR issuer: %v", err)
 	}
 
 	asClient := attestationclient.NewClient("http://localhost:0")
@@ -47,17 +81,22 @@ func testWhitelistApp() (http.Handler, *readiness.Checker) {
 			Challenges: &challengeStore,
 		},
 		WhitelistHandler: whitelist.Handler{
-			Store:            &store,
-			AdminPasswordB64: adminPasswordB64,
+			Store: &store,
+			WriteAuthorizer: whitelist.EARWriteAuthorizer{
+				PublicKey:           issuer.PublicKey,
+				ExpectedIssuer:      testIssuer,
+				AllowedMeasurements: map[string]bool{measurementA: true},
+				ClockSkew:           30 * time.Second,
+			}.Authorize,
 		},
 		ReadyFn: checker.Ready,
 	}
 
-	return server.NewRouter(deps), &checker
+	return server.NewRouter(deps), &checker, issuer
 }
 
 func TestHealthzReturnsOK(t *testing.T) {
-	app, _ := testWhitelistApp()
+	app, _, _ := testWhitelistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -73,7 +112,7 @@ func TestHealthzReturnsOK(t *testing.T) {
 }
 
 func TestReadyzReturnsUnavailableInitially(t *testing.T) {
-	app, _ := testWhitelistApp()
+	app, _, _ := testWhitelistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -89,7 +128,7 @@ func TestReadyzReturnsUnavailableInitially(t *testing.T) {
 }
 
 func TestWhitelistListEmpty(t *testing.T) {
-	app, _ := testWhitelistApp()
+	app, _, _ := testWhitelistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -131,7 +170,7 @@ func TestWhitelistListEmpty(t *testing.T) {
 }
 
 func TestWhitelistAddRequiresAuth(t *testing.T) {
-	app, _ := testWhitelistApp()
+	app, _, _ := testWhitelistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -147,8 +186,8 @@ func TestWhitelistAddRequiresAuth(t *testing.T) {
 	}
 }
 
-func TestWhitelistAddRejectsWrongPassword(t *testing.T) {
-	app, _ := testWhitelistApp()
+func TestWhitelistAddRejectsUnauthorizedMeasurement(t *testing.T) {
+	app, _, issuer := testWhitelistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -158,7 +197,7 @@ func TestWhitelistAddRejectsWrongPassword(t *testing.T) {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("wrong-password")))
+	req.Header.Set("Authorization", authHeader(t, issuer, "other-launch-digest", []byte(body)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -171,7 +210,74 @@ func TestWhitelistAddRejectsWrongPassword(t *testing.T) {
 	}
 }
 
-func addDigest(t *testing.T, srvURL, digest, image string) {
+func TestWhitelistWriteAuthorizerRejectsMissingExpiration(t *testing.T) {
+	keyPEM, err := earsigner.Generate()
+	if err != nil {
+		t.Fatalf("generate EAR key: %v", err)
+	}
+	issuer, err := ear.NewIssuer(keyPEM, testIssuer, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("new EAR issuer: %v", err)
+	}
+
+	token := signedEAR(t, keyPEM, jwt.MapClaims{
+		earclaims.Issuer:   testIssuer,
+		earclaims.IssuedAt: time.Now().Unix(),
+		earclaims.Submods: map[string]any{
+			earclaims.SubmodAttester: map[string]any{
+				earclaims.LaunchDigest: measurementA,
+			},
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/whitelist", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	err = (whitelist.EARWriteAuthorizer{
+		PublicKey:           issuer.PublicKey,
+		ExpectedIssuer:      testIssuer,
+		AllowedMeasurements: map[string]bool{measurementA: true},
+		ClockSkew:           30 * time.Second,
+	}).Authorize(req, nil)
+	if err == nil {
+		t.Fatal("expected missing expiration to be rejected")
+	}
+}
+
+func TestWhitelistWriteAuthorizerRejectsExpiredToken(t *testing.T) {
+	keyPEM, err := earsigner.Generate()
+	if err != nil {
+		t.Fatalf("generate EAR key: %v", err)
+	}
+	issuer, err := ear.NewIssuer(keyPEM, testIssuer, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("new EAR issuer: %v", err)
+	}
+
+	token := signedEAR(t, keyPEM, jwt.MapClaims{
+		earclaims.Issuer:    testIssuer,
+		earclaims.IssuedAt:  time.Now().Add(-10 * time.Minute).Unix(),
+		earclaims.ExpiresAt: time.Now().Add(-5 * time.Minute).Unix(),
+		earclaims.Submods: map[string]any{
+			earclaims.SubmodAttester: map[string]any{
+				earclaims.LaunchDigest: measurementA,
+			},
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/whitelist", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	err = (whitelist.EARWriteAuthorizer{
+		PublicKey:           issuer.PublicKey,
+		ExpectedIssuer:      testIssuer,
+		AllowedMeasurements: map[string]bool{measurementA: true},
+		ClockSkew:           30 * time.Second,
+	}).Authorize(req, nil)
+	if err == nil {
+		t.Fatal("expected expired EAR to be rejected")
+	}
+}
+
+func addDigest(t *testing.T, srvURL string, issuer ear.Issuer, digest, image string) {
 	t.Helper()
 	body := fmt.Sprintf(`{"digest":"%s","image":"%s"}`, digest, image)
 	req, err := http.NewRequest(http.MethodPost, srvURL+"/whitelist", strings.NewReader(body))
@@ -179,7 +285,7 @@ func addDigest(t *testing.T, srvURL, digest, image string) {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authHeader())
+	req.Header.Set("Authorization", authHeader(t, issuer, measurementA, []byte(body)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -193,11 +299,11 @@ func addDigest(t *testing.T, srvURL, digest, image string) {
 }
 
 func TestWhitelistAddAndListRoundtrip(t *testing.T) {
-	app, _ := testWhitelistApp()
+	app, _, issuer := testWhitelistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
-	addDigest(t, srv.URL, digestA, "test-image")
+	addDigest(t, srv.URL, issuer, digestA, "test-image")
 
 	resp, err := http.Get(srv.URL + "/whitelist")
 	if err != nil {
@@ -230,11 +336,11 @@ func TestWhitelistAddAndListRoundtrip(t *testing.T) {
 }
 
 func TestWhitelistDeleteExistingReturnsNoContent(t *testing.T) {
-	app, _ := testWhitelistApp()
+	app, _, issuer := testWhitelistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
-	addDigest(t, srv.URL, digestA, "test-image")
+	addDigest(t, srv.URL, issuer, digestA, "test-image")
 
 	body := fmt.Sprintf(`{"digests":["%s"]}`, digestA)
 	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/whitelist", strings.NewReader(body))
@@ -242,7 +348,7 @@ func TestWhitelistDeleteExistingReturnsNoContent(t *testing.T) {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authHeader())
+	req.Header.Set("Authorization", authHeader(t, issuer, measurementA, []byte(body)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -271,7 +377,7 @@ func TestWhitelistDeleteExistingReturnsNoContent(t *testing.T) {
 }
 
 func TestWhitelistDeleteNonexistentReturnsNotFound(t *testing.T) {
-	app, _ := testWhitelistApp()
+	app, _, issuer := testWhitelistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -281,7 +387,7 @@ func TestWhitelistDeleteNonexistentReturnsNotFound(t *testing.T) {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authHeader())
+	req.Header.Set("Authorization", authHeader(t, issuer, measurementA, []byte(body)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -295,7 +401,7 @@ func TestWhitelistDeleteNonexistentReturnsNotFound(t *testing.T) {
 }
 
 func TestWhitelistDeleteRequiresAuth(t *testing.T) {
-	app, _ := testWhitelistApp()
+	app, _, _ := testWhitelistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -319,7 +425,7 @@ func TestWhitelistDeleteRequiresAuth(t *testing.T) {
 }
 
 func TestWhitelistAddRejectsInvalidDigest(t *testing.T) {
-	app, _ := testWhitelistApp()
+	app, _, issuer := testWhitelistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -329,7 +435,7 @@ func TestWhitelistAddRejectsInvalidDigest(t *testing.T) {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authHeader())
+	req.Header.Set("Authorization", authHeader(t, issuer, measurementA, []byte(body)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -339,5 +445,125 @@ func TestWhitelistAddRejectsInvalidDigest(t *testing.T) {
 
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("got status %d, want 422", resp.StatusCode)
+	}
+}
+
+// TestWhitelistAddRejectsReplayWithDifferentBody is the H2 regression test:
+// a captured EAR for one body MUST NOT authorize a different body within the
+// EAR's TTL.
+func TestWhitelistAddRejectsReplayWithDifferentBody(t *testing.T) {
+	app, _, issuer := testWhitelistApp(t)
+	srv := httptest.NewServer(app)
+	defer srv.Close()
+
+	// Token is bound to the legitimate digestA body.
+	originalBody := fmt.Sprintf(`{"digest":"%s","image":"trusted-image"}`, digestA)
+	header := authHeader(t, issuer, measurementA, []byte(originalBody))
+
+	// Attacker replays the same token but ships a different digest.
+	attackerBody := fmt.Sprintf(`{"digest":"%s","image":"attacker-image"}`, digestMissing)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/whitelist", strings.NewReader(attackerBody))
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", header)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("captured token authorized a different body: got status %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestWhitelistAddRejectsTokenWithoutBodyHash confirms that the body-binding
+// claim is REQUIRED — a token issued without `pbh` (e.g. by older callers
+// that didn't use IssueForRequestBody) is rejected, not silently accepted.
+func TestWhitelistAddRejectsTokenWithoutBodyHash(t *testing.T) {
+	app, _, issuer := testWhitelistApp(t)
+	srv := httptest.NewServer(app)
+	defer srv.Close()
+
+	// IssueWithLaunchDigest produces a token without the pbh claim.
+	token, err := issuer.IssueWithLaunchDigest(json.RawMessage(`{"test":"evidence"}`), measurementA)
+	if err != nil {
+		t.Fatalf("issue EAR: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"digest":"%s","image":"test-image"}`, digestA)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/whitelist", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("token without pbh claim was accepted: got status %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestWhitelistAddRejectsBodyOverConfiguredCap confirms the per-Handler cap
+// is honoured: an over-cap body returns 413 *before* the auth check runs
+// (so the handler doesn't burn CPU hashing megabytes a malicious caller
+// supplied).
+func TestWhitelistAddRejectsBodyOverConfiguredCap(t *testing.T) {
+	store, err := whitelist.OpenInMemory()
+	if err != nil {
+		t.Fatalf("open in-memory store: %v", err)
+	}
+	keyPEM, err := earsigner.Generate()
+	if err != nil {
+		t.Fatalf("generate EAR key: %v", err)
+	}
+	issuer, err := ear.NewIssuer(keyPEM, testIssuer, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("new EAR issuer: %v", err)
+	}
+	asClient := attestationclient.NewClient("http://localhost:0")
+	checker := readiness.NewChecker(asClient, 10*time.Second)
+	challengeStore := attestation.NewChallengeStore(60 * time.Second)
+	deps := server.Dependencies{
+		AttestationHandler: attestation.Handler{Challenges: &challengeStore},
+		WhitelistHandler: whitelist.Handler{
+			Store: &store,
+			WriteAuthorizer: whitelist.EARWriteAuthorizer{
+				PublicKey:           issuer.PublicKey,
+				ExpectedIssuer:      testIssuer,
+				AllowedMeasurements: map[string]bool{measurementA: true},
+				ClockSkew:           30 * time.Second,
+			}.Authorize,
+			MaxWriteBodyBytes: 64,
+		},
+		ReadyFn: checker.Ready,
+	}
+	srv := httptest.NewServer(server.NewRouter(deps))
+	defer srv.Close()
+
+	body := strings.Repeat("x", 1024)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/whitelist", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", authHeader(t, issuer, measurementA, []byte(body)))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("over-cap body got status %d, want 413", resp.StatusCode)
 	}
 }

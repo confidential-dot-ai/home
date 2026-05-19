@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -34,23 +35,31 @@ import (
 
 // config holds all CLI configuration for get-cert.
 type config struct {
-	AssamURL                 string
-	AttestationServiceURL    string
-	AttestationServiceAPIKey string
-	OutPath                  string
-	KeyPath                  string
-	KeyOutPath               string
-	KeyMode                  string
-	SAN                      string
-	Verbose                  bool
-	RenewInterval            time.Duration
-	ReloadWatchPaths         []string
-	ReloadWatchInterval      time.Duration
-	DiscoveryOutPath         string
-	DiscoveryCDSCertURL      string
-	DiscoveryMeshCAURL       string
-	DiscoveryPublicTLSMode   string
+	AssamURL               string
+	AttestationServiceURL  string
+	OutPath                string
+	KeyPath                string
+	KeyOutPath             string
+	KeyMode                string
+	SAN                    string
+	Verbose                bool
+	RenewInterval          time.Duration
+	ReloadNginx            bool
+	ContinueOnInitialError bool
+	ReloadWatchPaths       []string
+	ReloadWatchInterval    time.Duration
+	DiscoveryOutPath       string
+	DiscoveryCDSCertURL    string
+	DiscoveryMeshCAURL     string
+	DiscoveryPublicTLSMode string
 }
+
+var (
+	errInvalidDiscoveryPublicTLSMode             = errors.New("invalid discovery public TLS mode")
+	errInvalidReloadWatchInterval                = errors.New("invalid reload watch interval")
+	errReloadWatchRequiresRenewInterval          = errors.New("reload watch requires renew interval")
+	errContinueOnInitialErrorRequiresRenewalLoop = errors.New("continue on initial error requires renewal loop")
+)
 
 type discoveryDocument struct {
 	Version     string               `json:"version"`
@@ -95,8 +104,8 @@ the assam attestation flow to obtain a signed certificate. The P-384 keypair
 used elsewhere in c8s is limited to mesh CA rotation; get-cert leaf keys stay
 P-256 by default.
 
-This tool is designed to run as a Kubernetes init-container alongside a
-load balancer (e.g. nginx) that terminates TLS with the obtained certificate.`,
+This tool is designed to run as a Kubernetes init container or renewal sidecar
+alongside a workload that uses the obtained certificate.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			setupLogging(cfg.Verbose)
 			return run(cfg)
@@ -107,14 +116,15 @@ load balancer (e.g. nginx) that terminates TLS with the obtained certificate.`,
 	flags := cmd.Flags()
 	flags.StringVar(&cfg.AssamURL, "assam-url", "", "URL of the assam service (e.g. http://assam:8080)")
 	flags.StringVar(&cfg.AttestationServiceURL, "attestation-service-url", "", "URL of the local attestation service (e.g. http://localhost:8400)")
-	flags.StringVar(&cfg.AttestationServiceAPIKey, "attestation-service-api-key", "", "API key for the attestation service (falls back to $C8S_ATTESTATION_SERVICE_API_KEY)")
-	flags.StringVarP(&cfg.OutPath, "out", "o", "", "Path to write the signed certificate PEM (prints to stdout if omitted)")
+	flags.StringVarP(&cfg.OutPath, "out", "o", "", "Path to write the signed certificate chain PEM (prints to stdout if omitted)")
 	flags.StringVar(&cfg.KeyPath, "key", "", "Path to a PEM private key to use for the CSR (generates an ephemeral key if omitted)")
 	flags.StringVar(&cfg.KeyOutPath, "key-out", "", "Path to write the generated private key PEM (only used with ephemeral keys)")
 	flags.StringVar(&cfg.KeyMode, "key-mode", "0600", "octal mode for generated private key")
 	flags.StringVar(&cfg.SAN, "san", "", "Subject Alternative Name for the certificate (IP address or hostname)")
 	flags.BoolVarP(&cfg.Verbose, "verbose", "v", false, "Enable debug logging")
-	flags.DurationVar(&cfg.RenewInterval, "renew-interval", 0, "Re-obtain the certificate at this interval and SIGHUP nginx (0 = run once and exit)")
+	flags.DurationVar(&cfg.RenewInterval, "renew-interval", 0, "Re-obtain the certificate at this interval (0 = run once and exit)")
+	flags.BoolVar(&cfg.ReloadNginx, "reload-nginx", true, "SIGHUP nginx after certificate renewal or watched file changes")
+	flags.BoolVar(&cfg.ContinueOnInitialError, "continue-on-initial-error", false, "In renewal mode, keep running when the first certificate request fails")
 	flags.StringArrayVar(&cfg.ReloadWatchPaths, "reload-watch", nil, "File path to poll for changes and reload nginx when it changes (repeatable)")
 	flags.DurationVar(&cfg.ReloadWatchInterval, "reload-watch-interval", time.Minute, "Poll interval for --reload-watch paths")
 	flags.StringVar(&cfg.DiscoveryOutPath, "discovery-out", "", "Path to write JSON discovery metadata for the issued certificate and attestation evidence")
@@ -140,13 +150,6 @@ func setupLogging(verbose bool) {
 
 func run(cfg config) error {
 	slog.Info("starting get-cert", "san", cfg.SAN)
-	if cfg.AttestationServiceAPIKey == "" {
-		cfg.AttestationServiceAPIKey = os.Getenv("C8S_ATTESTATION_SERVICE_API_KEY")
-	}
-
-	if cfg.AttestationServiceAPIKey == "" {
-		cfg.AttestationServiceAPIKey = os.Getenv("C8S_ATTESTATION_SERVICE_API_KEY")
-	}
 
 	if err := validateConfig(cfg); err != nil {
 		return err
@@ -157,20 +160,21 @@ func run(cfg config) error {
 	}
 	slog.Debug("output paths validated")
 
-	client := attestclient.NewClientWithAPIKey(cfg.AssamURL, cfg.AttestationServiceAPIKey)
+	client := attestclient.NewClient(cfg.AssamURL)
 
-	if err := obtainCert(cfg, client); err != nil {
-		return err
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
-	if cfg.RenewInterval <= 0 {
+	if err := obtainCert(ctx, cfg, client); err != nil {
+		if cfg.RenewInterval <= 0 || !cfg.ContinueOnInitialError {
+			return err
+		}
+		slog.Error("initial certificate request failed, will retry next interval", "error", err)
+	} else if cfg.RenewInterval <= 0 {
 		return nil
 	}
 
 	// Daemon mode: renew certificate periodically with graceful shutdown.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
-
 	slog.Info("entering renewal loop", "interval", cfg.RenewInterval)
 	ticker := time.NewTicker(cfg.RenewInterval)
 	defer ticker.Stop()
@@ -178,7 +182,7 @@ func run(cfg config) error {
 	var watchC <-chan time.Time
 	var watchTicker *time.Ticker
 	var watchState map[string]fileSnapshot
-	if len(cfg.ReloadWatchPaths) > 0 {
+	if cfg.ReloadNginx && len(cfg.ReloadWatchPaths) > 0 {
 		var err error
 		watchState, err = snapshotReloadWatchPaths(cfg.ReloadWatchPaths)
 		if err != nil {
@@ -196,12 +200,14 @@ func run(cfg config) error {
 			slog.Info("shutting down cert renewer")
 			return nil
 		case <-ticker.C:
-			if err := obtainCert(cfg, client); err != nil {
+			if err := obtainCert(ctx, cfg, client); err != nil {
 				slog.Error("certificate renewal failed, will retry next interval", "error", err)
 				continue
 			}
-			if err := reloadNginx(); err != nil {
-				slog.Warn("certificate renewed but nginx reload failed", "error", err)
+			if cfg.ReloadNginx {
+				if err := reloadNginx(); err != nil {
+					slog.Warn("certificate renewed but nginx reload failed", "error", err)
+				}
 			}
 		case <-watchC:
 			changed, nextState, err := reloadWatchChanged(watchState, cfg.ReloadWatchPaths)
@@ -221,7 +227,7 @@ func run(cfg config) error {
 	}
 }
 
-func obtainCert(cfg config, client attestclient.Client) error {
+func obtainCert(ctx context.Context, cfg config, client attestclient.Client) error {
 	privateKey, keyPEM, err := loadOrGenerateKey(cfg.KeyPath)
 	if err != nil {
 		return err
@@ -233,7 +239,7 @@ func obtainCert(cfg config, client attestclient.Client) error {
 	}
 
 	slog.Info("requesting certificate from assam", "assam_url", cfg.AssamURL, "san", cfg.SAN)
-	result, err := client.ObtainCertificateWithEvidence(cfg.AttestationServiceURL, string(csrPEM))
+	result, err := client.ObtainCertificateWithEvidenceContext(ctx, cfg.AttestationServiceURL, string(csrPEM))
 	if err != nil {
 		return fmt.Errorf("attestation failed: %w", err)
 	}
@@ -309,16 +315,19 @@ func validateConfig(cfg config) error {
 		switch discoveryPublicTLSMode(cfg.DiscoveryPublicTLSMode) {
 		case "cds", "webpki":
 		default:
-			return fmt.Errorf("--discovery-public-tls-mode must be 'cds' or 'webpki', got %q", cfg.DiscoveryPublicTLSMode)
+			return fmt.Errorf("%w: --discovery-public-tls-mode must be 'cds' or 'webpki', got %q", errInvalidDiscoveryPublicTLSMode, cfg.DiscoveryPublicTLSMode)
 		}
 	}
 	if len(cfg.ReloadWatchPaths) > 0 {
 		if cfg.ReloadWatchInterval <= 0 {
-			return fmt.Errorf("--reload-watch-interval must be greater than 0 when --reload-watch is set")
+			return fmt.Errorf("%w: --reload-watch-interval must be greater than 0 when --reload-watch is set", errInvalidReloadWatchInterval)
 		}
 		if cfg.RenewInterval <= 0 {
-			return fmt.Errorf("--renew-interval must be greater than 0 when --reload-watch is set")
+			return fmt.Errorf("%w: --renew-interval must be greater than 0 when --reload-watch is set", errReloadWatchRequiresRenewInterval)
 		}
+	}
+	if cfg.ContinueOnInitialError && cfg.RenewInterval <= 0 {
+		return fmt.Errorf("%w: --continue-on-initial-error requires --renew-interval", errContinueOnInitialErrorRequiresRenewalLoop)
 	}
 	return nil
 }

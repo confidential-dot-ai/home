@@ -1,17 +1,18 @@
-{{- if .Values.assam.enabled -}}
-{{- if not .Values.attestationService.enabled -}}
-{{- fail "assam.enabled requires attestationService.enabled=true so Assam can verify evidence" -}}
-{{- end -}}
 {{- $certIssuerURL := include "c8s.certIssuerURL" . -}}
-{{- $adminSecretName := printf "%s-admin" (include "c8s.assamName" .) -}}
-{{- $existing := (lookup "v1" "Secret" .Release.Namespace $adminSecretName) -}}
-{{- $adminPassword := .Values.assam.whitelistAdminPassword -}}
-{{- if and (not $adminPassword) $existing $existing.data.whitelistAdminPassword -}}
-  {{- $adminPassword = (b64dec $existing.data.whitelistAdminPassword) -}}
-{{- end -}}
-{{- if not $adminPassword -}}
-  {{- $adminPassword = randAlphaNum 32 -}}
-{{- end -}}
+{{- if .Values.assam.resourceMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "c8s.assamResourceMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: assam
+data:
+  resource-map.json: |
+{{ toPrettyJson .Values.assam.resourceMap | indent 4 }}
+---
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -21,21 +22,6 @@ metadata:
 {{ include "c8s.commonLabels" . | indent 4 }}
     app.kubernetes.io/component: assam
 {{ include "c8s.serviceAccountImagePullSecrets" . }}
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $adminSecretName }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-{{ include "c8s.commonLabels" . | indent 4 }}
-    app.kubernetes.io/component: assam
-  annotations:
-    confidential.ai/trust-boundary-warning: "chart-managed Assam is bootstrap convenience unless deployed as attested trust-boundary infrastructure"
-type: Opaque
-stringData:
-  whitelistAdminPassword: {{ $adminPassword | quote }}
-  admin-password: {{ $adminPassword | quote }}
 ---
 {{- if .Values.assam.persistence.enabled }}
 apiVersion: v1
@@ -102,35 +88,40 @@ spec:
             - --token-signer-rotation-interval={{ .Values.assam.tokenSignerRotationInterval }}
             - --token-signer-overlap={{ .Values.assam.tokenSignerOverlap }}
             - --token-signer-rotation-jitter={{ .Values.assam.tokenSignerRotationJitter }}
-          env:
-            - name: C8S_ATTESTATION_SERVICE_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "c8s.attestationServiceName" . }}-api-key
-                  key: apiKey
-            - name: C8S_ASSAM_WHITELIST_ADMIN_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $adminSecretName }}
-                  key: whitelistAdminPassword
+            - --ratls-platform={{ .Values.assam.ratlsPlatform }}
+            - --ratls-cert-ttl={{ .Values.assam.ratlsCertTTL }}
+            - --whitelist-max-body-bytes={{ .Values.assam.whitelistMaxBodyBytes }}
+            {{- with .Values.certIssuer.measurements }}
+            - --cert-issuer-measurements={{ join "," . }}
+            {{- end }}
+            {{- if .Values.assam.resourceMap }}
+            - --resource-map=/etc/assam/resource-map.json
+            {{- end }}
           ports:
-            - name: http
+            - name: https
               containerPort: {{ .Values.assam.port }}
           readinessProbe:
             httpGet:
               path: /readyz
-              port: http
+              port: https
+              scheme: HTTPS
             initialDelaySeconds: 3
           livenessProbe:
             httpGet:
               path: /healthz
-              port: http
+              port: https
+              scheme: HTTPS
             periodSeconds: 30
           resources:
 {{ toYaml .Values.assam.resources | indent 12 }}
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if .Values.assam.resourceMap }}
+            - name: resource-map
+              mountPath: /etc/assam
+              readOnly: true
+            {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -147,6 +138,11 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if .Values.assam.resourceMap }}
+        - name: resource-map
+          configMap:
+            name: {{ include "c8s.assamResourceMapName" . }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -169,4 +165,3 @@ spec:
       {{- if and (eq .Values.assam.service.type "NodePort") .Values.assam.service.nodePort }}
       nodePort: {{ .Values.assam.service.nodePort }}
       {{- end }}
-{{- end }}

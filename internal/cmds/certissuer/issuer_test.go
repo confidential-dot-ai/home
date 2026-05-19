@@ -1,6 +1,7 @@
 package certissuer
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -26,8 +27,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lunal-dev/c8s/internal/earclaims"
 	"github.com/lunal-dev/c8s/pkg/certutil"
 	"github.com/lunal-dev/c8s/pkg/issuerapi"
+	"github.com/lunal-dev/c8s/pkg/ratls"
+	"github.com/lunal-dev/c8s/pkg/resources"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/time/rate"
 )
@@ -211,6 +215,20 @@ func generateCSRWithSubject(t *testing.T, key *ecdsa.PrivateKey, subject pkix.Na
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
 }
 
+func generateCSRWithExtraExtension(t *testing.T, key *ecdsa.PrivateKey, cn string, ext pkix.Extension, ips ...net.IP) string {
+	t.Helper()
+	tmpl := &x509.CertificateRequest{
+		Subject:         pkix.Name{CommonName: cn},
+		IPAddresses:     ips,
+		ExtraExtensions: []pkix.Extension{ext},
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, tmpl, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
+}
+
 func TestHandleSignCSR(t *testing.T) {
 	iss, tokenKey := testIssuer(t)
 
@@ -223,16 +241,16 @@ func TestHandleSignCSR(t *testing.T) {
 
 	now := time.Now()
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        now.Unix(),
-		"exp":        now.Add(5 * time.Minute).Unix(),
-		"submods":    "test-evidence",
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     now.Unix(),
+		earclaims.ExpiresAt:    now.Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "12h"))
 
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
@@ -302,15 +320,15 @@ func TestHandleSignCSR_SubjectStripped(t *testing.T) {
 	})
 
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        time.Now().Unix(),
-		"exp":        time.Now().Add(5 * time.Minute).Unix(),
-		"submods":    "test",
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     time.Now().Unix(),
+		earclaims.ExpiresAt:    time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "1h"))
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
@@ -344,13 +362,13 @@ func TestHandleSignCSR_ExpiredToken(t *testing.T) {
 	csr := generateCSR(t, csrKey, "test-node")
 
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss": "kbs",
-		"iat": time.Now().Add(-10 * time.Minute).Unix(),
-		"exp": time.Now().Add(-5 * time.Minute).Unix(), // expired
+		earclaims.Issuer:    "kbs",
+		earclaims.IssuedAt:  time.Now().Add(-10 * time.Minute).Unix(),
+		earclaims.ExpiresAt: time.Now().Add(-5 * time.Minute).Unix(), // expired
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, ""))
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
@@ -368,13 +386,13 @@ func TestHandleSignCSR_InvalidSignature(t *testing.T) {
 	// Sign with a different key than the token-signer cert.
 	wrongKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	ear := signJWT(t, wrongKey, map[string]any{
-		"iss": "kbs",
-		"iat": time.Now().Unix(),
-		"exp": time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Issuer:    "kbs",
+		earclaims.IssuedAt:  time.Now().Unix(),
+		earclaims.ExpiresAt: time.Now().Add(5 * time.Minute).Unix(),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, ""))
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
@@ -391,14 +409,14 @@ func TestHandleSignCSR_TTLCapped(t *testing.T) {
 	csr := generateCSR(t, csrKey, "test-node")
 
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        time.Now().Unix(),
-		"exp":        time.Now().Add(5 * time.Minute).Unix(),
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     time.Now().Unix(),
+		earclaims.ExpiresAt:    time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "48h"))
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
@@ -418,10 +436,40 @@ func TestHandleSignCSR_TTLCapped(t *testing.T) {
 	}
 }
 
+func TestSignCSRWithBundleUsesCapturedSigner(t *testing.T) {
+	iss, _ := testIssuer(t)
+	captured := iss.getBundle()
+	replacement, _ := testIssuer(t)
+	iss.bundle.Store(replacement.getBundle())
+
+	csrKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	csrPEM := generateCSR(t, csrKey, "test-node")
+	csr, err := x509.ParseCertificateRequest(issuerapi.MustPEMData([]byte(csrPEM)).DER())
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := &earClaims{RawEvidence: json.RawMessage(`{"test":true}`)}
+
+	certPEM, _, err := iss.signCSRWithBundle(captured, csr, claims, time.Hour)
+	if err != nil {
+		t.Fatalf("signCSRWithBundle failed: %v", err)
+	}
+	cert, err := certutil.ParseCertificatePEM(certPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cert.CheckSignatureFrom(captured.caCert); err != nil {
+		t.Fatalf("leaf was not signed by captured CA: %v", err)
+	}
+	if err := cert.CheckSignatureFrom(replacement.getBundle().caCert); err == nil {
+		t.Fatal("leaf unexpectedly verifies against replacement CA")
+	}
+}
+
 func TestHandleCA(t *testing.T) {
 	iss, _ := testIssuer(t)
 
-	req := httptest.NewRequest("GET", "/v1/ca", nil)
+	req := httptest.NewRequest("GET", "/ca", nil)
 	w := httptest.NewRecorder()
 	iss.HandleCA(w, req)
 
@@ -441,6 +489,23 @@ func TestHandleCA(t *testing.T) {
 	}
 	if cert.Subject.CommonName != "Test Mesh CA" {
 		t.Errorf("CN = %q, want %q", cert.Subject.CommonName, "Test Mesh CA")
+	}
+}
+
+func TestHandlePublicCA_Public(t *testing.T) {
+	iss, _ := testIssuer(t)
+	bm := newBundleManager(iss.MaxTTL, "", "default/mesh/ca-bundle", slog.Default())
+	bm.setInitial(iss.getBundle().caCert)
+
+	req := httptest.NewRequest("GET", "/ca", nil)
+	w := httptest.NewRecorder()
+	handlePublicCA(bm)(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if block, _ := pem.Decode(w.Body.Bytes()); block == nil {
+		t.Fatal("no PEM block in public CA response")
 	}
 }
 
@@ -538,16 +603,16 @@ func TestHandleSignCSR_ES384(t *testing.T) {
 
 	now := time.Now()
 	ear := signJWT384(t, tokenKey384, map[string]any{
-		"iss":        "kbs",
-		"iat":        now.Unix(),
-		"exp":        now.Add(5 * time.Minute).Unix(),
-		"submods":    "test-evidence-384",
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     now.Unix(),
+		earclaims.ExpiresAt:    now.Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence-384",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "12h"))
 
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
@@ -606,16 +671,16 @@ func TestHandleSignCSR_KeyBindingMismatch(t *testing.T) {
 
 	now := time.Now()
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        now.Unix(),
-		"exp":        now.Add(5 * time.Minute).Unix(),
-		"submods":    "test-evidence",
-		"tee-pubkey": teePubKey,
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     now.Unix(),
+		earclaims.ExpiresAt:    now.Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence",
+		earclaims.TEEPublicKey: teePubKey,
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, ""))
 
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
@@ -645,16 +710,16 @@ func TestHandleSignCSR_AttestationDigestExtension(t *testing.T) {
 	rawEvidence := map[string]any{"cpu0": map[string]any{"status": "ok"}}
 	now := time.Now()
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        now.Unix(),
-		"exp":        now.Add(5 * time.Minute).Unix(),
-		"submods":    rawEvidence,
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     now.Unix(),
+		earclaims.ExpiresAt:    now.Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      rawEvidence,
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "12h"))
 
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
@@ -706,28 +771,82 @@ func TestHandleSignCSR_AttestationDigestExtension(t *testing.T) {
 	}
 }
 
-func TestHandleSignCSR_MissingTEEPubKey(t *testing.T) {
+func TestHandleSignCSR_CopiesRATLSExtension(t *testing.T) {
+	iss, tokenKey := testIssuer(t)
+
+	csrKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantExt := pkix.Extension{
+		Id:       ratls.OIDRATLSAttestation,
+		Critical: true,
+		Value:    []byte{0x30, 0x03, 0x02, 0x01, 0x01},
+	}
+	csr := generateCSRWithExtraExtension(t, csrKey, "ratls-mesh-10.0.0.4", wantExt, net.ParseIP("10.0.0.4"))
+
+	now := time.Now()
+	ear := signJWT(t, tokenKey, map[string]any{
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     now.Unix(),
+		earclaims.ExpiresAt:    now.Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      map[string]any{"cpu0": map[string]any{"status": "ok"}},
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
+	})
+
+	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "12h"))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
+	w := httptest.NewRecorder()
+	iss.HandleSignCSR(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, respBody)
+	}
+	var signResp signCSRResponse
+	if err := json.NewDecoder(resp.Body).Decode(&signResp); err != nil {
+		t.Fatal(err)
+	}
+	issuedCert, err := x509.ParseCertificate(signResp.Certificate.DER())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ext := range issuedCert.Extensions {
+		if ext.Id.Equal(ratls.OIDRATLSAttestation) {
+			if ext.Critical {
+				t.Fatal("issued RA-TLS extension should not be critical")
+			}
+			if !bytes.Equal(ext.Value, wantExt.Value) {
+				t.Fatalf("issued RA-TLS extension value = %x, want %x", ext.Value, wantExt.Value)
+			}
+			return
+		}
+	}
+	t.Fatal("issued certificate missing RA-TLS extension")
+}
+
+func TestHandleSignCSR_RejectsMissingTEEPublicKey(t *testing.T) {
 	iss, tokenKey := testIssuer(t)
 
 	csrKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	csr := generateCSR(t, csrKey, "test-node")
 
-	// JWT without tee-pubkey claim — Trustee KBS EAR tokens don't include it.
-	// Key binding is skipped; certificate should still be issued.
+	// Chart-managed Assam EAR tokens must bind the CSR key to the attested TEE.
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":     "kbs",
-		"iat":     time.Now().Unix(),
-		"exp":     time.Now().Add(5 * time.Minute).Unix(),
-		"submods": "test-evidence",
+		earclaims.Issuer:    "kbs",
+		earclaims.IssuedAt:  time.Now().Unix(),
+		earclaims.ExpiresAt: time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Submods:   "test-evidence",
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, ""))
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200 for missing tee-pubkey (skipped binding), got %d", w.Code)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for missing tee_public_key, got %d", w.Code)
 	}
 }
 
@@ -738,14 +857,14 @@ func TestHandleSignCSR_FutureIAT(t *testing.T) {
 	csr := generateCSR(t, csrKey, "test-node")
 
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        time.Now().Add(10 * time.Minute).Unix(), // future
-		"exp":        time.Now().Add(15 * time.Minute).Unix(),
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     time.Now().Add(10 * time.Minute).Unix(), // future
+		earclaims.ExpiresAt:    time.Now().Add(15 * time.Minute).Unix(),
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, ""))
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
@@ -770,11 +889,11 @@ func TestSignCSR_ReturnsSerial(t *testing.T) {
 	}
 
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        time.Now().Unix(),
-		"exp":        time.Now().Add(5 * time.Minute).Unix(),
-		"submods":    "test-evidence",
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     time.Now().Unix(),
+		earclaims.ExpiresAt:    time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 	claims, err := validateEARToken(ear, mustCertKeyProvider(t, iss.getBundle().tokenSignerCert), "", 30)
 	if err != nil {
@@ -800,15 +919,15 @@ func TestMetricsIncremented(t *testing.T) {
 	csr := generateCSR(t, csrKey, "test-node", net.ParseIP("10.0.0.6"))
 
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        time.Now().Unix(),
-		"exp":        time.Now().Add(5 * time.Minute).Unix(),
-		"submods":    "test-evidence",
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     time.Now().Unix(),
+		earclaims.ExpiresAt:    time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "1h"))
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
@@ -835,11 +954,11 @@ func TestRateLimiting(t *testing.T) {
 	csr := generateCSR(t, csrKey, "test-node", net.ParseIP("10.0.0.7"))
 
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        time.Now().Unix(),
-		"exp":        time.Now().Add(5 * time.Minute).Unix(),
-		"submods":    "test-evidence",
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     time.Now().Unix(),
+		earclaims.ExpiresAt:    time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "1h"))
@@ -849,7 +968,7 @@ func TestRateLimiting(t *testing.T) {
 	handler := rateLimitMiddleware(rl, http.HandlerFunc(iss.HandleSignCSR))
 
 	// First request should succeed.
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	req.RemoteAddr = "10.0.0.1:12345"
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -859,7 +978,7 @@ func TestRateLimiting(t *testing.T) {
 	}
 
 	// Second immediate request should be rate limited.
-	req2 := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req2 := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	req2.RemoteAddr = "10.0.0.1:12346"
 	w2 := httptest.NewRecorder()
 	handler.ServeHTTP(w2, req2)
@@ -886,6 +1005,25 @@ func TestTokenValidationError_Typed(t *testing.T) {
 	}
 }
 
+func TestValidateEARTokenRequiresExpiry(t *testing.T) {
+	iss, tokenKey := testIssuer(t)
+	token := signJWT(t, tokenKey, map[string]any{
+		earclaims.IssuedAt: time.Now().Unix(),
+	})
+
+	_, err := validateEARToken(token, mustCertKeyProvider(t, iss.getBundle().tokenSignerCert), "", 30)
+	if err == nil {
+		t.Fatal("expected missing expiry error")
+	}
+	var tve *tokenValidationError
+	if !errors.As(err, &tve) {
+		t.Fatalf("expected tokenValidationError, got %T: %v", err, err)
+	}
+	if tve.Reason != "malformed" {
+		t.Errorf("unexpected reason %q", tve.Reason)
+	}
+}
+
 // === New tests for Phase 1-4 ===
 
 func TestHandleSignCSR_DNSSANRejected(t *testing.T) {
@@ -897,15 +1035,15 @@ func TestHandleSignCSR_DNSSANRejected(t *testing.T) {
 	csr := generateCSRWithDNS(t, csrKey, "test-node", []string{"kubernetes.default.svc.cluster.local"}, net.ParseIP("10.0.0.1"))
 
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        time.Now().Unix(),
-		"exp":        time.Now().Add(5 * time.Minute).Unix(),
-		"submods":    "test-evidence",
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     time.Now().Unix(),
+		earclaims.ExpiresAt:    time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "1h"))
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	req.RemoteAddr = "10.0.0.1:12345"
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
@@ -913,6 +1051,34 @@ func TestHandleSignCSR_DNSSANRejected(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		respBody, _ := io.ReadAll(w.Result().Body)
 		t.Errorf("expected 403 for DNS SAN with no pattern, got %d: %s", w.Code, respBody)
+	}
+}
+
+func TestHandleSignCSR_DNSSANRejectedWhenSourceIPValidationDisabled(t *testing.T) {
+	iss, tokenKey := testIssuer(t)
+	iss.SANValidation = false
+	// No DNSSANPattern set -- all DNS SANs should still be rejected.
+
+	csrKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	csr := generateCSRWithDNS(t, csrKey, "test-node", []string{"kubernetes.default.svc.cluster.local"}, net.ParseIP("10.0.0.99"))
+
+	ear := signJWT(t, tokenKey, map[string]any{
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     time.Now().Unix(),
+		earclaims.ExpiresAt:    time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
+	})
+
+	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "1h"))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
+	req.RemoteAddr = "10.0.0.1:12345"
+	w := httptest.NewRecorder()
+	iss.HandleSignCSR(w, req)
+
+	if w.Code != http.StatusForbidden {
+		respBody, _ := io.ReadAll(w.Result().Body)
+		t.Errorf("expected 403 for DNS SAN with source-IP validation disabled, got %d: %s", w.Code, respBody)
 	}
 }
 
@@ -925,15 +1091,15 @@ func TestHandleSignCSR_ValidDNSSAN(t *testing.T) {
 	csr := generateCSRWithDNS(t, csrKey, "ratls-mesh-1", []string{"ratls-mesh-1.local"}, net.ParseIP("10.0.0.1"))
 
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        time.Now().Unix(),
-		"exp":        time.Now().Add(5 * time.Minute).Unix(),
-		"submods":    "test-evidence",
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     time.Now().Unix(),
+		earclaims.ExpiresAt:    time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "1h"))
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	req.RemoteAddr = "10.0.0.1:12345"
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
@@ -953,15 +1119,15 @@ func TestHandleSignCSR_InvalidCN(t *testing.T) {
 	csr := generateCSR(t, csrKey, "evil-impersonator", net.ParseIP("10.0.0.1"))
 
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "kbs",
-		"iat":        time.Now().Unix(),
-		"exp":        time.Now().Add(5 * time.Minute).Unix(),
-		"submods":    "test-evidence",
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     time.Now().Unix(),
+		earclaims.ExpiresAt:    time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "1h"))
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	req.RemoteAddr = "10.0.0.1:12345"
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
@@ -969,6 +1135,34 @@ func TestHandleSignCSR_InvalidCN(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		respBody, _ := io.ReadAll(w.Result().Body)
 		t.Errorf("expected 403 for invalid CN, got %d: %s", w.Code, respBody)
+	}
+}
+
+func TestHandleSignCSR_InvalidCNRejectedWhenSourceIPValidationDisabled(t *testing.T) {
+	iss, tokenKey := testIssuer(t)
+	iss.SANValidation = false
+	iss.AllowedCNPattern = regexp.MustCompile(`^ratls-mesh-`)
+
+	csrKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	csr := generateCSR(t, csrKey, "evil-impersonator", net.ParseIP("10.0.0.99"))
+
+	ear := signJWT(t, tokenKey, map[string]any{
+		earclaims.Issuer:       "kbs",
+		earclaims.IssuedAt:     time.Now().Unix(),
+		earclaims.ExpiresAt:    time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
+	})
+
+	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "1h"))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
+	req.RemoteAddr = "10.0.0.1:12345"
+	w := httptest.NewRecorder()
+	iss.HandleSignCSR(w, req)
+
+	if w.Code != http.StatusForbidden {
+		respBody, _ := io.ReadAll(w.Result().Body)
+		t.Errorf("expected 403 for invalid CN with source-IP validation disabled, got %d: %s", w.Code, respBody)
 	}
 }
 
@@ -980,15 +1174,15 @@ func TestHandleSignCSR_WrongIssuer(t *testing.T) {
 	csr := generateCSR(t, csrKey, "test-node")
 
 	ear := signJWT(t, tokenKey, map[string]any{
-		"iss":        "different-kbs-instance",
-		"iat":        time.Now().Unix(),
-		"exp":        time.Now().Add(5 * time.Minute).Unix(),
-		"submods":    "test-evidence",
-		"tee-pubkey": teePubKeyB64(t, csrKey),
+		earclaims.Issuer:       "different-kbs-instance",
+		earclaims.IssuedAt:     time.Now().Unix(),
+		earclaims.ExpiresAt:    time.Now().Add(5 * time.Minute).Unix(),
+		earclaims.Submods:      "test-evidence",
+		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
 
 	body, _ := json.Marshal(newSignCSRRequest(ear, csr, "1h"))
-	req := httptest.NewRequest("POST", "/v1/sign-csr", strings.NewReader(string(body)))
+	req := httptest.NewRequest("POST", "/sign-csr", strings.NewReader(string(body)))
 	w := httptest.NewRecorder()
 	iss.HandleSignCSR(w, req)
 
@@ -1053,80 +1247,21 @@ func TestRateLimiterMaxEntries(t *testing.T) {
 	}
 }
 
-func TestReload_BrokenChain(t *testing.T) {
-	// Generate two unrelated CAs.
-	intermediateKey, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
-	intermediateCert := selfSignedCA(t, intermediateKey, "Intermediate CA")
-
-	rootKey, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
-	rootCert := selfSignedCA(t, rootKey, "Root CA")
-
-	// The intermediate is NOT signed by the root — chain should fail.
-	err := validateChain(intermediateCert, rootCert)
-	if err == nil {
-		t.Fatal("expected error for broken chain")
-	}
-	if !strings.Contains(err.Error(), "not signed by parent CA") {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestValidateChain_Valid(t *testing.T) {
-	// Generate root CA with MaxPathLen=1 (allows one intermediate).
-	rootKey, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
-	rootTmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "Root CA", Organization: []string{"Test"}},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-		MaxPathLen:            1,
-	}
-	rootDER, err := x509.CreateCertificate(rand.Reader, rootTmpl, rootTmpl, &rootKey.PublicKey, rootKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rootCert, err := x509.ParseCertificate(rootDER)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Generate intermediate signed by root.
-	intermediateKey, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
-	intermediateTmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(3),
-		Subject:               pkix.Name{CommonName: "Intermediate CA"},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		MaxPathLen:            0,
-		MaxPathLenZero:        true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-	}
-	intermediateDER, err := x509.CreateCertificate(rand.Reader, intermediateTmpl, rootCert, &intermediateKey.PublicKey, rootKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	intermediateCert, err := x509.ParseCertificate(intermediateDER)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Chain should validate.
-	if err := validateChain(intermediateCert, rootCert); err != nil {
-		t.Fatalf("expected valid chain, got error: %v", err)
-	}
-}
-
 // === Resource map tests ===
+
+func mustBuildEndpointAllowlists(t *testing.T, rm resources.Map) (signCSR, handoff map[string]bool) {
+	t.Helper()
+	signCSR, handoff, err := buildEndpointAllowlists(rm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signCSR, handoff
+}
 
 func TestLoadResourceMap(t *testing.T) {
 	mapJSON := `{
 		"abc123": ["default/inference/*", "cert-issuer/sign-csr"],
-		"def456": ["cert-issuer/rotate-ca", "cert-issuer/ca"]
+		"def456": ["cert-issuer/handoff"]
 	}`
 
 	tmpFile := filepath.Join(t.TempDir(), "resource-map.json")
@@ -1144,8 +1279,8 @@ func TestLoadResourceMap(t *testing.T) {
 	if len(rm["abc123"]) != 2 {
 		t.Errorf("abc123 globs = %v, want 2 entries", rm["abc123"])
 	}
-	if len(rm["def456"]) != 2 {
-		t.Errorf("def456 globs = %v, want 2 entries", rm["def456"])
+	if len(rm["def456"]) != 1 {
+		t.Errorf("def456 globs = %v, want 1 entry", rm["def456"])
 	}
 }
 
@@ -1172,15 +1307,14 @@ func TestLoadResourceMap_InvalidJSON(t *testing.T) {
 }
 
 func TestBuildEndpointAllowlists(t *testing.T) {
-	rm := resourceMap{
-		"measurement_a": {"cert-issuer/sign-csr", "cert-issuer/ca"},
-		"measurement_b": {"cert-issuer/rotate-ca", "cert-issuer/ca"},
+	rm := resources.Map{
+		"measurement_a": {resources.CertIssuerSignCSR, resources.CertIssuerHandoff},
+		"measurement_b": {resources.CertIssuerHandoff},
 		"measurement_c": {"default/inference/*"}, // no cert-issuer paths
 	}
 
-	signCSR, rotateCA, ca := buildEndpointAllowlists(rm)
+	signCSR, handoff := mustBuildEndpointAllowlists(t, rm)
 
-	// sign-csr: only measurement_a
 	if !signCSR["measurement_a"] {
 		t.Error("expected measurement_a allowed for sign-csr")
 	}
@@ -1191,108 +1325,123 @@ func TestBuildEndpointAllowlists(t *testing.T) {
 		t.Errorf("sign-csr allowlist size = %d, want 1", len(signCSR))
 	}
 
-	// rotate-ca: only measurement_b
-	if !rotateCA["measurement_b"] {
-		t.Error("expected measurement_b allowed for rotate-ca")
+	if !handoff["measurement_a"] || !handoff["measurement_b"] {
+		t.Errorf("expected measurement_a and measurement_b allowed for handoff, got %v", handoff)
 	}
-	if len(rotateCA) != 1 {
-		t.Errorf("rotate-ca allowlist size = %d, want 1", len(rotateCA))
-	}
-
-	// ca: measurement_a and measurement_b
-	if !ca["measurement_a"] {
-		t.Error("expected measurement_a allowed for ca")
-	}
-	if !ca["measurement_b"] {
-		t.Error("expected measurement_b allowed for ca")
-	}
-	if len(ca) != 2 {
-		t.Errorf("ca allowlist size = %d, want 2", len(ca))
+	if len(handoff) != 2 {
+		t.Errorf("handoff allowlist size = %d, want 2", len(handoff))
 	}
 }
 
 func TestBuildEndpointAllowlists_WildcardGlob(t *testing.T) {
-	rm := resourceMap{
+	rm := resources.Map{
 		"measurement_wild": {"cert-issuer/*"},
 	}
 
-	signCSR, rotateCA, ca := buildEndpointAllowlists(rm)
+	signCSR, handoff := mustBuildEndpointAllowlists(t, rm)
 
 	if !signCSR["measurement_wild"] {
 		t.Error("cert-issuer/* should match sign-csr")
 	}
-	if !rotateCA["measurement_wild"] {
-		t.Error("cert-issuer/* should match rotate-ca")
-	}
-	if !ca["measurement_wild"] {
-		t.Error("cert-issuer/* should match ca")
+	if !handoff["measurement_wild"] {
+		t.Error("cert-issuer/* should match handoff")
 	}
 }
 
 func TestBuildEndpointAllowlists_Empty(t *testing.T) {
-	signCSR, rotateCA, ca := buildEndpointAllowlists(nil)
-	if signCSR != nil || rotateCA != nil || ca != nil {
+	signCSR, handoff := mustBuildEndpointAllowlists(t, nil)
+	if signCSR != nil || handoff != nil {
 		t.Error("expected nil allowlists for nil resource map")
 	}
 }
 
 func TestBuildEndpointAllowlists_NoCertIssuerPaths(t *testing.T) {
-	rm := resourceMap{
+	rm := resources.Map{
 		"measurement_x": {"default/inference/*", "default/keys/*"},
 	}
 
-	signCSR, rotateCA, ca := buildEndpointAllowlists(rm)
-	if signCSR != nil || rotateCA != nil || ca != nil {
+	signCSR, handoff := mustBuildEndpointAllowlists(t, rm)
+	if signCSR != nil || handoff != nil {
 		t.Error("expected nil allowlists when no cert-issuer paths match")
 	}
 }
 
-func TestCheckMeasurement_WithResourceMap(t *testing.T) {
-	// Build a resource map and derive allowlists.
-	rm := resourceMap{
-		"allowed_measurement": {"cert-issuer/sign-csr", "cert-issuer/ca"},
-		"other_measurement":   {"cert-issuer/rotate-ca"},
+func TestBuildEndpointAllowlists_InvalidGlobFailsClosed(t *testing.T) {
+	rm := resources.Map{
+		"measurement_x": {"cert-issuer/["},
 	}
-	signCSR, _, ca := buildEndpointAllowlists(rm)
 
-	// Build EAR claims with the allowed measurement.
+	_, _, err := buildEndpointAllowlists(rm)
+	if err == nil {
+		t.Fatal("expected invalid glob error")
+	}
+	if !strings.Contains(err.Error(), "invalid resource map glob") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBuildEndpointAllowlists_HandoffOnly(t *testing.T) {
+	rm := resources.Map{
+		"measurement_h": {resources.CertIssuerHandoff},
+	}
+
+	signCSR, handoff := mustBuildEndpointAllowlists(t, rm)
+	if signCSR != nil {
+		t.Errorf("expected nil sign-csr allowlist, got %v", signCSR)
+	}
+	if !handoff["measurement_h"] {
+		t.Error("expected measurement_h allowed for handoff")
+	}
+}
+
+func TestCheckMeasurement_WithResourceMap(t *testing.T) {
+	rm := resources.Map{
+		"allowed_measurement": {resources.CertIssuerSignCSR},
+		"other_measurement":   {"default/inference/*"},
+	}
+	signCSR, _ := mustBuildEndpointAllowlists(t, rm)
+
 	evidence := map[string]any{
-		"cpu0": map[string]any{
-			"ear.veraison.annotated-evidence": map[string]any{
-				"snp": map[string]any{
-					"measurement": "allowed_measurement",
-				},
-			},
+		earclaims.SubmodAttester: map[string]any{
+			earclaims.LaunchDigest: "allowed_measurement",
 		},
 	}
 	rawEvidence, _ := json.Marshal(evidence)
 	claims := &earClaims{RawEvidence: rawEvidence}
 
-	// sign-csr: should be allowed.
 	if err := checkMeasurement(claims, signCSR, "sign-csr"); err != nil {
 		t.Errorf("expected allowed for sign-csr, got: %v", err)
 	}
 
-	// ca: should be allowed.
-	if err := checkMeasurement(claims, ca, "ca"); err != nil {
-		t.Errorf("expected allowed for ca, got: %v", err)
-	}
-
-	// Build claims with a non-matching measurement.
 	evidenceDenied := map[string]any{
-		"cpu0": map[string]any{
-			"ear.veraison.annotated-evidence": map[string]any{
-				"snp": map[string]any{
-					"measurement": "unknown_measurement",
-				},
-			},
+		earclaims.SubmodAttester: map[string]any{
+			earclaims.LaunchDigest: "unknown_measurement",
 		},
 	}
 	rawDenied, _ := json.Marshal(evidenceDenied)
 	claimsDenied := &earClaims{RawEvidence: rawDenied}
 
-	// sign-csr: should be denied.
 	if err := checkMeasurement(claimsDenied, signCSR, "sign-csr"); err == nil {
 		t.Error("expected denial for unknown measurement on sign-csr")
+	}
+}
+
+func TestCheckMeasurement_WithChartManagedAssamLaunchDigest(t *testing.T) {
+	rm := resources.Map{
+		"allowed_measurement": {resources.CertIssuerSignCSR},
+	}
+	signCSR, _ := mustBuildEndpointAllowlists(t, rm)
+
+	evidence := map[string]any{
+		earclaims.SubmodAttester: map[string]any{
+			earclaims.LaunchDigest:   "allowed_measurement",
+			earclaims.EARRawEvidence: map[string]any{"opaque": true},
+		},
+	}
+	rawEvidence, _ := json.Marshal(evidence)
+	claims := &earClaims{RawEvidence: rawEvidence}
+
+	if err := checkMeasurement(claims, signCSR, "sign-csr"); err != nil {
+		t.Errorf("expected chart-managed Assam launch_digest to be allowed, got: %v", err)
 	}
 }

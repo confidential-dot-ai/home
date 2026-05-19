@@ -1,37 +1,3 @@
-{{- if .Values.attestationService.enabled -}}
-{{- /*
-  Resolve the api_key: explicit value > existing Secret > freshly generated.
-  Additional workload namespace keys are generated per namespace and added
-  to the attestation-service allowlist so one leaked workload Secret is not
-  the cluster-wide chart key.
-*/ -}}
-{{- $root := . -}}
-{{- $apiKeySecretName := printf "%s-api-key" (include "c8s.attestationServiceName" .) -}}
-{{- $workloadAPIKeySecretName := include "c8s.workloadAPIKeySecretName" . -}}
-{{- $existing := (lookup "v1" "Secret" .Release.Namespace $apiKeySecretName) -}}
-{{- $apiKey := .Values.attestationService.apiKey -}}
-{{- if and (not $apiKey) $existing $existing.data.apiKey -}}
-  {{- $apiKey = (b64dec $existing.data.apiKey) -}}
-{{- end -}}
-{{- if not $apiKey -}}
-  {{- $apiKey = randAlphaNum 32 -}}
-{{- end -}}
-{{- $authKeys := list $apiKey -}}
-{{- $workloadKeys := dict -}}
-{{- range $ns := .Values.webhook.apiKeySecret.createInNamespaces -}}
-  {{- $reuseReleaseSecret := and (eq $ns $root.Release.Namespace) (eq $workloadAPIKeySecretName $apiKeySecretName) -}}
-  {{- $existingWorkloadSecret := (lookup "v1" "Secret" $ns $workloadAPIKeySecretName) -}}
-  {{- $workloadKey := "" -}}
-  {{- if $reuseReleaseSecret -}}
-    {{- $workloadKey = $apiKey -}}
-  {{- else if and $existingWorkloadSecret (index $existingWorkloadSecret.data $root.Values.webhook.apiKeySecret.key) -}}
-    {{- $workloadKey = (b64dec (index $existingWorkloadSecret.data $root.Values.webhook.apiKeySecret.key)) -}}
-  {{- else -}}
-    {{- $workloadKey = randAlphaNum 32 -}}
-  {{- end -}}
-  {{- $_ := set $workloadKeys $ns $workloadKey -}}
-  {{- $authKeys = append $authKeys $workloadKey -}}
-{{- end -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -43,35 +9,6 @@ metadata:
 {{ include "c8s.serviceAccountImagePullSecrets" . }}
 ---
 apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $apiKeySecretName }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-{{ include "c8s.commonLabels" . | indent 4 }}
-    app.kubernetes.io/component: attestation-service
-type: Opaque
-stringData:
-  apiKey: {{ $apiKey | quote }}
-{{- range $ns := .Values.webhook.apiKeySecret.createInNamespaces }}
-{{- $reuseReleaseSecret := and (eq $ns $root.Release.Namespace) (eq $workloadAPIKeySecretName $apiKeySecretName) }}
-{{- if not $reuseReleaseSecret }}
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $workloadAPIKeySecretName }}
-  namespace: {{ $ns }}
-  labels:
-{{ include "c8s.commonLabels" $root | indent 4 }}
-    app.kubernetes.io/component: workload-auth
-type: Opaque
-stringData:
-  {{ $root.Values.webhook.apiKeySecret.key }}: {{ index $workloadKeys $ns | quote }}
-{{- end }}
-{{- end }}
----
-apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "c8s.attestationServiceName" . }}
@@ -81,7 +18,7 @@ metadata:
     app.kubernetes.io/component: attestation-service
 data:
   config.toml: |
-{{ include "c8s.attestationServiceConfig" (dict "root" . "authKeys" $authKeys) | indent 4 }}
+{{ include "c8s.attestationServiceConfig" (dict "root" .) | indent 4 }}
 ---
 apiVersion: v1
 kind: Service
@@ -126,7 +63,7 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/component: attestation-service
       annotations:
-        checksum/config: {{ include "c8s.attestationServiceConfig" (dict "root" . "authKeys" $authKeys) | sha256sum }}
+        checksum/config: {{ include "c8s.attestationServiceConfig" (dict "root" .) | sha256sum }}
     spec:
       serviceAccountName: {{ include "c8s.attestationServiceName" . }}
       tolerations:
@@ -202,4 +139,3 @@ spec:
             path: /dev/tpmrm0
             type: CharDevice
         {{- end }}
-{{- end }}

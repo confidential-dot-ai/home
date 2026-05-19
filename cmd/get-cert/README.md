@@ -2,7 +2,7 @@
 
 A CLI tool for obtaining TLS certificates through the assam TEE attestation flow. It generates (or loads) an ECDSA P-256 key pair, creates a CSR with a specified Subject Alternative Name (SAN), and runs the full attestation-verification-certification flow via assam.
 
-Designed to run as a Kubernetes init-container alongside a load balancer (e.g. nginx) that terminates TLS with the obtained certificate.
+Designed to run as a Kubernetes init container or renewal sidecar alongside a workload that uses the obtained certificate.
 
 ## Usage
 
@@ -28,18 +28,6 @@ get-cert \
   --key-out /tls/key.pem
 ```
 
-Authenticate with the attestation service using a Bearer token:
-
-```bash
-get-cert \
-  --assam-url http://assam:8080 \
-  --attestation-service-url http://localhost:8400 \
-  --attestation-service-api-key "$ATTESTATION_API_KEY" \
-  --san api.example.com \
-  --out /tls/cert.pem \
-  --key-out /tls/key.pem
-```
-
 Use an existing private key:
 
 ```bash
@@ -57,11 +45,14 @@ get-cert \
 |------|-------|---------|-------------|
 | `--assam-url` | | *(required)* | URL of the running assam service |
 | `--attestation-service-url` | | *(required)* | URL of the local attestation service |
-| `--attestation-service-api-key` | | | Bearer token for authenticating with the attestation service |
 | `--san` | | *(required)* | Subject Alternative Name — IP address or hostname |
-| `--out` | `-o` | *(stdout)* | Path to write the signed certificate PEM |
+| `--out` | `-o` | *(stdout)* | Path to write the signed certificate chain PEM |
 | `--key` | | *(ephemeral)* | Path to an existing PEM private key for the CSR |
 | `--key-out` | | | Path to write the generated private key PEM |
+| `--key-mode` | | `0600` | Octal mode for a generated private key |
+| `--renew-interval` | | `0` | Re-obtain the certificate at this interval; `0` runs once and exits |
+| `--reload-nginx` | | `true` | SIGHUP nginx after certificate renewal or watched file changes |
+| `--continue-on-initial-error` | | `false` | In renewal mode, keep running when the first certificate request fails |
 | `--verbose` | `-v` | `false` | Enable debug logging |
 
 ## Output path validation
@@ -78,3 +69,5 @@ The `--san` flag accepts either an IP address or a hostname. get-cert automatica
 ## Certificate TTL
 
 Certificate lifetime is controlled server-side by assam's `--cert-ttl` flag (default 24h). get-cert does not set the TTL — configure it on the assam server.
+
+For long-running pods, set `--renew-interval` shorter than the server-side TTL. When the workload is not nginx, pass `--reload-nginx=false` and have the workload reload the refreshed cert files using its own mechanism.

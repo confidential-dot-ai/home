@@ -101,10 +101,6 @@ jobs:
             image: ghcr.io/lunal-dev/cert-issuer
             dockerfile: cmd/cert-issuer/Dockerfile
             needs-attestation: false
-          - binary: cert-rotator
-            image: ghcr.io/lunal-dev/cert-rotator
-            dockerfile: cmd/cert-rotator/Dockerfile
-            needs-attestation: true
           - binary: nri-image-policy
             image: ghcr.io/lunal-dev/nri-image-policy
             dockerfile: cmd/nri-image-policy/Dockerfile

@@ -1,6 +1,3 @@
-{{- if hasKey .Values.operator "replicas" }}
-{{- fail "operator.replicas is unsupported; the operator must run as a singleton because webhook TLS is pod-local" }}
-{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -48,27 +45,18 @@ spec:
             - operator
             - --leader-election-namespace={{ .Release.Namespace }}
             - --status-mirror-enabled={{ .Values.statusMirror.enabled }}
-            {{- if .Values.webhook.enabled }}
-            - --operator-image={{ include "c8s.image" . }}
+            - --get-cert-image={{ include "c8s.image" . }}
             - --assam-url={{ include "c8s.assamURL" . }}
             - --webhook-config-name={{ include "c8s.fullname" . }}-pod-injector
             - --webhook-service-name={{ include "c8s.operatorName" . }}
             - --webhook-service-namespace={{ .Release.Namespace }}
-            {{- end }}
-            {{- if .Values.attestationService.enabled }}
             - --attestation-service-url={{ include "c8s.attestationServiceURL" . }}
-            {{- if .Values.webhook.enabled }}
-            - --attestation-service-api-key-secret-name={{ include "c8s.workloadAPIKeySecretName" . }}
-            - --attestation-service-api-key-secret-key={{ .Values.webhook.apiKeySecret.key }}
-            {{- end }}
-            {{- end }}
-            {{- if .Values.webhook.enabled }}
             - --cert-fs-group={{ .Values.webhook.certVolume.fsGroup }}
             - --cert-key-mode={{ .Values.webhook.certVolume.keyMode }}
-            - --init-run-as-user={{ .Values.webhook.initContainer.runAsUser }}
-            - --init-run-as-group={{ .Values.webhook.initContainer.runAsGroup }}
-            - --init-run-as-non-root={{ .Values.webhook.initContainer.runAsNonRoot }}
-            {{- end }}
+            - --get-cert-renew-interval={{ .Values.webhook.getCert.renewInterval }}
+            - --get-cert-run-as-user={{ .Values.webhook.getCert.runAsUser }}
+            - --get-cert-run-as-group={{ .Values.webhook.getCert.runAsGroup }}
+            - --get-cert-run-as-non-root={{ .Values.webhook.getCert.runAsNonRoot }}
             {{- range .Values.operator.extraArgs }}
             - {{ . | quote }}
             {{- end }}
@@ -112,11 +100,9 @@ spec:
     - name: metrics
       port: 8080
       targetPort: metrics
-    {{- if .Values.webhook.enabled }}
     # Webhook service port. The API server dials this Service:port; the
     # MutatingWebhookConfiguration's clientConfig.service.port matches.
     # controller-runtime's webhook server listens on 9443 by default.
     - name: webhook
       port: {{ .Values.webhook.service.port }}
       targetPort: 9443
-    {{- end }}

@@ -3,7 +3,7 @@
 The c8s operator installs the Kubernetes-facing c8s components. It hosts
 status-mirror controllers, serves the pod-injection admission webhook, and
 ships an embedded Helm chart for installing the operator, CRDs, RBAC, webhook
-resources, attestation-service DaemonSet, and optional Assam.
+resources, attestation-service DaemonSet, Assam, and cert-issuer.
 
 ## Overview
 
@@ -15,11 +15,10 @@ The operator tree is built around these pieces:
 - `cmd/c8s install` extracts the embedded chart from `internal/helmchart`
   and shells out to `helm upgrade --install`.
 - `internal/helmchart/c8s` installs the operator Deployment and Service, the
-  CRDs, RBAC, optional webhook configuration, and an attestation-service
-  DaemonSet. It can also install Assam and cert-issuer when
-  `assam.enabled=true` and `certIssuer.enabled=true`.
-- `internal/webhook` injects an init container into opted-in pods so each
-  workload can fetch a leaf certificate through Assam.
+  CRDs, RBAC, webhook configuration, attestation-service DaemonSet, Assam, and
+  cert-issuer.
+- `internal/webhook` injects get-cert containers into opted-in pods so each
+  workload can fetch and renew a leaf certificate through Assam.
 
 The operator does not inject the RA-TLS mesh sidecar. Pod-to-pod mTLS remains
 the responsibility of the node-level `ratls-mesh` DaemonSet.
@@ -34,17 +33,11 @@ the operator Deployment, the webhook Service and configuration, and the
 attestation-service DaemonSet. Enabling injection also requires platform-owned
 prerequisites:
 
-- an Assam endpoint reachable from workload pods;
-- if chart-managed Assam is enabled, a cert-issuer URL, whitelist storage and
-  admin secret handling, and an explicit decision about whether this deployment
-  is inside the production trust boundary;
-- if chart-managed cert-issuer is enabled, a Secret-backed mesh CA bootstrap
-  and an explicit decision that this is acceptable for the environment;
+- the chart-managed Assam Service reachable from workload pods;
+- whitelist storage and a measurement resource map for any workload allowed to
+  mutate the whitelist;
+- a cert-issuer public-bundle PVC for CA continuity;
 - nodes with the expected TEE device access for attestation-service;
-- permission for Helm to create workload auth Secrets in any namespaces listed
-  under `webhook.apiKeySecret.createInNamespaces`;
-- those workload namespaces must already exist, or be created by the platform
-  before rendering the chart.
 
 After the platform installs those pieces, workload opt-in is self-service:
 application teams annotate their pod templates with `confidential.ai/cw`.
@@ -57,142 +50,139 @@ The main source directories are:
 |---|---|
 | `cmd/c8s/` | User-facing operator and install CLI commands. |
 | `internal/controller/` | controller-runtime manager, webhook bootstrap, and status mirror setup. |
-| `internal/webhook/` | Pod mutation logic, init container args, SecretRef auth, cert volume permissions, and unit tests. |
+| `internal/webhook/` | Pod mutation logic, get-cert args, cert volume permissions, and unit tests. |
 | `internal/helmchart/c8s/` | Embedded Helm chart templates and defaults. |
-| `internal/helmchart/chart_test.go` | Helm render tests for default behavior, Assam gating, SecretRef auth, and scoped workload Secrets. |
-| `cmd/get-cert/` | Init-container certificate fetcher, including private-key file mode handling and API-key environment fallback. |
+| `internal/helmchart/chart_test.go` | Helm render tests for the supported chart-managed CVM-only shape. |
+| `cmd/get-cert/` | Certificate bootstrap and renewal helper, including private-key file mode handling. |
 
 ## Default install behavior
 
-The chart is intentionally conservative by default:
+The supported chart shape is chart-managed and CVM-only. The chart does not
+support a non-CVM install shape or a bring-your-own Assam/cert-issuer endpoint
+shape.
 
-- `webhook.enabled` defaults to `false`.
-- If the webhook is enabled, either `assam.url` or `assam.enabled=true` is
-  required at template time.
-- The chart deploys the attestation-service DaemonSet, but it does not deploy
-  Assam unless `assam.enabled=true`, and it does not deploy cert-issuer unless
-  `certIssuer.enabled=true`.
+- The chart renders webhook, attestation-service, Assam, and cert-issuer
+  together.
+- The webhook is wired to the chart-managed Assam Service.
+- Assam is wired to the chart-managed cert-issuer Service.
+- cert-issuer validates EAR JWTs through chart-managed Assam's JWKS endpoint.
+- whitelist admin is EAR-authorized through Assam; the chart does not render an
+  Assam whitelist password or attestation-service API key into Kubernetes
+  Secrets.
 - `image.tag` or `image.digest`, `attestationService.image.tag` or
-  `attestationService.image.digest`, and, when enabled, `assam.image.tag` or
-  `assam.image.digest` and `certIssuer.image.tag` or
+  `attestationService.image.digest`, `assam.image.tag` or
+  `assam.image.digest`, and `certIssuer.image.tag` or
   `certIssuer.image.digest` are required; the CLI passes its build version when
   running `c8s install`. Unstamped local builds report version `dev`, and the
   install CLI maps that to the `latest` image tag because CI does not publish
   `dev`.
 
-This means a default platform install creates the operator, CRDs, RBAC, and
-attestation-service without mutating application workloads. `c8s install
---install-crds=false` passes Helm's `--skip-crds`; CRDs are advisory and not
-required for pod injection. That path also disables the CRD-backed status
-mirror controller; if CRDs are absent at runtime, the operator skips that
-controller rather than failing startup. Injection is an explicit platform
-follow-up after Assam is reachable. Once injection is enabled, application teams
-can opt workloads in by annotation.
+This means a default platform install creates the operator, CRDs, RBAC,
+webhook, attestation-service, Assam, and cert-issuer. It does not mutate
+application workloads until those workloads opt in with
+`confidential.ai/cw`.
 
-Enable injection with Helm values:
-
-```yaml
-webhook:
-  enabled: true
-
-assam:
-  url: http://assam.c8s-system.svc:8080
-```
-
-Or with the install CLI:
+Install with the CLI:
 
 ```bash
-c8s install \
-  --enable-webhook \
-  --assam-url http://assam.c8s-system.svc:8080
+c8s install
 ```
+
+`c8s install --install-crds=false` passes Helm's `--skip-crds`; CRDs are
+advisory and not required for pod injection. That path also disables the
+CRD-backed status mirror controller; if CRDs are absent at runtime, the
+operator skips that controller rather than failing startup.
 
 ## Chart-managed Assam
 
-`assam.enabled` defaults to `false`. The default production posture is to point
-the webhook at an Assam/CDS endpoint that the platform already operates inside
-the intended c8s trust boundary:
+The supported deployment is chart-managed Assam plus cert-issuer running inside
+the intended CVM trust boundary.
+
+The chart installs an Assam Deployment, Service, ServiceAccount, and either an
+`emptyDir` whitelist DB or a PVC when `assam.persistence.enabled=true`. The
+operator injects pods with the chart-managed Assam Service URL. Whitelist
+writes use `Authorization: Bearer <EAR>`. Assam accepts `POST /whitelist` and
+`DELETE /whitelist` only when the EAR was issued by Assam and the requester's
+normalized launch measurement is allowed for `assam/whitelist-write` in
+`assam.resourceMap`.
+
+Internal Assam, cert-issuer, and CA-bundle refresh traffic uses chart-managed
+cluster Services. Trust for those flows comes from EAR validation, measurement
+allowlists, and CA continuity checks rather than WebPKI on the Service hop.
+
+Minimal whitelist-write values:
 
 ```yaml
-webhook:
-  enabled: true
-
 assam:
-  url: http://assam.c8s-system.svc:8080
+  resourceMap:
+    "<sha384-launch-measurement>":
+      - assam/whitelist-write
 ```
-
-When `assam.enabled=true`, the chart installs an Assam Deployment, Service,
-ServiceAccount, admin-password Secret, and either an `emptyDir` whitelist DB or
-a PVC when `assam.persistence.enabled=true`. The operator then injects pods
-with the chart-managed Assam Service URL, so `assam.url` can be omitted.
-If both `assam.url` and `assam.enabled=true` are set, `assam.url` remains an
-explicit override for the injected endpoint.
-
-Chart-managed Assam is useful for bootstrap/dev and for platforms that
-deliberately run Assam as part of their attested infrastructure. It is not, by
-itself, the complete whitepaper production security model. For production
-guarantees, Assam/CDS must run inside the attested trust boundary; whitelist
-state, signing material, admin credentials, and recovery procedures must not
-depend only on ordinary Kubernetes Secret/PV confidentiality.
-
-Minimal chart-managed Assam + cert-issuer values:
-
-```yaml
-webhook:
-  enabled: true
-
-assam:
-  enabled: true
-
-certIssuer:
-  enabled: true
-```
-
-Equivalent install CLI:
-
-```bash
-c8s install \
-  --enable-webhook \
-  --install-assam
-```
-
-When `--install-assam` is used without `--assam-cert-issuer-url`, the install
-CLI also enables chart-managed cert-issuer and bootstraps a mesh CA Secret.
-Set `--assam-cert-issuer-url` to use an external cert-issuer instead.
-
-The chart-managed Assam manifest deliberately injects
-`C8S_ATTESTATION_SERVICE_API_KEY` and
-`C8S_ASSAM_WHITELIST_ADMIN_PASSWORD` from Secrets instead of serializing those
-values as process arguments.
 
 ## Chart-managed cert-issuer
 
-`certIssuer.enabled` defaults to `false`. When enabled with chart-managed Assam,
-cert-issuer validates EAR JWTs through Assam's JWKS endpoint:
+Cert-issuer validates EAR JWTs through chart-managed Assam's JWKS endpoint.
 
-```yaml
-assam:
-  enabled: true
+The chart does not render a CA private key into a Kubernetes Secret. Cert-issuer
+generates its mesh CA key inside the process, keeps it in memory, and persists
+only the public CA bundle in the configured public-bundle PVC.
 
-certIssuer:
-  enabled: true
-```
+### Operational warning: cert-issuer is a singleton until handoff is enabled
 
-The chart creates or reuses a mesh CA Secret with `mesh-ca.crt` and
-`mesh-ca.key`, plus a ConfigMap containing `ca.pem`. The generated key is ECDSA
-so it matches cert-issuer's key loader. Existing Secrets are reused on Helm
-upgrades via `lookup`; fresh keys are generated only when no existing Secret or
-explicit `certIssuer.ca.certPEM` / `certIssuer.ca.keyPEM` values are present.
+By default, cert-issuer runs as a single replica with the in-memory mesh CA
+key, and **any restart is a full re-bootstrap event**: the replacement pod
+generates a fresh CA whose public key is not signed by anything ratls-mesh
+already trusts. `pkg/ratls/assamclient`'s continuity check then refuses the
+new CA on the next `/ca` poll, cert-issuer keeps signing leaves with the
+new key, no workload trusts them, and the mesh degrades as old leaves
+expire. Recovery is to restart every workload so its get-cert init container
+re-runs the Assam provisioning flow.
 
-This is a bootstrap/demo path. The mesh CA key is readable by cluster-admins
-and any principal granted read access to that Secret. The production direction
-is the CDS-shaped in-CVM key model described in `docs/THREAT_MODEL.md` and
-`docs/GAPS.md`.
+Scheduled in-process CA rotation (`--ca-rotation-interval`) is **not** a
+re-bootstrap: the rotator signs the new CA with the still-live current
+CA's key, the continuity check accepts it, and workloads pick it up on
+their next `/ca` refresh. Only restart loses the signing key.
+
+To remove this restriction, enable in-process handoff bootstrap by setting
+`certIssuer.handoff.enabled=true` in values and pinning
+`certIssuer.measurements` to cert-issuer's launch digest. The chart
+auto-injects the `cert-issuer/handoff` entry into the rendered
+resourceMap from those measurements (so the value is set in one place,
+not two); enabling handoff without measurements fails chart render. With
+that flag set, cert-issuer generates an ECDSA handoff signer key in process
+at startup and exchanges it for an Assam-issued EAR via Assam's
+`/attest-key` endpoint (over the H1 RA-TLS channel). No operator key file
+or Kubernetes Secret is rendered — the alternative would put CA-adjacent
+material into etcd, which the chart-managed CVM design forbids.
+
+Until handoff is enabled:
+
+- run cert-issuer with `replicas: 1` and `strategy: Recreate` (default in
+  this chart);
+- guard the cert-issuer Deployment with a PodDisruptionBudget that blocks
+  voluntary disruptions;
+- treat any cert-issuer restart as a planned maintenance event with workload
+  churn;
+- monitor the `cert_ca_fingerprint_info{fingerprint=…}` metric — a
+  fingerprint change without a planned rotation means a restart happened
+  and workload re-provisioning is needed.
+
+After enabling handoff, verify the bootstrap succeeded by checking
+cert-issuer logs for `attested CA handoff enabled` and
+`handoff EAR refreshed` lines. Failures will be logged at warn-level
+without crashing the binary; the handoff handler stays unregistered and the
+restart-fragility window above applies until the operator fixes the
+underlying issue.
 
 ## Injection contract
 
 The webhook only reads pod metadata. A `ConfidentialWorkload` CR is not
-required for injection.
+required for injection. For tls-lb pods in the c8s release namespace, the
+chart uses a dedicated webhook entry selected by the chart's existing
+`app.kubernetes.io/name=tls-lb` and release instance labels. That avoids
+sending every platform pod to the webhook during bootstrap while still ensuring
+tls-lb cannot silently start if its c8s annotation set is partially rendered or
+invalid.
 
 Opt a pod template in with:
 
@@ -210,14 +200,17 @@ For opted-in pods, the webhook:
 - adds an in-memory `emptyDir` volume named `c8s-certs`;
 - mounts that volume read-only into application containers at
   `/etc/c8s/certs`;
-- prepends a `c8s-init-cert` init container that runs the `get-cert` subcommand;
+- prepends a `c8s-init-cert` init container that fetches the first cert before
+  application containers start;
+- adds a native `c8s-renew-cert` sidecar init container that refreshes
+  `tls.crt` every `webhook.getCert.renewInterval`;
 - stamps `confidential.ai/c8s-injected=true` to make reinvocation a no-op.
 
 The init container runs:
 
 ```bash
 get-cert \
-  --assam-url=<assam.url> \
+  --assam-url=http://<release>-assam.<namespace>.svc:8080 \
   --attestation-service-url=<release-attestation-service-url> \
   --san=<confidential.ai/cw> \
   --out=/etc/c8s/certs/tls.crt \
@@ -225,57 +218,20 @@ get-cert \
   --key-mode=<webhook.certVolume.keyMode>
 ```
 
-## Attestation-service auth
+The renewal sidecar runs the same flow with `--key=/etc/c8s/certs/tls.key`,
+`--renew-interval=<webhook.getCert.renewInterval>`, and
+`--reload-nginx=false`. It renews the file on disk; application-level TLS
+reload remains the workload's responsibility unless the pod opts into one of
+the c8s reload annotations.
 
-The chart-managed attestation-service runs in hosted mode, so protected
-endpoints are gated by API keys.
-
-The operator no longer reads the API key and serializes it into every mutated
-Pod spec. Instead, the injected init container gets
-`C8S_ATTESTATION_SERVICE_API_KEY` from a workload-namespace `SecretKeyRef`.
-That avoids exposing a cluster-wide key to anyone who can `get pods` in an
-application namespace.
-
-Relevant values:
-
-```yaml
-webhook:
-  apiKeySecret:
-    name: ""
-    key: apiKey
-    createInNamespaces: []
-```
-
-If `name` is empty, the injected Secret name defaults to the chart-managed
-attestation-service API-key Secret name. That Secret only exists in the release
-namespace unless copied or created elsewhere.
-
-For chart-managed per-namespace workload keys, set:
-
-```yaml
-webhook:
-  apiKeySecret:
-    name: c8s-workload-attestation
-    key: token
-    createInNamespaces:
-      - tenant-a
-      - tenant-b
-```
-
-The chart will create one Secret per listed namespace and add each generated
-key to the attestation-service `api_keys` allowlist.
-
-The install CLI exposes the same path:
-
-```bash
-c8s install \
-  --enable-webhook \
-  --assam-url http://assam.c8s-system.svc:8080 \
-  --attestation-secret-name c8s-workload-attestation \
-  --attestation-secret-key token \
-  --workload-namespace tenant-a \
-  --workload-namespace tenant-b
-```
+Platform-owned workloads can specialize the same webhook behavior with typed
+c8s annotations for the cert volume, cert/key filenames, renewal interval,
+nginx reload, Secret watch paths, discovery output, and get-cert UID/GID. The
+tls-lb chart uses those annotations to keep its PKI volumes and nginx config in
+the chart while dogfooding the webhook-injected get-cert containers. The
+webhook rejects incomplete reload-watch or discovery annotation sets during pod
+admission instead of admitting a pod that cannot serve its configured
+certificate/discovery path.
 
 ## Certificate file permissions
 
@@ -291,7 +247,8 @@ webhook:
   certVolume:
     fsGroup: 65532
     keyMode: "0640"
-  initContainer:
+  getCert:
+    renewInterval: 6h
     runAsUser: 65532
     runAsGroup: 65532
     runAsNonRoot: true
@@ -301,12 +258,13 @@ Set `webhook.certVolume.fsGroup` to `-1` to disable pod `fsGroup` mutation.
 The webhook preserves an existing pod `fsGroup`.
 
 For Kata deployments that require UID 0 inside the guest, set
-`webhook.initContainer.runAsUser=0`, `webhook.initContainer.runAsGroup=0`, and
-`webhook.initContainer.runAsNonRoot=false`. The install CLI exposes those as
-`--webhook-init-run-as-user`, `--webhook-init-run-as-group`, and
-`--webhook-init-run-as-non-root=false`.
+`webhook.getCert.runAsUser=0`, `webhook.getCert.runAsGroup=0`, and
+`webhook.getCert.runAsNonRoot=false`. The install CLI exposes those as
+`--webhook-get-cert-run-as-user`, `--webhook-get-cert-run-as-group`, and
+`--webhook-get-cert-run-as-non-root=false`. The renewal interval is exposed as
+`--webhook-get-cert-renew-interval`.
 
-The injected init container also uses a locked-down security context:
+The injected get-cert containers also use a locked-down security context:
 
 - `allowPrivilegeEscalation: false`
 - `readOnlyRootFilesystem: true`
@@ -334,22 +292,12 @@ Run Helm lint:
 helm lint internal/helmchart/c8s \
   --set image.tag=latest \
   --set attestationService.image.tag=latest \
-  --set assam.image.tag=latest
+  --set assam.image.tag=latest \
+  --set certIssuer.image.tag=latest
 ```
 
-Render the chart defaults. The output should not include a
-`MutatingWebhookConfiguration`, `--operator-image`, `--assam-url`, or a literal
-`C8S_ATTESTATION_SERVICE_API_KEY` environment variable:
-
-```bash
-helm template c8s internal/helmchart/c8s \
-  --namespace c8s-system \
-  --set image.tag=latest \
-  --set attestationService.image.tag=latest \
-  --set assam.image.tag=latest
-```
-
-Verify webhook enablement requires Assam:
+Render the chart defaults. The output should include the chart-managed Assam
+and cert-issuer Services wired through the operator and Assam args:
 
 ```bash
 helm template c8s internal/helmchart/c8s \
@@ -357,16 +305,10 @@ helm template c8s internal/helmchart/c8s \
   --set image.tag=latest \
   --set attestationService.image.tag=latest \
   --set assam.image.tag=latest \
-  --set webhook.enabled=true
+  --set certIssuer.image.tag=latest
 ```
 
-That command should fail with:
-
-```text
-assam.url must be set when webhook.enabled=true unless assam.enabled=true
-```
-
-Render enabled injection with chart-managed Assam:
+Render the supported shape with a whitelist-write allowlist:
 
 ```bash
 helm template c8s internal/helmchart/c8s \
@@ -374,39 +316,14 @@ helm template c8s internal/helmchart/c8s \
   --set image.tag=latest \
   --set attestationService.image.tag=latest \
   --set assam.image.tag=latest \
-  --set webhook.enabled=true \
-  --set assam.enabled=true \
-  --set-string assam.certIssuerURL=http://cert-issuer.c8s-system.svc:8090
+  --set certIssuer.image.tag=latest \
+  --set 'assam.resourceMap.<sha384-launch-measurement>[0]=assam/whitelist-write'
 ```
 
 The rendered manifests should include:
 
-- an Assam Deployment, Service, ServiceAccount, and admin Secret;
+- an Assam Deployment, Service, ServiceAccount, and resource-map ConfigMap;
 - the operator arg `--assam-url=http://c8s-assam.c8s-system.svc:8080`;
-- Assam SecretRef environment variables for attestation-service auth and the
-  whitelist admin password;
+- no Assam admin-password Secret and no attestation-service API-key Secret;
 - `confidential.ai/trust-boundary-warning` annotations on the chart-managed
   Assam resources.
-
-Render enabled injection with scoped workload auth:
-
-```bash
-helm template c8s internal/helmchart/c8s \
-  --namespace c8s-system \
-  --set image.tag=latest \
-  --set attestationService.image.tag=latest \
-  --set assam.image.tag=latest \
-  --set webhook.enabled=true \
-  --set-string assam.url=http://assam.c8s-system.svc:8080 \
-  --set-string webhook.apiKeySecret.name=c8s-workload-attestation \
-  --set-string webhook.apiKeySecret.key=token \
-  --set 'webhook.apiKeySecret.createInNamespaces={tenant-a,tenant-b}'
-```
-
-The rendered manifests should include:
-
-- operator args for `--assam-url`, `--attestation-service-api-key-secret-*`,
-  `--cert-fs-group`, `--cert-key-mode`, and init-container UID/GID/non-root
-  settings;
-- workload-auth Secrets in `tenant-a` and `tenant-b`;
-- the generated workload keys included in the attestation-service allowlist.

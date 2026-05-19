@@ -14,7 +14,6 @@ hook available for uninstall.
 - Patches `containerd.configPath` with the managed NRI plugin block and
   `default_validator.required_plugins`.
 - Restarts containerd through `containerd.restartCommand`.
-- Seeds assam with the runtime whitelist when `seeder.enabled=true`.
 
 ## Install verification
 
@@ -44,8 +43,10 @@ image digest is already allowed.
 
 Use this order:
 
-1. Resolve the new digest in CI, push it to assam, and add it to
-   `bootstrapWhitelist.digests` in the per-cluster HelmRelease values.
+1. Resolve the new digest in CI, update Assam through its EAR-authorized
+   `/whitelist` API, and add it to `bootstrapWhitelist.digests` in the
+   per-cluster HelmRelease values. Operators should not manually edit the
+   node-level runtime whitelist; Assam owns that state.
 2. Let Flux or Helm reconcile the values. Existing install pods pick up the new
    `bootstrap.yaml` on the next reconcile and write it to disk.
 3. Bump `image.tag`. New install pods can start because the image is present in

@@ -1,6 +1,7 @@
 package issuer_test
 
 import (
+	"crypto/elliptic"
 	"crypto/x509"
 	"net"
 	"testing"
@@ -36,6 +37,68 @@ func TestNewCA(t *testing.T) {
 	}
 	if !roundtrip.Cert.Equal(ca.Cert) {
 		t.Error("round-tripped CA cert does not equal original")
+	}
+}
+
+func TestNewCAWithParent(t *testing.T) {
+	parent, err := issuer.NewCA("parent ca", time.Hour)
+	if err != nil {
+		t.Fatalf("NewCA parent: %v", err)
+	}
+	child, err := issuer.NewCAWithParent("child ca", time.Hour, elliptic.P384(), parent.Cert, parent.Key)
+	if err != nil {
+		t.Fatalf("NewCAWithParent: %v", err)
+	}
+	if child.Cert.Subject.CommonName != "child ca" {
+		t.Fatalf("child CN = %q, want child ca", child.Cert.Subject.CommonName)
+	}
+	if err := child.Cert.CheckSignatureFrom(parent.Cert); err != nil {
+		t.Fatalf("child CA was not signed by parent: %v", err)
+	}
+
+	otherParent, err := issuer.NewCA("other ca", time.Hour)
+	if err != nil {
+		t.Fatalf("NewCA other parent: %v", err)
+	}
+	if _, err := issuer.NewCAWithParent("child ca", time.Hour, elliptic.P384(), parent.Cert, otherParent.Key); err == nil {
+		t.Fatal("expected parent key mismatch error")
+	}
+}
+
+func TestNewCAWithParentAllowsMultiGenerationChains(t *testing.T) {
+	root, err := issuer.NewCA("root ca", time.Hour)
+	if err != nil {
+		t.Fatalf("NewCA root: %v", err)
+	}
+	intermediate, err := issuer.NewCAWithParent("intermediate ca", time.Hour, elliptic.P384(), root.Cert, root.Key)
+	if err != nil {
+		t.Fatalf("NewCAWithParent intermediate: %v", err)
+	}
+	current, err := issuer.NewCAWithParent("current ca", time.Hour, elliptic.P384(), intermediate.Cert, intermediate.Key)
+	if err != nil {
+		t.Fatalf("NewCAWithParent current: %v", err)
+	}
+
+	res, err := current.Issue(issuer.Request{CommonName: "mesh-node"})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	leaf, err := certutil.ParseCertificatePEM(res.CertPEM)
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+
+	roots := x509.NewCertPool()
+	roots.AddCert(root.Cert)
+	intermediates := x509.NewCertPool()
+	intermediates.AddCert(intermediate.Cert)
+	intermediates.AddCert(current.Cert)
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}); err != nil {
+		t.Fatalf("multi-generation CA chain does not verify from root: %v", err)
 	}
 }
 

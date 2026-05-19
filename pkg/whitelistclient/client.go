@@ -3,7 +3,6 @@ package whitelistclient
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -57,8 +56,9 @@ func (c Client) List() (types.WhitelistListResponse, error) {
 	return result, nil
 }
 
-// Add adds an image digest to the whitelist. Requires admin password.
-func (c Client) Add(digest types.Digest, image, adminPassword string) error {
+// Add adds an image digest to the whitelist. Requires an EAR bearer token
+// authorized for assam/whitelist-write.
+func (c Client) Add(digest types.Digest, image string, earToken []byte) error {
 	reqBody := types.WhitelistAddRequest{
 		Digest: digest,
 		Image:  image,
@@ -74,7 +74,7 @@ func (c Client) Add(digest types.Digest, image, adminPassword string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(adminPassword)))
+	req.Header.Set("Authorization", "Bearer "+string(earToken))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -89,9 +89,10 @@ func (c Client) Add(digest types.Digest, image, adminPassword string) error {
 	return nil
 }
 
-// Delete removes image digests from the whitelist. Requires admin password.
+// Delete removes image digests from the whitelist. Requires an EAR bearer token
+// authorized for assam/whitelist-write.
 // Returns an error with 404 status if any digest does not exist.
-func (c Client) Delete(digests []types.Digest, adminPassword string) error {
+func (c Client) Delete(digests []types.Digest, earToken []byte) error {
 	reqBody := types.WhitelistDeleteRequest{
 		Digests: digests,
 	}
@@ -106,7 +107,7 @@ func (c Client) Delete(digests []types.Digest, adminPassword string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(adminPassword)))
+	req.Header.Set("Authorization", "Bearer "+string(earToken))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

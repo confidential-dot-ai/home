@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/lunal-dev/c8s/pkg/certutil"
@@ -57,6 +58,7 @@ func NewCA(commonName string, validity time.Duration) (*CA, error) {
 // NewCAWithCurve generates a fresh self-signed ECDSA CA on the given curve.
 // Use NewCA for the default P-256 mesh CA.
 func NewCAWithCurve(commonName string, validity time.Duration, curve elliptic.Curve) (*CA, error) {
+	commonName = strings.TrimSpace(commonName)
 	if commonName == "" {
 		commonName = DefaultCACommonName
 	}
@@ -78,6 +80,54 @@ func NewCAWithCurve(commonName string, validity time.Duration, curve elliptic.Cu
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		return nil, fmt.Errorf("self-sign ca: %w", err)
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, fmt.Errorf("parse freshly-signed ca: %w", err)
+	}
+	return &CA{Cert: cert, Key: key}, nil
+}
+
+// NewCAWithParent generates a fresh ECDSA CA certificate on the given curve,
+// signed by parentCert/parentKey. This is used for rolling CA rotation: clients
+// that already trust the parent can authenticate the replacement CA before
+// adding it as a trust anchor.
+func NewCAWithParent(commonName string, validity time.Duration, curve elliptic.Curve, parentCert *x509.Certificate, parentKey *ecdsa.PrivateKey) (*CA, error) {
+	if parentCert == nil {
+		return nil, fmt.Errorf("parent ca certificate is required")
+	}
+	if parentKey == nil {
+		return nil, fmt.Errorf("parent ca key is required")
+	}
+	parentPub, ok := parentCert.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("parent ca certificate has non-ECDSA public key: %T", parentCert.PublicKey)
+	}
+	if !parentKey.PublicKey.Equal(parentPub) {
+		return nil, fmt.Errorf("parent ca key does not match certificate")
+	}
+	commonName = strings.TrimSpace(commonName)
+	if commonName == "" {
+		commonName = DefaultCACommonName
+	}
+	if validity <= 0 {
+		validity = DefaultCAValidity
+	}
+
+	key, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate ca key: %w", err)
+	}
+
+	serial, err := certutil.GenerateSerial()
+	if err != nil {
+		return nil, fmt.Errorf("generate ca serial: %w", err)
+	}
+
+	tmpl := certutil.NewCATemplate(serial, commonName, time.Now().Add(validity))
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, parentCert, &key.PublicKey, parentKey)
+	if err != nil {
+		return nil, fmt.Errorf("sign ca with parent: %w", err)
 	}
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {

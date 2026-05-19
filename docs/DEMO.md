@@ -7,14 +7,8 @@ production trust boundary.
 ## 1. Install c8s
 
 ```sh
-c8s install \
-  --namespace c8s-system \
-  --enable-webhook \
-  --install-assam \
-  --workload-namespace default
+c8s install --namespace c8s-system
 ```
-
-Equivalent Helm values are in `samples/values-demo.yaml`.
 
 ## 2. Apply optional CRD object
 
@@ -43,10 +37,10 @@ kubectl get cwl -A
 
 Expected injected pieces:
 
-- an init container running `c8s get-cert`;
+- an init container and renewal sidecar running `c8s get-cert`;
 - an in-memory `c8s-certs` volume;
 - workload containers mounting `/etc/c8s/certs`;
-- `C8S_ATTESTATION_SERVICE_API_KEY` sourced from a workload-namespace Secret.
+- no injected credential Secret references.
 
 ## Reset
 

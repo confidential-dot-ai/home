@@ -1,7 +1,6 @@
 package whitelistclient
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -55,7 +54,7 @@ func TestListSuccess(t *testing.T) {
 
 func TestAddSuccess(t *testing.T) {
 	digest, _ := types.ParseDigest("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	password := "secret123"
+	earToken := []byte("test-ear")
 
 	var gotAuth string
 	mux := http.NewServeMux()
@@ -71,12 +70,12 @@ func TestAddSuccess(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClientWithHTTP(srv.URL, srv.Client())
-	err := c.Add(digest, "my-image", password)
+	err := c.Add(digest, "my-image", earToken)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	expectedAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(password))
+	expectedAuth := "Bearer " + string(earToken)
 	if gotAuth != expectedAuth {
 		t.Fatalf("expected auth header %q, got %q", expectedAuth, gotAuth)
 	}
@@ -97,7 +96,7 @@ func TestDeleteSuccess(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClientWithHTTP(srv.URL, srv.Client())
-	err := c.Delete([]types.Digest{digest}, "secret123")
+	err := c.Delete([]types.Digest{digest}, []byte("test-ear"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -114,7 +113,7 @@ func TestDeleteNotFound(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClientWithHTTP(srv.URL, srv.Client())
-	err := c.Delete([]types.Digest{digest}, "secret123")
+	err := c.Delete([]types.Digest{digest}, []byte("test-ear"))
 	if err == nil {
 		t.Fatal("expected error")
 	}

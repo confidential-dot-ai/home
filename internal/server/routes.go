@@ -33,6 +33,7 @@ func NewRouter(deps Dependencies) http.Handler {
 
 	r.Post("/authenticate", deps.AttestationHandler.HandleAuthenticate)
 	r.Post("/attest", deps.AttestationHandler.HandleAttest)
+	r.Post("/attest-key", deps.AttestationHandler.HandleAttestKey)
 
 	r.Get("/whitelist", deps.WhitelistHandler.HandleList)
 	r.Post("/whitelist", deps.WhitelistHandler.HandleAdd)

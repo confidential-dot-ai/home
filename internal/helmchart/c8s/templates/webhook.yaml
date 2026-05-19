@@ -1,4 +1,3 @@
-{{- if .Values.webhook.enabled -}}
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
@@ -39,4 +38,34 @@ webhooks:
       {{- if .Values.webhook.caBundle }}
       caBundle: {{ .Values.webhook.caBundle }}
       {{- end }}
-{{- end }}
+  - name: platform-pods.c8s.confidential.ai
+    admissionReviewVersions: [v1]
+    sideEffects: None
+    failurePolicy: {{ .Values.webhook.failurePolicy }}
+    timeoutSeconds: 5
+    reinvocationPolicy: IfNeeded
+    objectSelector:
+      matchLabels:
+        app.kubernetes.io/name: tls-lb
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values:
+            - {{ .Release.Namespace }}
+    rules:
+      - operations: [CREATE]
+        apiGroups: [""]
+        apiVersions: [v1]
+        resources: [pods]
+        scope: Namespaced
+    clientConfig:
+      service:
+        namespace: {{ .Release.Namespace }}
+        name: {{ include "c8s.operatorName" . }}
+        path: /mutate-pods
+        port: {{ .Values.webhook.service.port }}
+      {{- if .Values.webhook.caBundle }}
+      caBundle: {{ .Values.webhook.caBundle }}
+      {{- end }}

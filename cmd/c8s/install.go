@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -22,20 +23,12 @@ var (
 	installWait      bool
 	installCRDs      bool
 
-	installEnableWebhook         bool
-	installAssam                 bool
-	installAssamURL              string
-	installAssamCertIssuerURL    string
-	installCertIssuer            bool
-	installCertIssuerJWKSURL     string
-	installAttestationSecretName string
-	installAttestationSecretKey  string
-	installWorkloadNamespaces    []string
-	installCertFSGroup           int64
-	installCertKeyMode           string
-	installInitRunAsUser         int64
-	installInitRunAsGroup        int64
-	installInitRunAsNonRoot      bool
+	installCertFSGroup          int64
+	installCertKeyMode          string
+	installGetCertRenewInterval time.Duration
+	installGetCertRunAsUser     int64
+	installGetCertRunAsGroup    int64
+	installGetCertRunAsNonRoot  bool
 )
 
 var installCmd = &cobra.Command{
@@ -48,7 +41,7 @@ var installCmd = &cobra.Command{
   - the ConfidentialWorkload CRD
   - the mutating admission webhook configuration
   - the attestation-service DaemonSet (per-node /attest + /verify)
-  - chart-managed Assam, cert-issuer, and bootstrap mesh CA
+  - chart-managed Assam and cert-issuer
   - vendored component charts from lunal-dev/c8s-charts
 
 Requires the 'helm' CLI to be on PATH.`,
@@ -79,44 +72,25 @@ Requires the 'helm' CLI to be on PATH.`,
 			"--set", "ratls-mesh.image.tag=" + imageTag,
 			"--set", "nri-image-policy.image.tag=" + imageTag,
 			"--set", "tee-proxy.image.tag=" + imageTag,
-			"--set", "tls-lb.initContainer.image.tag=" + imageTag,
 		}
 		helmArgs = appendInstallCRDArgs(helmArgs, installCRDs)
-		if installEnableWebhook {
-			helmArgs = append(helmArgs, "--set", "webhook.enabled=true")
+		if cmd.Flags().Changed("webhook-cert-fs-group") {
+			helmArgs = append(helmArgs, "--set", fmt.Sprintf("webhook.certVolume.fsGroup=%d", installCertFSGroup))
 		}
-		if installAssam {
-			helmArgs = append(helmArgs, "--set", "assam.enabled=true")
+		if cmd.Flags().Changed("webhook-cert-key-mode") {
+			helmArgs = append(helmArgs, "--set-string", "webhook.certVolume.keyMode="+installCertKeyMode)
 		}
-		if installCertIssuer || (installAssam && installAssamCertIssuerURL == "") {
-			helmArgs = append(helmArgs, "--set", "certIssuer.enabled=true")
+		if cmd.Flags().Changed("webhook-get-cert-renew-interval") {
+			helmArgs = append(helmArgs, "--set-string", "webhook.getCert.renewInterval="+installGetCertRenewInterval.String())
 		}
-		if installAssamURL != "" {
-			helmArgs = append(helmArgs, "--set-string", "assam.url="+installAssamURL)
+		if cmd.Flags().Changed("webhook-get-cert-run-as-user") {
+			helmArgs = append(helmArgs, "--set", fmt.Sprintf("webhook.getCert.runAsUser=%d", installGetCertRunAsUser))
 		}
-		if installAssamCertIssuerURL != "" {
-			helmArgs = append(helmArgs, "--set-string", "assam.certIssuerURL="+installAssamCertIssuerURL)
+		if cmd.Flags().Changed("webhook-get-cert-run-as-group") {
+			helmArgs = append(helmArgs, "--set", fmt.Sprintf("webhook.getCert.runAsGroup=%d", installGetCertRunAsGroup))
 		}
-		if installCertIssuerJWKSURL != "" {
-			helmArgs = append(helmArgs, "--set-string", "certIssuer.jwksURL="+installCertIssuerJWKSURL)
-		}
-		if installAttestationSecretName != "" {
-			helmArgs = append(helmArgs, "--set-string", "webhook.apiKeySecret.name="+installAttestationSecretName)
-		}
-		if installAttestationSecretKey != "" {
-			helmArgs = append(helmArgs, "--set-string", "webhook.apiKeySecret.key="+installAttestationSecretKey)
-		}
-		if len(installWorkloadNamespaces) > 0 {
-			helmArgs = append(helmArgs, "--set", "webhook.apiKeySecret.createInNamespaces={"+strings.Join(installWorkloadNamespaces, ",")+"}")
-		}
-		if installEnableWebhook {
-			helmArgs = append(helmArgs,
-				"--set", fmt.Sprintf("webhook.certVolume.fsGroup=%d", installCertFSGroup),
-				"--set-string", "webhook.certVolume.keyMode="+installCertKeyMode,
-				"--set", fmt.Sprintf("webhook.initContainer.runAsUser=%d", installInitRunAsUser),
-				"--set", fmt.Sprintf("webhook.initContainer.runAsGroup=%d", installInitRunAsGroup),
-				"--set", fmt.Sprintf("webhook.initContainer.runAsNonRoot=%t", installInitRunAsNonRoot),
-			)
+		if cmd.Flags().Changed("webhook-get-cert-run-as-non-root") {
+			helmArgs = append(helmArgs, "--set", fmt.Sprintf("webhook.getCert.runAsNonRoot=%t", installGetCertRunAsNonRoot))
 		}
 		for _, vf := range installValues {
 			helmArgs = append(helmArgs, "-f", vf)
@@ -169,11 +143,9 @@ func appendInstallCRDArgs(helmArgs []string, installCRDs bool) []string {
 
 const installNextSteps = `Next steps:
 
-  1. Enable pod injection only after Assam and cert-issuer are reachable.
-     Use an external assam.url/cert issuer pair, or enable chart-managed
-     Assam and cert-issuer together. Chart-managed Assam/cert-issuer are
-     bootstrap/dev convenience unless deployed as attested trust-boundary
-     infrastructure.
+  1. Deploy this chart inside the intended CVM trust boundary. The supported
+     install shape wires chart-managed Assam, cert-issuer, and
+     attestation-service together.
 
   2. (Optional) Mirror status with a ConfidentialWorkload CR:
 
@@ -193,19 +165,11 @@ func init() {
 	installCmd.Flags().StringSliceVarP(&installValues, "values", "f", nil, "values files (repeatable)")
 	installCmd.Flags().BoolVar(&installWait, "wait", true, "wait for the release to become ready (helm --wait)")
 	installCmd.Flags().BoolVar(&installCRDs, "install-crds", true, "install chart CRDs (false passes helm --skip-crds)")
-	installCmd.Flags().BoolVar(&installEnableWebhook, "enable-webhook", false, "enable pod injection webhook (requires --assam-url or --install-assam)")
-	installCmd.Flags().BoolVar(&installAssam, "install-assam", false, "install chart-managed Assam (bootstrap/dev unless deployed as attested trust-boundary infrastructure)")
-	installCmd.Flags().StringVar(&installAssamURL, "assam-url", "", "assam URL for injected get-cert containers")
-	installCmd.Flags().StringVar(&installAssamCertIssuerURL, "assam-cert-issuer-url", "", "external cert-issuer URL for chart-managed Assam (empty installs chart-managed cert-issuer with --install-assam)")
-	installCmd.Flags().BoolVar(&installCertIssuer, "install-cert-issuer", false, "install chart-managed cert-issuer and bootstrap mesh CA Secret")
-	installCmd.Flags().StringVar(&installCertIssuerJWKSURL, "cert-issuer-jwks-url", "", "JWKS URL for chart-managed cert-issuer (empty uses chart-managed Assam when enabled)")
-	installCmd.Flags().StringVar(&installAttestationSecretName, "attestation-secret-name", "", "workload-namespace Secret name injected for attestation-service auth")
-	installCmd.Flags().StringVar(&installAttestationSecretKey, "attestation-secret-key", "apiKey", "Secret key injected for attestation-service auth")
-	installCmd.Flags().StringArrayVar(&installWorkloadNamespaces, "workload-namespace", nil, "namespace where the chart should create a workload auth Secret (repeatable)")
 	installCmd.Flags().Int64Var(&installCertFSGroup, "webhook-cert-fs-group", 65532, "fsGroup for injected certificate volume")
 	installCmd.Flags().StringVar(&installCertKeyMode, "webhook-cert-key-mode", "0640", "octal mode for injected tls.key")
-	installCmd.Flags().Int64Var(&installInitRunAsUser, "webhook-init-run-as-user", 65532, "runAsUser for injected init container")
-	installCmd.Flags().Int64Var(&installInitRunAsGroup, "webhook-init-run-as-group", 65532, "runAsGroup for injected init container")
-	installCmd.Flags().BoolVar(&installInitRunAsNonRoot, "webhook-init-run-as-non-root", true, "set runAsNonRoot for injected init container")
+	installCmd.Flags().DurationVar(&installGetCertRenewInterval, "webhook-get-cert-renew-interval", 6*time.Hour, "renewal interval for injected workload certificates")
+	installCmd.Flags().Int64Var(&installGetCertRunAsUser, "webhook-get-cert-run-as-user", 65532, "runAsUser for injected get-cert containers")
+	installCmd.Flags().Int64Var(&installGetCertRunAsGroup, "webhook-get-cert-run-as-group", 65532, "runAsGroup for injected get-cert containers")
+	installCmd.Flags().BoolVar(&installGetCertRunAsNonRoot, "webhook-get-cert-run-as-non-root", true, "set runAsNonRoot for injected get-cert containers")
 	rootCmd.AddCommand(installCmd)
 }

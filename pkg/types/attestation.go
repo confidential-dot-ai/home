@@ -3,6 +3,10 @@ package types
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/lunal-dev/c8s/pkg/certutil"
 )
 
 // ChallengeResponse is the response body for POST /authenticate.
@@ -15,6 +19,28 @@ type AttestRequestBody struct {
 	Challenge string              `json:"challenge"`
 	Evidence  AttestationEvidence `json:"evidence"`
 	CSR       string              `json:"csr"`
+}
+
+// AttestKeyRequestBody is the request body for POST /attest-key. Used by
+// in-cluster c8s components (currently cert-issuer for its handoff signer
+// key) that need an Assam-issued EAR bound to a TEE-attested ECDSA public
+// key, without going through the full cert-issuance flow that /attest does.
+type AttestKeyRequestBody struct {
+	Challenge string              `json:"challenge"`
+	Evidence  AttestationEvidence `json:"evidence"`
+	// PublicKey is the standard-base64-encoded PKIX DER of the ECDSA public
+	// key the caller wants attested. The TEE evidence's REPORTDATA must be
+	// SHA-384(this key) — the server verifies this binding before issuing
+	// the EAR.
+	PublicKey string `json:"public_key"`
+}
+
+// AttestKeyResponseBody is the response body for POST /attest-key.
+type AttestKeyResponseBody struct {
+	// EAR is a signed JWT whose tee_public_key claim equals PublicKey from
+	// the request. Verifiers re-check the JWT signature against Assam's
+	// JWKS and re-derive the binding before trusting it for any action.
+	EAR string `json:"ear"`
 }
 
 // AttestationEvidence carries platform-specific attestation evidence.
@@ -156,14 +182,40 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
-// SignCsrRequest is sent to the cert-issuer POST /v1/sign-csr.
+// SignCsrRequest is sent to the cert-issuer POST /sign-csr.
 type SignCsrRequest struct {
 	Ear string `json:"ear"`
 	Csr string `json:"csr"`
 	Ttl string `json:"ttl"`
 }
 
-// SignCsrResponse is the response from the cert-issuer POST /v1/sign-csr.
+// SignCsrResponse is the response from the cert-issuer POST /sign-csr.
 type SignCsrResponse struct {
-	Certificate string `json:"certificate"`
+	Certificate   string `json:"certificate"`
+	CACertificate string `json:"ca_certificate"`
+}
+
+// SignedCert validates the response certificate fields and returns the PEM leaf
+// plus CA bundle in the order expected by TLS clients.
+func (r SignCsrResponse) SignedCert() (string, error) {
+	certPEM := strings.TrimSpace(r.Certificate)
+	if certPEM == "" {
+		return "", fmt.Errorf("certificate is required")
+	}
+	certs, err := certutil.ParsePEMCertificates([]byte(certPEM))
+	if err != nil {
+		return "", fmt.Errorf("certificate must be PEM-encoded X.509: %w", err)
+	}
+	if len(certs) != 1 {
+		return "", fmt.Errorf("certificate must contain exactly one CERTIFICATE block, got %d", len(certs))
+	}
+
+	caPEM := strings.TrimSpace(r.CACertificate)
+	if caPEM == "" {
+		return certPEM + "\n", nil
+	}
+	if _, err := certutil.ParsePEMCertificates([]byte(caPEM)); err != nil {
+		return "", fmt.Errorf("ca_certificate must be PEM-encoded X.509: %w", err)
+	}
+	return certPEM + "\n" + caPEM + "\n", nil
 }

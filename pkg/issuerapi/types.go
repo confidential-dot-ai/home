@@ -176,9 +176,9 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// SignCSRRequest is the JSON request body for POST /v1/sign-csr.
+// SignCSRRequest is the JSON request body for POST /sign-csr.
 type SignCSRRequest struct {
-	// EAR is the Entity Attestation Result JWT token from KBS.
+	// EAR is the Entity Attestation Result JWT token from the EAR issuer.
 	EAR string `json:"ear"`
 	// CSR is the PEM-encoded Certificate Signing Request.
 	CSR PEMData `json:"csr"`
@@ -186,22 +186,42 @@ type SignCSRRequest struct {
 	TTL Duration `json:"ttl"`
 }
 
-// SignCSRResponse is the JSON response for POST /v1/sign-csr.
+// SignCSRResponse is the JSON response for POST /sign-csr.
 type SignCSRResponse struct {
 	// Certificate is the PEM-encoded signed certificate.
 	Certificate PEMData `json:"certificate"`
-	// CACertificate is the PEM-encoded CA certificate for chain building.
+	// CACertificate is the PEM-encoded CA bundle for chain building.
 	CACertificate PEMData `json:"ca_certificate"`
 }
 
-// RotateCARequest is the JSON request body for POST /v1/rotate-ca.
-type RotateCARequest struct {
-	// EAR is the Entity Attestation Result JWT token from KBS.
+// HandoffRequest asks an active cert-issuer replica to wrap its in-memory CA
+// signing material to a recipient-bound X25519 public key.
+type HandoffRequest struct {
+	// EAR is the requester's Entity Attestation Result JWT token.
 	EAR string `json:"ear"`
+	// PublicKey is the recipient's base64url-encoded raw X25519 public key.
+	PublicKey string `json:"public_key"`
+	// Signature is a base64url-encoded ECDSA signature over this request's
+	// handoff public key, made by the private key bound to EAR's tee_public_key
+	// claim.
+	Signature string `json:"signature"`
 }
 
-// RotateCAResponse is the JSON response for POST /v1/rotate-ca.
-type RotateCAResponse struct {
-	// CACertificate is the PEM-encoded new CA certificate.
-	CACertificate PEMData `json:"ca_certificate"`
+// HandoffResponse carries the CA payload encrypted to the requester's public
+// key. The issuer EAR lets the requester verify the active replica before
+// accepting the unwrapped signing material.
+type HandoffResponse struct {
+	// IssuerEAR is the active replica's Entity Attestation Result JWT token.
+	IssuerEAR string `json:"issuer_ear"`
+	// PublicKey is the active replica's base64url-encoded ephemeral X25519
+	// public key used for this wrap.
+	PublicKey string `json:"public_key"`
+	// Signature is a base64url-encoded ECDSA signature over this response's
+	// handoff public key, made by the private key bound to IssuerEAR's
+	// tee_public_key claim.
+	Signature string `json:"signature"`
+	// Nonce is the base64url-encoded AES-GCM nonce.
+	Nonce string `json:"nonce"`
+	// Ciphertext is the base64url-encoded wrapped handoff payload.
+	Ciphertext string `json:"ciphertext"`
 }

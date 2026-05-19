@@ -10,8 +10,7 @@ Confidential computing infrastructure for Kubernetes. Provides TEE attestation, 
 | [`cmd/c8s`](cmd/c8s/) | Operator and install CLI for CRDs, status mirroring, webhook injection, and the embedded Helm chart | [operator docs](docs/operator.md) |
 | [`cmd/get-cert`](cmd/get-cert/) | CLI tool and init-container for TEE-attested certificate provisioning | [README](cmd/get-cert/README.md) |
 | [`cmd/ratls-mesh`](cmd/ratls-mesh/) | Transparent L4 proxy wrapping inter-node K8s traffic in RA-TLS | [README](cmd/ratls-mesh/README.md) |
-| [`cmd/cert-issuer`](cmd/cert-issuer/) | Certificate issuer sidecar | [README](cmd/cert-issuer/README.md) |
-| [`cmd/cert-rotator`](cmd/cert-rotator/) | Kubernetes cert rotation controller | [README](cmd/cert-rotator/README.md) |
+| [`cmd/cert-issuer`](cmd/cert-issuer/) | Certificate issuer with in-process mesh CA rotation | [README](cmd/cert-issuer/README.md) |
 | [`cmd/nri-image-policy`](cmd/nri-image-policy/) | NRI plugin enforcing container image digest whitelists | - |
 
 ## Libraries
@@ -37,8 +36,7 @@ cmd/
   c8s/                     Operator and Helm install CLI
   get-cert/                TEE-attested cert provisioning CLI/init-container
   ratls-mesh/              Transparent L4 RA-TLS proxy (DaemonSet)
-  cert-issuer/             Certificate issuer sidecar
-  cert-rotator/            Kubernetes cert rotation controller
+  cert-issuer/             Certificate issuer with in-process mesh CA rotation
   nri-image-policy/        NRI container image policy plugin
 internal/
   attestation/             Attestation handlers and challenge store
@@ -70,7 +68,7 @@ test/
 
 ## Build
 
-Requires Go 1.26.1+.
+Requires Go 1.26.3+.
 
 ```bash
 # Build all binaries
@@ -114,7 +112,6 @@ per-role image names remain stable, but each image copies the same multi-mode
 | `ghcr.io/lunal-dev/get-cert` | distroless | |
 | `ghcr.io/lunal-dev/cert-issuer` | distroless | |
 | `ghcr.io/lunal-dev/ratls-mesh` | debian-slim | Needs iptables + attestation binaries |
-| `ghcr.io/lunal-dev/cert-rotator` | distroless | Includes attestation binaries |
 | `ghcr.io/lunal-dev/nri-image-policy` | debian-slim | Needs TSS2 libs + attestation binaries |
 
 ## Related repos

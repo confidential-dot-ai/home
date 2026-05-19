@@ -46,7 +46,7 @@ type ServerConfig struct {
 	// DynamicCACert, when true, enables dual-mode verification with an
 	// initially empty CA pool. CA certs are populated later via
 	// CertManager.UpdateCACerts. Until then, falls through to RA-TLS.
-	// Use this when CA certs are fetched at runtime (e.g., from cert-issuer /v1/ca).
+	// Use this when CA certs are fetched at runtime (e.g., from cert-issuer /ca).
 	DynamicCACert bool
 
 	// DNSNames for the server certificate.
@@ -374,7 +374,7 @@ func (m *CertManager) SwapProvider(ctx context.Context, provider CertProvider) e
 
 // UpdateCACerts dynamically updates the CA certificates used for dual-mode
 // peer verification. This is used by the CA bundle refresh goroutine when
-// polling the cert-issuer /v1/ca endpoint in KBS key mode.
+// polling the cert-issuer /ca endpoint in cert-issuer-backed modes.
 func (m *CertManager) UpdateCACerts(certs []*x509.Certificate) {
 	if m.sharedCA != nil {
 		m.sharedCA.update(certs)

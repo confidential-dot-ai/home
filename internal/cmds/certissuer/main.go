@@ -2,21 +2,23 @@ package certissuer
 
 import (
 	"context"
+	"crypto/elliptic"
 	"crypto/x509"
-	"errors"
 	"flag"
 	"fmt"
 	"net"
 	"net/http"
 	"os/signal"
 	"regexp"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/lunal-dev/c8s/internal/cmds/cmdsutil"
+	"github.com/lunal-dev/c8s/internal/issuer"
+	"github.com/lunal-dev/c8s/pkg/attestclient"
 	"github.com/lunal-dev/c8s/pkg/certutil"
+	"github.com/lunal-dev/c8s/pkg/ratls"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
 )
@@ -26,15 +28,13 @@ import (
 func Run(args []string) error {
 	fs := flag.NewFlagSet("cert-issuer", flag.ContinueOnError)
 	listen := fs.String("listen", ":8090", "listen address")
-	caKeyF := fs.String("ca-key", "", "path to CA private key (PEM)")
-	caCertF := fs.String("ca-cert", "", "path to CA certificate (PEM)")
+	caCommonName := fs.String("ca-common-name", issuer.DefaultCACommonName, "common name for an in-memory generated mesh CA")
 	tokenCert := fs.String("token-cert", "", "path to EAR token-signer certificate (PEM, for JWT verification when --jwks-url is unset)")
 	maxTTLF := fs.Duration("max-ttl", 24*time.Hour, "maximum certificate TTL")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
 	rateLimit := fs.Float64("rate-limit", 10, "maximum requests per second per source IP")
 	rateBurst := fs.Int("rate-burst", 20, "maximum burst size per source IP")
 	sanValidation := fs.Bool("san-validation", true, "validate CSR IP SANs match request source IP")
-	parentCertF := fs.String("parent-cert", "", "path to parent (root) CA certificate for intermediate CA mode")
 	dnsSANPattern := fs.String("dns-san-pattern", "", "regex pattern for allowed DNS SANs in CSRs (empty = reject all DNS SANs)")
 	allowedCNPattern := fs.String("allowed-cn-pattern", "", "regex pattern for allowed CN in CSRs (empty = no restriction)")
 	expectedIssuer := fs.String("expected-issuer", "", "expected JWT issuer claim (empty = skip validation, with warning)")
@@ -50,8 +50,9 @@ func Run(args []string) error {
 	rateLimiterEvictInterval := fs.Duration("rate-limiter-evict-interval", 60*time.Second, "interval for per-IP rate limiter eviction sweep")
 	rateLimiterIdleTimeout := fs.Duration("rate-limiter-idle-timeout", 5*time.Minute, "idle duration before a per-IP rate limiter entry is evicted")
 
-	kbsModeF := fs.Bool("kbs-mode", false, "enable CDS mode: JWT-gated /v1/ca, /v1/rotate-ca endpoint, CA bundle management")
-	caRepoDir := fs.String("ca-repo-dir", "/opt/confidential-containers/kbs/crypto-keys", "local path for CDS CA key write-back on rotation")
+	caRotationInterval := fs.Duration("ca-rotation-interval", 720*time.Hour, "positive interval for scheduled in-process mesh CA rotation")
+	caRepoDir := fs.String("ca-repo-dir", "", "optional local path for public CA bundle write-back on startup and rotation; private keys are never persisted")
+	caBundlePath := fs.String("ca-bundle-path", "ca-bundle.pem", "relative path under --ca-repo-dir for the public CA bundle")
 
 	resourceMapF := fs.String("resource-map", "", "path to JSON resource map file for measurement-based endpoint access control")
 
@@ -59,80 +60,78 @@ func Run(args []string) error {
 	jwtClockSkew := fs.Int64("jwt-clock-skew", 30, "clock skew tolerance in seconds for JWT validation")
 	minCAValidity := fs.Duration("min-ca-validity", 1*time.Hour, "minimum remaining CA cert validity for readiness")
 	maxRequestSize := fs.Int64("max-request-size", 65536, "maximum request body size in bytes")
-	certWatchDebounce := fs.Duration("cert-watch-debounce", 2*time.Second, "debounce delay for certificate file watcher")
 
-	jwksURL := fs.String("jwks-url", "", "JWKS endpoint URL for EAR token verification (empty = use --token-cert)")
+	jwksURL := fs.String("jwks-url", "", "JWKS endpoint URL for EAR token verification (empty = use --token-cert). When the URL scheme is https, the fetch is RA-TLS-verified against --assam-measurements.")
 	jwksCacheTTL := fs.Duration("jwks-cache-ttl", 5*time.Minute, "how long to cache the JWKS before re-fetching")
+	assamMeasurementsRaw := fs.String("assam-measurements", "", "comma-separated SHA-384 hex launch measurements that Assam's RA-TLS peer cert must match. Used by JWKS fetch and handoff bootstrap. Empty = accept any (UNSAFE outside development; pin to the operator-supplied Assam launch digest).")
+
+	handoffAssamURL := fs.String("handoff-assam-url", "", "Assam base URL used to bootstrap the in-process handoff signer key + EAR via /attest-key. Empty = /handoff disabled.")
+	handoffAttestationServiceURL := fs.String("handoff-attestation-service-url", "", "local attestation service URL used by handoff bootstrap to mint TEE evidence binding the handoff signer key. Required when --handoff-assam-url is set.")
+
+	ratlsPlatform := fs.String("ratls-platform", "", "TEE platform for the cert-issuer RA-TLS serving cert (snp, tdx, az-snp, az-tdx, gcp-snp, gcp-tdx). Empty disables TLS on the listener — UNSAFE outside tests; an on-path attacker between Assam and cert-issuer could otherwise forge sign-csr responses.")
+	ratlsCertTTL := fs.Duration("ratls-cert-ttl", 24*time.Hour, "TTL for the cert-issuer RA-TLS serving certificate (rotated at 50%).")
+	ratlsAttestationServiceURL := fs.String("ratls-attestation-service-url", "", "local attestation service URL used to mint evidence for the RA-TLS serving cert. Required when --ratls-platform is set.")
+
 	if err := cmdsutil.ParseFlags(fs, args); err != nil {
 		return err
 	}
 
 	logger := certutil.NewJSONLogger(*logLevel)
 
-	kbsMode := *kbsModeF
-	if kbsMode {
-		logger.Info("CDS mode enabled: /v1/rotate-ca and JWT-gated /v1/ca active")
+	if *caRotationInterval <= 0 {
+		return fmt.Errorf("--ca-rotation-interval must be positive")
 	}
-
-	if *caKeyF == "" || *caCertF == "" {
-		return fmt.Errorf("--ca-key and --ca-cert are required")
-	}
+	logger.Info("CA bundle management active")
 	if *tokenCert == "" && *jwksURL == "" {
 		return fmt.Errorf("either --token-cert or --jwks-url is required")
 	}
 
-	caKey, err := certutil.LoadECPrivateKeyFile(*caKeyF)
-	if err != nil {
-		return fmt.Errorf("load CA key: %w", err)
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
-	caCert, err := certutil.LoadCertificateFile(*caCertF)
-	if err != nil {
-		return fmt.Errorf("load CA certificate: %w", err)
-	}
-
+	var tokenSignerCert *x509.Certificate
 	var kp KeyProvider
 	if *jwksURL != "" {
-		kp = newJWKSKeyProvider(*jwksURL, *jwksCacheTTL, logger)
+		jwksClient, err := buildJWKSHTTPClient(*jwksURL, *assamMeasurementsRaw, logger)
+		if err != nil {
+			return err
+		}
+		provider, err := newJWKSKeyProvider(ctx, *jwksURL, *jwksCacheTTL, jwksClient, logger)
+		if err != nil {
+			return fmt.Errorf("init JWKS key provider: %w", err)
+		}
+		kp = provider
 		logger.Info("JWKS verification mode", "url", *jwksURL, "cache_ttl", *jwksCacheTTL)
 	} else {
-		tokenSignerCert, err := certutil.LoadCertificateFile(*tokenCert)
+		cert, err := certutil.LoadCertificateFile(*tokenCert)
 		if err != nil {
 			return fmt.Errorf("load token-signer certificate: %w", err)
 		}
-		kp, err = newCertKeyProvider(tokenSignerCert)
+		provider, err := newCertKeyProvider(cert)
 		if err != nil {
 			return fmt.Errorf("invalid token-signer certificate: %w", err)
 		}
-	}
-
-	var parentCert *x509.Certificate
-	if *parentCertF != "" {
-		parentCert, err = certutil.LoadCertificateFile(*parentCertF)
-		if err != nil {
-			return fmt.Errorf("load parent CA certificate: %w", err)
-		}
-		if err := validateChain(caCert, parentCert); err != nil {
-			return fmt.Errorf("intermediate CA chain validation: %w", err)
-		}
-		logger.Info("intermediate CA mode enabled", "parent_subject", parentCert.Subject.CommonName)
+		tokenSignerCert = cert
+		kp = provider
 	}
 
 	var compiledDNSSANPattern *regexp.Regexp
 	if *dnsSANPattern != "" {
-		compiledDNSSANPattern, err = regexp.Compile(*dnsSANPattern)
+		compiled, err := regexp.Compile(*dnsSANPattern)
 		if err != nil {
 			return fmt.Errorf("invalid --dns-san-pattern %q: %w", *dnsSANPattern, err)
 		}
+		compiledDNSSANPattern = compiled
 		logger.Info("DNS SAN validation enabled", "pattern", *dnsSANPattern)
 	}
 
 	var compiledCNPattern *regexp.Regexp
 	if *allowedCNPattern != "" {
-		compiledCNPattern, err = regexp.Compile(*allowedCNPattern)
+		compiled, err := regexp.Compile(*allowedCNPattern)
 		if err != nil {
 			return fmt.Errorf("invalid --allowed-cn-pattern %q: %w", *allowedCNPattern, err)
 		}
+		compiledCNPattern = compiled
 		logger.Info("CN validation enabled", "pattern", *allowedCNPattern)
 	}
 
@@ -140,46 +139,59 @@ func Run(args []string) error {
 		logger.Warn("--expected-issuer not set: JWT issuer claim will not be validated")
 	}
 
-	var signCSRMeasurements, rotateCAMeasurements, caMeasurements map[string]bool
+	var signCSRMeasurements, handoffMeasurements map[string]bool
 	if *resourceMapF != "" {
 		rm, err := loadResourceMap(*resourceMapF)
 		if err != nil {
 			return fmt.Errorf("load resource map: %w", err)
 		}
-		signCSRMeasurements, rotateCAMeasurements, caMeasurements = buildEndpointAllowlists(rm)
+		signCSRMeasurements, handoffMeasurements, err = buildEndpointAllowlists(rm)
+		if err != nil {
+			return fmt.Errorf("build resource map allowlists: %w", err)
+		}
 		logger.Info("resource map loaded", "path", *resourceMapF)
 	}
 
+	ca, err := issuer.NewCAWithCurve(*caCommonName, *caCertValidity, elliptic.P384())
+	if err != nil {
+		return fmt.Errorf("generate in-memory CA: %w", err)
+	}
+	caKey := ca.Key
+	caCert := ca.Cert
+	if err := validateCAKeyPair(caCert, caKey); err != nil {
+		return err
+	}
+	logger.Info("generated in-memory mesh CA",
+		"ca_fingerprint", certutil.CertFingerprint(caCert.Raw),
+		"not_after", caCert.NotAfter.Format(time.RFC3339),
+	)
+
 	iss := &Issuer{
-		keyProvider:          kp,
-		MaxTTL:               *maxTTLF,
-		SANValidation:        *sanValidation,
-		DNSSANPattern:        compiledDNSSANPattern,
-		AllowedCNPattern:     compiledCNPattern,
-		ExpectedIssuer:       *expectedIssuer,
-		RequestTimeout:       *requestTimeout,
-		JWTClockSkew:         *jwtClockSkew,
-		MinCAValidity:        *minCAValidity,
-		Logger:               logger,
-		tracker:              newNodeTracker(*maxTTLF),
-		SignCSRMeasurements:  signCSRMeasurements,
-		RotateCAMeasurements: rotateCAMeasurements,
-		CAMeasurements:       caMeasurements,
+		keyProvider:         kp,
+		MaxTTL:              *maxTTLF,
+		SANValidation:       *sanValidation,
+		DNSSANPattern:       compiledDNSSANPattern,
+		AllowedCNPattern:    compiledCNPattern,
+		ExpectedIssuer:      *expectedIssuer,
+		RequestTimeout:      *requestTimeout,
+		JWTClockSkew:        *jwtClockSkew,
+		MinCAValidity:       *minCAValidity,
+		Logger:              logger,
+		tracker:             newNodeTracker(*maxTTLF),
+		SignCSRMeasurements: signCSRMeasurements,
+		HandoffMeasurements: handoffMeasurements,
 	}
 
 	if len(iss.SignCSRMeasurements) > 0 {
-		logger.Info("measurement pinning enabled for /v1/sign-csr", "count", len(iss.SignCSRMeasurements))
+		logger.Info("measurement pinning enabled for /sign-csr", "count", len(iss.SignCSRMeasurements))
 	}
-	if len(iss.RotateCAMeasurements) > 0 {
-		logger.Info("measurement pinning enabled for /v1/rotate-ca", "count", len(iss.RotateCAMeasurements))
-	}
-	if len(iss.CAMeasurements) > 0 {
-		logger.Info("measurement pinning enabled for /v1/ca", "count", len(iss.CAMeasurements))
+	if len(iss.HandoffMeasurements) > 0 {
+		logger.Info("measurement pinning enabled for /handoff", "count", len(iss.HandoffMeasurements))
 	}
 	iss.bundle.Store(&certBundle{
-		caCert:     caCert,
-		caKey:      caKey,
-		parentCert: parentCert,
+		caCert:          caCert,
+		caKey:           caKey,
+		tokenSignerCert: tokenSignerCert,
 	})
 
 	// Set initial CA fingerprint metric.
@@ -188,84 +200,73 @@ func Run(args []string) error {
 
 	rl := newIPRateLimiter(rate.Limit(*rateLimit), *rateBurst, *rateLimiterMax)
 
-	// Initialize bundle manager for CDS mode.
-	var bm *bundleManager
-	if kbsMode {
-		bundlePath := "default/mesh/ca-bundle"
-		bm = newBundleManager(*maxTTLF, *caRepoDir, bundlePath, logger)
+	// Initialize public bundle manager.
+	bm := newBundleManager(*maxTTLF, *caRepoDir, *caBundlePath, logger)
 
-		// Try to load existing bundle from the CDS repo (restart recovery).
-		existingBundle, err := bm.loadFromRepo()
-		if err != nil {
-			logger.Warn("failed to load existing CA bundle from CDS repo", "error", err)
-		}
-		if existingBundle != nil {
-			bm.mu.Lock()
-			bm.certs = existingBundle
-			bm.mu.Unlock()
-			logger.Info("loaded existing CA bundle from CDS repo", "count", len(existingBundle))
-		} else {
-			bm.setInitial(caCert)
-		}
+	// Try to load existing public bundle from the repo (restart recovery).
+	existingBundle, err := bm.loadFromRepo()
+	if err != nil {
+		logger.Warn("failed to load existing public CA bundle", "error", err)
+	}
+	if existingBundle != nil {
+		bm.setWithCurrent(caCert, existingBundle)
+		logger.Info("loaded existing public CA bundle", "count", len(existingBundle))
+	} else {
+		bm.setInitial(caCert)
+	}
+	if err := bm.persistCurrent(); err != nil {
+		return fmt.Errorf("persist initial public CA bundle: %w", err)
+	}
+	iss.caBundle = bm
+
+	rotator := &caRotator{
+		issuer:         iss,
+		bundle:         bm,
+		caCertValidity: *caCertValidity,
+		caCommonName:   *caCommonName,
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("POST /v1/sign-csr", http.MaxBytesHandler(rateLimitMiddleware(rl, http.HandlerFunc(iss.HandleSignCSR)), *maxRequestSize))
+	mux.Handle("POST /sign-csr", http.MaxBytesHandler(rateLimitMiddleware(rl, http.HandlerFunc(iss.HandleSignCSR)), *maxRequestSize))
 	mux.HandleFunc("GET /live", handleLive)
 	mux.HandleFunc("GET /ready", iss.handleReady)
 	mux.Handle("GET /metrics", promhttp.Handler())
 
-	// /v1/ca: in CDS mode, serve the full bundle from bundleManager and require JWT auth.
-	// In file mode, serve CA cert chain directly (no auth, backward compatible).
-	if kbsMode {
-		mux.Handle("GET /v1/ca", rateLimitMiddleware(rl, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			b := iss.getBundle()
-			if b == nil {
-				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-				return
-			}
+	// /ca serves the public bundle unauthenticated; clients chain the
+	// continuity check (see pkg/ratls/assamclient) to reject untrusted updates.
+	mux.Handle("GET /ca", rateLimitMiddleware(rl, http.HandlerFunc(handlePublicCA(bm))))
 
-			// Require JWT auth in CDS mode.
-			authHeader := r.Header.Get("Authorization")
-			if !strings.HasPrefix(authHeader, "Bearer ") {
-				http.Error(w, "unauthorized: missing or invalid Authorization header", http.StatusUnauthorized)
-				return
-			}
-			token := authHeader[7:]
-			claims, err := validateEARToken(token, iss.keyProvider, iss.ExpectedIssuer, iss.JWTClockSkew)
-			if err != nil {
-				var tve *tokenValidationError
-				if errors.As(err, &tve) {
-					tokenValidationFailuresTotal.WithLabelValues(tve.Reason).Inc()
-				}
-				http.Error(w, "unauthorized: invalid attestation token", http.StatusUnauthorized)
-				return
-			}
-			if err := checkMeasurement(claims, iss.CAMeasurements, "ca"); err != nil {
-				measurementDeniedTotal.WithLabelValues("ca").Inc()
-				http.Error(w, "forbidden: measurement not allowed", http.StatusForbidden)
-				return
-			}
-
-			w.Header().Set("Content-Type", "application/x-pem-file")
-			w.Write(bm.bundlePEM())
-		})))
-	} else {
-		mux.HandleFunc("GET /v1/ca", iss.HandleCA)
+	if *handoffAssamURL != "" && *handoffAttestationServiceURL == "" {
+		return fmt.Errorf("--handoff-attestation-service-url is required when --handoff-assam-url is set")
 	}
-
-	// /v1/rotate-ca: only available in CDS mode.
-	if kbsMode {
-		rh := &rotateHandler{
-			issuer:         iss,
-			bundle:         bm,
-			caRepoDir:      *caRepoDir,
-			keyPath:        "default/mesh/ca-key",
-			maxTTL:         *maxTTLF,
-			caCertValidity: *caCertValidity,
+	var handoffSrc handoffEARSource
+	var handoffBoot *handoffBootstrap
+	if *handoffAssamURL != "" {
+		measurements, err := ratls.ParseHexMeasurements(*assamMeasurementsRaw)
+		if err != nil {
+			return fmt.Errorf("--assam-measurements: %w", err)
 		}
-		mux.Handle("POST /v1/rotate-ca", http.MaxBytesHandler(rateLimitMiddleware(rl, http.HandlerFunc(rh.HandleRotateCA)), *maxRequestSize))
-		logger.Info("CDS mode: /v1/rotate-ca endpoint enabled")
+		if len(measurements) == 0 {
+			logger.Warn("--assam-measurements not set; handoff bootstrap accepts any Assam measurement. Pin the operator-supplied launch digest to close bootstrap MITM.")
+		}
+
+		boot, err := newHandoffBootstrap(*handoffAssamURL, *handoffAttestationServiceURL, measurements)
+		if err != nil {
+			return fmt.Errorf("prepare handoff bootstrap: %w", err)
+		}
+
+		hh, err := newHandoffHandler(iss, bm, boot.signer, boot.earSource)
+		if err != nil {
+			return err
+		}
+		mux.Handle("POST /handoff", http.MaxBytesHandler(rateLimitMiddleware(rl, http.HandlerFunc(hh.HandleHandoff)), *maxRequestSize))
+		logger.Info("attested CA handoff enabled (bootstrap will run in background)",
+			"assam_url", *handoffAssamURL,
+			"measurements", len(iss.HandoffMeasurements),
+			"pinned_assam_measurements", len(measurements),
+		)
+		handoffSrc = hh.issuerEARSource
+		handoffBoot = boot
 	}
 
 	srv := &http.Server{
@@ -275,35 +276,55 @@ func Run(args []string) error {
 		IdleTimeout:  *idleTimeout,
 	}
 
+	if *ratlsPlatform != "" {
+		if *ratlsAttestationServiceURL == "" {
+			return fmt.Errorf("--ratls-attestation-service-url is required when --ratls-platform is set")
+		}
+		attestFunc := attestclient.MakeSNPRATLSAttestFunc(attestclient.NewClient(""), *ratlsAttestationServiceURL)
+		tlsCfg, certMgr, err := ratls.NewServerTLSConfig(&ratls.ServerConfig{
+			Platform:   *ratlsPlatform,
+			AttestFunc: attestFunc,
+			CertTTL:    *ratlsCertTTL,
+			Logger:     logger,
+		})
+		if err != nil {
+			return fmt.Errorf("ratls server config: %w", err)
+		}
+		srv.TLSConfig = tlsCfg
+
+		warmupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err = certMgr.WarmUp(warmupCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("warm up ratls serving cert: %w", err)
+		}
+	} else {
+		logger.Warn("RA-TLS disabled (--ratls-platform empty); serving plain HTTP. UNSAFE outside tests.")
+	}
+
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
+	go rotator.run(ctx, *caRotationInterval)
+	logger.Info("scheduled CA rotation enabled", "interval", caRotationInterval.String())
 
 	// Update cert expiry gauges periodically.
 	go certExpiryUpdater(ctx, iss, *metricsUpdateInterval)
-
-	// Start certificate hot-reload watcher.
-	// In CDS mode, CA key is managed via /v1/rotate-ca, so skip watching the key file.
-	caKeyPath := *caKeyF
-	if kbsMode {
-		caKeyPath = "" // Don't watch CA key file; /v1/rotate-ca handles rotation.
-	}
-	reloader := newCertReloader(iss, caKeyPath, *caCertF, *tokenCert, *parentCertF, *certWatchDebounce, logger)
-	go func() {
-		if err := reloader.run(ctx); err != nil {
-			logger.Error("cert reloader failed", "error", err)
-		}
-	}()
 
 	// Start rate limiter eviction goroutine.
 	go rl.evictionLoop(ctx, *rateLimiterEvictInterval, *rateLimiterIdleTimeout)
 
 	// Start node tracker metric updater.
 	go nodeTrackerUpdater(ctx, iss.tracker, *metricsUpdateInterval)
+
+	if handoffSrc != nil {
+		go handoffEARExpiryUpdater(ctx, handoffSrc, *metricsUpdateInterval, logger)
+	}
+	if handoffBoot != nil {
+		go handoffBoot.runRefresh(ctx, logger)
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -312,6 +333,13 @@ func Run(args []string) error {
 		srv.Shutdown(shutdownCtx)
 	}()
 
+	if srv.TLSConfig != nil {
+		logger.Info("cert-issuer starting (RA-TLS)", "address", ln.Addr().String(), "platform", *ratlsPlatform)
+		if err := srv.ServeTLS(ln, "", ""); err != http.ErrServerClosed {
+			return fmt.Errorf("server: %w", err)
+		}
+		return nil
+	}
 	logger.Info("cert-issuer starting", "address", ln.Addr().String())
 	if err := srv.Serve(ln); err != http.ErrServerClosed {
 		return fmt.Errorf("server: %w", err)

@@ -1,5 +1,5 @@
 ## Operator container image. The same image runs every c8s mode that
-## doesn't need extra OS bins: controller manager and c8s-init-cert/get-cert.
+## doesn't need extra OS bins: controller manager and injected get-cert.
 ## `tag` and `digest` are consumer-supplied — the chart fails to render if
 ## neither is set. TEE measurements depend on the exact binary running,
 ## so floating tags break attestation semantics; prefer `digest`.
@@ -33,47 +33,34 @@ serviceAccount:
 statusMirror:
   enabled: true
 
-## Mutating admission webhook that injects the init-container into pods
-## annotated with confidential.ai/cw. Enabled by default because this chart
-## also deploys Assam/cert-issuer by default.
+## Mutating admission webhook that injects get-cert containers into pods
+## annotated with confidential.ai/cw.
 webhook:
-  enabled: true
   caBundle: ""
   service:
     port: 443
   failurePolicy: Fail
   extraExcluded: []
-  ## SecretRef injected into workload pods for attestation-service auth.
-  ## The Secret must exist in each workload namespace. Set
-  ## createInNamespaces to have the chart create per-namespace API keys and
-  ## register those keys with the chart-managed attestation-service.
-  apiKeySecret:
-    name: ""
-    key: apiKey
-    createInNamespaces: []
   certVolume:
     fsGroup: 65532
     keyMode: "0640"
-  initContainer:
+  getCert:
+    ## Must be shorter than Assam's certTTL. The default renews at 25% of
+    ## the chart's 24h certificate TTL.
+    renewInterval: 6h
     ## Defaults match distroless nonroot. Kata deployments that need UID 0
     ## inside the guest can set runAsUser/runAsGroup to 0 and runAsNonRoot=false.
     runAsUser: 65532
     runAsGroup: 65532
     runAsNonRoot: true
 
-## Assam is the key broker / certificate broker that the c8s-init-cert
-## container talks to through its get-cert subcommand.
+## Assam is the key broker / certificate broker that injected get-cert
+## containers talk to.
 ##
-## Chart-managed Assam is enabled by default so this chart can replace the
-## standalone assam release. For the whitepaper production security model,
-## Assam/CDS must run inside the attested trust boundary and its state/secrets
-## must not rely only on Kubernetes control-plane secrecy.
+## For the whitepaper production security model, Assam/CDS must run inside the
+## attested trust boundary and its state/secrets must not rely only on
+## Kubernetes control-plane secrecy.
 assam:
-  enabled: true
-  ## External Assam URL. If empty and assam.enabled=true, the webhook uses the
-  ## chart-managed Assam Service URL. Required for webhook.enabled=true when
-  ## assam.enabled=false.
-  url: ""
   image:
     repository: ghcr.io/lunal-dev/assam
     tag: ""
@@ -83,15 +70,11 @@ assam:
   service:
     type: NodePort
     nodePort: 30808
-  ## External cert-issuer URL. If empty and certIssuer.enabled=true, Assam uses
-  ## the chart-managed cert-issuer Service URL. Required when assam.enabled=true
-  ## and certIssuer.enabled=false.
-  certIssuerURL: ""
   whitelistDB: /data/whitelist.db
-  ## Optional explicit admin password. Empty means the chart creates/reuses a
-  ## Secret in the release namespace; this is bootstrap convenience, not a
-  ## production trust-boundary secret model by itself.
-  whitelistAdminPassword: ""
+  ## Optional Assam resource map:
+  ##   <measurement>: ["assam/whitelist-write"]
+  ## Empty means whitelist mutation endpoints reject writes.
+  resourceMap: {}
   earIssuer: assam
   certTTL: 24h
   challengeTTL: 60s
@@ -99,6 +82,22 @@ assam:
   tokenSignerRotationInterval: 720h
   tokenSignerOverlap: 25h
   tokenSignerRotationJitter: 0.1
+  ## RA-TLS settings for the Assam serving cert (closes the bootstrap-channel
+  ## MITM gap: ratls-mesh validates Assam's peer cert via the embedded SEV-SNP
+  ## attestation report instead of trusting the cluster network).
+  ## Empty platform disables TLS — UNSAFE outside tests.
+  ratlsPlatform: snp
+  ratlsCertTTL: 24h
+  ## Cap on whitelist mutation request bodies (bytes). Whitelist payloads
+  ## are tiny; the cap stops a malicious client from forcing the handler
+  ## to buffer megabytes during the auth body-binding check.
+  whitelistMaxBodyBytes: 65536
+  ## Expected launch digests (SHA-384 hex) of the attested Assam binary.
+  ## ratls-mesh and other RA-TLS-aware clients pass this list to the TLS
+  ## handshake's measurement allowlist. Empty means the client accepts ANY
+  ## measurement — suitable for dev only; chart-managed CVM-only deployments
+  ## MUST populate this with the operator-pinned Assam launch digest.
+  measurements: []
   persistence:
     enabled: false
     size: 1Gi
@@ -111,46 +110,71 @@ assam:
       cpu: 500m
       memory: 256Mi
 
-## Chart-managed cert-issuer. This completes the bootstrap/dev certificate
-## path when paired with chart-managed Assam. It deliberately uses a Kubernetes
-## Secret-backed mesh CA as an interim install convenience; the whitepaper
-## production model replaces this with an in-CVM signing key and attested
-## replica handoff.
+## Chart-managed cert-issuer. This completes the certificate path when paired
+## with chart-managed Assam. The mesh CA key is generated inside the
+## cert-issuer process and remains in memory only.
 certIssuer:
-  enabled: true
   image:
     repository: ghcr.io/lunal-dev/cert-issuer
     tag: ""
     digest: ""
     pullPolicy: IfNotPresent
   port: 8090
-  ## External Assam JWKS URL. If empty and assam.enabled=true, cert-issuer uses
-  ## the chart-managed Assam JWKS endpoint.
-  jwksURL: ""
   jwksCacheTTL: 5m
   expectedIssuer: assam
   rateLimit: 10
   rateBurst: 20
   logLevel: info
-  sanValidation: true
+  ## Assam forwards CSRs from its own pod, so cert-issuer cannot compare the
+  ## CSR node IP SAN to the TCP source IP in the chart-managed path. DNS SAN
+  ## and CN validation still run; set dnsSanPattern/cnPattern for those names.
+  sanValidation: false
   dnsSanPattern: ""
   cnPattern: ""
   ## Optional cert-issuer resource map:
-  ##   <measurement>: ["cert-issuer/sign-csr", "cert-issuer/ca"]
-  ## Empty means cert-issuer accepts any valid EAR signed by Assam.
+  ##   <measurement>: ["cert-issuer/sign-csr", "cert-issuer/handoff"]
+  ## Empty means sign-csr accepts any valid EAR signed by Assam.
   resourceMap: {}
+  ## RA-TLS settings for cert-issuer's serving cert. Without this Assam
+  ## (and any other in-cluster client) talks to cert-issuer over plaintext
+  ## HTTP and an on-path attacker can forge sign-csr responses.
+  ratlsPlatform: snp
+  ratlsCertTTL: 24h
+  ## Expected SHA-384 hex launch measurements of the cert-issuer binary
+  ## itself. Distributed to peers (Assam, future replicas) so their
+  ## RA-TLS handshake against cert-issuer pins this identity.
+  ## Empty = peers accept any measurement (UNSAFE outside dev).
+  measurements: []
   ca:
-    create: true
-    ## Empty defaults to <release>-cert-issuer-mesh-ca.
-    secretName: ""
-    configMapName: ""
+    ## The mesh CA key is generated inside cert-issuer memory and is not
+    ## rendered into a Kubernetes Secret or persistent volume.
     commonName: c8s Mesh CA
-    validityDays: 365
-    certPEM: ""
-    keyPEM: ""
     maxTTL: 24h
     minValidity: 1h
     certValidity: 8760h
+    ## Rotate the in-memory mesh CA inside cert-issuer on this interval.
+    rotationInterval: 720h
+    ## Persist only the public CA bundle across cert-issuer pod restarts.
+    ## Private CA keys remain in process memory and are never written here.
+    publicBundlePersistence:
+      existingClaim: ""
+      claimName: ""
+      storageClassName: ""
+      size: 16Mi
+      mountPath: /var/lib/cert-issuer/public-bundle
+  ## Attested CA handoff between cert-issuer replicas. When enabled,
+  ## cert-issuer generates an ECDSA handoff signer key in process at startup
+  ## and exchanges it for an Assam-issued EAR via /attest-key — no operator
+  ## key file or Kubernetes Secret is involved. Required for any active/active
+  ## cert-issuer deployment; without it, a cert-issuer pod restart triggers a
+  ## full mesh re-bootstrap (see docs/THREAT_MODEL.md).
+  ##
+  ## handoff.enabled also requires a `cert-issuer/handoff` measurement entry
+  ## in certIssuer.resourceMap (or the bootstrap will succeed but the handoff
+  ## handler will reject every caller). The Assam launch-digest pin is
+  ## inherited from the parent assam.measurements value.
+  handoff:
+    enabled: false
   resources:
     requests:
       cpu: 50m
@@ -161,7 +185,6 @@ certIssuer:
 
 ## DaemonSet running github.com/lunal-dev/attestation-service.
 attestationService:
-  enabled: true
   image:
     repository: ghcr.io/lunal-dev/attestation-service
     tag: ""
@@ -180,7 +203,6 @@ attestationService:
     sevGuest: false
     tdxGuest: false
     tpm: true
-  apiKey: ""
   platforms:
     - snp
     - tdx
@@ -218,12 +240,17 @@ ratls-mesh:
     pullPolicy: IfNotPresent
   imagePullSecrets: []
   certMode: assam
-  attestationService:
-    url: ""
-    apiKey: ""
+  tpm:
+    enabled: false
+  networkPolicy:
+    enabled: false
+    monitoringNamespace: monitoring
+  ## Mirror the parent `assam.measurements` here so the subchart's
+  ## --assam-measurements flag is populated. Helm does not pass parent values
+  ## into subchart values automatically; operators must keep these two in
+  ## sync (chart_test fails if they diverge).
   assam:
-    url: ""
-    certIssuerUrl: ""
+    measurements: []
 
 nri-image-policy:
   enabled: true
@@ -237,14 +264,6 @@ nri-image-policy:
     mode: audit
     exemptNamespaces:
       - kube-system
-  seeder:
-    image:
-      repository: docker.io/curlimages/curl
-      digest: "sha256:d94d07ba9e7d6de898b6d96c1a072f6f8266c687af78a74f380087a0addf5d17"
-    adminPasswordSecretName: ""
-    adminPasswordSecretKey: ""
-    assamURL: ""
-
 tee-proxy:
   enabled: true
   upstream: vllm-router-service.vllm.svc.cluster.local
@@ -255,25 +274,18 @@ tee-proxy:
     pullPolicy: IfNotPresent
   imagePullSecrets: []
   attestationURL: ""
+  tpm:
+    enabled: false
   router:
     routes:
       - path: /whitelist
-        upstream: http://c8s-assam.tee-attestation.svc:8080
+        upstream: "http://{{ .Release.Name }}-assam.{{ .Release.Namespace }}.svc:8080"
     image:
       repository: docker.io/library/nginx
       digest: "sha256:1eff5a5f3fcf8431a0abb7eddf5471fec24e5e1905a2581aeacdb07a4479b92b"
 
 tls-lb:
   enabled: true
-  assamURL: ""
-  attestationServiceURL: ""
-  initContainer:
-    attestationServiceApiKey: ""
-    image:
-      repository: ghcr.io/lunal-dev/get-cert
-      tag: ""
-      digest: ""
-      pullPolicy: IfNotPresent
   nginx:
     image:
       repository: nginxinc/nginx-unprivileged

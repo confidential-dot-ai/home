@@ -1,11 +1,6 @@
-# -- Subject Alternative Name for the TLS certificate (IP address or hostname).
-san: "example.com"
-
-# -- URL of the assam key broker service.
-assamURL: "http://assam.default.svc.cluster.local:8080"
-
-# -- URL of the local attestation service (typically a DaemonSet on each node).
-attestationServiceURL: "http://attestation-service.default.svc.cluster.local:8400"
+# -- Subject Alternative Name for the CDS certificate. Empty defaults to the
+# chart-managed Service DNS name: <release>-tls-lb.<namespace>.svc.
+san: ""
 
 # -- Upstream backend service to proxy traffic to.
 upstream:
@@ -47,8 +42,8 @@ publicTLS:
   keyKey: tls.key
   mountPath: "/public-tls"
 
-# -- Discovery/preflight metadata served by nginx. Requires a get-cert image
-# that supports --discovery-out.
+# -- Discovery/preflight metadata served by nginx. The c8s admission webhook
+# injects get-cert with the matching discovery-output annotations.
 discovery:
   enabled: false
   path: "/v1/discovery"
@@ -61,31 +56,32 @@ discovery:
 # chart-managed c8s cert-issuer ConfigMap name.
 meshCA:
   # -- Serve and advertise the mesh CA PEM when discovery is enabled. The
-  # ConfigMap is required when the URL is advertised.
+  # ConfigMap must exist for nginx to serve the bundle; setting optional=true
+  # below lets the pod start without it (the discovery URL will then return
+  # 404 until the ConfigMap is created).
   expose: true
+  # -- Name of an existing ConfigMap holding the mesh CA bundle. cert-issuer
+  # does not render this ConfigMap itself (the bundle lives in the in-memory
+  # CA + PVC-backed public bundle on the cert-issuer pod), so the operator
+  # must provide one when discovery is enabled. Empty defaults to
+  # "<release>-cert-issuer-mesh-ca".
   configMapName: ""
   key: ca.pem
   mountPath: "/mesh-ca"
+  # -- Tolerate a missing mesh CA ConfigMap at pod start. Defaults to true so
+  # enabling discovery does not break pod creation; set to false to fail fast
+  # in environments that pre-create the ConfigMap.
+  optional: true
 
-imagePullSecrets:
-  - name: ghcr-secret
+imagePullSecrets: []
 
-initContainer:
-  image:
-    repository: ghcr.io/lunal-dev/get-cert
-    # -- Image tag or sha-prefixed digest. Required: the chart does not pin a
-    #    default tag — the consumer (fleet HelmRelease or cluster overlay)
-    #    must set this so the running image is explicit.
-    tag: ""
-    pullPolicy: IfNotPresent
-  # -- Enable verbose (debug) logging for the init container.
+certProvisioning:
+  # -- Enable verbose (debug) logging for webhook-injected cert provisioning.
   verbose: false
-  # -- How often to renew the TLS certificate. get-cert runs as a native sidecar
-  #    and SIGHUPs nginx after each renewal. Must be shorter than the cert TTL
-  #    issued by assam (currently ~4h).
+  # -- How often the webhook-injected get-cert sidecar renews the TLS
+  #    certificate and SIGHUPs nginx. Must be shorter than the cert TTL issued
+  #    by Assam.
   renewInterval: "1h"
-  # -- API key for authenticating with the attestation service (hosted mode).
-  attestationServiceApiKey: "28950a6a10bc4bfe991e7b51edeb0233891b62550abf7c3d331f512e9d2d83ad"
 
 nginx:
   image:
@@ -98,6 +94,11 @@ nginx:
   replicas: 1
   # -- HTTPS port nginx listens on.
   httpsPort: 443
+  # -- UID/GID used by nginx and the webhook-injected get-cert containers so
+  #    both can access the in-memory CDS key material.
+  runAsUser: 101
+  runAsGroup: 101
+  runAsNonRoot: true
   resources: {}
 
 service:

@@ -7,7 +7,6 @@ build/
 /assam
 /c8s
 /cert-issuer
-/cert-rotator
 /get-cert
 /node-container-whitelist
 /nri-image-policy

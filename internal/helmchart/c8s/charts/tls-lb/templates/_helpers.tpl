@@ -22,6 +22,14 @@ Create a default fully qualified app name.
 {{- end }}
 
 {{/*
+Default the CDS certificate SAN to the chart-managed Service DNS name. Public
+deployments should set .Values.san to the externally routed hostname.
+*/}}
+{{- define "tls-lb.san" -}}
+{{- default (printf "%s.%s.svc" (include "tls-lb.fullname" .) .Release.Namespace) .Values.san }}
+{{- end }}
+
+{{/*
 Common labels.
 */}}
 {{- define "tls-lb.labels" -}}

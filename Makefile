@@ -1,4 +1,4 @@
-.PHONY: build build-c8s build-c8s-node build-assam build-get-cert build-ratls-mesh build-cert-issuer build-cert-rotator \
+.PHONY: build build-c8s build-c8s-node build-assam build-get-cert build-ratls-mesh build-cert-issuer \
        build-nri-image-policy \
        test test-integration vet fmt lint clean \
        manifests generate check-crd-chart install-controller-gen require-controller-gen
@@ -73,15 +73,6 @@ build-cert-issuer:
 		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
 		-o $(BUILD_DIR)/cert-issuer ./cmd/cert-issuer
 	@echo "Built $(BUILD_DIR)/cert-issuer"
-
-# --- Cert Rotator ---
-
-build-cert-rotator:
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
-		-o $(BUILD_DIR)/cert-rotator ./cmd/cert-rotator
-	@echo "Built $(BUILD_DIR)/cert-rotator"
 
 # --- NRI Image Policy ---
 

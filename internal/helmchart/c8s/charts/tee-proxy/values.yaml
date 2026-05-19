@@ -6,12 +6,11 @@ image:
   digest: ""
   pullPolicy: IfNotPresent
 
-imagePullSecrets:
-  - name: ghcr-secret
+imagePullSecrets: []
 
 replicas: 1
 
-# TEE platform: sev-snp or tdx
+# TEE platform. The supported c8s chart shape is SEV-SNP.
 platform: sev-snp
 
 # Domain for autocert TLS

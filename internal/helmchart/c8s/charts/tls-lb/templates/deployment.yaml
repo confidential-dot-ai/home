@@ -1,5 +1,4 @@
-{{- $assamURL := default (printf "http://%s-assam.%s.svc:8080" .Release.Name .Release.Namespace) .Values.assamURL -}}
-{{- $attestationServiceURL := default (printf "http://%s-attestation-service.%s.svc:8400" .Release.Name .Release.Namespace) .Values.attestationServiceURL -}}
+{{- $san := include "tls-lb.san" . -}}
 {{- $discoveryFilePath := printf "%s/%s" .Values.discovery.mountPath .Values.discovery.fileName -}}
 {{- $meshCAConfigMapName := default (printf "%s-cert-issuer-mesh-ca" .Release.Name) .Values.meshCA.configMapName -}}
 {{- $defaultMeshCAPath := printf "%s/%s" .Values.meshCA.mountPath .Values.meshCA.key -}}
@@ -33,109 +32,40 @@ spec:
         {{- include "tls-lb.selectorLabels" . | nindent 8 }}
       annotations:
         checksum/nginx-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        confidential.ai/cw: {{ $san | quote }}
+        confidential.ai/c8s-cert-volume: "tls-certs"
+        confidential.ai/c8s-cert-dir: {{ .Values.tlsMountPath | quote }}
+        confidential.ai/c8s-cert-file: "cert.pem"
+        confidential.ai/c8s-key-file: "key.pem"
+        confidential.ai/c8s-renew-interval: {{ .Values.certProvisioning.renewInterval | quote }}
+        confidential.ai/c8s-reload-nginx: "true"
+        confidential.ai/c8s-get-cert-run-as-user: {{ .Values.nginx.runAsUser | quote }}
+        confidential.ai/c8s-get-cert-run-as-group: {{ .Values.nginx.runAsGroup | quote }}
+        confidential.ai/c8s-get-cert-run-as-non-root: {{ .Values.nginx.runAsNonRoot | quote }}
+        {{- if .Values.certProvisioning.verbose }}
+        confidential.ai/c8s-get-cert-verbose: "true"
+        {{- end }}
+        {{- if .Values.publicTLS.secretName }}
+        confidential.ai/c8s-reload-watch-volume: "public-tls"
+        confidential.ai/c8s-reload-watch-mount-path: {{ .Values.publicTLS.mountPath | quote }}
+        confidential.ai/c8s-reload-watch-paths: {{ printf "%s,%s" $publicCertPath $publicKeyPath | quote }}
+        {{- end }}
+        {{- if .Values.discovery.enabled }}
+        confidential.ai/c8s-discovery-volume: "discovery"
+        confidential.ai/c8s-discovery-mount-path: {{ .Values.discovery.mountPath | quote }}
+        confidential.ai/c8s-discovery-out: {{ $discoveryFilePath | quote }}
+        confidential.ai/c8s-discovery-cds-cert-url: {{ .Values.discovery.cdsCertPath | quote }}
+        confidential.ai/c8s-discovery-public-tls-mode: {{ $publicTLSMode | quote }}
+        {{- if .Values.meshCA.expose }}
+        confidential.ai/c8s-discovery-mesh-ca-url: {{ .Values.discovery.meshCAPath | quote }}
+        {{- end }}
+        {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       shareProcessNamespace: true
-      initContainers:
-        # One-shot init: fetch the first cert synchronously so nginx has
-        # something to load when it starts.
-        - name: get-cert-init
-          image: {{ include "c8s-common.image" .Values.initContainer.image }}
-          imagePullPolicy: {{ .Values.initContainer.image.pullPolicy }}
-          securityContext:
-            runAsUser: 101
-            allowPrivilegeEscalation: false
-          args:
-            - --assam-url={{ $assamURL }}
-            - --attestation-service-url={{ $attestationServiceURL }}
-            {{- if .Values.initContainer.attestationServiceApiKey }}
-            - --attestation-service-api-key={{ .Values.initContainer.attestationServiceApiKey }}
-            {{- end }}
-            - --san={{ required "san is required - set it to the domain name for the TLS certificate" .Values.san }}
-            - --out={{ .Values.tlsMountPath }}/cert.pem
-            - --key-out={{ .Values.tlsMountPath }}/key.pem
-            {{- if .Values.discovery.enabled }}
-            - --discovery-out={{ $discoveryFilePath }}
-            - --discovery-cds-cert-url={{ .Values.discovery.cdsCertPath }}
-            - --discovery-public-tls-mode={{ $publicTLSMode }}
-            {{- if .Values.meshCA.expose }}
-            - --discovery-mesh-ca-url={{ .Values.discovery.meshCAPath }}
-            {{- end }}
-            {{- end }}
-            {{- if .Values.initContainer.verbose }}
-            - --verbose
-            {{- end }}
-          {{- if not .Values.initContainer.attestationServiceApiKey }}
-          env:
-            - name: C8S_ATTESTATION_SERVICE_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Release.Name }}-attestation-service-api-key
-                  key: apiKey
-          {{- end }}
-          volumeMounts:
-            - name: tls-certs
-              mountPath: {{ .Values.tlsMountPath }}
-            {{- if .Values.discovery.enabled }}
-            - name: discovery
-              mountPath: {{ .Values.discovery.mountPath }}
-            {{- end }}
-        # Native sidecar: keeps running to renew the cert and SIGHUP nginx.
-        - name: get-cert
-          image: {{ include "c8s-common.image" .Values.initContainer.image }}
-          imagePullPolicy: {{ .Values.initContainer.image.pullPolicy }}
-          restartPolicy: Always
-          securityContext:
-            runAsUser: 101
-            allowPrivilegeEscalation: false
-          args:
-            - --assam-url={{ $assamURL }}
-            - --attestation-service-url={{ $attestationServiceURL }}
-            {{- if .Values.initContainer.attestationServiceApiKey }}
-            - --attestation-service-api-key={{ .Values.initContainer.attestationServiceApiKey }}
-            {{- end }}
-            - --san={{ required "san is required - set it to the domain name for the TLS certificate" .Values.san }}
-            - --out={{ .Values.tlsMountPath }}/cert.pem
-            - --key-out={{ .Values.tlsMountPath }}/key.pem
-            {{- if .Values.publicTLS.secretName }}
-            - --reload-watch={{ $publicCertPath }}
-            - --reload-watch={{ $publicKeyPath }}
-            {{- end }}
-            {{- if .Values.discovery.enabled }}
-            - --discovery-out={{ $discoveryFilePath }}
-            - --discovery-cds-cert-url={{ .Values.discovery.cdsCertPath }}
-            - --discovery-public-tls-mode={{ $publicTLSMode }}
-            {{- if .Values.meshCA.expose }}
-            - --discovery-mesh-ca-url={{ .Values.discovery.meshCAPath }}
-            {{- end }}
-            {{- end }}
-            - --renew-interval={{ .Values.initContainer.renewInterval }}
-            {{- if .Values.initContainer.verbose }}
-            - --verbose
-            {{- end }}
-          {{- if not .Values.initContainer.attestationServiceApiKey }}
-          env:
-            - name: C8S_ATTESTATION_SERVICE_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Release.Name }}-attestation-service-api-key
-                  key: apiKey
-          {{- end }}
-          volumeMounts:
-            - name: tls-certs
-              mountPath: {{ .Values.tlsMountPath }}
-            {{- if .Values.publicTLS.secretName }}
-            - name: public-tls
-              mountPath: {{ .Values.publicTLS.mountPath }}
-              readOnly: true
-            {{- end }}
-            {{- if .Values.discovery.enabled }}
-            - name: discovery
-              mountPath: {{ .Values.discovery.mountPath }}
-            {{- end }}
       containers:
         - name: nginx
           image: {{ include "c8s-common.image" .Values.nginx.image }}
@@ -147,6 +77,9 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+            runAsNonRoot: {{ .Values.nginx.runAsNonRoot }}
+            runAsUser: {{ .Values.nginx.runAsUser }}
+            runAsGroup: {{ .Values.nginx.runAsGroup }}
             capabilities:
               drop:
                 - ALL
@@ -220,7 +153,7 @@ spec:
         - name: mesh-ca
           configMap:
             name: {{ $meshCAConfigMapName }}
-            optional: false
+            optional: {{ .Values.meshCA.optional }}
             items:
               - key: {{ .Values.meshCA.key }}
                 path: {{ .Values.meshCA.key }}
@@ -233,7 +166,7 @@ spec:
           configMap:
             name: {{ include "tls-lb.fullname" . }}-nginx
       securityContext:
-        runAsNonRoot: true
-        fsGroup: 101
+        runAsNonRoot: {{ .Values.nginx.runAsNonRoot }}
+        fsGroup: {{ .Values.nginx.runAsGroup }}
         seccompProfile:
           type: RuntimeDefault

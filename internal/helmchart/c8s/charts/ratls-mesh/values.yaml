@@ -6,16 +6,10 @@ image:
   digest: ""
   pullPolicy: IfNotPresent
 
-imagePullSecrets:
-  - name: ghcr-secret
+imagePullSecrets: []
 
-# TEE platform: sev-snp or tdx
+# TEE platform. The supported c8s chart shape is SEV-SNP.
 platform: sev-snp
-
-attestationService:
-  enabled: true
-  url: "http://attestation-service:8400"
-  apiKey: "28950a6a10bc4bfe991e7b51edeb0233891b62550abf7c3d331f512e9d2d83ad"
 
 # Host path for iptables lock (k3s: /run/k3s/agent/xtables.lock)
 xtablesLockPath: /run/xtables.lock
@@ -39,10 +33,12 @@ rotationTimeout: "30s"
 
 # Assam integration (used when certMode=assam)
 assam:
-  url: ""
-  certIssuerUrl: ""
-  caUrl: ""
   caPollInterval: "5m"
+  # SHA-384 hex launch measurements that Assam's RA-TLS peer cert must match.
+  # Set from the parent chart's `assam.measurements`. Empty = accept any
+  # (UNSAFE outside tests — bootstrap MITM defence depends on this list being
+  # populated with the operator-pinned Assam launch digest).
+  measurements: []
 
 # Expected launch digests for measurement pinning (empty = accept any)
 measurements: []
@@ -79,6 +75,17 @@ resources:
     memory: 128Mi
 
 # Iptables cleanup sidecar resources
+iptablesSync:
+  resyncPeriod: 30s
+  ipsetMaxElem: 262144
+  resources:
+    requests:
+      cpu: 5m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
 iptablesCleanup:
   resources:
     requests:
@@ -106,7 +113,7 @@ probes:
 # --- Policies ---
 
 networkPolicy:
-  enabled: true
+  enabled: false
   monitoringNamespace: monitoring
 
 # TCP-only egress policy for application namespaces

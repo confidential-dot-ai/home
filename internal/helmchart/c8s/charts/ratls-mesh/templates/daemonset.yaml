@@ -1,6 +1,7 @@
-{{- $attestationServiceURL := default (printf "http://%s-attestation-service.%s.svc:8400" .Release.Name .Release.Namespace) .Values.attestationService.url -}}
-{{- $assamURL := default (printf "http://%s-assam.%s.svc:8080" .Release.Name .Release.Namespace) .Values.assam.url -}}
-{{- $certIssuerURL := default (printf "http://%s-cert-issuer.%s.svc:8090" .Release.Name .Release.Namespace) .Values.assam.certIssuerUrl -}}
+{{- $attestationServiceURL := printf "http://%s-attestation-service.%s.svc:8400" .Release.Name .Release.Namespace -}}
+{{- $assamURL := printf "https://%s-assam.%s.svc:8080" .Release.Name .Release.Namespace -}}
+{{- $certIssuerURL := printf "http://%s-cert-issuer.%s.svc:8090" .Release.Name .Release.Namespace -}}
+{{- $caURL := printf "%s/ca" $certIssuerURL -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -54,11 +55,6 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 1Mi
-        {{- if and (ne .Values.certMode "self-signed") (not .Values.assam.caUrl) }}
-        - name: mesh-ca-cert
-          configMap:
-            name: {{ default (printf "%s-cert-issuer-mesh-ca" .Release.Name) .Values.assam.caConfigMapName }}
-        {{- end }}
       initContainers:
         - name: iptables-setup
           image: {{ include "ratls-mesh.image" . }}
@@ -142,25 +138,11 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
-            {{- if and (ne .Values.certMode "self-signed") (not .Values.assam.caUrl) }}
-            - name: mesh-ca-cert
-              mountPath: /etc/mesh-ca
-              readOnly: true
-            {{- end }}
           args:
             - --platform
             - {{ .Values.platform | quote }}
-            {{- if .Values.attestationService.enabled }}
             - --attestation-service-url
             - {{ $attestationServiceURL | quote }}
-            {{- if .Values.attestationService.apiKey }}
-            - --attestation-service-api-key
-            - {{ .Values.attestationService.apiKey | quote }}
-            {{- end }}
-            {{- else if .Values.attestCmd }}
-            - --attest-cmd
-            - {{ .Values.attestCmd | quote }}
-            {{- end }}
             - --inbound-port
             - {{ .Values.ports.inbound | quote }}
             - --health-port
@@ -202,14 +184,13 @@ spec:
             - {{ $assamURL | quote }}
             - --cert-issuer-url
             - {{ $certIssuerURL | quote }}
-            {{- if .Values.assam.caUrl }}
             - --ca-url
-            - {{ .Values.assam.caUrl | quote }}
+            - {{ $caURL | quote }}
             - --ca-poll-interval
             - {{ .Values.assam.caPollInterval | quote }}
-            {{- else }}
-            - --ca-cert
-            - /etc/mesh-ca/ca.pem
+            {{- with .Values.assam.measurements }}
+            - --assam-measurements
+            - {{ join "," . | quote }}
             {{- end }}
             {{- end }}
           env:
@@ -217,13 +198,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.hostIP
-            {{- if and .Values.attestationService.enabled (not .Values.attestationService.apiKey) }}
-            - name: C8S_ATTESTATION_SERVICE_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Release.Name }}-attestation-service-api-key
-                  key: apiKey
-            {{- end }}
           ports:
             - name: outbound
               containerPort: {{ .Values.ports.outbound }}

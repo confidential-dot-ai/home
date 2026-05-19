@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -42,7 +43,6 @@ func Run(args []string) error {
 	fs := flag.NewFlagSet("ratls-mesh", flag.ContinueOnError)
 	platform := fs.String("platform", "sev-snp", "TEE platform: sev-snp, tdx")
 	attestationServiceURL := fs.String("attestation-service-url", "", "URL of the local attestation service (e.g. http://localhost:8400)")
-	attestationServiceAPIKey := fs.String("attestation-service-api-key", "", "API key for the attestation service (required when running in remote mode)")
 	outboundPort := fs.Int("outbound-port", 15001, "outbound listener port (intercepted app traffic)")
 	inboundPort := fs.Int("inbound-port", 15006, "inbound listener port (RA-TLS from remote nodes)")
 	nodeIP := fs.String("node-ip", "", "this node's IP (auto-detected from NODE_IP env if unset)")
@@ -62,10 +62,11 @@ func Run(args []string) error {
 
 	certMode := fs.String("cert-mode", "self-signed", "certificate mode: self-signed (default), assam (boots self-signed, upgrades to assam-issued in background)")
 	assamURL := fs.String("assam-url", "", "assam service URL for attestation (required for assam mode)")
-	certIssuerURL := fs.String("cert-issuer-url", "", "cert-issuer URL for CA bundle retrieval (required for assam mode)")
+	certIssuerURL := fs.String("cert-issuer-url", "", "cert-issuer URL for CA bundle refresh after authenticated provisioning (required for assam mode)")
 	caCertPath := fs.String("ca-cert", "", "path to CA certificate file for peer verification")
-	caURL := fs.String("ca-url", "", "cert-issuer /v1/ca URL for periodic CA bundle refresh (assam mode)")
-	caPollInterval := fs.Duration("ca-poll-interval", 5*time.Minute, "interval to poll cert-issuer /v1/ca for CA bundle updates")
+	caURL := fs.String("ca-url", "", "cert-issuer /ca URL for periodic CA bundle refresh (assam mode)")
+	caPollInterval := fs.Duration("ca-poll-interval", 5*time.Minute, "interval to poll cert-issuer /ca for CA bundle updates")
+	assamMeasurements := fs.String("assam-measurements", "", "comma-separated SHA-384 hex launch measurements that Assam's RA-TLS peer cert must match. Empty = accept any (UNSAFE outside development).")
 
 	sessionCacheSize := fs.Int("session-cache-size", 64, "TLS session cache size per node (0 disables session resumption)")
 	accessLog := fs.Bool("access-log", true, "emit per-connection structured access log")
@@ -100,11 +101,6 @@ func Run(args []string) error {
 	if err := validateConfig(*attestationServiceURL, *outboundPort, *inboundPort, *certTTL); err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
-	apiKey := *attestationServiceAPIKey
-	if apiKey == "" {
-		apiKey = os.Getenv("C8S_ATTESTATION_SERVICE_API_KEY")
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
@@ -121,9 +117,9 @@ func Run(args []string) error {
 		return fmt.Errorf("k8s resolver: %w", err)
 	}
 
-	asClient := attestclient.NewClientWithHTTPAndAPIKey("", &http.Client{
+	asClient := attestclient.NewClientWithHTTP("", &http.Client{
 		Timeout: durOrDefault(*rotationTimeout, 30*time.Second),
-	}, apiKey)
+	})
 	attestFunc := makeAttestFunc(asClient, *attestationServiceURL)
 
 	meshPolicy := &ratls.VerifyPolicy{}
@@ -165,6 +161,11 @@ func Run(args []string) error {
 	if *certMode == "assam" && (*assamURL == "" || *attestationServiceURL == "" || *certIssuerURL == "") {
 		return fmt.Errorf("--assam-url, --attestation-service-url, and --cert-issuer-url are required for --cert-mode assam")
 	}
+	teeType, err := ratlsTEEType(*platform)
+	if err != nil {
+		return err
+	}
+	effectiveCAURL := effectiveAssamCAURL(*certMode, *certIssuerURL, *caURL)
 
 	serverTLS, serverCertMgr, err := ratls.NewServerTLSConfig(&ratls.ServerConfig{
 		Platform:        *platform,
@@ -173,7 +174,7 @@ func Run(args []string) error {
 		CertTTL:         *certTTL,
 		ClientPolicy:    meshPolicy,
 		CACert:          caCerts,
-		DynamicCACert:   *caURL != "",
+		DynamicCACert:   effectiveCAURL != "",
 		RotationTimeout: *rotationTimeout,
 		Logger:          logger,
 	})
@@ -186,7 +187,7 @@ func Run(args []string) error {
 		Platform:        *platform,
 		AttestFunc:      attestFunc,
 		CACert:          caCerts,
-		DynamicCACert:   *caURL != "",
+		DynamicCACert:   effectiveCAURL != "",
 		CertTTL:         *certTTL,
 		RotationTimeout: *rotationTimeout,
 		Logger:          logger,
@@ -313,19 +314,57 @@ func Run(args []string) error {
 
 	// Assam certificate upgrade: after self-signed RA-TLS boot, a background
 	// goroutine contacts assam, gets CA-signed certs, and hot-swaps them via
-	// CertManager.SwapProvider. The assamCfg is shared with the CA bundle
-	// refresh goroutine below.
-	var assamCfg *assamclient.Config
+	// CertManager.SwapProvider.
 	if *certMode == "assam" {
-		assamCfg = &assamclient.Config{
-			AssamURL:                 *assamURL,
-			AttestationServiceURL:    *attestationServiceURL,
-			AttestationServiceAPIKey: apiKey,
-			CertIssuerURL:            *certIssuerURL,
-			NodeIP:                   *nodeIP,
+		measurements, err := parseHexMeasurements(*assamMeasurements)
+		if err != nil {
+			return fmt.Errorf("--assam-measurements: %w", err)
 		}
+		if len(measurements) == 0 {
+			logger.Warn("--assam-measurements not set; the RA-TLS handshake will accept any Assam measurement. Set this to the chart-distributed launch digest of Assam to close bootstrap MITM.")
+		}
+		assamCfg := &assamclient.Config{
+			AssamURL:              *assamURL,
+			AttestationServiceURL: *attestationServiceURL,
+			CertIssuerURL:         *certIssuerURL,
+			CACertURL:             effectiveCAURL,
+			NodeIP:                *nodeIP,
+			TEEType:               teeType,
+			AssamMeasurements:     measurements,
+		}
+		assamClient := assamclient.NewClient(assamCfg)
+
+		updateTrustedCABundle := func() int {
+			newCerts := assamClient.TrustedCABundle()
+			if len(newCerts) == 0 {
+				return 0
+			}
+			serverCertMgr.UpdateCACerts(newCerts)
+			if clientCertMgr != nil {
+				clientCertMgr.UpdateCACerts(newCerts)
+			}
+			return len(newCerts)
+		}
+		refreshCABundle := func(refreshCtx context.Context) (int, error) {
+			newCerts, err := assamClient.RefreshCABundle(refreshCtx)
+			if err != nil {
+				return 0, err
+			}
+			serverCertMgr.UpdateCACerts(newCerts)
+			if clientCertMgr != nil {
+				clientCertMgr.UpdateCACerts(newCerts)
+			}
+			return len(newCerts), nil
+		}
+
+		caReady := make(chan struct{})
+		var caReadyOnce sync.Once
+		markCAReady := func() {
+			caReadyOnce.Do(func() { close(caReady) })
+		}
+
 		go func() {
-			assamProvider, err := assamclient.NewProvider(assamCfg, logger)
+			assamProvider, err := assamclient.NewProviderWithClient(assamClient, logger)
 			if err != nil {
 				logger.Error("assam provider creation failed", "error", err)
 				return
@@ -346,6 +385,9 @@ func Run(args []string) error {
 				cancel()
 				if err == nil {
 					logger.Info("certificate upgraded from self-signed to assam-issued (server)")
+					count := updateTrustedCABundle()
+					logger.Info("trusted CA bundle established from assam-issued certificate", "count", count)
+					markCAReady()
 					break
 				}
 				logger.Warn("assam certificate upgrade attempt failed (will retry)", "error", err, "backoff", backoff)
@@ -359,43 +401,57 @@ func Run(args []string) error {
 					logger.Warn("assam client certificate upgrade failed", "error", err)
 				} else {
 					logger.Info("certificate upgraded from self-signed to assam-issued (client)")
+					count := updateTrustedCABundle()
+					logger.Info("trusted CA bundle refreshed from assam-issued client certificate", "count", count)
 				}
 				cancel()
 			}
 
 			m.certMode.Store(1) // 1 = assam mode active
 		}()
-	}
 
-	// CA bundle refresh: periodically poll cert-issuer /v1/ca for updated CA bundle.
-	if *caURL != "" && *certMode == "assam" {
-		go func() {
-			assamClient := assamclient.NewClient(assamCfg)
+		// CA bundle refresh: wait until certificate provisioning has established
+		// a trusted CA, then poll cert-issuer /ca. Unauthenticated refreshes
+		// only retain/prune already trusted roots; new roots are admitted by
+		// certificate provisioning after the issued leaf verifies to them.
+		if effectiveCAURL != "" {
+			go func() {
+				refreshOnce := func(level string) {
+					refreshCtx, cancel := context.WithTimeout(ctx, *assamOpTimeout)
+					count, err := refreshCABundle(refreshCtx)
+					cancel()
+					if err != nil {
+						logger.Warn("CA bundle refresh failed", "url", effectiveCAURL, "error", err)
+						return
+					}
+					if level == "info" {
+						logger.Info("CA bundle refreshed from cert-issuer", "url", effectiveCAURL, "count", count)
+					} else {
+						logger.Debug("CA bundle refreshed from cert-issuer", "url", effectiveCAURL, "count", count)
+					}
+				}
 
-			ticker := time.NewTicker(*caPollInterval)
-			defer ticker.Stop()
-
-			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-ticker.C:
-					refreshCtx, cancel := context.WithTimeout(ctx, *assamOpTimeout)
-					newCerts, err := assamClient.RefreshCABundle(refreshCtx)
-					cancel()
-					if err != nil {
-						logger.Warn("CA bundle refresh failed", "url", *caURL, "error", err)
-						continue
-					}
-					serverCertMgr.UpdateCACerts(newCerts)
-					if clientCertMgr != nil {
-						clientCertMgr.UpdateCACerts(newCerts)
-					}
-					logger.Debug("CA bundle refreshed from cert-issuer", "count", len(newCerts))
+				case <-caReady:
+					refreshOnce("info")
 				}
-			}
-		}()
-		logger.Info("CA bundle refresh enabled", "url", *caURL, "interval", *caPollInterval)
+
+				ticker := time.NewTicker(*caPollInterval)
+				defer ticker.Stop()
+
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						refreshOnce("debug")
+					}
+				}
+			}()
+			logger.Info("CA bundle refresh enabled", "url", effectiveCAURL, "interval", *caPollInterval)
+		}
 	}
 
 	// Cert pipeline health probe: periodically check cert-issuer /ready.
@@ -475,6 +531,54 @@ func validateConfig(attestationServiceURL string, outboundPort, inboundPort int,
 		return fmt.Errorf("--cert-ttl %s is too short (minimum 1m to avoid rotation thrashing)", certTTL)
 	}
 	return nil
+}
+
+func effectiveAssamCAURL(certMode, certIssuerURL, caURL string) string {
+	caURL = strings.TrimSpace(caURL)
+	if caURL != "" || certMode != "assam" {
+		return caURL
+	}
+	return strings.TrimRight(certIssuerURL, "/") + "/ca"
+}
+
+func ratlsTEEType(platform string) (ratls.TEEType, error) {
+	switch strings.TrimSpace(platform) {
+	case "sev-snp":
+		return ratls.TEETypeSEVSNP, nil
+	case "":
+		return 0, fmt.Errorf("--platform is required")
+	case "tdx":
+		return 0, fmt.Errorf("ratls-mesh: TDX platform is not yet implemented (use sev-snp)")
+	default:
+		return 0, fmt.Errorf("ratls-mesh: unsupported --platform %q", platform)
+	}
+}
+
+// parseHexMeasurements parses a comma-separated list of hex-encoded SEV-SNP
+// launch digests into the byte form pkg/ratls.VerifyPolicy expects. Empty
+// input returns nil (the caller decides whether to warn).
+func parseHexMeasurements(raw string) ([][]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([][]byte, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		decoded, err := hex.DecodeString(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid hex measurement %q: %w", p, err)
+		}
+		if len(decoded) != ratls.SNPMeasurementSize {
+			return nil, fmt.Errorf("measurement %q is %d bytes, want %d", p, len(decoded), ratls.SNPMeasurementSize)
+		}
+		out = append(out, decoded)
+	}
+	return out, nil
 }
 
 // makeAttestFunc returns an AttestFunc that calls the attestation service

@@ -42,7 +42,6 @@ ratls-mesh iptables-cleanup --outbound-port 15001 --inbound-port 15006 --uid 133
 |------|---------|-------------|
 | `--platform` | `sev-snp` | TEE platform: `sev-snp` or `tdx` |
 | `--attestation-service-url` | (required) | URL of the local attestation service (e.g. `http://localhost:8400`) |
-| `--attestation-service-api-key` | `""` | Bearer token for authenticating with the attestation service |
 | `--outbound-port` | `15001` | Outbound listener port (iptables redirect target) |
 | `--inbound-port` | `15006` | Inbound listener port (RA-TLS from remote nodes) |
 | `--node-ip` | `$NODE_IP` | This node's IP address |
@@ -59,7 +58,7 @@ ratls-mesh iptables-cleanup --outbound-port 15001 --inbound-port 15006 --uid 133
 | `--cert-mode` | `self-signed` | Certificate mode: `self-signed` or `assam` |
 | `--assam-url` | `""` | Assam service URL for attestation (required for `assam` cert mode) |
 | `--attestation-service-url` | (required) | Local attestation service URL (required for `assam` cert mode) |
-| `--cert-issuer-url` | `""` | Cert-issuer URL for CA bundle retrieval (required for `assam` cert mode) |
+| `--cert-issuer-url` | `""` | Cert-issuer URL for CA bundle refresh after authenticated provisioning (required for `assam` cert mode) |
 | `--ca-cert` | `""` | Path to CA certificate PEM for X.509 chain verification |
 | `--cert-ttl` | `24h` | Certificate lifetime; rotates at 50% of TTL |
 | `--rotation-timeout` | `30s` | Max time for background certificate rotation |
@@ -77,10 +76,11 @@ The `--cert-mode` flag controls how ratls-mesh obtains TLS certificates:
 ### Bootstrap flow (assam mode)
 
 1. Proxy starts immediately with self-signed RA-TLS certificates (no assam dependency at startup)
-2. Background goroutine initiates assam attestation: authenticate → attest → obtain cert, fetch CA from cert-issuer
+2. Background goroutine initiates assam attestation: authenticate → attest → obtain cert and authenticated CA bundle
 3. On success, `CertManager.SwapProvider()` hot-swaps to CA-signed certificates
-4. Peer verification accepts BOTH RA-TLS attestation AND CA-chain during the transition (dual verification)
-5. Once all nodes upgrade, CA-chain verification is the fast path
+4. `/ca` polling starts only after that authenticated CA bundle has seeded trust, and accepts only continuity-signed updates
+5. Peer verification accepts BOTH RA-TLS attestation AND CA-chain during the transition (dual verification)
+6. Once all nodes upgrade, CA-chain verification is the fast path
 
 This design ensures zero-downtime upgrades — nodes can be upgraded from self-signed to assam-issued certificates without service interruption.
 
@@ -117,8 +117,7 @@ Key Ansible variables (in `defaults/main.yml`):
 | `ratls_mesh_cert_mode` | `self-signed` | Certificate mode |
 | `ratls_mesh_assam_url` | `""` | Assam URL for attestation |
 | `ratls_mesh_attestation_service_url` | `""` | Attestation service URL |
-| `ratls_mesh_attestation_service_api_key` | `""` | Attestation service API key |
-| `ratls_mesh_cert_issuer_url` | `""` | Cert-issuer URL |
+| `ratls_mesh_cert_issuer_url` | `""` | Cert-issuer URL for CA bundle refresh |
 
 ## Observability
 

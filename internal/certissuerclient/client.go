@@ -34,7 +34,8 @@ func NewClientWithHTTP(baseURL string, httpClient *http.Client) Client {
 	}
 }
 
-// SignCSR signs a CSR with the cert-issuer, returning the signed certificate PEM.
+// SignCSR signs a CSR with the cert-issuer, returning the signed certificate
+// chain PEM.
 func (c Client) SignCSR(ctx context.Context, earToken, csrPEM, ttl string) (string, error) {
 	reqBody := types.SignCsrRequest{
 		Ear: earToken,
@@ -47,7 +48,7 @@ func (c Client) SignCSR(ctx context.Context, earToken, csrPEM, ttl string) (stri
 		return "", fmt.Errorf("marshal sign-csr request: %w", err)
 	}
 
-	url := c.baseURL + "/v1/sign-csr"
+	url := c.baseURL + "/sign-csr"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
@@ -70,7 +71,11 @@ func (c Client) SignCSR(ctx context.Context, earToken, csrPEM, ttl string) (stri
 		return "", err
 	}
 
-	return signResp.Certificate, nil
+	cert, err := signResp.SignedCert()
+	if err != nil {
+		return "", fmt.Errorf("decode sign-csr response: %w", err)
+	}
+	return cert, nil
 }
 
 // Ready checks if the cert-issuer is ready (GET /ready).

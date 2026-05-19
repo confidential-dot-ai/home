@@ -1,7 +1,15 @@
 package attestclient
 
 import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -47,7 +55,14 @@ func TestObtainCertificateWithEvidenceReturnsAttestationMaterial(t *testing.T) {
 	const challenge = "dGVzdC1jaGFsbGVuZ2U="
 	const certPEM = "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n"
 
-	var attestationServiceSawReportData string
+	csrPEM := testCSRPEM(t)
+	challengeBytes := []byte("test-challenge")
+	expectedReportData, err := reportDataForCSR(csrPEM, challengeBytes)
+	if err != nil {
+		t.Fatalf("reportDataForCSR: %v", err)
+	}
+
+	var attestationServiceSawReportData []byte
 	attestationService := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/attest" {
 			t.Fatalf("attestation service path = %s, want /attest", r.URL.Path)
@@ -56,7 +71,7 @@ func TestObtainCertificateWithEvidenceReturnsAttestationMaterial(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode attestation request: %v", err)
 		}
-		attestationServiceSawReportData = string(req.ReportData.Bytes())
+		attestationServiceSawReportData = append([]byte(nil), req.ReportData.Bytes()...)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"platform":"snp","evidence":{"quote":"abc"}}`)
 	}))
@@ -87,7 +102,7 @@ func TestObtainCertificateWithEvidenceReturnsAttestationMaterial(t *testing.T) {
 	defer assam.Close()
 
 	client := NewClientWithHTTP(assam.URL, assam.Client())
-	result, err := client.ObtainCertificateWithEvidence(attestationService.URL, "csr")
+	result, err := client.ObtainCertificateWithEvidence(attestationService.URL, csrPEM)
 	if err != nil {
 		t.Fatalf("ObtainCertificateWithEvidence: %v", err)
 	}
@@ -104,8 +119,44 @@ func TestObtainCertificateWithEvidenceReturnsAttestationMaterial(t *testing.T) {
 	if !strings.Contains(string(result.Evidence), `"quote":"abc"`) {
 		t.Fatalf("evidence = %s, want quote", result.Evidence)
 	}
-	if attestationServiceSawReportData != "test-challenge" {
-		t.Fatalf("report_data = %q, want challenge bytes", attestationServiceSawReportData)
+	if !bytes.Equal(attestationServiceSawReportData, expectedReportData) {
+		t.Fatalf("report_data = %x, want key-bound challenge %x", attestationServiceSawReportData, expectedReportData)
+	}
+}
+
+func testCSRPEM(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate csr key: %v", err)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: "test-node"},
+	}, key)
+	if err != nil {
+		t.Fatalf("create csr: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
+}
+
+func TestObtainCertificateWithEvidenceContextCanceled(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/authenticate", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("authenticate handler should not be called after context cancellation")
+	})
+	assam := httptest.NewServer(mux)
+	defer assam.Close()
+
+	client := NewClientWithHTTP(assam.URL, assam.Client())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.ObtainCertificateWithEvidenceContext(ctx, "http://127.0.0.1:1", "csr")
+	if err == nil {
+		t.Fatal("ObtainCertificateWithEvidenceContext succeeded with canceled context")
+	}
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("error = %v, want context canceled", err)
 	}
 }
 

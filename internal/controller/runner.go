@@ -5,6 +5,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,23 +37,18 @@ type Options struct {
 	// mirror controller. Pod injection does not depend on CRDs.
 	DisableStatusMirror bool
 
-	// OperatorImage is the c8s multi-mode binary image the admission
-	// webhook injects as the init-cert container. Empty disables pod
-	// injection. Pod-to-pod mTLS is the node-level ratls-mesh DaemonSet's
-	// job, so no mesh sidecar is injected.
-	OperatorImage string
+	// GetCertImage is the c8s multi-mode binary image the admission webhook
+	// injects for get-cert bootstrap and renewal. Empty disables pod injection.
+	// Pod-to-pod mTLS is the node-level ratls-mesh DaemonSet's job, so no mesh
+	// sidecar is injected.
+	GetCertImage string
 
 	// AssamURL points at the assam Service in-cluster (the URL the
-	// injected init container POSTs evidence + CSR to).
+	// injected get-cert containers POST evidence + CSR to).
 	AssamURL string
 
 	// AttestationServiceURL points at the attestation-service.
 	AttestationServiceURL string
-
-	// AttestationServiceAPIKeySecretName/Key identifies the workload-namespace
-	// Secret the injected init container reads for attestation-service auth.
-	AttestationServiceAPIKeySecretName string
-	AttestationServiceAPIKeySecretKey  string
 
 	// WebhookConfigName is the MutatingWebhookConfiguration to patch.
 	WebhookConfigName string
@@ -60,11 +56,12 @@ type Options struct {
 	WebhookServiceName      string
 	WebhookServiceNamespace string
 
-	CertFSGroup      int64
-	CertKeyMode      string
-	InitRunAsUser    int64
-	InitRunAsGroup   int64
-	InitRunAsNonRoot bool
+	CertFSGroup         int64
+	CertKeyMode         string
+	CertRenewInterval   time.Duration
+	GetCertRunAsUser    int64
+	GetCertRunAsGroup   int64
+	GetCertRunAsNonRoot bool
 }
 
 var scheme = runtime.NewScheme()
@@ -115,27 +112,26 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 
-	// Admission webhook — injects init-container into annotated pods.
-	if opts.OperatorImage != "" {
+	// Admission webhook — injects get-cert containers into annotated pods.
+	if opts.GetCertImage != "" {
 		if err := bootstrapWebhookPKI(ctx, mgr, opts); err != nil {
 			return fmt.Errorf("bootstrap webhook PKI: %w", err)
 		}
 		if err := webhook.Register(mgr, webhook.Config{
-			OperatorImage:                      opts.OperatorImage,
-			AssamURL:                           opts.AssamURL,
-			AttestationServiceURL:              opts.AttestationServiceURL,
-			AttestationServiceAPIKeySecretName: opts.AttestationServiceAPIKeySecretName,
-			AttestationServiceAPIKeySecretKey:  opts.AttestationServiceAPIKeySecretKey,
-			CertFSGroup:                        int64Ptr(opts.CertFSGroup),
-			CertKeyMode:                        opts.CertKeyMode,
-			InitRunAsUser:                      int64Ptr(opts.InitRunAsUser),
-			InitRunAsGroup:                     int64Ptr(opts.InitRunAsGroup),
-			InitRunAsNonRoot:                   boolPtr(opts.InitRunAsNonRoot),
+			GetCertImage:          opts.GetCertImage,
+			AssamURL:              opts.AssamURL,
+			AttestationServiceURL: opts.AttestationServiceURL,
+			CertFSGroup:           int64Ptr(opts.CertFSGroup),
+			CertKeyMode:           opts.CertKeyMode,
+			CertRenewInterval:     opts.CertRenewInterval,
+			GetCertRunAsUser:      int64Ptr(opts.GetCertRunAsUser),
+			GetCertRunAsGroup:     int64Ptr(opts.GetCertRunAsGroup),
+			GetCertRunAsNonRoot:   boolPtr(opts.GetCertRunAsNonRoot),
 		}); err != nil {
 			return fmt.Errorf("register webhook: %w", err)
 		}
 		logger.Info("pod-injection webhook enabled",
-			"image", opts.OperatorImage,
+			"image", opts.GetCertImage,
 			"assam", opts.AssamURL)
 	}
 

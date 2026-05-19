@@ -1,17 +1,16 @@
 package certissuer
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/x509"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
-	"github.com/go-jose/go-jose/v4"
+	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -40,146 +39,106 @@ func (p *certKeyProvider) PublicKey(_ string) (*ecdsa.PublicKey, error) {
 	return p.pub, nil
 }
 
-// jwksKeyProvider fetches keys from a JWKS endpoint and caches them.
-type jwksKeyProvider struct {
-	url      string
-	cacheTTL time.Duration
-	client   *http.Client
-	logger   *slog.Logger
-
-	mu        sync.RWMutex
-	keys      map[string]*ecdsa.PublicKey // kid → pubkey
-	allKeys   []*ecdsa.PublicKey          // for empty-kid fallback
-	fetchedAt time.Time
-	lastForce time.Time // rate-limit force-refreshes to 1/sec
-}
-
 var jwksRefreshesTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "cert_issuer_jwks_refreshes_total",
 	Help: "Total JWKS endpoint refreshes.",
 })
 
-func newJWKSKeyProvider(url string, cacheTTL time.Duration, logger *slog.Logger) *jwksKeyProvider {
-	return &jwksKeyProvider{
-		url:      url,
-		cacheTTL: cacheTTL,
-		client:   &http.Client{Timeout: 10 * time.Second},
-		logger:   logger,
-		keys:     make(map[string]*ecdsa.PublicKey),
+// jwksKeyProvider resolves EAR signing keys from a JWKS endpoint via
+// jwx's background-refreshing cache. On a kid miss we force-refresh once
+// per second to pick up an Assam key rotation between scheduled refreshes.
+type jwksKeyProvider struct {
+	url    string
+	cache  *jwk.Cache
+	logger *slog.Logger
+
+	mu        sync.Mutex
+	lastForce time.Time
+}
+
+func newJWKSKeyProvider(ctx context.Context, url string, cacheTTL time.Duration, client *http.Client, logger *slog.Logger) (*jwksKeyProvider, error) {
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
 	}
+	cache := jwk.NewCache(ctx, jwk.WithRefreshWindow(cacheTTL))
+	if err := cache.Register(url,
+		jwk.WithHTTPClient(client),
+		jwk.WithMinRefreshInterval(cacheTTL),
+		jwk.WithFetchWhitelist(jwk.NewMapWhitelist().Add(url)),
+	); err != nil {
+		return nil, fmt.Errorf("register JWKS url: %w", err)
+	}
+	if _, err := cache.Refresh(ctx, url); err != nil {
+		logger.Warn("initial JWKS fetch failed; will retry on first verification", "url", url, "err", err)
+	} else {
+		jwksRefreshesTotal.Inc()
+	}
+	return &jwksKeyProvider{url: url, cache: cache, logger: logger}, nil
 }
 
 func (p *jwksKeyProvider) PublicKey(kid string) (*ecdsa.PublicKey, error) {
-	if err := p.refreshIfStale(); err != nil {
-		// Stale cache + fetch failure — if we have cached keys, try them.
-		if key, ok := p.lookup(kid); ok {
-			return key, nil
-		}
-		return nil, fmt.Errorf("JWKS fetch failed and no cached key for kid %q: %w", kid, err)
-	}
-
-	if key, ok := p.lookup(kid); ok {
-		return key, nil
-	}
-
-	// Kid miss — force-refresh once (rate-limited).
-	refreshed, err := p.forceRefresh()
+	ctx := context.Background()
+	set, err := p.cache.Get(ctx, p.url)
 	if err != nil {
-		return nil, fmt.Errorf("JWKS force-refresh failed for kid %q: %w", kid, err)
+		return nil, fmt.Errorf("JWKS cache lookup: %w", err)
 	}
-
-	if key, ok := p.lookup(kid); ok {
+	if key, ok := lookupECDSA(set, kid, p.logger); ok {
 		return key, nil
 	}
-	if refreshed {
-		return nil, fmt.Errorf("JWKS key not found for kid %q after refresh", kid)
+	if !p.tryForceRefresh(ctx) {
+		return nil, fmt.Errorf("JWKS key not found for kid %q (refresh rate-limited)", kid)
 	}
-	return nil, fmt.Errorf("JWKS key not found for kid %q (refresh rate-limited)", kid)
+	set, err = p.cache.Get(ctx, p.url)
+	if err != nil {
+		return nil, fmt.Errorf("JWKS cache lookup after refresh: %w", err)
+	}
+	if key, ok := lookupECDSA(set, kid, p.logger); ok {
+		return key, nil
+	}
+	return nil, fmt.Errorf("JWKS key not found for kid %q after refresh", kid)
 }
 
-// lookup resolves a key under read lock. Empty kid falls back to the first key.
-func (p *jwksKeyProvider) lookup(kid string) (*ecdsa.PublicKey, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if kid != "" {
-		key, ok := p.keys[kid]
-		return key, ok
+func (p *jwksKeyProvider) tryForceRefresh(ctx context.Context) bool {
+	p.mu.Lock()
+	if time.Since(p.lastForce) < time.Second {
+		p.mu.Unlock()
+		return false
 	}
-	if len(p.allKeys) > 0 {
-		p.logger.Debug("EAR token has no kid header, using first JWKS key")
-		return p.allKeys[0], true
+	p.lastForce = time.Now()
+	p.mu.Unlock()
+	if _, err := p.cache.Refresh(ctx, p.url); err != nil {
+		p.logger.Warn("JWKS force-refresh failed", "err", err)
+		return true
+	}
+	jwksRefreshesTotal.Inc()
+	p.logger.Info("JWKS refreshed (kid miss)")
+	return true
+}
+
+// lookupECDSA returns the ECDSA public key for kid, or the first ECDSA key
+// in the set when kid is empty (legacy tokens issued before the JWKS rollout).
+func lookupECDSA(set jwk.Set, kid string, logger *slog.Logger) (*ecdsa.PublicKey, bool) {
+	if kid != "" {
+		key, ok := set.LookupKeyID(kid)
+		if !ok {
+			return nil, false
+		}
+		return rawECDSA(key)
+	}
+	for i := 0; i < set.Len(); i++ {
+		key, _ := set.Key(i)
+		if pub, ok := rawECDSA(key); ok {
+			logger.Debug("EAR token has no kid header, using first JWKS key")
+			return pub, true
+		}
 	}
 	return nil, false
 }
 
-func (p *jwksKeyProvider) refreshIfStale() error {
-	p.mu.RLock()
-	fresh := time.Since(p.fetchedAt) < p.cacheTTL
-	p.mu.RUnlock()
-	if fresh {
-		return nil
+func rawECDSA(key jwk.Key) (*ecdsa.PublicKey, bool) {
+	var pub ecdsa.PublicKey
+	if err := key.Raw(&pub); err != nil {
+		return nil, false
 	}
-	return p.fetch()
-}
-
-// forceRefresh fetches regardless of cache, rate-limited to 1/sec.
-// Returns (true, nil) if a fetch was performed, (false, nil) if rate-limited.
-func (p *jwksKeyProvider) forceRefresh() (bool, error) {
-	p.mu.Lock()
-	if time.Since(p.lastForce) < time.Second {
-		p.mu.Unlock()
-		return false, nil
-	}
-	p.lastForce = time.Now()
-	p.mu.Unlock()
-	return true, p.fetch()
-}
-
-func (p *jwksKeyProvider) fetch() error {
-	req, err := http.NewRequest(http.MethodGet, p.url, nil)
-	if err != nil {
-		return fmt.Errorf("build JWKS request: %w", err)
-	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("GET %s: %w", p.url, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: status %d", p.url, resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB
-	if err != nil {
-		return fmt.Errorf("read JWKS body: %w", err)
-	}
-
-	var set jose.JSONWebKeySet
-	if err := json.Unmarshal(body, &set); err != nil {
-		return fmt.Errorf("parse JWKS: %w", err)
-	}
-
-	keys := make(map[string]*ecdsa.PublicKey, len(set.Keys))
-	var allKeys []*ecdsa.PublicKey
-	for _, jwk := range set.Keys {
-		pub, ok := jwk.Key.(*ecdsa.PublicKey)
-		if !ok {
-			continue
-		}
-		if jwk.KeyID != "" {
-			keys[jwk.KeyID] = pub
-		}
-		allKeys = append(allKeys, pub)
-	}
-
-	p.mu.Lock()
-	p.keys = keys
-	p.allKeys = allKeys
-	p.fetchedAt = time.Now()
-	p.mu.Unlock()
-
-	jwksRefreshesTotal.Inc()
-	p.logger.Info("JWKS refreshed", "keys", len(keys))
-	return nil
+	return &pub, true
 }

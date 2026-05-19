@@ -19,6 +19,10 @@
 {{- printf "%s-assam" .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{- define "c8s.assamResourceMapName" -}}
+{{- printf "%s-resource-map" (include "c8s.assamName" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{- define "c8s.certIssuerName" -}}
 {{- printf "%s-cert-issuer" .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
@@ -56,7 +60,7 @@
 {{- else if .Values.assam.image.tag -}}
 {{ .Values.assam.image.repository }}:{{ .Values.assam.image.tag }}
 {{- else -}}
-{{ fail "assam.image.tag or assam.image.digest must be set when assam.enabled=true" }}
+{{ fail "assam.image.tag or assam.image.digest must be set" }}
 {{- end -}}
 {{- end -}}
 
@@ -66,7 +70,7 @@
 {{- else if .Values.certIssuer.image.tag -}}
 {{ .Values.certIssuer.image.repository }}:{{ .Values.certIssuer.image.tag }}
 {{- else -}}
-{{ fail "certIssuer.image.tag or certIssuer.image.digest must be set when certIssuer.enabled=true" }}
+{{ fail "certIssuer.image.tag or certIssuer.image.digest must be set" }}
 {{- end -}}
 {{- end -}}
 
@@ -75,68 +79,33 @@ http://{{ include "c8s.attestationServiceName" . }}.{{ .Release.Namespace }}.svc
 {{- end -}}
 
 {{- define "c8s.assamURL" -}}
-{{- if .Values.assam.url -}}
-{{- .Values.assam.url -}}
-{{- else if .Values.assam.enabled -}}
-http://{{ include "c8s.assamName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.assam.port }}
-{{- else -}}
-{{- required "assam.url must be set when webhook.enabled=true unless assam.enabled=true" .Values.assam.url -}}
-{{- end -}}
+https://{{ include "c8s.assamName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.assam.port }}
 {{- end -}}
 
 {{- define "c8s.certIssuerURL" -}}
-{{- if .Values.assam.certIssuerURL -}}
-{{- .Values.assam.certIssuerURL -}}
-{{- else if .Values.certIssuer.enabled -}}
-http://{{ include "c8s.certIssuerName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.certIssuer.port }}
-{{- else -}}
-{{- required "assam.certIssuerURL must be set when assam.enabled=true unless certIssuer.enabled=true" .Values.assam.certIssuerURL -}}
-{{- end -}}
+https://{{ include "c8s.certIssuerName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.certIssuer.port }}
 {{- end -}}
 
 {{- define "c8s.certIssuerJWKSURL" -}}
-{{- if .Values.certIssuer.jwksURL -}}
-{{- .Values.certIssuer.jwksURL -}}
-{{- else if .Values.assam.enabled -}}
-http://{{ include "c8s.assamName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.assam.port }}/.well-known/jwks.json
-{{- else -}}
-{{- required "certIssuer.jwksURL must be set when certIssuer.enabled=true unless assam.enabled=true" .Values.certIssuer.jwksURL -}}
-{{- end -}}
-{{- end -}}
-
-{{- define "c8s.certIssuerCASecretName" -}}
-{{- default (printf "%s-mesh-ca" (include "c8s.certIssuerName" .)) .Values.certIssuer.ca.secretName -}}
-{{- end -}}
-
-{{- define "c8s.certIssuerCAConfigMapName" -}}
-{{- default (printf "%s-mesh-ca" (include "c8s.certIssuerName" .)) .Values.certIssuer.ca.configMapName -}}
+https://{{ include "c8s.assamName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.assam.port }}/.well-known/jwks.json
 {{- end -}}
 
 {{- define "c8s.certIssuerResourceMapName" -}}
 {{- printf "%s-resource-map" (include "c8s.certIssuerName" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "c8s.workloadAPIKeySecretName" -}}
-{{- default (printf "%s-api-key" (include "c8s.attestationServiceName" .)) .Values.webhook.apiKeySecret.name -}}
+{{- define "c8s.certIssuerPublicBundleClaimName" -}}
+{{- default (printf "%s-public-bundle" (include "c8s.certIssuerName" .)) .Values.certIssuer.ca.publicBundlePersistence.claimName | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{- define "c8s.attestationServiceConfig" -}}
 {{- $root := .root -}}
-{{- $authKeys := .authKeys -}}
 [server]
 bind = "0.0.0.0:{{ $root.Values.attestationService.port }}"
-# hosted mode: loopback guard is off; api_key auth gates protected
-# endpoints (/attest, /verify, ...). /health remains public so kubelet
-# probes succeed without an auth header.
 mode = "hosted"
 
 [server.tls]
 enabled = false
-
-[auth]
-api_keys = [{{- range $i, $key := $authKeys -}}
-  {{- if $i }}, {{ end -}}{{- $key | quote -}}
-{{- end -}}]
 
 [attestation]
 enabled = true

@@ -1,4 +1,5 @@
-{{- include "tls-lb.validateSan" (required "san is required - set it to the domain name for the TLS certificate" .Values.san) -}}
+{{- $san := include "tls-lb.san" . -}}
+{{- include "tls-lb.validateSan" $san -}}
 {{- include "tls-lb.validateProtocol" (required "protocol must be http or https" .Values.upstream.protocol) -}}
 {{- include "tls-lb.validateUpstreamAddress" .Values.upstream -}}
 {{- $publicCertPath := printf "%s/cert.pem" .Values.tlsMountPath -}}
@@ -50,7 +51,7 @@ data:
 
         server {
             listen {{ .Values.nginx.httpsPort }} ssl;
-            server_name "{{ .Values.san }}";
+            server_name "{{ $san }}";
 
             ssl_certificate     {{ $publicCertPath }};
             ssl_certificate_key {{ $publicKeyPath }};
@@ -112,7 +113,7 @@ data:
                 access_log off;
                 default_type application/x-pem-file;
                 add_header Cache-Control "no-store" always;
-                alias {{ .Values.meshCA.mountPath }}/{{ .Values.meshCA.key }};
+                alias {{ $defaultMeshCAPath }};
             }
             {{- end }}
 

@@ -2,6 +2,9 @@ package ear
 
 import (
 	"crypto/ecdsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sync/atomic"
@@ -9,6 +12,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
+	"github.com/lunal-dev/c8s/internal/earclaims"
 	"github.com/lunal-dev/c8s/internal/version"
 	"github.com/lunal-dev/c8s/pkg/certutil"
 	"github.com/lunal-dev/c8s/pkg/jwks"
@@ -91,31 +95,81 @@ func NewIssuer(keyPEM []byte, issuer string, lifetime time.Duration) (Issuer, er
 
 // Issue produces a signed EAR JWT for a successful attestation verification.
 func (iss Issuer) Issue(submodsEvidence json.RawMessage) (string, error) {
+	return iss.IssueWithLaunchDigest(submodsEvidence, "")
+}
+
+// IssueWithLaunchDigest produces a signed EAR JWT and includes the normalized
+// launch digest extracted by the attestation verifier when available.
+func (iss Issuer) IssueWithLaunchDigest(submodsEvidence json.RawMessage, launchDigest string) (string, error) {
+	return iss.IssueWithLaunchDigestAndPubKey(submodsEvidence, launchDigest, nil)
+}
+
+// IssueForRequestBody produces an EAR JWT bound to a specific request body
+// hash. Verifiers reject the token if the body they receive doesn't match
+// the SHA-256 in the `pbh` claim, which stops captured tokens from being
+// replayed against different payloads within their TTL.
+//
+// requestBody is the raw bytes that will be hashed and embedded as the
+// `pbh` claim — the caller must hash the same bytes the server will see
+// (canonicalized JSON, etc.) for verification to succeed.
+func (iss Issuer) IssueForRequestBody(submodsEvidence json.RawMessage, launchDigest string, requestBody []byte) (string, error) {
+	bodyHash := sha256.Sum256(requestBody)
+	pbh := base64.RawURLEncoding.EncodeToString(bodyHash[:])
+	return iss.issueWithExtras(submodsEvidence, launchDigest, nil, map[string]any{
+		earclaims.PayloadBodyHash: pbh,
+	})
+}
+
+// IssueWithLaunchDigestAndPubKey produces a signed EAR JWT, includes the
+// normalized launch digest when available, and optionally binds the EAR to the
+// attested ECDSA TEE public key.
+func (iss Issuer) IssueWithLaunchDigestAndPubKey(submodsEvidence json.RawMessage, launchDigest string, teePubKey *ecdsa.PublicKey) (string, error) {
+	return iss.issueWithExtras(submodsEvidence, launchDigest, teePubKey, nil)
+}
+
+func (iss Issuer) issueWithExtras(submodsEvidence json.RawMessage, launchDigest string, teePubKey *ecdsa.PublicKey, extras map[string]any) (string, error) {
 	m := iss.mat.Load()
 	if m == nil {
 		return "", fmt.Errorf("no signing key configured")
 	}
 
 	now := time.Now().Unix()
+	attester := map[string]any{
+		earclaims.EARStatus: statusAffirming,
+		earclaims.EARTrustworthinessVector: map[string]any{
+			earclaims.InstanceIdentity: statusAffirming,
+		},
+		earclaims.EARRawEvidence: json.RawMessage(submodsEvidence),
+	}
+	if launchDigest != "" {
+		attester[earclaims.LaunchDigest] = launchDigest
+	}
+
+	var teePubKeyClaim string
+	if teePubKey != nil {
+		pubDER, err := x509.MarshalPKIXPublicKey(teePubKey)
+		if err != nil {
+			return "", fmt.Errorf("marshal TEE public key: %w", err)
+		}
+		teePubKeyClaim = base64.RawURLEncoding.EncodeToString(pubDER)
+	}
 
 	claims := jwt.MapClaims{
-		"eat_profile": earProfile,
-		"iss":         iss.issuer,
-		"iat":         now,
-		"exp":         now + int64(iss.lifetime.Seconds()),
-		"ear_verifier_id": map[string]string{
-			"developer": iss.issuer,
-			"build":     version.Version,
+		earclaims.EATProfile: earProfile,
+		earclaims.Issuer:     iss.issuer,
+		earclaims.IssuedAt:   now,
+		earclaims.ExpiresAt:  now + int64(iss.lifetime.Seconds()),
+		earclaims.EARVerifierID: map[string]string{
+			earclaims.Developer: iss.issuer,
+			earclaims.Build:     version.Version,
 		},
-		"submods": map[string]any{
-			"attester": map[string]any{
-				"ear_status": statusAffirming,
-				"ear_trustworthiness_vector": map[string]any{
-					"instance-identity": statusAffirming,
-				},
-				"ear_raw_evidence": json.RawMessage(submodsEvidence),
-			},
-		},
+		earclaims.Submods: map[string]any{earclaims.SubmodAttester: attester},
+	}
+	if teePubKeyClaim != "" {
+		claims[earclaims.TEEPublicKey] = teePubKeyClaim
+	}
+	for k, v := range extras {
+		claims[k] = v
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)

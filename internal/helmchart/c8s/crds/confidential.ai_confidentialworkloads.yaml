@@ -161,15 +161,6 @@ spec:
                   - type
                   type: object
                 type: array
-              issuedCertRef:
-                description: SecretRef points at the Secret holding the issued keypair.
-                properties:
-                  name:
-                    minLength: 1
-                    type: string
-                required:
-                - name
-                type: object
               observedGeneration:
                 format: int64
                 type: integer

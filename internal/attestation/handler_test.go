@@ -1,15 +1,20 @@
 package attestation_test
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha512"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,6 +24,7 @@ import (
 	"github.com/lunal-dev/c8s/internal/attestation"
 	"github.com/lunal-dev/c8s/internal/certissuerclient"
 	"github.com/lunal-dev/c8s/internal/ear"
+	"github.com/lunal-dev/c8s/internal/earclaims"
 	"github.com/lunal-dev/c8s/internal/server"
 	"github.com/lunal-dev/c8s/internal/whitelist"
 	"github.com/lunal-dev/c8s/pkg/attestationclient"
@@ -38,38 +44,32 @@ func testKeyPEM() []byte {
 }
 
 func mockVerifyResponse(signatureValid, reportDataMatch bool) string {
-	rdm := fmt.Sprintf("%t", reportDataMatch)
-	return fmt.Sprintf(`{
-		"result": {
-			"platform": "snp",
-			"signature_valid": %t,
-			"claims": {
-				"launch_digest": "",
-				"report_data": "",
-				"signed_data": "",
-				"init_data": ""
-			},
-			"report_data_match": %s
+	return mustJSON(types.VerifyResponse{
+		Result: types.VerificationResult{
+			Platform:        "snp",
+			SignatureValid:  signatureValid,
+			Claims:          types.Claims{},
+			ReportDataMatch: &reportDataMatch,
 		},
-		"token": null
-	}`, signatureValid, rdm)
+	})
 }
 
 func mockVerifyResponseNullReportData() string {
-	return `{
-		"result": {
-			"platform": "snp",
-			"signature_valid": true,
-			"claims": {
-				"launch_digest": "",
-				"report_data": "",
-				"signed_data": "",
-				"init_data": ""
-			},
-			"report_data_match": null
+	return mustJSON(types.VerifyResponse{
+		Result: types.VerificationResult{
+			Platform:       "snp",
+			SignatureValid: true,
+			Claims:         types.Claims{},
 		},
-		"token": null
-	}`
+	})
+}
+
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }
 
 func testApp(attestationURL, certIssuerURL string) http.Handler {
@@ -97,8 +97,7 @@ func testApp(attestationURL, certIssuerURL string) http.Handler {
 			EarIssuer:         earIssuer,
 		},
 		WhitelistHandler: whitelist.Handler{
-			Store:            &whitelistStore,
-			AdminPasswordB64: base64.StdEncoding.EncodeToString([]byte("test-password")),
+			Store: &whitelistStore,
 		},
 		ReadyFn:   func() bool { return false },
 		EarIssuer: earIssuer,
@@ -107,8 +106,70 @@ func testApp(attestationURL, certIssuerURL string) http.Handler {
 	return server.NewRouter(deps)
 }
 
-func attestRequestBody(challenge string) string {
-	return fmt.Sprintf(`{"challenge":"%s","evidence":{"platform":"snp","evidence":{}},"csr":"fake-csr"}`, challenge)
+func attestRequestBody(t *testing.T, challenge string) string {
+	t.Helper()
+	csr := testCSRPEM(t)
+	body, err := json.Marshal(types.AttestRequestBody{
+		Challenge: challenge,
+		Evidence: types.AttestationEvidence{
+			Platform: "snp",
+			Evidence: json.RawMessage(`{}`),
+		},
+		CSR: csr,
+	})
+	if err != nil {
+		t.Fatalf("marshal attest request: %v", err)
+	}
+	return string(body)
+}
+
+func testCSRPEM(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate csr key: %v", err)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: "test-node"},
+	}, key)
+	if err != nil {
+		t.Fatalf("create csr: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
+}
+
+func testRSACSRPEM(t *testing.T) string {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate rsa csr key: %v", err)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: "test-node"},
+	}, key)
+	if err != nil {
+		t.Fatalf("create rsa csr: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
+}
+
+func testCertificatePEM(t *testing.T, commonName string) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate certificate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: commonName},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
 }
 
 func authenticate(t *testing.T, appURL string) string {
@@ -130,8 +191,28 @@ func authenticate(t *testing.T, appURL string) string {
 
 func doAttest(t *testing.T, appURL, challenge string) *http.Response {
 	t.Helper()
-	body := attestRequestBody(challenge)
+	body := attestRequestBody(t, challenge)
 	resp, err := http.Post(appURL+"/attest", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("attest request failed: %v", err)
+	}
+	return resp
+}
+
+func doAttestWithCSR(t *testing.T, appURL, challenge, csr string) *http.Response {
+	t.Helper()
+	body, err := json.Marshal(types.AttestRequestBody{
+		Challenge: challenge,
+		Evidence: types.AttestationEvidence{
+			Platform: "snp",
+			Evidence: json.RawMessage(`{}`),
+		},
+		CSR: csr,
+	})
+	if err != nil {
+		t.Fatalf("marshal attest request: %v", err)
+	}
+	resp, err := http.Post(appURL+"/attest", "application/json", strings.NewReader(string(body)))
 	if err != nil {
 		t.Fatalf("attest request failed: %v", err)
 	}
@@ -193,6 +274,24 @@ func TestAttestRejectsInvalidChallenge(t *testing.T) {
 	}
 }
 
+func TestAttestRejectsNonECDSACSRKey(t *testing.T) {
+	mockAS := httptest.NewServer(http.NotFoundHandler())
+	defer mockAS.Close()
+	mockCI := httptest.NewServer(http.NotFoundHandler())
+	defer mockCI.Close()
+
+	app := httptest.NewServer(testApp(mockAS.URL, mockCI.URL))
+	defer app.Close()
+
+	challenge := authenticate(t, app.URL)
+	resp := doAttestWithCSR(t, app.URL, challenge, testRSACSRPEM(t))
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("got status %d, want 400", resp.StatusCode)
+	}
+}
+
 func TestAttestRejectsReusedChallenge(t *testing.T) {
 	mockAS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -201,7 +300,7 @@ func TestAttestRejectsReusedChallenge(t *testing.T) {
 	defer mockAS.Close()
 	mockCI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"certificate":"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n"}`)
+		json.NewEncoder(w).Encode(types.SignCsrResponse{Certificate: testCertificatePEM(t, "leaf")})
 	}))
 	defer mockCI.Close()
 
@@ -224,14 +323,37 @@ func TestAttestRejectsReusedChallenge(t *testing.T) {
 }
 
 func TestAttestReturnsCertificateOnValidAttestation(t *testing.T) {
+	var sawKeyBoundReportData bool
 	mockAS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req types.VerifyRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode verify request: %v", err)
+		}
+		if req.Params == nil || req.Params.ExpectedReportData == nil {
+			t.Fatal("verify request missing expected_report_data")
+		}
+		if got := len(req.Params.ExpectedReportData.Bytes()); got != sha512.Size384 {
+			t.Fatalf("expected_report_data length = %d, want %d", got, sha512.Size384)
+		}
+		sawKeyBoundReportData = true
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, mockVerifyResponse(true, true))
 	}))
 	defer mockAS.Close()
+	var sawTEEPubKey bool
 	mockCI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req types.SignCsrRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode sign-csr request: %v", err)
+		}
+		var claims map[string]any
+		decodeJWTPayload(t, req.Ear, &claims)
+		if claims[earclaims.TEEPublicKey] == "" {
+			t.Fatal("sign-csr EAR missing tee_public_key")
+		}
+		sawTEEPubKey = true
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"certificate":"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n"}`)
+		json.NewEncoder(w).Encode(types.SignCsrResponse{Certificate: testCertificatePEM(t, "leaf")})
 	}))
 	defer mockCI.Close()
 
@@ -257,6 +379,118 @@ func TestAttestReturnsCertificateOnValidAttestation(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "BEGIN CERTIFICATE") {
 		t.Fatal("response body does not contain BEGIN CERTIFICATE")
+	}
+	if !sawKeyBoundReportData {
+		t.Fatal("attestation service did not receive key-bound report data")
+	}
+	if !sawTEEPubKey {
+		t.Fatal("cert-issuer did not receive tee_public_key-bound EAR")
+	}
+}
+
+func TestAttestKeyReturnsEARForAttestedPubkey(t *testing.T) {
+	mockAS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, mockVerifyResponse(true, true))
+	}))
+	defer mockAS.Close()
+
+	app := httptest.NewServer(testApp(mockAS.URL, "http://unused"))
+	defer app.Close()
+
+	challenge := authenticate(t, app.URL)
+
+	pubKey := generateAttestKeyPubKey(t)
+	pubDER, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		t.Fatalf("marshal pubkey: %v", err)
+	}
+
+	body, err := json.Marshal(types.AttestKeyRequestBody{
+		Challenge: challenge,
+		Evidence: types.AttestationEvidence{
+			Platform: "snp",
+			Evidence: json.RawMessage(`{"quote":"abc"}`),
+		},
+		PublicKey: base64.StdEncoding.EncodeToString(pubDER),
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	resp, err := http.Post(app.URL+"/attest-key", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatalf("POST /attest-key: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, respBody)
+	}
+
+	var out types.AttestKeyResponseBody
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.EAR == "" {
+		t.Fatal("response missing ear")
+	}
+
+	var claims map[string]any
+	decodeJWTPayload(t, out.EAR, &claims)
+	if claims[earclaims.TEEPublicKey] == nil {
+		t.Fatal("EAR missing tee_public_key claim")
+	}
+	wantPubKeyClaim := base64.RawURLEncoding.EncodeToString(pubDER)
+	if got, _ := claims[earclaims.TEEPublicKey].(string); got != wantPubKeyClaim {
+		t.Fatalf("tee_public_key = %q, want %q", got, wantPubKeyClaim)
+	}
+}
+
+func TestAttestKeyRejectsNonECDSAPubkey(t *testing.T) {
+	app := httptest.NewServer(testApp("http://unused", "http://unused"))
+	defer app.Close()
+
+	challenge := authenticate(t, app.URL)
+	body, err := json.Marshal(types.AttestKeyRequestBody{
+		Challenge: challenge,
+		Evidence:  types.AttestationEvidence{Platform: "snp", Evidence: json.RawMessage(`{}`)},
+		PublicKey: base64.StdEncoding.EncodeToString([]byte("not-a-pubkey")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(app.URL+"/attest-key", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func generateAttestKeyPubKey(t *testing.T) crypto.PublicKey {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	return &key.PublicKey
+}
+
+func decodeJWTPayload(t *testing.T, token string, v any) {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 JWT parts, got %d", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode JWT payload: %v", err)
+	}
+	if err := json.Unmarshal(payload, v); err != nil {
+		t.Fatalf("unmarshal JWT payload: %v", err)
 	}
 }
 
@@ -520,7 +754,7 @@ func TestAttestRejectsMissingContentType(t *testing.T) {
 	defer app.Close()
 
 	challenge := authenticate(t, app.URL)
-	body := attestRequestBody(challenge)
+	body := attestRequestBody(t, challenge)
 
 	req, err := http.NewRequest(http.MethodPost, app.URL+"/attest", strings.NewReader(body))
 	if err != nil {

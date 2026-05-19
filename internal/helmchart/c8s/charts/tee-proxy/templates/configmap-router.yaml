@@ -35,9 +35,10 @@ data:
             listen {{ .Values.router.port }};
 
             {{- range $i, $route := .Values.router.routes }}
-            # Route: {{ $route.path }} -> {{ $route.upstream }}
+            {{- $routeUpstream := tpl $route.upstream $ }}
+            # Route: {{ $route.path }} -> {{ $routeUpstream }}
             location {{ $route.path }} {
-                set $upstream_{{ $i }} "{{ $route.upstream }}";
+                set $upstream_{{ $i }} "{{ $routeUpstream }}";
                 proxy_pass $upstream_{{ $i }};
                 proxy_set_header Host $host;
                 proxy_set_header X-Real-IP $remote_addr;

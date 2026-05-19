@@ -16,7 +16,6 @@ import (
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
-	apiKey     string
 }
 
 // NewClient creates a new attestation service client.
@@ -27,29 +26,11 @@ func NewClient(baseURL string) Client {
 	}
 }
 
-// NewClientWithAPIKey creates a new client that authenticates with an API key.
-func NewClientWithAPIKey(baseURL, apiKey string) Client {
-	return Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		httpClient: http.DefaultClient,
-		apiKey:     apiKey,
-	}
-}
-
 // NewClientWithHTTP creates a new client with a custom HTTP client.
 func NewClientWithHTTP(baseURL string, httpClient *http.Client) Client {
 	return Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		httpClient: httpClient,
-	}
-}
-
-// NewClientWithHTTPAndAPIKey creates a new client with a custom HTTP client and API key.
-func NewClientWithHTTPAndAPIKey(baseURL string, httpClient *http.Client, apiKey string) Client {
-	return Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		httpClient: httpClient,
-		apiKey:     apiKey,
 	}
 }
 
@@ -106,10 +87,6 @@ func (c Client) postJSON(ctx context.Context, path string, body any, out any) er
 }
 
 func (c Client) doAndDecode(req *http.Request, out any) error {
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return &RequestError{Err: err}

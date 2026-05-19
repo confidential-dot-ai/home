@@ -10,11 +10,6 @@ import (
 // rules from persisting after crashes or version changes.
 const chainName = "RATLS-MESH"
 
-// defaultProxyUID is the UID under which the ratls-mesh sidecar proxy runs.
-// Traffic from this UID is excluded from iptables redirect to avoid loops.
-// This follows the Istio/Envoy convention of UID 1337.
-const defaultProxyUID = 1337
-
 type iptablesRule struct {
 	table string
 	chain string

@@ -9,8 +9,7 @@ image:
   digest: ""
   pullPolicy: IfNotPresent
 
-imagePullSecrets:
-  - name: ghcr-secret
+imagePullSecrets: []
 
 # Pin this DaemonSet to a subset of nodes. Empty (default) installs on all
 # nodes the existing nodeAffinity allows.
@@ -109,10 +108,6 @@ bootstrapWhitelist:
   digests: {}
   # sha256:abc123...: "ghcr.io/lunal-dev/assam:v0.1.0"
 
-# --- Whitelist seeder ---
-# Helm hook that pre-populates assam with the runtime whitelist. The plugin
-# will pull this same content via assam at runtime. Unrelated to the
-# bootstrap allowlist above.
 whitelist:
   digests: {}
 
@@ -123,19 +118,6 @@ whitelist:
 # place (rare; mostly forensic use).
 uninstall:
   enabled: true
-
-seeder:
-  enabled: true
-  image:
-    repository: curlimages/curl
-    # -- Required: consumer must set tag or digest.
-    tag: ""
-    digest: ""
-  # Secret containing admin-password key for assam whitelist mutations
-  adminPasswordSecretName: assam-whitelist-admin
-  # URL the seeder uses to talk to assam. Distinct from the runtime
-  # NodePort path — the seeder runs as a K8s pod and uses cluster DNS.
-  assamURL: "http://assam:8080"
 
 # Node affinity — exclude edge nodes by default
 nodeAffinity:

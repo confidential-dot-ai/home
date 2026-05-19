@@ -62,11 +62,6 @@ var (
 		Help: "Total successful certificate reloads.",
 	})
 
-	certReloadFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "cert_issuer_cert_reload_failures_total",
-		Help: "Total certificate reload failures.",
-	})
-
 	caCertFingerprintInfo = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cert_issuer_ca_cert_fingerprint_info",
 		Help: "Info metric exposing the active CA certificate SHA-256 fingerprint.",
@@ -97,13 +92,13 @@ var (
 		Help: "Seconds until the oldest active node certificate expires.",
 	})
 
-	rotateRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "cert_issuer_rotate_requests_total",
-		Help: "Total rotate-ca requests by result.",
-	}, []string{"result"})
-
 	measurementDeniedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "cert_issuer_measurement_denied_total",
 		Help: "Requests denied due to measurement mismatch.",
 	}, []string{"endpoint"})
+
+	handoffEARExpirySeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cert_issuer_handoff_ear_expiry_seconds",
+		Help: "Seconds until the handoff issuer EAR exp claim; negative when expired or unreadable.",
+	})
 )

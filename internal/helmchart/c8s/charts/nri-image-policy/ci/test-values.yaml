@@ -1,8 +1,5 @@
 image:
   tag: ci-test
-seeder:
-  image:
-    tag: ci-test
 bootstrapWhitelist:
   digests:
     "sha256:0000000000000000000000000000000000000000000000000000000000000001": "ghcr.io/lunal-dev/nri-image-policy:ci-test"

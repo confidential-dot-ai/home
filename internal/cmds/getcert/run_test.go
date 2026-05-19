@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -114,7 +115,7 @@ func TestValidateConfigRejectsInvalidDiscoveryPublicTLSMode(t *testing.T) {
 	if err == nil {
 		t.Fatal("validateConfig succeeded, want invalid discovery public TLS mode error")
 	}
-	if !strings.Contains(err.Error(), "--discovery-public-tls-mode") {
+	if !errors.Is(err, errInvalidDiscoveryPublicTLSMode) {
 		t.Fatalf("error = %v, want discovery public TLS mode error", err)
 	}
 }
@@ -129,7 +130,7 @@ func TestValidateConfigRejectsInvalidReloadWatchInterval(t *testing.T) {
 	if err == nil {
 		t.Fatal("validateConfig succeeded, want reload watch interval error")
 	}
-	if !strings.Contains(err.Error(), "--reload-watch-interval") {
+	if !errors.Is(err, errInvalidReloadWatchInterval) {
 		t.Fatalf("error = %v, want reload watch interval error", err)
 	}
 }
@@ -145,8 +146,23 @@ func TestValidateConfigRejectsReloadWatchWithoutRenewInterval(t *testing.T) {
 	if err == nil {
 		t.Fatal("validateConfig succeeded, want reload watch renew interval error")
 	}
-	if !strings.Contains(err.Error(), "--renew-interval") {
+	if !errors.Is(err, errReloadWatchRequiresRenewInterval) {
 		t.Fatalf("error = %v, want renew interval error", err)
+	}
+}
+
+func TestValidateConfigRejectsContinueOnInitialErrorWithoutRenewInterval(t *testing.T) {
+	err := validateConfig(config{
+		AssamURL:               "http://assam:8080",
+		AttestationServiceURL:  "http://attestation-service:8400",
+		SAN:                    "confidential-gke.lunal.dev",
+		ContinueOnInitialError: true,
+	})
+	if err == nil {
+		t.Fatal("validateConfig succeeded, want continue-on-initial-error renew interval error")
+	}
+	if !errors.Is(err, errContinueOnInitialErrorRequiresRenewalLoop) {
+		t.Fatalf("error = %v, want continue-on-initial-error error", err)
 	}
 }
 

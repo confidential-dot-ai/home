@@ -3,17 +3,15 @@ package certissuer
 import (
 	"context"
 	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/sha512"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"log/slog"
 	"math/big"
@@ -27,8 +25,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jws"
+
+	"github.com/lunal-dev/c8s/internal/earclaims"
 	"github.com/lunal-dev/c8s/pkg/certutil"
 	"github.com/lunal-dev/c8s/pkg/issuerapi"
+	"github.com/lunal-dev/c8s/pkg/ratls"
+	"github.com/lunal-dev/c8s/pkg/resources"
 )
 
 // certBundle holds the loaded certificate material for atomic hot-swap.
@@ -49,17 +53,17 @@ type Issuer struct {
 	SANValidation    bool           // When true, CSR IP SANs must match the request source IP.
 	DNSSANPattern    *regexp.Regexp // When set, DNS SANs matching this pattern are allowed. Nil = reject all DNS SANs.
 	AllowedCNPattern *regexp.Regexp // When set, CSR CN must match this pattern. Nil = no CN restriction.
-	ExpectedIssuer   string         // When non-empty, validates the "iss" claim in EAR tokens.
+	ExpectedIssuer   string         // When non-empty, validates the EAR issuer claim.
 	RequestTimeout   time.Duration  // Per-request timeout. Zero = no timeout.
 	JWTClockSkew     int64          // Maximum acceptable clock difference (seconds) for JWT validation.
 	MinCAValidity    time.Duration  // Minimum remaining CA cert validity for readiness.
 	Logger           *slog.Logger
 	tracker          *nodeTracker
+	caBundle         *bundleManager // Optional public CA bundle source for sign-csr responses.
 
 	// Per-endpoint measurement allowlists. Empty map = skip check (opt-in).
-	SignCSRMeasurements  map[string]bool
-	RotateCAMeasurements map[string]bool
-	CAMeasurements       map[string]bool
+	SignCSRMeasurements map[string]bool
+	HandoffMeasurements map[string]bool
 }
 
 func (iss *Issuer) getBundle() *certBundle {
@@ -79,7 +83,7 @@ type tokenValidationError struct {
 func (e *tokenValidationError) Error() string { return e.Err.Error() }
 func (e *tokenValidationError) Unwrap() error { return e.Err }
 
-// HandleSignCSR handles POST /v1/sign-csr.
+// HandleSignCSR handles POST /sign-csr.
 func (iss *Issuer) HandleSignCSR(w http.ResponseWriter, r *http.Request) {
 	activeRequests.Inc()
 	defer activeRequests.Dec()
@@ -174,7 +178,7 @@ func (iss *Issuer) HandleSignCSR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify key binding: CSR public key must match the tee-pubkey in EAR claims.
+	// Verify key binding: CSR public key must match the tee_public_key in EAR claims.
 	if err := verifyKeyBinding(csr, claims); err != nil {
 		iss.Logger.Warn("key binding failed", "error", err)
 		http.Error(w, "forbidden: certificate request denied", http.StatusForbidden)
@@ -183,10 +187,20 @@ func (iss *Issuer) HandleSignCSR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate CSR SANs: IP SANs must match the request source IP; DNS SANs validated against pattern.
+	// Validate requested names even when source-IP matching is disabled for
+	// forwarding brokers such as Assam.
+	if err := iss.validateCSRRequestedNames(csr); err != nil {
+		iss.Logger.Warn("CSR requested-name validation failed", "error", err, "remote_addr", r.RemoteAddr)
+		http.Error(w, "forbidden: certificate request denied", http.StatusForbidden)
+		sanValidationFailuresTotal.Inc()
+		signRequestsTotal.WithLabelValues("forbidden").Inc()
+		return
+	}
+
+	// Validate CSR source binding: IP SANs must match the request source IP.
 	if iss.SANValidation {
-		if err := iss.validateCSRSANs(csr, r.RemoteAddr); err != nil {
-			iss.Logger.Warn("CSR SAN validation failed", "error", err, "remote_addr", r.RemoteAddr)
+		if err := iss.validateCSRSourceIP(csr, r.RemoteAddr); err != nil {
+			iss.Logger.Warn("CSR source-IP validation failed", "error", err, "remote_addr", r.RemoteAddr)
 			http.Error(w, "forbidden: certificate request denied", http.StatusForbidden)
 			sanValidationFailuresTotal.Inc()
 			signRequestsTotal.WithLabelValues("forbidden").Inc()
@@ -205,7 +219,7 @@ func (iss *Issuer) HandleSignCSR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Sign the certificate.
-	certPEM, serial, err := iss.signCSR(csr, claims, ttl)
+	certPEM, serial, err := iss.signCSRWithBundle(b, csr, claims, ttl)
 	if err != nil {
 		iss.Logger.Error("failed to sign CSR", "error", err)
 		http.Error(w, "signing failed", http.StatusInternalServerError)
@@ -213,15 +227,9 @@ func (iss *Issuer) HandleSignCSR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build CA certificate PEM: intermediate + root if parent is set.
-	caCertPEMBytes := certutil.EncodeCertPEM(b.caCert.Raw)
-	if b.parentCert != nil {
-		caCertPEMBytes = append(caCertPEMBytes, certutil.EncodeCertPEM(b.parentCert.Raw)...)
-	}
-
 	resp := signCSRResponse{
 		Certificate:   issuerapi.MustPEMData(certPEM),
-		CACertificate: issuerapi.MustPEMData(caCertPEMBytes),
+		CACertificate: issuerapi.MustPEMData(iss.caBundlePEMForResponse(b)),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -298,6 +306,23 @@ func (iss *Issuer) handleReady(w http.ResponseWriter, _ *http.Request) {
 	w.Write([]byte("ok\n"))
 }
 
+func (iss *Issuer) caBundlePEMForResponse(b *certBundle) []byte {
+	if b == nil {
+		return nil
+	}
+	if iss.caBundle != nil {
+		if bundlePEM := iss.caBundle.bundlePEMForCurrent(b.caCert); len(bundlePEM) > 0 {
+			return bundlePEM
+		}
+	}
+
+	caCertPEMBytes := certutil.EncodeCertPEM(b.caCert.Raw)
+	if b.parentCert != nil {
+		caCertPEMBytes = append(caCertPEMBytes, certutil.EncodeCertPEM(b.parentCert.Raw)...)
+	}
+	return caCertPEMBytes
+}
+
 // signCSR creates a CA-signed certificate from the CSR using the current cert bundle.
 // Subject is constructed from validated CN only — O, OU, and other fields are stripped.
 func (iss *Issuer) signCSR(csr *x509.CertificateRequest, claims *earClaims, ttl time.Duration) ([]byte, *big.Int, error) {
@@ -305,7 +330,10 @@ func (iss *Issuer) signCSR(csr *x509.CertificateRequest, claims *earClaims, ttl 
 	if b == nil {
 		return nil, nil, fmt.Errorf("no certificate bundle loaded")
 	}
+	return iss.signCSRWithBundle(b, csr, claims, ttl)
+}
 
+func (iss *Issuer) signCSRWithBundle(b *certBundle, csr *x509.CertificateRequest, claims *earClaims, ttl time.Duration) ([]byte, *big.Int, error) {
 	template, err := certutil.NewLeafTemplate(csr.Subject.CommonName, ttl)
 	if err != nil {
 		return nil, nil, err
@@ -316,6 +344,7 @@ func (iss *Issuer) signCSR(csr *x509.CertificateRequest, claims *earClaims, ttl 
 	if err := certutil.AppendAttestationDigest(template, attDigest[:]); err != nil {
 		return nil, nil, err
 	}
+	copyRATLSExtension(template, csr)
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, b.caCert, csr.PublicKey, b.caKey)
 	if err != nil {
@@ -326,21 +355,51 @@ func (iss *Issuer) signCSR(csr *x509.CertificateRequest, claims *earClaims, ttl 
 	return certPEM, template.SerialNumber, nil
 }
 
+func copyRATLSExtension(template *x509.Certificate, csr *x509.CertificateRequest) {
+	for _, ext := range csr.Extensions {
+		if ext.Id.Equal(ratls.OIDRATLSAttestation) {
+			template.ExtraExtensions = append(template.ExtraExtensions, pkix.Extension{
+				Id:    ext.Id,
+				Value: ext.Value,
+			})
+			return
+		}
+	}
+}
+
 // earClaims represents the relevant claims from an EAR (Entity Attestation
 // Result) JWT token issued by assam after successful TEE attestation.
 type earClaims struct {
-	// Issuer is the "iss" claim (matched against --expected-issuer at startup).
-	Issuer string `json:"iss"`
-	// IssuedAt is the "iat" claim (Unix timestamp).
-	IssuedAt int64 `json:"iat"`
-	// Expiry is the "exp" claim (Unix timestamp).
-	Expiry int64 `json:"exp"`
+	// Issuer is matched against --expected-issuer at startup.
+	Issuer string
+	// IssuedAt is a Unix timestamp.
+	IssuedAt int64
+	// Expiry is a Unix timestamp.
+	Expiry int64
 	// TEEPubKey is the base64url-encoded DER PKIX public key from the TEE,
 	// bound to the attestation report via REPORTDATA.
-	TEEPubKey string `json:"tee-pubkey"`
+	TEEPubKey string
 	// RawEvidence is the raw attestation evidence for audit hashing.
 	// EAR carries submods as a JSON object, so we use json.RawMessage.
-	RawEvidence json.RawMessage `json:"submods"`
+	RawEvidence json.RawMessage
+}
+
+func (claims *earClaims) UnmarshalJSON(raw []byte) error {
+	*claims = earClaims{RawEvidence: append(json.RawMessage(nil), raw...)}
+	var rawEvidence json.RawMessage
+	if err := earclaims.UnmarshalObject(raw,
+		earclaims.Bind(earclaims.Issuer, &claims.Issuer),
+		earclaims.Bind(earclaims.IssuedAt, &claims.IssuedAt),
+		earclaims.Bind(earclaims.ExpiresAt, &claims.Expiry),
+		earclaims.Bind(earclaims.TEEPublicKey, &claims.TEEPubKey),
+		earclaims.Bind(earclaims.Submods, &rawEvidence),
+	); err != nil {
+		return err
+	}
+	if len(rawEvidence) > 0 {
+		claims.RawEvidence = rawEvidence
+	}
+	return nil
 }
 
 // validateEARToken validates the EAR JWT signature, claims, and issuer.
@@ -352,8 +411,15 @@ func validateEARToken(tokenStr string, provider KeyProvider, expectedIssuer stri
 
 	now := time.Now().Unix()
 
+	if claims.Expiry == 0 {
+		return nil, &tokenValidationError{
+			Reason: "malformed",
+			Err:    fmt.Errorf("token missing exp claim"),
+		}
+	}
+
 	// Check expiry with clock skew tolerance.
-	if claims.Expiry > 0 && now > claims.Expiry+clockSkew {
+	if now > claims.Expiry+clockSkew {
 		return nil, &tokenValidationError{
 			Reason: "expired",
 			Err:    fmt.Errorf("token expired at %d, now %d (skew tolerance %ds)", claims.Expiry, now, clockSkew),
@@ -379,41 +445,13 @@ func validateEARToken(tokenStr string, provider KeyProvider, expectedIssuer stri
 	return claims, nil
 }
 
-// submodsEvidence represents the nested EAR token submods structure
-// for extracting the SNP launch measurement.
-type submodsEvidence struct {
-	CPU0 struct {
-		AnnotatedEvidence struct {
-			SNP *struct {
-				Measurement string `json:"measurement"`
-			} `json:"snp,omitempty"`
-		} `json:"ear.veraison.annotated-evidence"`
-	} `json:"cpu0"`
-}
-
-// extractMeasurement parses the EAR submods JSON and returns the SNP launch measurement.
-func extractMeasurement(rawEvidence json.RawMessage) (string, error) {
-	var evidence submodsEvidence
-	if err := json.Unmarshal(rawEvidence, &evidence); err != nil {
-		return "", fmt.Errorf("parse submods: %w", err)
-	}
-	if evidence.CPU0.AnnotatedEvidence.SNP == nil {
-		return "", fmt.Errorf("no SNP evidence in submods")
-	}
-	m := evidence.CPU0.AnnotatedEvidence.SNP.Measurement
-	if m == "" {
-		return "", fmt.Errorf("empty measurement in SNP evidence")
-	}
-	return m, nil
-}
-
 // checkMeasurement validates that the EAR token's attestation evidence contains
 // a measurement in the allowed set. Returns nil if allowed is empty (opt-in).
 func checkMeasurement(claims *earClaims, allowed map[string]bool, endpoint string) error {
 	if len(allowed) == 0 {
 		return nil
 	}
-	measurement, err := extractMeasurement(claims.RawEvidence)
+	measurement, err := earclaims.LaunchDigestFromSubmods(claims.RawEvidence)
 	if err != nil {
 		return &tokenValidationError{
 			Reason: "measurement_denied",
@@ -429,13 +467,9 @@ func checkMeasurement(claims *earClaims, allowed map[string]bool, endpoint strin
 	return nil
 }
 
-// resourceMap maps SHA-384 hex launch measurements to allowed KBS resource path globs.
-// This is the same structure used by the KBS Rego policy's measurement_resource_map.
-type resourceMap map[string][]string
-
 // loadResourceMap reads a JSON resource map file and returns the parsed map.
 // Returns an empty map if path is empty.
-func loadResourceMap(path string) (resourceMap, error) {
+func loadResourceMap(path string) (resources.Map, error) {
 	if path == "" {
 		return nil, nil
 	}
@@ -443,74 +477,65 @@ func loadResourceMap(path string) (resourceMap, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read resource map %s: %w", path, err)
 	}
-	var rm resourceMap
+	var rm resources.Map
 	if err := json.Unmarshal(data, &rm); err != nil {
 		return nil, fmt.Errorf("parse resource map %s: %w", path, err)
 	}
 	return rm, nil
 }
 
-// certIssuerEndpoints maps cert-issuer KBS resource path prefixes to endpoint names.
-var certIssuerEndpoints = map[string]string{
-	"cert-issuer/sign-csr":  "sign-csr",
-	"cert-issuer/rotate-ca": "rotate-ca",
-	"cert-issuer/ca":        "ca",
+// certIssuerResources lists the resource paths cert-issuer's sign-csr and
+// handoff endpoints check authorisation against.
+var certIssuerResources = []resources.Resource{
+	resources.CertIssuerSignCSR,
+	resources.CertIssuerHandoff,
 }
 
 // buildEndpointAllowlists derives per-endpoint measurement allowlists from a resourceMap.
 // For each measurement, if any of its glob patterns matches a cert-issuer resource path,
 // that measurement is added to the corresponding endpoint's allowlist.
-// Uses path.Match for glob matching (same semantics as KBS's glob.match with "/" separator).
-func buildEndpointAllowlists(rm resourceMap) (signCSR, rotateCA, ca map[string]bool) {
+// Uses path.Match for glob matching with "/" separators.
+func buildEndpointAllowlists(rm resources.Map) (signCSR, handoff map[string]bool, err error) {
 	if len(rm) == 0 {
 		return nil, nil, nil
 	}
 
-	signCSR = make(map[string]bool)
-	rotateCA = make(map[string]bool)
-	ca = make(map[string]bool)
+	allowlists := map[resources.Resource]map[string]bool{
+		resources.CertIssuerSignCSR: make(map[string]bool),
+		resources.CertIssuerHandoff: make(map[string]bool),
+	}
 
 	for measurement, globs := range rm {
 		for _, pattern := range globs {
-			for resourcePath, endpoint := range certIssuerEndpoints {
-				matched, err := path.Match(pattern, resourcePath)
+			for _, resource := range certIssuerResources {
+				matched, err := path.Match(string(pattern), string(resource))
 				if err != nil {
-					continue // invalid pattern, skip
+					return nil, nil, fmt.Errorf("invalid resource map glob %q for measurement %q: %w", pattern, measurement, err)
 				}
 				if matched {
-					switch endpoint {
-					case "sign-csr":
-						signCSR[measurement] = true
-					case "rotate-ca":
-						rotateCA[measurement] = true
-					case "ca":
-						ca[measurement] = true
-					}
+					allowlists[resource][measurement] = true
 				}
 			}
 		}
 	}
+	signCSR = allowlists[resources.CertIssuerSignCSR]
+	handoff = allowlists[resources.CertIssuerHandoff]
 
 	// Return nil instead of empty maps (nil = skip check in checkMeasurement).
 	if len(signCSR) == 0 {
 		signCSR = nil
 	}
-	if len(rotateCA) == 0 {
-		rotateCA = nil
+	if len(handoff) == 0 {
+		handoff = nil
 	}
-	if len(ca) == 0 {
-		ca = nil
-	}
-	return signCSR, rotateCA, ca
+	return signCSR, handoff, nil
 }
 
 // verifyKeyBinding checks that the CSR's public key matches the TEE-bound key
 // in the EAR claims.
 func verifyKeyBinding(csr *x509.CertificateRequest, claims *earClaims) error {
 	if claims.TEEPubKey == "" {
-		// Some EAR issuers omit tee-pubkey; in that mode we trust the
-		// issuer's attestation verification and skip the binding check.
-		return nil
+		return fmt.Errorf("EAR is missing %s claim", earclaims.TEEPublicKey)
 	}
 
 	csrPubDER, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
@@ -520,7 +545,7 @@ func verifyKeyBinding(csr *x509.CertificateRequest, claims *earClaims) error {
 
 	claimPubDER, err := base64.RawURLEncoding.DecodeString(claims.TEEPubKey)
 	if err != nil {
-		return fmt.Errorf("decode tee-pubkey claim: %w", err)
+		return fmt.Errorf("decode %s claim: %w", earclaims.TEEPublicKey, err)
 	}
 
 	csrHash := sha256.Sum256(csrPubDER)
@@ -532,12 +557,11 @@ func verifyKeyBinding(csr *x509.CertificateRequest, claims *earClaims) error {
 	return nil
 }
 
-// validateCSRSANs checks that all IP SANs in the CSR match the request source
-// IP. This prevents a compromised TEE node from requesting certificates with
-// arbitrary SANs to impersonate other nodes. DNS SANs are validated against a
-// configurable pattern — rejected by default if no pattern is set.
-// CN is validated against AllowedCNPattern when set.
-func (iss *Issuer) validateCSRSANs(csr *x509.CertificateRequest, remoteAddr string) error {
+// validateCSRSourceIP checks that all IP SANs in the CSR match the request
+// source IP. This prevents a directly connected compromised TEE node from
+// requesting IP SANs for other nodes. Brokers that forward CSRs can disable this
+// source-IP check while still using validateCSRRequestedNames below.
+func (iss *Issuer) validateCSRSourceIP(csr *x509.CertificateRequest, remoteAddr string) error {
 	srcIP, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
 		// remoteAddr might not have a port (e.g., Unix socket).
@@ -550,7 +574,13 @@ func (iss *Issuer) validateCSRSANs(csr *x509.CertificateRequest, remoteAddr stri
 		}
 	}
 
-	// DNS SAN validation: reject all DNS SANs by default.
+	return nil
+}
+
+// validateCSRRequestedNames checks requested DNS names and common names. DNS
+// SANs are rejected by default unless the caller configures DNSSANPattern. CN is
+// validated against AllowedCNPattern when set.
+func (iss *Issuer) validateCSRRequestedNames(csr *x509.CertificateRequest) error {
 	if len(csr.DNSNames) > 0 {
 		if iss.DNSSANPattern == nil {
 			dnsSanValidationFailuresTotal.Inc()
@@ -564,7 +594,6 @@ func (iss *Issuer) validateCSRSANs(csr *x509.CertificateRequest, remoteAddr stri
 		}
 	}
 
-	// CN validation.
 	if iss.AllowedCNPattern != nil && csr.Subject.CommonName != "" {
 		if !iss.AllowedCNPattern.MatchString(csr.Subject.CommonName) {
 			return fmt.Errorf("CSR CN %q does not match allowed pattern", csr.Subject.CommonName)
@@ -586,115 +615,55 @@ func capTTL(d time.Duration, maxTTL time.Duration) time.Duration {
 
 // parseAndVerifyJWT is a minimal JWT parser for ES256/ES384 tokens.
 func parseAndVerifyJWT(tokenStr string, provider KeyProvider) (*earClaims, error) {
-	parts := strings.SplitN(tokenStr, ".", 3)
-	if len(parts) != 3 {
-		return nil, &tokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("malformed JWT: expected 3 parts, got %d", len(parts)),
-		}
-	}
-
-	// Decode header to determine algorithm.
-	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	tokenBytes := []byte(tokenStr)
+	msg, err := jws.Parse(tokenBytes)
 	if err != nil {
 		return nil, &tokenValidationError{
 			Reason: "malformed",
-			Err:    fmt.Errorf("decode JWT header: %w", err),
+			Err:    fmt.Errorf("parse JWT: %w", err),
 		}
 	}
-	var header struct {
-		Alg string `json:"alg"`
-		Kid string `json:"kid"`
-	}
-	if err := json.Unmarshal(headerBytes, &header); err != nil {
+	sigs := msg.Signatures()
+	if len(sigs) != 1 {
 		return nil, &tokenValidationError{
 			Reason: "malformed",
-			Err:    fmt.Errorf("parse JWT header: %w", err),
+			Err:    fmt.Errorf("JWT has %d signatures, expected 1", len(sigs)),
+		}
+	}
+	header := sigs[0].ProtectedHeaders()
+	alg := header.Algorithm()
+	if alg != jwa.ES256 && alg != jwa.ES384 {
+		return nil, &tokenValidationError{
+			Reason: "malformed",
+			Err:    fmt.Errorf("unsupported JWT algorithm: %s (need ES256 or ES384)", alg),
 		}
 	}
 
-	// Determine expected curve and hash from algorithm.
-	var curve elliptic.Curve
-	var newHash func() hash.Hash
-	switch header.Alg {
-	case "ES256":
-		curve = elliptic.P256()
-		newHash = sha256.New
-	case "ES384":
-		curve = elliptic.P384()
-		newHash = sha512.New384
-	default:
-		return nil, &tokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("unsupported JWT algorithm: %s (need ES256 or ES384)", header.Alg),
-		}
-	}
-
-	// Resolve ECDSA public key via the provider (JWKS or cert-based).
-	ecPub, err := provider.PublicKey(header.Kid)
+	ecPub, err := provider.PublicKey(header.KeyID())
 	if err != nil {
 		return nil, &tokenValidationError{
 			Reason: "invalid_signature",
 			Err:    fmt.Errorf("resolve signing key: %w", err),
 		}
 	}
-	if ecPub.Curve != curve {
-		return nil, &tokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("signing key curve %s doesn't match JWT alg %s", ecPub.Curve.Params().Name, header.Alg),
-		}
-	}
 
-	// Verify signature: hash(header.payload) then ECDSA verify.
-	signingInput := []byte(parts[0] + "." + parts[1])
-	h := newHash()
-	h.Write(signingInput)
-	digest := h.Sum(nil)
-
-	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil {
-		return nil, &tokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("decode JWT signature: %w", err),
-		}
-	}
-
-	// JWT ECDSA signatures are r||s (each half = key size / 8 bytes).
-	keySize := (curve.Params().BitSize + 7) / 8
-	if len(sigBytes) != 2*keySize {
-		return nil, &tokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("JWT signature length %d, expected %d for %s", len(sigBytes), 2*keySize, header.Alg),
-		}
-	}
-	r := new(big.Int).SetBytes(sigBytes[:keySize])
-	s := new(big.Int).SetBytes(sigBytes[keySize:])
-
-	if !ecdsa.Verify(ecPub, digest, r, s) {
+	if _, err := jws.Verify(tokenBytes, jws.WithKey(alg, ecPub)); err != nil {
 		return nil, &tokenValidationError{
 			Reason: "invalid_signature",
-			Err:    fmt.Errorf("JWT signature verification failed"),
+			Err:    fmt.Errorf("JWT signature verification failed: %w", err),
 		}
 	}
 
-	// Decode claims.
-	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return nil, &tokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("decode JWT claims: %w", err),
-		}
-	}
-
+	payload := msg.Payload()
 	var claims earClaims
-	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+	if err := json.Unmarshal(payload, &claims); err != nil {
 		return nil, &tokenValidationError{
 			Reason: "malformed",
 			Err:    fmt.Errorf("parse JWT claims: %w", err),
 		}
 	}
 	if len(claims.RawEvidence) == 0 {
-		claims.RawEvidence = claimsBytes
+		claims.RawEvidence = payload
 	}
 
 	return &claims, nil

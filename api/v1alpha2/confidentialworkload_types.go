@@ -39,12 +39,6 @@ type AttestationSummary struct {
 	Attested int32 `json:"attested"`
 }
 
-// SecretRef points at the Secret holding the issued keypair.
-type SecretRef struct {
-	// +kubebuilder:validation:MinLength=1
-	Name string `json:"name"`
-}
-
 // Condition types surfaced on ConfidentialWorkload.status.
 const (
 	ConditionAttested   = "Attested"
@@ -57,8 +51,6 @@ type ConfidentialWorkloadStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
 	AttestationSummary *AttestationSummary `json:"attestationSummary,omitempty"`
-
-	IssuedCertRef *SecretRef `json:"issuedCertRef,omitempty"`
 
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
