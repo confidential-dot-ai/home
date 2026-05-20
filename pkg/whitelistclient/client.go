@@ -123,8 +123,8 @@ func (c Client) Delete(digests []types.Digest, earToken []byte) error {
 }
 
 // FetchWhitelist calls GET /whitelist and returns the parsed whitelist.
-// This is a context-aware alternative to List that returns the whitelist type
-// used by the NRI image policy plugin.
+// This is a context-aware alternative to List that returns the whitelist
+// type used by the NRI image policy plugin.
 func (c Client) FetchWhitelist(ctx context.Context) (*whitelist.Whitelist, error) {
 	url := c.baseURL + "/whitelist"
 
@@ -144,16 +144,62 @@ func (c Client) FetchWhitelist(ctx context.Context) (*whitelist.Whitelist, error
 		return nil, &StatusError{Status: resp.StatusCode, Body: string(body)}
 	}
 
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		return nil, fmt.Errorf("fetch whitelist: unexpected content type: %s", ct)
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response body: %w", err)
 	}
 
-	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
-		return nil, fmt.Errorf("fetch whitelist: unexpected content type: %s", ct)
+	return whitelist.ParseJSON(body)
+}
+
+// FetchWhitelistConditional issues GET /whitelist with If-None-Match.
+// notModified is true on a 304 (whitelist nil, etag ""); on 200 the
+// parsed whitelist is returned with the new ETag (which may be empty).
+func (c Client) FetchWhitelistConditional(ctx context.Context, ifNoneMatch string) (*whitelist.Whitelist, string, bool, error) {
+	url := c.baseURL + "/whitelist"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("create request: %w", err)
+	}
+	if ifNoneMatch != "" {
+		req.Header.Set("If-None-Match", ifNoneMatch)
 	}
 
-	return whitelist.ParseJSON(body)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("fetch whitelist: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified {
+		io.Copy(io.Discard, resp.Body)
+		return nil, "", true, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", false, &StatusError{Status: resp.StatusCode, Body: string(body)}
+	}
+
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		return nil, "", false, fmt.Errorf("fetch whitelist: unexpected content type: %s", ct)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("read response body: %w", err)
+	}
+
+	wl, err := whitelist.ParseJSON(body)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return wl, resp.Header.Get("ETag"), false, nil
 }
 
 // StatusError represents a non-success HTTP response.

@@ -567,3 +567,76 @@ func TestWhitelistAddRejectsBodyOverConfiguredCap(t *testing.T) {
 		t.Fatalf("over-cap body got status %d, want 413", resp.StatusCode)
 	}
 }
+
+func TestWhitelistListEmitsETag(t *testing.T) {
+	app, _, _ := testWhitelistApp(t)
+	srv := httptest.NewServer(app)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/whitelist")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("ETag"); got != `W/"1"` {
+		t.Fatalf("ETag = %q, want W/\"1\"", got)
+	}
+}
+
+func TestWhitelistListMatchingIfNoneMatchReturns304(t *testing.T) {
+	app, _, _ := testWhitelistApp(t)
+	srv := httptest.NewServer(app)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/whitelist", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("If-None-Match", `W/"1"`)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("status = %d, want 304", resp.StatusCode)
+	}
+	if got := resp.Header.Get("ETag"); got != `W/"1"` {
+		t.Fatalf("ETag = %q, want W/\"1\"", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) != 0 {
+		t.Fatalf("304 body should be empty, got %d bytes", len(body))
+	}
+}
+
+func TestWhitelistListStaleIfNoneMatchReturns200WithNewETag(t *testing.T) {
+	app, _, issuer := testWhitelistApp(t)
+	srv := httptest.NewServer(app)
+	defer srv.Close()
+
+	addDigest(t, srv.URL, issuer, digestA, "test-image")
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/whitelist", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("If-None-Match", `W/"1"`)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("ETag"); got != `W/"2"` {
+		t.Fatalf("ETag = %q, want W/\"2\"", got)
+	}
+}

@@ -8,13 +8,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/lunal-dev/c8s/internal/earclaims"
+	"github.com/lunal-dev/c8s/internal/httputil"
 	"github.com/lunal-dev/c8s/pkg/resources"
 	"github.com/lunal-dev/c8s/pkg/types"
 )
@@ -42,6 +42,8 @@ type Handler struct {
 type WriteAuthorizer func(r *http.Request, body []byte) error
 
 // HandleList handles GET /whitelist - returns all whitelisted digests.
+// Emits a weak ETag derived from the store version; matching
+// If-None-Match returns 304.
 func (h Handler) HandleList(w http.ResponseWriter, r *http.Request) {
 	version, digests, err := h.Store.ListAll()
 	if err != nil {
@@ -49,6 +51,14 @@ func (h Handler) HandleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	etag := `W/"` + version + `"`
+	if r.Header.Get("If-None-Match") == etag {
+		w.Header().Set("ETag", etag)
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	w.Header().Set("ETag", etag)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(types.WhitelistListResponse{
 		Version: version,
@@ -108,9 +118,8 @@ func (h Handler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// authorize reads the request body (capped) and runs the configured
-// authorizer against it. On success returns the body bytes for downstream
-// decoding; on failure writes the appropriate status and returns ok=false.
+// authorize reads the body (capped) and runs the configured authorizer.
+// On success returns the body for downstream decoding.
 func (h Handler) authorize(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	if h.WriteAuthorizer == nil {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -120,13 +129,8 @@ func (h Handler) authorize(w http.ResponseWriter, r *http.Request) ([]byte, bool
 	if cap <= 0 {
 		cap = DefaultMaxWriteBodyBytes
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, cap+1))
-	if err != nil {
-		http.Error(w, "read request body", http.StatusBadRequest)
-		return nil, false
-	}
-	if int64(len(body)) > cap {
-		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+	body, ok := httputil.ReadCappedBody(w, r, cap)
+	if !ok {
 		return nil, false
 	}
 	if err := h.WriteAuthorizer(r, body); err != nil {
