@@ -1,5 +1,3 @@
-{{- $san := include "tls-lb.san" . -}}
-{{- $discoveryFilePath := printf "%s/%s" .Values.discovery.mountPath .Values.discovery.fileName -}}
 {{- $meshCAConfigMapName := default (printf "%s-cert-issuer-mesh-ca" .Release.Name) .Values.meshCA.configMapName -}}
 {{- $defaultMeshCAPath := printf "%s/%s" .Values.meshCA.mountPath .Values.meshCA.key -}}
 {{- $configuredTrustedCAPath := .Values.upstream.tls.trustedCAPath -}}
@@ -7,14 +5,6 @@
 {{- $upstreamUsesMeshCA := and $upstreamTLSVerify (or (not $configuredTrustedCAPath) (eq $configuredTrustedCAPath $defaultMeshCAPath)) -}}
 {{- $discoveryExposesMeshCA := and .Values.discovery.enabled .Values.meshCA.expose -}}
 {{- $mountMeshCA := or $discoveryExposesMeshCA $upstreamUsesMeshCA -}}
-{{- $publicCertPath := printf "%s/cert.pem" .Values.tlsMountPath -}}
-{{- $publicKeyPath := printf "%s/key.pem" .Values.tlsMountPath -}}
-{{- $publicTLSMode := "cds" -}}
-{{- if .Values.publicTLS.secretName -}}
-{{- $publicCertPath = printf "%s/%s" .Values.publicTLS.mountPath .Values.publicTLS.certKey -}}
-{{- $publicKeyPath = printf "%s/%s" .Values.publicTLS.mountPath .Values.publicTLS.keyKey -}}
-{{- $publicTLSMode = "webpki" -}}
-{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,34 +22,7 @@ spec:
         {{- include "tls-lb.selectorLabels" . | nindent 8 }}
       annotations:
         checksum/nginx-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        confidential.ai/cw: {{ $san | quote }}
-        confidential.ai/c8s-cert-volume: "tls-certs"
-        confidential.ai/c8s-cert-dir: {{ .Values.tlsMountPath | quote }}
-        confidential.ai/c8s-cert-file: "cert.pem"
-        confidential.ai/c8s-key-file: "key.pem"
-        confidential.ai/c8s-renew-interval: {{ .Values.certProvisioning.renewInterval | quote }}
-        confidential.ai/c8s-reload-nginx: "true"
-        confidential.ai/c8s-get-cert-run-as-user: {{ .Values.nginx.runAsUser | quote }}
-        confidential.ai/c8s-get-cert-run-as-group: {{ .Values.nginx.runAsGroup | quote }}
-        confidential.ai/c8s-get-cert-run-as-non-root: {{ .Values.nginx.runAsNonRoot | quote }}
-        {{- if .Values.certProvisioning.verbose }}
-        confidential.ai/c8s-get-cert-verbose: "true"
-        {{- end }}
-        {{- if .Values.publicTLS.secretName }}
-        confidential.ai/c8s-reload-watch-volume: "public-tls"
-        confidential.ai/c8s-reload-watch-mount-path: {{ .Values.publicTLS.mountPath | quote }}
-        confidential.ai/c8s-reload-watch-paths: {{ printf "%s,%s" $publicCertPath $publicKeyPath | quote }}
-        {{- end }}
-        {{- if .Values.discovery.enabled }}
-        confidential.ai/c8s-discovery-volume: "discovery"
-        confidential.ai/c8s-discovery-mount-path: {{ .Values.discovery.mountPath | quote }}
-        confidential.ai/c8s-discovery-out: {{ $discoveryFilePath | quote }}
-        confidential.ai/c8s-discovery-cds-cert-url: {{ .Values.discovery.cdsCertPath | quote }}
-        confidential.ai/c8s-discovery-public-tls-mode: {{ $publicTLSMode | quote }}
-        {{- if .Values.meshCA.expose }}
-        confidential.ai/c8s-discovery-mesh-ca-url: {{ .Values.discovery.meshCAPath | quote }}
-        {{- end }}
-        {{- end }}
+        {{- include "tls-lb.c8s-annotations" . | nindent 8 }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

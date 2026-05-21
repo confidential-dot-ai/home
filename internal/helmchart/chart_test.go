@@ -1287,6 +1287,9 @@ func TestChartRendersTLSLBPublicTLSAndDiscovery(t *testing.T) {
 	if got := deployment.Spec.Template.Spec.InitContainers; len(got) != 0 {
 		t.Fatalf("tls-lb should rely on webhook-injected get-cert containers, got %v", got)
 	}
+	if got, ok := deployment.Spec.Template.Annotations[webhook.AnnotationGetCertRunAsNonRoot]; ok {
+		t.Fatalf("%s should be absent when nginx.runAsNonRoot matches the webhook default, got %q", webhook.AnnotationGetCertRunAsNonRoot, got)
+	}
 }
 
 func TestChartRendersTeeProxyStaticTLSSecret(t *testing.T) {
@@ -1951,16 +1954,15 @@ func assertRenderedDeploymentPodAnnotations(t *testing.T, manifest, name string,
 
 func tlsLBAnnotations(workload string, overrides map[string]string) map[string]string {
 	annotations := map[string]string{
-		webhook.AnnotationWorkload:            workload,
-		webhook.AnnotationCertVolume:          "tls-certs",
-		webhook.AnnotationCertDir:             "/tls",
-		webhook.AnnotationCertFile:            "cert.pem",
-		webhook.AnnotationKeyFile:             "key.pem",
-		webhook.AnnotationRenewInterval:       "1h",
-		webhook.AnnotationReloadNginx:         "true",
-		webhook.AnnotationGetCertRunAsUser:    "101",
-		webhook.AnnotationGetCertRunAsGroup:   "101",
-		webhook.AnnotationGetCertRunAsNonRoot: "true",
+		webhook.AnnotationWorkload:          workload,
+		webhook.AnnotationCertVolume:        "tls-certs",
+		webhook.AnnotationCertDir:           "/tls",
+		webhook.AnnotationCertFile:          "cert.pem",
+		webhook.AnnotationKeyFile:           "key.pem",
+		webhook.AnnotationRenewInterval:     "1h",
+		webhook.AnnotationReloadNginx:       "true",
+		webhook.AnnotationGetCertRunAsUser:  "101",
+		webhook.AnnotationGetCertRunAsGroup: "101",
 	}
 	for key, value := range overrides {
 		annotations[key] = value

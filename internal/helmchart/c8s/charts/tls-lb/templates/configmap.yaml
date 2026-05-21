@@ -2,13 +2,6 @@
 {{- include "tls-lb.validateSan" $san -}}
 {{- include "tls-lb.validateProtocol" (required "protocol must be http or https" .Values.upstream.protocol) -}}
 {{- include "tls-lb.validateUpstreamAddress" .Values.upstream -}}
-{{- $publicCertPath := printf "%s/cert.pem" .Values.tlsMountPath -}}
-{{- $publicKeyPath := printf "%s/key.pem" .Values.tlsMountPath -}}
-{{- if .Values.publicTLS.secretName -}}
-{{- $publicCertPath = printf "%s/%s" .Values.publicTLS.mountPath .Values.publicTLS.certKey -}}
-{{- $publicKeyPath = printf "%s/%s" .Values.publicTLS.mountPath .Values.publicTLS.keyKey -}}
-{{- end -}}
-{{- $discoveryFilePath := printf "%s/%s" .Values.discovery.mountPath .Values.discovery.fileName -}}
 {{- $defaultMeshCAPath := printf "%s/%s" .Values.meshCA.mountPath .Values.meshCA.key -}}
 {{- $upstreamTrustedCAPath := default $defaultMeshCAPath .Values.upstream.tls.trustedCAPath -}}
 {{- $upstreamServerName := .Values.upstream.tls.serverName -}}
@@ -53,8 +46,8 @@ data:
             listen {{ .Values.nginx.httpsPort }} ssl;
             server_name "{{ $san }}";
 
-            ssl_certificate     {{ $publicCertPath }};
-            ssl_certificate_key {{ $publicKeyPath }};
+            ssl_certificate     {{ include "tls-lb.publicCertPath" . }};
+            ssl_certificate_key {{ include "tls-lb.publicKeyPath" . }};
 
             ssl_protocols TLSv1.2 TLSv1.3;
             ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305;
@@ -98,7 +91,7 @@ data:
                 access_log off;
                 default_type application/json;
                 add_header Cache-Control "no-store" always;
-                alias {{ $discoveryFilePath }};
+                alias {{ include "tls-lb.discoveryFilePath" . }};
             }
 
             location = {{ .Values.discovery.cdsCertPath }} {
