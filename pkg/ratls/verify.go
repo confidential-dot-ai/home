@@ -7,7 +7,6 @@ import (
 	"crypto/sha512"
 	"crypto/x509"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -50,6 +49,12 @@ type VerifyPolicy struct {
 	// that cannot be verified from the SNP report alone. AKS az-snp binds the
 	// caller nonce through the TPM quote, so verifiers must call the local
 	// attestation-service /verify endpoint for those RA-TLS extensions.
+	//
+	// SECURITY: the /verify response is currently not signed; the verifier
+	// trusts whatever this URL returns. Operators MUST point this at an
+	// attestation service inside the same TCB (e.g. a same-node DaemonSet
+	// fronted by a Service with internalTrafficPolicy=Local, or a loopback
+	// sidecar). A response-signing scheme would lift this constraint.
 	AttestationServiceURL string
 
 	// AttestationVerifyTimeout bounds online attestation-service verification.
@@ -183,30 +188,34 @@ func checkSEVSNPBinding(rawReport []byte, expected [64]byte) (*spb.Report, error
 
 const defaultAttestationVerifyTimeout = 10 * time.Second
 
-type embeddedEvidenceEnvelope struct {
-	Platform string          `json:"platform"`
-	Evidence json.RawMessage `json:"evidence"`
+// unpackSNPMinTcb maps a packed AMD SEV-SNP TCB uint64 onto the components
+// the attestation service understands. Layout matches the SEV-SNP ABI
+// TcbVersion: byte 0 = bootloader, byte 1 = tee, bytes 2-5 reserved,
+// byte 6 = snp, byte 7 = microcode.
+func unpackSNPMinTcb(packed uint64) types.MinTcb {
+	return types.MinTcb{
+		Bootloader: byte(packed),
+		Tee:        byte(packed >> 8),
+		Snp:        byte(packed >> 48),
+		Microcode:  byte(packed >> 56),
+	}
 }
 
-func embeddedEvidence(raw []byte) (types.AttestationEvidence, bool, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return types.AttestationEvidence{}, false, nil
+func verifySEVSNPOnline(evidence *types.AttestationEvidence, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
+	// Only az-snp is wired end-to-end through this verifier today. az-tdx and
+	// any future platform would need their own measurement semantics and
+	// result population; fail closed rather than approve under SNP rules.
+	if evidence.Platform != string(types.PlatformAzSnp) {
+		return nil, fmt.Errorf("%w: online verification not implemented for platform %q", ErrUnsupportedTEE, evidence.Platform)
 	}
-
-	var envelope embeddedEvidenceEnvelope
-	if err := json.Unmarshal(trimmed, &envelope); err != nil {
-		return types.AttestationEvidence{}, true, fmt.Errorf("ratls: parse embedded attestation evidence: %w", err)
-	}
-	if envelope.Platform == "" || len(envelope.Evidence) == 0 {
-		return types.AttestationEvidence{}, true, fmt.Errorf("%w: embedded attestation evidence missing platform or evidence", ErrInvalidReport)
-	}
-	return types.AttestationEvidence{Platform: envelope.Platform, Evidence: envelope.Evidence}, true, nil
-}
-
-func verifySEVSNPOnline(evidence types.AttestationEvidence, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
 	if policy == nil || policy.AttestationServiceURL == "" {
 		return nil, fmt.Errorf("%w: attestation service URL is required for %s evidence", ErrInvalidReport, evidence.Platform)
+	}
+	if policy.RequireSMT {
+		// The attestation-service /verify API has no SMT parameter, so we
+		// cannot enforce this constraint online without extending the wire
+		// protocol. Fail closed so the policy is never silently ignored.
+		return nil, fmt.Errorf("%w: RequireSMT is not enforceable for online (%s) verification", ErrPolicyViolation, evidence.Platform)
 	}
 
 	timeout := policy.AttestationVerifyTimeout
@@ -219,12 +228,17 @@ func verifySEVSNPOnline(evidence types.AttestationEvidence, policy *VerifyPolicy
 	expected := types.NewBase64Bytes(expectedReportData[:sha512.Size384])
 	allowDebug := policy.AllowDebug
 	issueToken := false
+	params := &types.VerifyParams{
+		ExpectedReportData: &expected,
+		AllowDebug:         &allowDebug,
+	}
+	if policy.MinTCBVersion != 0 {
+		minTcb := unpackSNPMinTcb(policy.MinTCBVersion)
+		params.MinTcb = &minTcb
+	}
 	resp, err := attestationclient.NewClient(policy.AttestationServiceURL).Verify(ctx, types.VerifyRequest{
-		Evidence: evidence,
-		Params: &types.VerifyParams{
-			ExpectedReportData: &expected,
-			AllowDebug:         &allowDebug,
-		},
+		Evidence:   *evidence,
+		Params:     params,
 		IssueToken: &issueToken,
 	})
 	if err != nil {
@@ -237,9 +251,9 @@ func verifySEVSNPOnline(evidence types.AttestationEvidence, policy *VerifyPolicy
 		return nil, fmt.Errorf("%w — key was not generated in this TEE", ErrKeyBinding)
 	}
 
-	result := &VerifyResult{
-		TEEType:      TEETypeSEVSNP,
-		PlatformInfo: resp.Result.Claims.PlatformData,
+	result := &VerifyResult{TEEType: TEETypeSEVSNP}
+	if len(resp.Result.Claims.PlatformData) > 0 && !bytes.Equal(resp.Result.Claims.PlatformData, []byte("null")) {
+		result.PlatformInfo = resp.Result.Claims.PlatformData
 	}
 	copy(result.ReportData[:], expectedReportData[:])
 
@@ -265,10 +279,8 @@ func verifySEVSNPOnline(evidence types.AttestationEvidence, policy *VerifyPolicy
 // verifySEVSNP performs full verification: key binding, AMD signature chain,
 // and policy validation. The report is parsed once and reused.
 func verifySEVSNP(att *Attestation, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
-	if evidence, ok, err := embeddedEvidence(att.Report); err != nil {
-		return nil, err
-	} else if ok {
-		return verifySEVSNPOnline(evidence, policy, expectedReportData)
+	if att.embedded != nil {
+		return verifySEVSNPOnline(att.embedded, policy, expectedReportData)
 	}
 
 	report, err := checkSEVSNPBinding(att.Report, expectedReportData)

@@ -11,8 +11,8 @@ import (
 
 // snpReportEnvelope holds the fields we care about inside the inner evidence
 // blob returned by the attestation service. Bare-metal SNP carries the raw
-// report under attestation_report (standard base64); vTPM (az-snp, az-tdx)
-// carries it inside hcl_report (URL-safe base64, no padding).
+// report under attestation_report (standard base64); vTPM (az-snp) carries
+// it inside hcl_report (URL-safe base64, no padding).
 type snpReportEnvelope struct {
 	AttestationReport string `json:"attestation_report"`
 	HCLReport         string `json:"hcl_report"`
@@ -52,18 +52,19 @@ func ExtractSNPReport(resp types.AttestResponse) (string, error) {
 
 // RATLSEvidence returns the payload to embed in an RA-TLS certificate
 // extension. Bare-metal SNP can be verified offline from the raw SNP report.
-// Azure vTPM evidence must keep the full attestation-service envelope because
-// the caller-controlled nonce is bound through the TPM quote, not SNP
-// REPORTDATA.
+// Azure SNP vTPM evidence must keep the full attestation-service envelope
+// because the caller-controlled nonce is bound through the TPM quote, not
+// SNP REPORTDATA — pkg/ratls/verify.go forwards the envelope to the local
+// attestation-service /verify endpoint. az-tdx is intentionally not handled:
+// the verifier has no TDX-specific measurement or claims logic yet, so the
+// envelope would be accepted under SNP rules.
 func RATLSEvidence(resp types.AttestResponse) (string, error) {
-	switch resp.Platform {
-	case string(types.PlatformAzSnp), string(types.PlatformAzTdx):
+	if resp.Platform == string(types.PlatformAzSnp) {
 		evidence, err := json.Marshal(types.AttestationEvidence(resp))
 		if err != nil {
 			return "", fmt.Errorf("marshal RA-TLS attestation evidence: %w", err)
 		}
 		return string(evidence), nil
-	default:
-		return ExtractSNPReport(resp)
 	}
+	return ExtractSNPReport(resp)
 }

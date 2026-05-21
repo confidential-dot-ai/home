@@ -10,6 +10,7 @@
 package ratls
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -18,8 +19,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/lunal-dev/c8s/pkg/types"
 )
 
 // DefaultCertTTL is the default certificate lifetime used by both
@@ -81,6 +85,12 @@ type Attestation struct {
 	// For SEV-SNP: VCEK || ASK || ARK (concatenated DER certificates).
 	// If empty, the verifier must fetch certificates from AMD KDS online.
 	CertChain []byte
+
+	// embedded is the parsed attestation-service envelope when Report was
+	// produced by a verifier-requires-online path (e.g. az-snp). Populated
+	// by UnmarshalExtension; nil means the Report holds a raw hardware
+	// report that can be verified offline.
+	embedded *types.AttestationEvidence
 }
 
 // attestationASN1 is the ASN.1 DER encoding structure.
@@ -132,25 +142,48 @@ func UnmarshalExtension(der []byte) (*Attestation, error) {
 		return nil, fmt.Errorf("%w: TEE type %d", ErrUnsupportedTEE, raw.TEEType)
 	}
 
+	att := &Attestation{
+		TEEType:   teeType,
+		Report:    raw.Report,
+		CertChain: raw.CertChain,
+	}
+
 	if teeType == TEETypeSEVSNP {
-		_, hasEmbeddedEvidence, err := embeddedEvidence(raw.Report)
+		embedded, err := parseEmbeddedEvidence(raw.Report)
 		if err != nil {
 			return nil, err
 		}
-		if !hasEmbeddedEvidence {
+		if embedded != nil {
+			att.embedded = embedded
+		} else {
 			report, err := NormalizeSEVSNPReport(raw.Report)
 			if err != nil {
 				return nil, err
 			}
-			raw.Report = report
+			att.Report = report
 		}
 	}
 
-	return &Attestation{
-		TEEType:   teeType,
-		Report:    raw.Report,
-		CertChain: raw.CertChain,
-	}, nil
+	return att, nil
+}
+
+// parseEmbeddedEvidence returns the parsed attestation-service envelope when
+// raw is a JSON-encoded types.AttestationEvidence, or nil when raw is a raw
+// hardware report. Callers use the non-nil return as a signal to take the
+// online verification path instead of parsing raw as an SNP report.
+func parseEmbeddedEvidence(raw []byte) (*types.AttestationEvidence, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, nil
+	}
+	var envelope types.AttestationEvidence
+	if err := json.Unmarshal(trimmed, &envelope); err != nil {
+		return nil, fmt.Errorf("ratls: parse embedded attestation evidence: %w", err)
+	}
+	if envelope.Platform == "" || len(envelope.Evidence) == 0 {
+		return nil, fmt.Errorf("%w: embedded attestation evidence missing platform or evidence", ErrInvalidReport)
+	}
+	return &envelope, nil
 }
 
 // ReportDataForKey computes the REPORTDATA value for binding a public key

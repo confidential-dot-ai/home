@@ -654,6 +654,51 @@ func TestSNPMeasurementSizeConstant(t *testing.T) {
 	}
 }
 
+// embeddedAzureCert builds an RA-TLS certificate whose attestation extension
+// carries an az-snp envelope (the post-PR-98 wire shape). Returns the parsed
+// cert and the SHA-384(pubkey) that the attestation-service would expect to
+// see bound through the TPM quote.
+func embeddedAzureCert(t *testing.T) (*x509.Certificate, [64]byte) {
+	t.Helper()
+	key, expectedReportData, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	embedded, err := json.Marshal(types.AttestationEvidence{
+		Platform: string(types.PlatformAzSnp),
+		Evidence: json.RawMessage(`{"hcl_report":"fake","tpm_quote":{"message":"fake"}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	certDER, err := CreateAttestedCert(key, &Attestation{TEEType: TEETypeSEVSNP, Report: embedded}, nil)
+	if err != nil {
+		t.Fatalf("CreateAttestedCert: %v", err)
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		t.Fatalf("ParseCertificate: %v", err)
+	}
+	return cert, expectedReportData
+}
+
+// verifyResponse is a minimal builder for an attestation-service /verify
+// response. Tests mutate the returned map then JSON-encode it.
+func verifyResponse(measurement []byte) map[string]any {
+	result := map[string]any{
+		"platform":          string(types.PlatformAzSnp),
+		"signature_valid":   true,
+		"report_data_match": true,
+		"claims":            map[string]any{},
+	}
+	if measurement != nil {
+		result["claims"] = map[string]any{
+			"launch_digest": hex.EncodeToString(measurement),
+		}
+	}
+	return map[string]any{"result": result}
+}
+
 func TestVerifyCertEmbeddedAzureEvidenceUsesAttestationService(t *testing.T) {
 	key, expectedReportData, err := GenerateKeyPair()
 	if err != nil {
@@ -731,4 +776,204 @@ func TestVerifyCertEmbeddedAzureEvidenceUsesAttestationService(t *testing.T) {
 	if !bytes.Equal(result.Measurement[:], measurement) {
 		t.Fatalf("Measurement = %x, want %x", result.Measurement, measurement)
 	}
+}
+
+// TestVerifyCertEmbeddedAzureNegativePaths covers the online-verification
+// failure modes. Each case mutates either the policy or the mocked /verify
+// response and asserts that the verifier maps it to the expected sentinel
+// error. A bug that flipped any of these to a "pass" would be silent
+// downgrade of the attestation policy.
+func TestVerifyCertEmbeddedAzureNegativePaths(t *testing.T) {
+	cert, _ := embeddedAzureCert(t)
+	measurement := bytes.Repeat([]byte{0x42}, SNPMeasurementSize)
+	allowedMeasurements := [][]byte{measurement}
+
+	newMockedSrv := func(t *testing.T, body any) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if err := json.NewEncoder(w).Encode(body); err != nil {
+				t.Fatalf("encode response: %v", err)
+			}
+		}))
+	}
+
+	t.Run("signature_valid=false maps to ErrSignatureInvalid", func(t *testing.T) {
+		resp := verifyResponse(measurement)
+		resp["result"].(map[string]any)["signature_valid"] = false
+		srv := newMockedSrv(t, resp)
+		defer srv.Close()
+		_, err := VerifyCert(cert, &VerifyPolicy{AttestationServiceURL: srv.URL, Measurements: allowedMeasurements}, nil)
+		if !errors.Is(err, ErrSignatureInvalid) {
+			t.Fatalf("got %v, want ErrSignatureInvalid", err)
+		}
+	})
+
+	t.Run("report_data_match=nil maps to ErrKeyBinding", func(t *testing.T) {
+		resp := verifyResponse(measurement)
+		delete(resp["result"].(map[string]any), "report_data_match")
+		srv := newMockedSrv(t, resp)
+		defer srv.Close()
+		_, err := VerifyCert(cert, &VerifyPolicy{AttestationServiceURL: srv.URL, Measurements: allowedMeasurements}, nil)
+		if !errors.Is(err, ErrKeyBinding) {
+			t.Fatalf("got %v, want ErrKeyBinding", err)
+		}
+	})
+
+	t.Run("report_data_match=false maps to ErrKeyBinding", func(t *testing.T) {
+		resp := verifyResponse(measurement)
+		resp["result"].(map[string]any)["report_data_match"] = false
+		srv := newMockedSrv(t, resp)
+		defer srv.Close()
+		_, err := VerifyCert(cert, &VerifyPolicy{AttestationServiceURL: srv.URL, Measurements: allowedMeasurements}, nil)
+		if !errors.Is(err, ErrKeyBinding) {
+			t.Fatalf("got %v, want ErrKeyBinding", err)
+		}
+	})
+
+	t.Run("empty attestation service URL rejects embedded evidence", func(t *testing.T) {
+		_, err := VerifyCert(cert, &VerifyPolicy{Measurements: allowedMeasurements}, nil)
+		if !errors.Is(err, ErrInvalidReport) {
+			t.Fatalf("got %v, want ErrInvalidReport", err)
+		}
+	})
+
+	t.Run("RequireSMT fails closed on online path", func(t *testing.T) {
+		srv := newMockedSrv(t, verifyResponse(measurement))
+		defer srv.Close()
+		_, err := VerifyCert(cert, &VerifyPolicy{AttestationServiceURL: srv.URL, Measurements: allowedMeasurements, RequireSMT: true}, nil)
+		if !errors.Is(err, ErrPolicyViolation) {
+			t.Fatalf("got %v, want ErrPolicyViolation", err)
+		}
+	})
+
+	t.Run("launch_digest missing with pinned measurements is rejected", func(t *testing.T) {
+		srv := newMockedSrv(t, verifyResponse(nil))
+		defer srv.Close()
+		_, err := VerifyCert(cert, &VerifyPolicy{AttestationServiceURL: srv.URL, Measurements: allowedMeasurements}, nil)
+		if !errors.Is(err, ErrPolicyViolation) {
+			t.Fatalf("got %v, want ErrPolicyViolation", err)
+		}
+	})
+
+	t.Run("launch_digest not in allowed set is rejected", func(t *testing.T) {
+		other := bytes.Repeat([]byte{0x99}, SNPMeasurementSize)
+		srv := newMockedSrv(t, verifyResponse(other))
+		defer srv.Close()
+		_, err := VerifyCert(cert, &VerifyPolicy{AttestationServiceURL: srv.URL, Measurements: allowedMeasurements}, nil)
+		if !errors.Is(err, ErrPolicyViolation) {
+			t.Fatalf("got %v, want ErrPolicyViolation", err)
+		}
+	})
+
+	t.Run("launch_digest not hex is rejected", func(t *testing.T) {
+		resp := verifyResponse(measurement)
+		resp["result"].(map[string]any)["claims"] = map[string]any{"launch_digest": "not-hex"}
+		srv := newMockedSrv(t, resp)
+		defer srv.Close()
+		_, err := VerifyCert(cert, &VerifyPolicy{AttestationServiceURL: srv.URL, Measurements: allowedMeasurements}, nil)
+		if !errors.Is(err, ErrInvalidReport) {
+			t.Fatalf("got %v, want ErrInvalidReport", err)
+		}
+	})
+
+	t.Run("launch_digest wrong length is rejected", func(t *testing.T) {
+		resp := verifyResponse(measurement)
+		resp["result"].(map[string]any)["claims"] = map[string]any{
+			"launch_digest": hex.EncodeToString(bytes.Repeat([]byte{0x11}, 32)),
+		}
+		srv := newMockedSrv(t, resp)
+		defer srv.Close()
+		_, err := VerifyCert(cert, &VerifyPolicy{AttestationServiceURL: srv.URL, Measurements: allowedMeasurements}, nil)
+		if !errors.Is(err, ErrInvalidReport) {
+			t.Fatalf("got %v, want ErrInvalidReport", err)
+		}
+	})
+
+	t.Run("attestation service HTTP 500 surfaces an error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+		_, err := VerifyCert(cert, &VerifyPolicy{AttestationServiceURL: srv.URL, Measurements: allowedMeasurements}, nil)
+		if err == nil {
+			t.Fatal("expected error from 500 response")
+		}
+	})
+
+	t.Run("AttestationVerifyTimeout bounds the call", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(200 * time.Millisecond)
+			_ = json.NewEncoder(w).Encode(verifyResponse(measurement))
+		}))
+		defer srv.Close()
+		start := time.Now()
+		_, err := VerifyCert(cert, &VerifyPolicy{
+			AttestationServiceURL:    srv.URL,
+			Measurements:             allowedMeasurements,
+			AttestationVerifyTimeout: 25 * time.Millisecond,
+		}, nil)
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("expected timeout error")
+		}
+		if elapsed > 150*time.Millisecond {
+			t.Fatalf("verify took %s, expected <150ms (timeout not enforced)", elapsed)
+		}
+	})
+
+	t.Run("MinTCBVersion is forwarded as unpacked components", func(t *testing.T) {
+		var observed types.VerifyRequest
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if err := json.NewDecoder(r.Body).Decode(&observed); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(verifyResponse(measurement))
+		}))
+		defer srv.Close()
+		// Packed layout: bootloader=0x11, tee=0x22, snp=0x33 (byte 6),
+		// microcode=0x44 (byte 7). Reserved bytes stay zero.
+		packed := uint64(0x44_33_00_00_00_00_22_11)
+		_, err := VerifyCert(cert, &VerifyPolicy{
+			AttestationServiceURL: srv.URL,
+			Measurements:          allowedMeasurements,
+			MinTCBVersion:         packed,
+		}, nil)
+		if err != nil {
+			t.Fatalf("VerifyCert: %v", err)
+		}
+		if observed.Params == nil || observed.Params.MinTcb == nil {
+			t.Fatal("MinTcb was not forwarded to /verify")
+		}
+		want := types.MinTcb{Bootloader: 0x11, Tee: 0x22, Snp: 0x33, Microcode: 0x44}
+		if *observed.Params.MinTcb != want {
+			t.Fatalf("MinTcb = %+v, want %+v", *observed.Params.MinTcb, want)
+		}
+	})
+
+	t.Run("az-tdx evidence is rejected by online verifier", func(t *testing.T) {
+		key, _, err := GenerateKeyPair()
+		if err != nil {
+			t.Fatal(err)
+		}
+		embedded, err := json.Marshal(types.AttestationEvidence{
+			Platform: string(types.PlatformAzTdx),
+			Evidence: json.RawMessage(`{"any":"shape"}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		certDER, err := CreateAttestedCert(key, &Attestation{TEEType: TEETypeSEVSNP, Report: embedded}, nil)
+		if err != nil {
+			t.Fatalf("CreateAttestedCert: %v", err)
+		}
+		tdxCert, err := x509.ParseCertificate(certDER)
+		if err != nil {
+			t.Fatalf("ParseCertificate: %v", err)
+		}
+		srv := newMockedSrv(t, verifyResponse(measurement))
+		defer srv.Close()
+		_, err = VerifyCert(tdxCert, &VerifyPolicy{AttestationServiceURL: srv.URL, Measurements: allowedMeasurements}, nil)
+		if !errors.Is(err, ErrUnsupportedTEE) {
+			t.Fatalf("got %v, want ErrUnsupportedTEE", err)
+		}
+	})
 }
