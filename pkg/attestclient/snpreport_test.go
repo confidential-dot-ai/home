@@ -77,6 +77,37 @@ func TestExtractSNPReport_VTPM(t *testing.T) {
 	}
 }
 
+func TestRATLSEvidence_VTPMPreservesEnvelope(t *testing.T) {
+	fakeHCLReport := hclEnvelope(make([]byte, 1184), 64)
+	evidence := map[string]any{
+		"version":    1,
+		"hcl_report": base64.RawURLEncoding.EncodeToString(fakeHCLReport),
+		"tpm_quote": map[string]any{
+			"signature": "deadbeef",
+			"message":   "cafebabe",
+			"pcrs":      []string{},
+		},
+	}
+	evidenceJSON, _ := json.Marshal(evidence)
+
+	resp := types.AttestResponse{Platform: "az-snp", Evidence: evidenceJSON}
+	payload, err := attestclient.RATLSEvidence(resp)
+	if err != nil {
+		t.Fatalf("RATLSEvidence failed: %v", err)
+	}
+
+	var embedded types.AttestationEvidence
+	if err := json.Unmarshal([]byte(payload), &embedded); err != nil {
+		t.Fatalf("embedded evidence is not JSON: %v", err)
+	}
+	if embedded.Platform != "az-snp" {
+		t.Fatalf("embedded platform = %q, want az-snp", embedded.Platform)
+	}
+	if !bytes.Equal(embedded.Evidence, evidenceJSON) {
+		t.Fatal("embedded evidence was not preserved")
+	}
+}
+
 func TestExtractSNPReport_HCLEnvelope(t *testing.T) {
 	fakeReport := make([]byte, 1184)
 	fakeReport[0] = 0x03

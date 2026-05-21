@@ -183,7 +183,7 @@ func runProxy(ctx context.Context, c *proxyConfig) error {
 	})
 	attestFunc := makeAttestFunc(asClient, c.attestationServiceURL)
 
-	meshPolicy := &ratls.VerifyPolicy{}
+	meshPolicy := &ratls.VerifyPolicy{AttestationServiceURL: c.attestationServiceURL}
 	if c.measurements != "" {
 		for _, h := range strings.Split(c.measurements, ",") {
 			h = strings.TrimSpace(h)
@@ -671,7 +671,7 @@ func makeAttestFunc(client attestclient.Client, attestationServiceURL string) fu
 			return "", fmt.Errorf("attestation service: %w", err)
 		}
 
-		return attestclient.ExtractSNPReport(resp)
+		return attestclient.RATLSEvidence(resp)
 	}
 }
 

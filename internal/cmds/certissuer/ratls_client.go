@@ -14,7 +14,7 @@ import (
 // the scheme is https (the chart-managed CVM path), plain HTTP otherwise
 // (legacy/dev paths). Empty measurements with an https URL still succeeds
 // but logs a warning — operators in production should pin the value.
-func buildJWKSHTTPClient(rawURL, measurementsRaw string, logger *slog.Logger) (*http.Client, error) {
+func buildJWKSHTTPClient(rawURL, measurementsRaw, attestationServiceURL string, logger *slog.Logger) (*http.Client, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid --jwks-url: %w", err)
@@ -30,5 +30,5 @@ func buildJWKSHTTPClient(rawURL, measurementsRaw string, logger *slog.Logger) (*
 	if len(measurements) == 0 {
 		logger.Warn("--jwks-assam-measurements not set; the JWKS RA-TLS handshake accepts any Assam measurement. Pin the operator-supplied launch digest to close bootstrap MITM.")
 	}
-	return ratls.NewVerifyingHTTPClient(measurements)
+	return ratls.NewVerifyingHTTPClient(measurements, attestationServiceURL)
 }

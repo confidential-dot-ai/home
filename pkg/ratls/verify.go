@@ -2,14 +2,21 @@ package ratls
 
 import (
 	"bytes"
+	"context"
 	"crypto"
+	"crypto/sha512"
 	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"time"
 
 	sabi "github.com/google/go-sev-guest/abi"
 	spb "github.com/google/go-sev-guest/proto/sevsnp"
 	"github.com/google/go-sev-guest/validate"
 	"github.com/google/go-sev-guest/verify"
+	"github.com/lunal-dev/c8s/pkg/attestationclient"
+	"github.com/lunal-dev/c8s/pkg/types"
 )
 
 // VerifyPolicy defines what attestation claims are acceptable.
@@ -38,6 +45,16 @@ type VerifyPolicy struct {
 	// a pre-shared nonce for additional freshness guarantees. If nil, no nonce
 	// check is performed (TLS 1.3 already provides replay protection).
 	Nonce []byte
+
+	// AttestationServiceURL enables online verification for evidence formats
+	// that cannot be verified from the SNP report alone. AKS az-snp binds the
+	// caller nonce through the TPM quote, so verifiers must call the local
+	// attestation-service /verify endpoint for those RA-TLS extensions.
+	AttestationServiceURL string
+
+	// AttestationVerifyTimeout bounds online attestation-service verification.
+	// If unset, a conservative default is used.
+	AttestationVerifyTimeout time.Duration
 }
 
 // VerifyResult contains the verified attestation claims extracted from the cert.
@@ -164,9 +181,96 @@ func checkSEVSNPBinding(rawReport []byte, expected [64]byte) (*spb.Report, error
 	return report, nil
 }
 
+const defaultAttestationVerifyTimeout = 10 * time.Second
+
+type embeddedEvidenceEnvelope struct {
+	Platform string          `json:"platform"`
+	Evidence json.RawMessage `json:"evidence"`
+}
+
+func embeddedEvidence(raw []byte) (types.AttestationEvidence, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return types.AttestationEvidence{}, false, nil
+	}
+
+	var envelope embeddedEvidenceEnvelope
+	if err := json.Unmarshal(trimmed, &envelope); err != nil {
+		return types.AttestationEvidence{}, true, fmt.Errorf("ratls: parse embedded attestation evidence: %w", err)
+	}
+	if envelope.Platform == "" || len(envelope.Evidence) == 0 {
+		return types.AttestationEvidence{}, true, fmt.Errorf("%w: embedded attestation evidence missing platform or evidence", ErrInvalidReport)
+	}
+	return types.AttestationEvidence{Platform: envelope.Platform, Evidence: envelope.Evidence}, true, nil
+}
+
+func verifySEVSNPOnline(evidence types.AttestationEvidence, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
+	if policy == nil || policy.AttestationServiceURL == "" {
+		return nil, fmt.Errorf("%w: attestation service URL is required for %s evidence", ErrInvalidReport, evidence.Platform)
+	}
+
+	timeout := policy.AttestationVerifyTimeout
+	if timeout <= 0 {
+		timeout = defaultAttestationVerifyTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	expected := types.NewBase64Bytes(expectedReportData[:sha512.Size384])
+	allowDebug := policy.AllowDebug
+	issueToken := false
+	resp, err := attestationclient.NewClient(policy.AttestationServiceURL).Verify(ctx, types.VerifyRequest{
+		Evidence: evidence,
+		Params: &types.VerifyParams{
+			ExpectedReportData: &expected,
+			AllowDebug:         &allowDebug,
+		},
+		IssueToken: &issueToken,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("ratls: online attestation verify: %w", err)
+	}
+	if !resp.Result.SignatureValid {
+		return nil, ErrSignatureInvalid
+	}
+	if resp.Result.ReportDataMatch == nil || !*resp.Result.ReportDataMatch {
+		return nil, fmt.Errorf("%w — key was not generated in this TEE", ErrKeyBinding)
+	}
+
+	result := &VerifyResult{
+		TEEType:      TEETypeSEVSNP,
+		PlatformInfo: resp.Result.Claims.PlatformData,
+	}
+	copy(result.ReportData[:], expectedReportData[:])
+
+	if resp.Result.Claims.LaunchDigest != "" {
+		measurement, err := hex.DecodeString(resp.Result.Claims.LaunchDigest)
+		if err != nil {
+			return nil, fmt.Errorf("%w: launch digest is not hex: %w", ErrInvalidReport, err)
+		}
+		if len(measurement) != SNPMeasurementSize {
+			return nil, fmt.Errorf("%w: launch digest is %d bytes, expected %d", ErrInvalidReport, len(measurement), SNPMeasurementSize)
+		}
+		copy(result.Measurement[:], measurement)
+		if len(policy.Measurements) > 0 && !measurementAllowed(measurement, policy.Measurements) {
+			return nil, fmt.Errorf("%w: launch measurement not in allowed set", ErrPolicyViolation)
+		}
+	} else if len(policy.Measurements) > 0 {
+		return nil, fmt.Errorf("%w: launch measurement missing", ErrPolicyViolation)
+	}
+
+	return result, nil
+}
+
 // verifySEVSNP performs full verification: key binding, AMD signature chain,
 // and policy validation. The report is parsed once and reused.
 func verifySEVSNP(att *Attestation, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
+	if evidence, ok, err := embeddedEvidence(att.Report); err != nil {
+		return nil, err
+	} else if ok {
+		return verifySEVSNPOnline(evidence, policy, expectedReportData)
+	}
+
 	report, err := checkSEVSNPBinding(att.Report, expectedReportData)
 	if err != nil {
 		return nil, err

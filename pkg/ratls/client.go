@@ -16,9 +16,13 @@ import (
 // Connection-pool and timeout knobs match the values both Assam and
 // cert-issuer were using before this helper existed (5s dial, 10s
 // response-header, 30s overall, MaxIdleConns=5, MaxConnsPerHost=2).
-func NewVerifyingHTTPClient(measurements [][]byte) (*http.Client, error) {
+func NewVerifyingHTTPClient(measurements [][]byte, attestationServiceURLs ...string) (*http.Client, error) {
+	var attestationServiceURL string
+	if len(attestationServiceURLs) > 0 {
+		attestationServiceURL = attestationServiceURLs[0]
+	}
 	tlsCfg, _, err := NewClientTLSConfig(&ClientConfig{
-		Policy: &VerifyPolicy{Measurements: measurements},
+		Policy: &VerifyPolicy{Measurements: measurements, AttestationServiceURL: attestationServiceURL},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("ratls client config: %w", err)

@@ -92,7 +92,7 @@ func Run(args []string) error {
 	var tokenSignerCert *x509.Certificate
 	var kp KeyProvider
 	if *jwksURL != "" {
-		jwksClient, err := buildJWKSHTTPClient(*jwksURL, *assamMeasurementsRaw, logger)
+		jwksClient, err := buildJWKSHTTPClient(*jwksURL, *assamMeasurementsRaw, *ratlsAttestationServiceURL, logger)
 		if err != nil {
 			return err
 		}

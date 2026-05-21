@@ -91,7 +91,7 @@ type Client struct {
 func NewClient(cfg *Config) *Client {
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		policy := &ratls.VerifyPolicy{Measurements: cfg.AssamMeasurements}
+		policy := &ratls.VerifyPolicy{Measurements: cfg.AssamMeasurements, AttestationServiceURL: cfg.AttestationServiceURL}
 		tlsCfg, _, err := ratls.NewClientTLSConfig(&ratls.ClientConfig{Policy: policy})
 		if err != nil {
 			// NewClientTLSConfig only errors on misconfigured Platform/AttestFunc
@@ -265,7 +265,7 @@ func (c *Client) attestationExtension(ctx context.Context, key *ecdsa.PrivateKey
 	if err != nil {
 		return pkix.Extension{}, fmt.Errorf("attestation service: %w", err)
 	}
-	report, err := attestclient.ExtractSNPReport(resp)
+	report, err := attestclient.RATLSEvidence(resp)
 	if err != nil {
 		return pkix.Extension{}, err
 	}

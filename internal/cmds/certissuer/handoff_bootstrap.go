@@ -60,7 +60,7 @@ func newHandoffBootstrap(assamURL, attestationServiceURL string, assamMeasuremen
 	if err != nil {
 		return nil, fmt.Errorf("generate handoff signer key: %w", err)
 	}
-	httpClient, err := ratls.NewVerifyingHTTPClient(assamMeasurements)
+	httpClient, err := ratls.NewVerifyingHTTPClient(assamMeasurements, attestationServiceURL)
 	if err != nil {
 		return nil, err
 	}

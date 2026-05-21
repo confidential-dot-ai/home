@@ -23,6 +23,6 @@ func MakeSNPRATLSAttestFunc(client Client, attestationServiceURL string) func(co
 		if err != nil {
 			return "", fmt.Errorf("attestation service: %w", err)
 		}
-		return ExtractSNPReport(resp)
+		return RATLSEvidence(resp)
 	}
 }

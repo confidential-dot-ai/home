@@ -133,11 +133,17 @@ func UnmarshalExtension(der []byte) (*Attestation, error) {
 	}
 
 	if teeType == TEETypeSEVSNP {
-		report, err := NormalizeSEVSNPReport(raw.Report)
+		_, hasEmbeddedEvidence, err := embeddedEvidence(raw.Report)
 		if err != nil {
 			return nil, err
 		}
-		raw.Report = report
+		if !hasEmbeddedEvidence {
+			report, err := NormalizeSEVSNPReport(raw.Report)
+			if err != nil {
+				return nil, err
+			}
+			raw.Report = report
+		}
 	}
 
 	return &Attestation{

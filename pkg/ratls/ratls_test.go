@@ -9,10 +9,16 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/lunal-dev/c8s/pkg/types"
 )
 
 // fakeSNPReport creates a minimal fake SEV-SNP attestation report (1184 bytes)
@@ -645,5 +651,84 @@ func TestSNPReportSizeConstant(t *testing.T) {
 func TestSNPMeasurementSizeConstant(t *testing.T) {
 	if SNPMeasurementSize != 48 {
 		t.Errorf("SNPMeasurementSize = %d, want 48", SNPMeasurementSize)
+	}
+}
+
+func TestVerifyCertEmbeddedAzureEvidenceUsesAttestationService(t *testing.T) {
+	key, expectedReportData, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidenceJSON := json.RawMessage(`{"hcl_report":"fake","tpm_quote":{"message":"fake"}}`)
+	embedded, err := json.Marshal(types.AttestationEvidence{
+		Platform: string(types.PlatformAzSnp),
+		Evidence: evidenceJSON,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	certDER, err := CreateAttestedCert(key, &Attestation{TEEType: TEETypeSEVSNP, Report: embedded}, nil)
+	if err != nil {
+		t.Fatalf("CreateAttestedCert: %v", err)
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		t.Fatalf("ParseCertificate: %v", err)
+	}
+
+	measurement := bytes.Repeat([]byte{0x42}, SNPMeasurementSize)
+	var sawVerify bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/verify" {
+			t.Fatalf("path = %s, want /verify", r.URL.Path)
+		}
+		var req types.VerifyRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode verify request: %v", err)
+		}
+		sawVerify = true
+		if req.Evidence.Platform != string(types.PlatformAzSnp) {
+			t.Fatalf("platform = %q, want az-snp", req.Evidence.Platform)
+		}
+		if req.Params == nil || req.Params.ExpectedReportData == nil {
+			t.Fatal("missing expected report data")
+		}
+		if got := req.Params.ExpectedReportData.Bytes(); !bytes.Equal(got, expectedReportData[:sha512.Size384]) {
+			t.Fatalf("expected_report_data = %x, want %x", got, expectedReportData[:sha512.Size384])
+		}
+
+		resp := map[string]any{
+			"result": map[string]any{
+				"platform":          string(types.PlatformAzSnp),
+				"signature_valid":   true,
+				"report_data_match": true,
+				"claims": map[string]any{
+					"launch_digest": hex.EncodeToString(measurement),
+					"platform_data": map[string]any{"source": "test"},
+				},
+			},
+		}
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	result, err := VerifyCert(cert, &VerifyPolicy{
+		AttestationServiceURL: srv.URL,
+		Measurements:          [][]byte{measurement},
+	}, nil)
+	if err != nil {
+		t.Fatalf("VerifyCert: %v", err)
+	}
+	if !sawVerify {
+		t.Fatal("attestation-service /verify was not called")
+	}
+	if !bytes.Equal(result.ReportData[:], expectedReportData[:]) {
+		t.Fatalf("ReportData = %x, want %x", result.ReportData, expectedReportData)
+	}
+	if !bytes.Equal(result.Measurement[:], measurement) {
+		t.Fatalf("Measurement = %x, want %x", result.Measurement, measurement)
 	}
 }

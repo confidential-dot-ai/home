@@ -150,7 +150,7 @@ func run(cfg config) error {
 
 	asClient := attestationclient.NewClient(cfg.attestationSvcURL)
 
-	ciHTTPClient, err := buildCertIssuerHTTPClient(cfg.certIssuerURL, certIssuerMeasurements)
+	ciHTTPClient, err := buildCertIssuerHTTPClient(cfg.certIssuerURL, certIssuerMeasurements, cfg.attestationSvcURL)
 	if err != nil {
 		return fmt.Errorf("build cert-issuer client: %w", err)
 	}
@@ -294,11 +294,11 @@ func loadResourceMap(path string) (resources.Map, error) {
 // buildCertIssuerHTTPClient picks an RA-TLS-aware http.Client when the
 // cert-issuer URL is https; otherwise returns a plain-HTTP client. Empty
 // measurements with https accepts ANY peer measurement — caller warns.
-func buildCertIssuerHTTPClient(rawURL string, measurements [][]byte) (*http.Client, error) {
+func buildCertIssuerHTTPClient(rawURL string, measurements [][]byte, attestationServiceURL string) (*http.Client, error) {
 	if !strings.HasPrefix(rawURL, "https://") {
 		return &http.Client{Timeout: 30 * time.Second}, nil
 	}
-	return ratls.NewVerifyingHTTPClient(measurements)
+	return ratls.NewVerifyingHTTPClient(measurements, attestationServiceURL)
 }
 
 func buildWhitelistWriteAllowlist(rm resources.Map) (map[string]bool, error) {
