@@ -2,6 +2,7 @@
 {{- $assamURL := printf "https://%s-assam.%s.svc:8080" .Release.Name .Release.Namespace -}}
 {{- $certIssuerURL := printf "https://%s-cert-issuer.%s.svc:8090" .Release.Name .Release.Namespace -}}
 {{- $caURL := printf "%s/ca" $certIssuerURL -}}
+{{- $excludeSourceNamespaces := append .Values.iptablesSync.excludeSourceNamespaces .Release.Namespace | uniq | join "," -}}
 {{- /*
 The iptables-cleanup preStop sleep fires last in the native-sidecar
 reverse-init order; its budget is what terminationGracePeriod leaves after
@@ -143,6 +144,8 @@ spec:
             - {{ .Values.uid | quote }}
             - --exclude-uids
             - {{ .Values.excludeUids | quote }}
+            - --exclude-source-namespaces
+            - {{ $excludeSourceNamespaces | quote }}
             - --node-ip
             - $(NODE_IP)
             - --resync-period

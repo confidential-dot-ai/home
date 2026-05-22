@@ -645,6 +645,24 @@ func TestK8sResolverPodEvents(t *testing.T) {
 		},
 	}
 	pending := &corev1.Pod{Status: corev1.PodStatus{PodIP: "10.244.0.5"}}
+	succeeded := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "uid-1"},
+		Status: corev1.PodStatus{
+			Phase:  corev1.PodSucceeded,
+			PodIP:  "10.244.0.5",
+			HostIP: "10.0.0.1",
+			PodIPs: []corev1.PodIP{{IP: "10.244.0.5"}, {IP: "fd00::5"}},
+		},
+	}
+	failed := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "uid-1"},
+		Status: corev1.PodStatus{
+			Phase:  corev1.PodFailed,
+			PodIP:  "10.244.0.5",
+			HostIP: "10.0.0.1",
+			PodIPs: []corev1.PodIP{{IP: "10.244.0.5"}},
+		},
+	}
 	tombstone := cache.DeletedFinalStateUnknown{
 		Obj: &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{UID: "uid-tomb"},
@@ -689,6 +707,27 @@ func TestK8sResolverPodEvents(t *testing.T) {
 			name:    "pending pod without HostIP not cached",
 			event:   func(r *k8sResolver) { r.onPod(pending) },
 			wantOut: []string{"10.244.0.5"},
+		},
+		{
+			name:    "succeeded pod evicted from cache",
+			seed:    map[string]podEntry{"10.244.0.5": {nodeIP: "10.0.0.1", uid: "uid-1"}, "fd00::5": {nodeIP: "10.0.0.1", uid: "uid-1"}},
+			event:   func(r *k8sResolver) { r.onPod(succeeded) },
+			wantOut: []string{"10.244.0.5", "fd00::5"},
+		},
+		{
+			name:    "failed pod evicted from cache",
+			seed:    map[string]podEntry{"10.244.0.5": {nodeIP: "10.0.0.1", uid: "uid-1"}},
+			event:   func(r *k8sResolver) { r.onPod(failed) },
+			wantOut: []string{"10.244.0.5"},
+		},
+		{
+			// IP reuse: the cache already holds the successor pod under a
+			// different UID. A late terminal update for the prior owner must
+			// not evict the new entry.
+			name:   "succeeded update after IP reuse preserves successor",
+			seed:   map[string]podEntry{"10.244.0.5": {nodeIP: "10.0.0.1", uid: "uid-successor"}},
+			event:  func(r *k8sResolver) { r.onPod(succeeded) },
+			wantIn: []string{"10.244.0.5"},
 		},
 	}
 	for _, tc := range cases {

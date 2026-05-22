@@ -21,7 +21,11 @@ The operator tree is built around these pieces:
   workload can fetch and renew a leaf certificate through Assam.
 
 The operator does not inject the RA-TLS mesh sidecar. Pod-to-pod mTLS remains
-the responsibility of the node-level `ratls-mesh` DaemonSet.
+the responsibility of the node-level `ratls-mesh` DaemonSet. The chart-managed
+mesh excludes `kube-system` and its own release namespace as local traffic
+sources, so API-server webhooks and c8s control-plane agents do not get
+captured by the pod-to-pod mesh path. Mesh endpoints are still resolved from
+pod IPs; the exclusion is not a broad destination denylist.
 
 ## Ownership model
 

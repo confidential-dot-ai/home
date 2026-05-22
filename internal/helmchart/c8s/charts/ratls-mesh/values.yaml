@@ -96,6 +96,10 @@ resources:
 
 # Iptables cleanup sidecar resources
 iptablesSync:
+  # Local source namespaces excluded from transparent mesh interception. The chart
+  # also appends its release namespace so ratls does not intercept its own control plane.
+  excludeSourceNamespaces:
+    - kube-system
   resyncPeriod: 30s
   watchdogPeriod: 2s
   ipsetMaxElem: 262144

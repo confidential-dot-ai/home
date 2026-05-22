@@ -198,6 +198,7 @@ func TestChartRendersRATLSHostRoutingDefaults(t *testing.T) {
 		{"--ipset-maxelem", "262144"},
 		{"--ready-file", "/tmp/ratls-iptables-ready"},
 		{"--iptables-metrics-file", "/tmp/ratls-iptables-metrics.json"},
+		{"--exclude-source-namespaces", "kube-system,c8s-system"},
 	} {
 		if !argvContainsFlagValue(sync.Command, pair[0], pair[1]) {
 			t.Errorf("iptables-sync command missing %s %s; command=%q", pair[0], pair[1], sync.Command)
@@ -214,7 +215,6 @@ func TestChartRendersRATLSHostRoutingDefaults(t *testing.T) {
 	if !argvContainsFlagValue(mesh.Args, "--iptables-metrics-file", "/tmp/ratls-iptables-metrics.json") {
 		t.Errorf("ratls-mesh args missing the shared iptables metrics file flag; args=%q", mesh.Args)
 	}
-
 	if hp, ok := containerHostPort(mesh, "inbound"); !ok || hp != 15006 {
 		t.Errorf("ratls-mesh inbound port must publish hostPort 15006; got %d (found=%v)", hp, ok)
 	}

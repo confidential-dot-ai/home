@@ -150,7 +150,7 @@ func (r *k8sResolver) applyPod(pod *corev1.Pod) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if pod.Spec.HostNetwork {
+	if !podEligibleForMeshEndpoint(pod) {
 		r.deletePodLocked(pod)
 		return true
 	}

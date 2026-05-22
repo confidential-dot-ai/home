@@ -91,6 +91,7 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 	if err != nil {
 		return fmt.Errorf("k8s clientset: %w", err)
 	}
+	excludedSourceNamespaces := parseExcludedNamespaces(cfg.excludeSourceNamespaces)
 
 	factory := informers.NewSharedInformerFactory(clientset, 0)
 	podInformer := factory.Core().V1().Pods().Informer()
@@ -116,7 +117,7 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 	if err := reconcileLiveSetMaxElem(logger, cfg.ipsetMaxElem); err != nil {
 		return err
 	}
-	if err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, cfg.ipsetMaxElem, logger); err != nil {
+	if err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, excludedSourceNamespaces, cfg.ipsetMaxElem, logger); err != nil {
 		return err
 	}
 	if err := installIptablesRules(logger, rules, jumps); err != nil {
@@ -147,7 +148,7 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 		case <-ticker.C:
 		case <-syncCh:
 		}
-		if err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, cfg.ipsetMaxElem, logger); err != nil {
+		if err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, excludedSourceNamespaces, cfg.ipsetMaxElem, logger); err != nil {
 			logger.Warn("pod ipset sync failed", "error", err)
 			continue
 		}
@@ -180,8 +181,8 @@ func runJumpWatchdog(ctx context.Context, logger *slog.Logger, jumps []iptablesR
 	}
 }
 
-func reconcilePodIPSets(store cache.Store, nodeIPs []string, ipsetMaxElem int, logger *slog.Logger) error {
-	sets := collectPodIPSetMembers(store.List(), nodeIPs)
+func reconcilePodIPSets(store cache.Store, nodeIPs []string, excludedSourceNamespaces map[string]struct{}, ipsetMaxElem int, logger *slog.Logger) error {
+	sets := collectPodIPSetMembers(store.List(), nodeIPs, excludedSourceNamespaces)
 	if sets.exceeds(ipsetMaxElem) {
 		ipsetOverflows.Add(1)
 		publishIptablesMetrics(logger)
@@ -219,7 +220,7 @@ func (m podIPSetMembers) exceeds(maxElem int) bool {
 		len(m.localIPv6) > maxElem
 }
 
-func collectPodIPSetMembers(objs []interface{}, nodeIPs []string) podIPSetMembers {
+func collectPodIPSetMembers(objs []interface{}, nodeIPs []string, excludedSourceNamespaces map[string]struct{}) podIPSetMembers {
 	ourNodeIPs := make(map[string]struct{}, len(nodeIPs))
 	for _, ip := range nodeIPs {
 		if canon := normalizeIP(ip); canon != "" {
@@ -244,13 +245,13 @@ func collectPodIPSetMembers(objs []interface{}, nodeIPs []string) podIPSetMember
 
 	for _, obj := range objs {
 		pod, ok := obj.(*corev1.Pod)
-		if !ok || pod.Spec.HostNetwork {
+		if !ok || !podEligibleForMeshEndpoint(pod) {
 			continue
 		}
-		local := podIsLocal(pod, ourNodeIPs)
+		localSource := podIsLocal(pod, ourNodeIPs) && podEligibleForMeshSource(pod, excludedSourceNamespaces)
 		for _, ip := range podStatusIPs(pod) {
 			add(ip, v4Set, v6Set)
-			if local {
+			if localSource {
 				add(ip, localV4Set, localV6Set)
 			}
 		}

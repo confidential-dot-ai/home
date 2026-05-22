@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestCollectPodIPSetMembersSkipsHostNetworkAndDeduplicates(t *testing.T) {
@@ -42,9 +43,23 @@ func TestCollectPodIPSetMembersSkipsHostNetworkAndDeduplicates(t *testing.T) {
 				PodIP:  "10.244.0.6",
 			},
 		},
-	}, []string{"10.0.0.1"})
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system"},
+			Status: corev1.PodStatus{
+				HostIP: "10.0.0.1",
+				PodIP:  "10.244.0.7",
+			},
+		},
+		&corev1.Pod{
+			Status: corev1.PodStatus{
+				Phase:  corev1.PodSucceeded,
+				HostIP: "10.0.0.1",
+				PodIP:  "10.244.0.8",
+			},
+		},
+	}, []string{"10.0.0.1"}, parseExcludedNamespaces("kube-system"))
 
-	if want := []string{"10.244.0.5", "10.244.0.6"}; !reflect.DeepEqual(sets.allIPv4, want) {
+	if want := []string{"10.244.0.5", "10.244.0.6", "10.244.0.7"}; !reflect.DeepEqual(sets.allIPv4, want) {
 		t.Fatalf("IPv4 pod IPs = %#v, want %#v", sets.allIPv4, want)
 	}
 	if want := []string{"fd00::5"}; !reflect.DeepEqual(sets.allIPv6, want) {
