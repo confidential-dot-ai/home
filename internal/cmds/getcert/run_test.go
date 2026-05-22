@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,42 @@ import (
 	"github.com/lunal-dev/c8s/internal/fileutil"
 	"github.com/lunal-dev/c8s/pkg/attestclient"
 )
+
+func TestAssamHTTPClientUsesDefaultTransportForPlainHTTP(t *testing.T) {
+	client, err := assamHTTPClient(config{
+		AssamURL:              "http://assam:8080",
+		AttestationServiceURL: "http://attestation-service:8400",
+	})
+	if err != nil {
+		t.Fatalf("assamHTTPClient: %v", err)
+	}
+	if client != http.DefaultClient {
+		t.Fatalf("client = %#v, want http.DefaultClient", client)
+	}
+}
+
+func TestAssamHTTPClientUsesRATLSForHTTPS(t *testing.T) {
+	client, err := assamHTTPClient(config{
+		AssamURL:              "https://assam:8080",
+		AttestationServiceURL: "http://attestation-service:8400",
+	})
+	if err != nil {
+		t.Fatalf("assamHTTPClient: %v", err)
+	}
+	if client == http.DefaultClient {
+		t.Fatal("client = http.DefaultClient, want RA-TLS client")
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", client.Transport)
+	}
+	if transport.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig is nil")
+	}
+	if !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("TLSClientConfig.InsecureSkipVerify = false, want RA-TLS verification path")
+	}
+}
 
 func TestParseFileMode(t *testing.T) {
 	tests := []struct {

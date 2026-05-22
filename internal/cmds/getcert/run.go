@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -32,11 +34,13 @@ import (
 	"github.com/lunal-dev/c8s/internal/fileutil"
 	"github.com/lunal-dev/c8s/pkg/attestclient"
 	"github.com/lunal-dev/c8s/pkg/certutil"
+	"github.com/lunal-dev/c8s/pkg/ratls"
 )
 
 // config holds all CLI configuration for get-cert.
 type config struct {
 	AssamURL               string
+	AssamMeasurements      string
 	AttestationServiceURL  string
 	OutPath                string
 	KeyPath                string
@@ -116,6 +120,7 @@ alongside a workload that uses the obtained certificate.`,
 
 	flags := cmd.Flags()
 	flags.StringVar(&cfg.AssamURL, "assam-url", "", "URL of the assam service (e.g. http://assam:8080)")
+	flags.StringVar(&cfg.AssamMeasurements, "assam-measurements", "", "comma-separated SHA-384 hex launch measurements for Assam RA-TLS verification (empty = accept any attested Assam)")
 	flags.StringVar(&cfg.AttestationServiceURL, "attestation-service-url", "", "URL of the local attestation service (e.g. http://localhost:8400)")
 	flags.StringVarP(&cfg.OutPath, "out", "o", "", "Path to write the signed certificate chain PEM (prints to stdout if omitted)")
 	flags.StringVar(&cfg.KeyPath, "key", "", "Path to a PEM private key to use for the CSR (generates an ephemeral key if omitted)")
@@ -149,6 +154,39 @@ func setupLogging(verbose bool) {
 	slog.SetDefault(slog.New(handler))
 }
 
+func newAssamClient(cfg config) (attestclient.Client, error) {
+	httpClient, err := assamHTTPClient(cfg)
+	if err != nil {
+		var zero attestclient.Client
+		return zero, err
+	}
+	return attestclient.NewClientWithHTTP(cfg.AssamURL, httpClient), nil
+}
+
+func assamHTTPClient(cfg config) (*http.Client, error) {
+	parsed, err := url.Parse(cfg.AssamURL)
+	if err != nil {
+		return nil, fmt.Errorf("--assam-url: %w", err)
+	}
+	if parsed.Scheme != "https" {
+		return http.DefaultClient, nil
+	}
+
+	measurements, err := ratls.ParseHexMeasurements(cfg.AssamMeasurements)
+	if err != nil {
+		return nil, fmt.Errorf("--assam-measurements: %w", err)
+	}
+	if len(measurements) == 0 {
+		slog.Warn("--assam-measurements not set; get-cert accepts any RA-TLS-attested Assam measurement")
+	}
+
+	client, err := ratls.NewVerifyingHTTPClient(measurements, cfg.AttestationServiceURL)
+	if err != nil {
+		return nil, fmt.Errorf("assam RA-TLS client: %w", err)
+	}
+	return client, nil
+}
+
 func run(cfg config) error {
 	slog.Info("starting get-cert", "san", cfg.SAN)
 
@@ -161,7 +199,10 @@ func run(cfg config) error {
 	}
 	slog.Debug("output paths validated")
 
-	client := attestclient.NewClient(cfg.AssamURL)
+	client, err := newAssamClient(cfg)
+	if err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
