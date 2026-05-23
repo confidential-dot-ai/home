@@ -35,8 +35,10 @@ type VerifyPolicy struct {
 	// Default: false (reject debug guests).
 	AllowDebug bool
 
-	// RequireSMT requires SMT (Simultaneous Multi-Threading) to be enabled.
-	// Default: false.
+	// RequireSMT requires the SNP guest policy to allow SMT
+	// (Simultaneous Multi-Threading).
+	// SMT is otherwise allowed by default, matching the upstream SEV-SNP
+	// verifier's guest-policy model and common CVM cloud behavior.
 	RequireSMT bool
 
 	// Nonce, when set, is verified against the attestation report's REPORTDATA.
@@ -303,15 +305,16 @@ func verifySEVSNP(att *Attestation, policy *VerifyPolicy, expectedReportData [64
 		return nil, fmt.Errorf("%w: %w", ErrSignatureInvalid, err)
 	}
 
-	// Validate report fields against policy.
-	validateOpts := &validate.Options{
-		GuestPolicy: sabi.SnpPolicy{
-			SMT:   policy.RequireSMT,
-			Debug: policy.AllowDebug,
-		},
-	}
+	// Validate report fields against policy. go-sev-guest treats each true
+	// GuestPolicy field as an allowed capability, not as a required property.
+	// SMT-enabled CVMs are common, so allow SMT by default and enforce
+	// RequireSMT explicitly below when callers ask for it.
+	validateOpts := snpValidateOptions(policy)
 	if err := validate.SnpAttestation(snpAttestation, validateOpts); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrPolicyViolation, err)
+	}
+	if err := enforceSNPRequiredPolicy(report, policy); err != nil {
+		return nil, err
 	}
 
 	// Validate measurement length before comparison.
@@ -341,6 +344,32 @@ func verifySEVSNP(att *Attestation, policy *VerifyPolicy, expectedReportData [64
 	copy(result.ReportData[:], report.ReportData)
 	copy(result.Measurement[:], report.Measurement)
 	return result, nil
+}
+
+func snpValidateOptions(policy *VerifyPolicy) *validate.Options {
+	if policy == nil {
+		policy = &VerifyPolicy{}
+	}
+	return &validate.Options{
+		GuestPolicy: sabi.SnpPolicy{
+			SMT:   true,
+			Debug: policy.AllowDebug,
+		},
+	}
+}
+
+func enforceSNPRequiredPolicy(report *spb.Report, policy *VerifyPolicy) error {
+	if policy == nil || !policy.RequireSMT {
+		return nil
+	}
+	guestPolicy, err := sabi.ParseSnpPolicy(report.Policy)
+	if err != nil {
+		return fmt.Errorf("%w: parse SNP guest policy: %w", ErrInvalidReport, err)
+	}
+	if !guestPolicy.SMT {
+		return fmt.Errorf("%w: SMT is required but not enabled", ErrPolicyViolation)
+	}
+	return nil
 }
 
 // parseSEVCertChain parses concatenated DER-encoded certificates into the

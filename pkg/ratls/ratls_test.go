@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	spb "github.com/google/go-sev-guest/proto/sevsnp"
 	"github.com/lunal-dev/c8s/pkg/types"
 )
 
@@ -35,7 +36,8 @@ func fakeSNPReport(reportData [64]byte) []byte {
 	report[0] = 0x02
 
 	// POLICY (offset 0x08): 8 bytes, little-endian
-	// Bit 17 = SMT allowed. Minimum: 0x30000 (ABI major=0, minor=0, SMT=1)
+	// Bit 16 = SMT allowed; bit 17 = reserved/must-be-one. Minimum: 0x30000
+	// (ABI major=0, minor=0, SMT=1)
 	report[0x08] = 0x00
 	report[0x09] = 0x00
 	report[0x0A] = 0x03 // SMT bit set
@@ -454,6 +456,36 @@ func TestTCBAtLeast(t *testing.T) {
 				t.Errorf("tcbAtLeast(0x%016x, 0x%016x) = %v, want %v", tt.current, tt.minimum, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSNPValidateOptionsAllowsSMTByDefault(t *testing.T) {
+	opts := snpValidateOptions(&VerifyPolicy{})
+	if !opts.GuestPolicy.SMT {
+		t.Fatal("SMT must be allowed by default")
+	}
+	if opts.GuestPolicy.Debug {
+		t.Fatal("debug guests must remain rejected by default")
+	}
+
+	opts = snpValidateOptions(&VerifyPolicy{AllowDebug: true})
+	if !opts.GuestPolicy.Debug {
+		t.Fatal("AllowDebug must allow debug guests")
+	}
+}
+
+func TestRequireSMTPolicy(t *testing.T) {
+	const smtPolicyBit = uint64(1 << 16)
+	const reservedPolicyBit = uint64(1 << 17)
+
+	if err := enforceSNPRequiredPolicy(&spb.Report{Policy: reservedPolicyBit}, &VerifyPolicy{}); err != nil {
+		t.Fatalf("unexpected error without RequireSMT: %v", err)
+	}
+	if err := enforceSNPRequiredPolicy(&spb.Report{Policy: reservedPolicyBit | smtPolicyBit}, &VerifyPolicy{RequireSMT: true}); err != nil {
+		t.Fatalf("unexpected error with SMT enabled: %v", err)
+	}
+	if err := enforceSNPRequiredPolicy(&spb.Report{Policy: reservedPolicyBit}, &VerifyPolicy{RequireSMT: true}); !errors.Is(err, ErrPolicyViolation) {
+		t.Fatalf("got %v, want ErrPolicyViolation", err)
 	}
 }
 
