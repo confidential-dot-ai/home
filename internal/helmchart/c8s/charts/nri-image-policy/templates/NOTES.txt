@@ -1,20 +1,25 @@
 {{ include "nri-image-policy.fullname" . }} installed in namespace {{ .Release.Namespace }}.
 
-Plugin name (must match required_plugins): {{ .Values.pluginName }}
-Mode:                                     {{ .Values.policy.mode }}
-Bootstrap digests:                        {{ len (default dict .Values.bootstrapWhitelist.digests) }}
-Restart command:                          {{ include "nri-image-policy.restartCommand" . }}
+  Worker installer DS:  {{ include "nri-image-policy.fullname" . }}-worker  (pull mode, polls {{ .Values.cds.url }})
+  CDS installer DS:     {{ include "nri-image-policy.fullname" . }}-cds     (push mode)
+  Push hook:            post-install/post-upgrade Job
+  CDS node selector:    {{ include "nri-image-policy.cdsNodeKey" . }}={{ include "nri-image-policy.cdsNodeValue" . }}
+  Mode:                 {{ .Values.policy.mode }}
+  Bootstrap digests:    {{ len (default dict .Values.bootstrapWhitelist.digests) }}
+  Containerd restart:   {{ include "nri-image-policy.restartCommand" . }}
 
-Verify the install rolled out cleanly:
+To rotate the CDS image digest:
 
-    kubectl -n {{ .Release.Namespace }} rollout status ds/{{ include "nri-image-policy.fullname" . }} --timeout=5m
+  helm upgrade {{ .Release.Name }} <chart> \
+    --set cds.image.digest=sha256:<new> \
+    --set cds.image.reference=ghcr.io/<owner>/cds:<new>
 
-Confirm the host plugin is running on a node:
+The post-install/post-upgrade hook re-fires and pushes the new digest into the
+CDS-node plugin's unix socket. The plugin persists the payload to
+{{ .Values.hostPaths.cacheDir }}/pushed.json so it survives restarts.
 
-    NODE=$(kubectl -n {{ .Release.Namespace }} get pod -l app.kubernetes.io/instance={{ .Release.Name }} -o jsonpath='{.items[0].spec.nodeName}')
-    kubectl debug node/$NODE -it --image=busybox -- ls -la /host{{ .Values.hostPaths.pluginDir }} /host{{ .Values.hostPaths.configDir }}
+To uninstall and revert containerd patches:
 
-Read the chart README.md before upgrading, uninstalling, or changing the
-install image. It documents the whitelist ordering, cleanup behavior,
-first-install trust boundary, plugin-source contract, and node distro
-compatibility constraints.
+  helm uninstall {{ .Release.Name }}
+
+Read README.md for the node-image-baking transition path.

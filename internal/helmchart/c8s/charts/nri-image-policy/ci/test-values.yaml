@@ -1,6 +1,14 @@
 image:
   tag: ci-test
+  digest: "sha256:aaaa000000000000000000000000000000000000000000000000000000000000"
+cds:
+  image:
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+    reference: "ghcr.io/lunal-dev/cds:ci-test"
+  url: "http://cds.c8s-system.svc:8080"
+  node:
+    selector:
+      role: cds-node
 bootstrapWhitelist:
   digests:
-    "sha256:0000000000000000000000000000000000000000000000000000000000000001": "ghcr.io/lunal-dev/nri-image-policy:ci-test"
-    "sha256:0000000000000000000000000000000000000000000000000000000000000002": "ghcr.io/lunal-dev/assam:ci-test"
+    "sha256:0000000000000000000000000000000000000000000000000000000000000002": "ghcr.io/lunal-dev/nri-image-policy:ci-test"

@@ -989,28 +989,41 @@ func TestChartRatlsMeshCDSMeasurementsFlagsThrough(t *testing.T) {
 	}
 }
 
-func TestChartNRIWhitelistUsesRATLSAssam(t *testing.T) {
-	const measurement = "abc1230000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff"
+func TestChartNRIImagePolicyUsesCDSPushAndPullModes(t *testing.T) {
 	out, err := helmTemplate(t,
-		"--set", "nri-image-policy.assam.measurements[0]="+measurement,
+		"--set", "nri-image-policy.cds.url=http://c8s-cds.c8s-system.svc:8080",
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	cm := renderedConfigMap(t, out, "c8s-nri-image-policy-runtime")
-	cfg := cm.Data["image-policy.yaml"]
+
+	worker := renderedDaemonSet(t, out, "c8s-nri-image-policy-worker")
+	workerInstall := strings.Join(containerArgs(t, &worker, "install"), "\n")
 	for _, want := range []string{
-		`url: "https://127.0.0.1:30808"`,
-		`attestation_service_url: ""`,
-		`assam_measurements:`,
-		`- "` + measurement + `"`,
+		`pull:`,
+		`url: "http://c8s-cds.c8s-system.svc:8080"`,
+		`interval: "30s"`,
 	} {
-		if !strings.Contains(cfg, want) {
-			t.Fatalf("runtime config missing %q\n%s", want, cfg)
+		if !strings.Contains(workerInstall, want) {
+			t.Fatalf("worker install script missing %q\n%s", want, workerInstall)
 		}
 	}
-	if strings.Contains(cfg, `url: "http://127.0.0.1:30808"`) {
-		t.Fatalf("runtime config still uses plaintext Assam URL\n%s", cfg)
+	if strings.Contains(workerInstall, `push:`) || strings.Contains(workerInstall, `assam_measurements`) {
+		t.Fatalf("worker boot config contains stale push/Assam fields\n%s", workerInstall)
+	}
+
+	cds := renderedDaemonSet(t, out, "c8s-nri-image-policy-cds")
+	cdsInstall := strings.Join(containerArgs(t, &cds, "install"), "\n")
+	for _, want := range []string{
+		`push:`,
+		`persist_path: "/var/lib/nri-image-policy/pushed.json"`,
+	} {
+		if !strings.Contains(cdsInstall, want) {
+			t.Fatalf("CDS install script missing %q\n%s", want, cdsInstall)
+		}
+	}
+	if strings.Contains(cdsInstall, `pull:`) || strings.Contains(cdsInstall, `127.0.0.1:30808`) {
+		t.Fatalf("CDS boot config contains stale pull/Assam fields\n%s", cdsInstall)
 	}
 }
 
@@ -2265,18 +2278,20 @@ func TestChartNriImagePolicyDistroSelectsContainerdLayout(t *testing.T) {
 			if err != nil {
 				t.Fatalf("helm template: %v\n%s", err, out)
 			}
-			ds := renderedDaemonSet(t, out, "c8s-nri-image-policy")
-			if got := hostPathVolume(t, ds, "host-containerd-config"); got != tc.wantDir {
-				t.Fatalf("distro %q: host-containerd-config hostPath = %q, want %q", tc.distro, got, tc.wantDir)
-			}
-			env := initContainerEnv(t, ds, "install")
-			for name, want := range map[string]string{
-				"HOST_CONTAINERD_DIR":    tc.wantDir,
-				"CONTAINERD_CONFIG_MODE": tc.wantMode,
-				"RESTART_COMMAND":        tc.wantRestart,
-			} {
-				if got := env[name]; got != want {
-					t.Fatalf("distro %q: install env %s = %q, want %q", tc.distro, name, got, want)
+			for _, name := range []string{"c8s-nri-image-policy-worker", "c8s-nri-image-policy-cds"} {
+				ds := renderedDaemonSet(t, out, name)
+				if got := hostPathVolume(t, ds, "host-containerd-config"); got != tc.wantDir {
+					t.Fatalf("%s distro %q: host-containerd-config hostPath = %q, want %q", name, tc.distro, got, tc.wantDir)
+				}
+				script := strings.Join(containerArgs(t, &ds, "install"), "\n")
+				for _, want := range []string{
+					"CONTAINERD_DIR=/host" + tc.wantDir,
+					`CONTAINERD_CONFIG_MODE="` + tc.wantMode + `"`,
+					`RESTART_COMMAND="` + tc.wantRestart + `"`,
+				} {
+					if !strings.Contains(script, want) {
+						t.Fatalf("%s distro %q: install script missing %q\n%s", name, tc.distro, want, script)
+					}
 				}
 			}
 		})
@@ -2302,19 +2317,21 @@ func TestChartNriImagePolicyContainerdPrepInitContainer(t *testing.T) {
 		if err != nil {
 			t.Fatalf("helm template: %v\n%s", err, out)
 		}
-		ds := renderedDaemonSet(t, out, "c8s-nri-image-policy")
-		names := containerNames(ds.Spec.Template.Spec.InitContainers)
-		prepIdx, installIdx := slices.Index(names, "containerd-prep"), slices.Index(names, "install")
-		if prepIdx < 0 {
-			t.Fatalf("rke2: nri-image-policy DaemonSet missing containerd-prep initContainer; have %v", names)
-		}
-		// initContainers run in order — prep must precede install.
-		if prepIdx > installIdx {
-			t.Fatalf("containerd-prep must run before install; initContainers=%v", names)
-		}
-		env := initContainerEnv(t, ds, "containerd-prep")
-		if got := env["HOST_CONTAINERD_DIR"]; got != "/var/lib/rancher/rke2/agent/etc/containerd" {
-			t.Errorf("HOST_CONTAINERD_DIR = %q, want the rke2 containerd dir", got)
+		for _, name := range []string{"c8s-nri-image-policy-worker", "c8s-nri-image-policy-cds"} {
+			ds := renderedDaemonSet(t, out, name)
+			names := containerNames(ds.Spec.Template.Spec.InitContainers)
+			prepIdx, installIdx := slices.Index(names, "containerd-prep"), slices.Index(names, "install")
+			if prepIdx < 0 {
+				t.Fatalf("rke2: %s missing containerd-prep initContainer; have %v", name, names)
+			}
+			// initContainers run in order: prep must precede install.
+			if prepIdx > installIdx {
+				t.Fatalf("%s: containerd-prep must run before install; initContainers=%v", name, names)
+			}
+			env := initContainerEnv(t, ds, "containerd-prep")
+			if got := env["HOST_CONTAINERD_DIR"]; got != "/var/lib/rancher/rke2/agent/etc/containerd" {
+				t.Errorf("%s HOST_CONTAINERD_DIR = %q, want the rke2 containerd dir", name, got)
+			}
 		}
 	})
 
@@ -2323,9 +2340,11 @@ func TestChartNriImagePolicyContainerdPrepInitContainer(t *testing.T) {
 		if err != nil {
 			t.Fatalf("helm template: %v\n%s", err, out)
 		}
-		ds := renderedDaemonSet(t, out, "c8s-nri-image-policy")
-		if _, ok := findContainer(ds.Spec.Template.Spec.InitContainers, "containerd-prep"); ok {
-			t.Fatalf("k8s: nri-image-policy must not carry a containerd-prep initContainer")
+		for _, name := range []string{"c8s-nri-image-policy-worker", "c8s-nri-image-policy-cds"} {
+			ds := renderedDaemonSet(t, out, name)
+			if _, ok := findContainer(ds.Spec.Template.Spec.InitContainers, "containerd-prep"); ok {
+				t.Fatalf("k8s: %s must not carry a containerd-prep initContainer", name)
+			}
 		}
 	})
 }
@@ -2376,6 +2395,10 @@ func helmTemplate(t *testing.T, args ...string) (string, error) {
 		"--set", "certIssuer.image.tag=dev",
 		"--set", "ratls-mesh.image.tag=dev",
 		"--set", "nri-image-policy.image.tag=dev",
+		"--set", "nri-image-policy.image.digest=sha256:aaaa000000000000000000000000000000000000000000000000000000000000",
+		"--set", "nri-image-policy.cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001",
+		"--set", "nri-image-policy.cds.image.reference=ghcr.io/lunal-dev/cds:dev",
+		"--set", "nri-image-policy.cds.node.selector.role=cds-node",
 		"--set", "tee-proxy.image.tag=dev",
 	}
 	cmd := exec.Command("helm", append(base, args...)...)

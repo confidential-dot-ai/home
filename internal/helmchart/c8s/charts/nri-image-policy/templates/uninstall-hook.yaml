@@ -1,14 +1,4 @@
 {{- if .Values.uninstall.enabled }}
-# Pre-delete hook DaemonSet. Runs on every node when `helm uninstall` fires
-# to revert the containerd config patch, kill the host plugin, and remove
-# the binary + configs + cache. Helm waits for the DS to be Ready (each
-# pod's init must succeed) before proceeding to delete the rest of the
-# release.
-#
-# Operators that don't want the cleanup (e.g. for forensics) can run
-# `helm uninstall --no-hooks`. Operators that want a fresh install on the
-# same nodes can run normal `helm uninstall` + `helm install` and the
-# host state ends up clean.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -42,63 +32,11 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
       tolerations:
         - operator: "Exists"
           effect: "NoExecute"
         - operator: "Exists"
           effect: "NoSchedule"
-      initContainers:
-        - name: uninstall
-          image: {{ include "nri-image-policy.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          securityContext:
-            privileged: true
-          env:
-            - name: HOST_PLUGIN_PATH
-              value: {{ include "nri-image-policy.hostPluginPath" . | quote }}
-            - name: HOST_BOOTSTRAP_PATH
-              value: {{ include "nri-image-policy.hostBootstrapPath" . | quote }}
-            - name: HOST_CONFIG_PATH
-              value: {{ include "nri-image-policy.hostConfigPath" . | quote }}
-            - name: HOST_CONTAINERD_DIR
-              value: {{ include "nri-image-policy.containerdConfigDir" . | quote }}
-            - name: CONTAINERD_CONFIG_MODE
-              value: {{ include "nri-image-policy.containerdConfigMode" . | quote }}
-            - name: HOST_CACHE_DIR
-              value: {{ .Values.hostPaths.cacheDir | quote }}
-            - name: RESTART_COMMAND
-              value: {{ include "nri-image-policy.restartCommand" . | quote }}
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-{{ .Files.Get "files/scripts/uninstall.sh" | indent 14 }}
-          volumeMounts:
-            - name: host-plugin-dir
-              mountPath: /host{{ .Values.hostPaths.pluginDir }}
-            - name: host-config-dir
-              mountPath: /host{{ .Values.hostPaths.configDir }}
-            - name: host-containerd-config
-              mountPath: /host{{ include "nri-image-policy.containerdConfigDir" . }}
-            - name: host-cache-dir
-              mountPath: /host{{ .Values.hostPaths.cacheDir }}
-          resources:
-            {{- toYaml .Values.resources | nindent 12 }}
-      containers:
-        - name: pause
-          image: {{ include "nri-image-policy.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["/bin/sh", "-c", "sleep infinity"]
-          resources:
-            requests:
-              cpu: 10m
-              memory: 16Mi
-            limits:
-              cpu: 50m
-              memory: 32Mi
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -114,21 +52,47 @@ spec:
                     values:
                       {{- toYaml .values | nindent 22 }}
                   {{- end }}
+      initContainers:
+        - name: uninstall
+          image: {{ include "nri-image-policy.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          env:
+            - name: HOST_PLUGIN_PATH
+              value: {{ include "nri-image-policy.hostPluginPath" . | quote }}
+            - name: HOST_CONFIG_PATH
+              value: {{ include "nri-image-policy.hostConfigPath" . | quote }}
+            - name: HOST_CONTAINERD_DIR
+              value: {{ include "nri-image-policy.containerdConfigDir" . | quote }}
+            - name: CONTAINERD_CONFIG_MODE
+              value: {{ include "nri-image-policy.containerdConfigMode" . | quote }}
+            - name: HOST_CACHE_DIR
+              value: {{ .Values.hostPaths.cacheDir | quote }}
+            - name: HOST_HEALTH_SOCKET
+              value: {{ include "nri-image-policy.hostHealthSocket" . | quote }}
+            - name: RESTART_COMMAND
+              value: {{ include "nri-image-policy.restartCommand" . | quote }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+{{ .Files.Get "files/scripts/uninstall.sh" | indent 14 }}
+          volumeMounts:
+            {{- include "nri-image-policy.hostVolumeMounts" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      containers:
+        - name: pause
+          image: {{ include "nri-image-policy.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
       volumes:
-        - name: host-plugin-dir
-          hostPath:
-            path: {{ .Values.hostPaths.pluginDir }}
-            type: DirectoryOrCreate
-        - name: host-config-dir
-          hostPath:
-            path: {{ .Values.hostPaths.configDir }}
-            type: DirectoryOrCreate
-        - name: host-containerd-config
-          hostPath:
-            path: {{ include "nri-image-policy.containerdConfigDir" . }}
-            type: Directory
-        - name: host-cache-dir
-          hostPath:
-            path: {{ .Values.hostPaths.cacheDir }}
-            type: DirectoryOrCreate
+        {{- include "nri-image-policy.hostVolumes" . | nindent 8 }}
 {{- end }}

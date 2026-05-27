@@ -23,7 +23,7 @@ dependencies:
     repository: file://charts/ratls-mesh
     condition: ratls-mesh.enabled
   - name: nri-image-policy
-    version: 0.2.0
+    version: 0.3.0
     repository: file://charts/nri-image-policy
     condition: nri-image-policy.enabled
   - name: tee-proxy

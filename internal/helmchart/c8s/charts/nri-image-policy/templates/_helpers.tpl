@@ -42,54 +42,88 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Image reference
+Install image reference.
 */}}
 {{- define "nri-image-policy.image" -}}
 {{ include "c8s-common.image" .Values.image }}
 {{- end }}
 
 {{/*
-Full host path of the installed plugin binary.
+Single nodeSelector entry from cds.node.selector. The chart requires exactly
+one label key/value pair so both CDS-installer affinity (matching) and
+worker-installer anti-affinity (NotIn) can be derived mechanically.
+*/}}
+{{- define "nri-image-policy.cdsNodeKey" -}}
+{{- $sel := .Values.cds.node.selector -}}
+{{- if ne (len $sel) 1 -}}
+{{- fail "cds.node.selector must be exactly one key/value pair (e.g. {role: cds-node})" -}}
+{{- end -}}
+{{- range $k, $_ := $sel }}{{ $k }}{{ end -}}
+{{- end }}
+
+{{- define "nri-image-policy.cdsNodeValue" -}}
+{{- $sel := .Values.cds.node.selector -}}
+{{- range $_, $v := $sel }}{{ $v }}{{ end -}}
+{{- end }}
+
+{{/*
+Host paths derived from values.
 */}}
 {{- define "nri-image-policy.hostPluginPath" -}}
 {{ printf "%s/%s" .Values.hostPaths.pluginDir .Values.pluginFilename }}
 {{- end }}
 
-{{/*
-Full host path of the rendered runtime config (image-policy.yaml).
-*/}}
 {{- define "nri-image-policy.hostConfigPath" -}}
 {{ printf "%s/image-policy.yaml" .Values.hostPaths.configDir }}
 {{- end }}
 
-{{/*
-Full host path of the rendered bootstrap allowlist.
-*/}}
-{{- define "nri-image-policy.hostBootstrapPath" -}}
-{{ printf "%s/bootstrap.yaml" .Values.hostPaths.configDir }}
-{{- end }}
-
-{{/*
-Full host path of the plugin's health unix socket.
-*/}}
 {{- define "nri-image-policy.hostHealthSocket" -}}
-{{ printf "%s/%s" .Values.hostPaths.runtimeDir .Values.healthSocket }}
+{{ printf "%s/%s" .Values.hostPaths.runtimeDir .Values.healthSocketName }}
 {{- end }}
 
 {{/*
-  Containerd config handling differs by host distro.
-
-  k8s (vanilla / kubeadm): the installer patches the containerd config in
-  place, between sentinel markers.
-
-  rke2: RKE2 regenerates its containerd config from a template on every
-  supervisor restart, so an in-place patch does not survive. The installer
-  writes a standalone drop-in file into config-v3.toml.d/ instead (the dir
-  tracks the containerd config schema version); the DaemonSet's
-  containerd-prep initContainer adds the matching import.
+Shared hostPath mounts and volumes used by installer DaemonSets and the
+uninstall hook.
 */}}
+{{- define "nri-image-policy.hostVolumeMounts" -}}
+- name: host-plugin-dir
+  mountPath: /host{{ .Values.hostPaths.pluginDir }}
+- name: host-config-dir
+  mountPath: /host{{ .Values.hostPaths.configDir }}
+- name: host-containerd-config
+  mountPath: /host{{ include "nri-image-policy.containerdConfigDir" . }}
+- name: host-cache-dir
+  mountPath: /host{{ .Values.hostPaths.cacheDir }}
+- name: host-runtime-dir
+  mountPath: /host{{ .Values.hostPaths.runtimeDir }}
+{{- end }}
 
-{{/* Host containerd config directory bind-mounted into the installer. */}}
+{{- define "nri-image-policy.hostVolumes" -}}
+- name: host-plugin-dir
+  hostPath:
+    path: {{ .Values.hostPaths.pluginDir }}
+    type: DirectoryOrCreate
+- name: host-config-dir
+  hostPath:
+    path: {{ .Values.hostPaths.configDir }}
+    type: DirectoryOrCreate
+- name: host-containerd-config
+  hostPath:
+    path: {{ include "nri-image-policy.containerdConfigDir" . }}
+    type: Directory
+- name: host-cache-dir
+  hostPath:
+    path: {{ .Values.hostPaths.cacheDir }}
+    type: DirectoryOrCreate
+- name: host-runtime-dir
+  hostPath:
+    path: {{ .Values.hostPaths.runtimeDir }}
+    type: DirectoryOrCreate
+{{- end }}
+
+{{/*
+Host containerd config directory bind-mounted into the installer.
+*/}}
 {{- define "nri-image-policy.containerdConfigDir" -}}
 {{- if .Values.containerd.configDir -}}
 {{ .Values.containerd.configDir }}
@@ -103,8 +137,8 @@ Full host path of the plugin's health unix socket.
 {{- end -}}
 
 {{/*
-  patch  = splice an in-place sentinel-delimited block into config.toml.
-  dropin = write a standalone file the installer owns entirely.
+patch  = splice an in-place sentinel-delimited block into config.toml.
+dropin = write a standalone file the installer owns entirely.
 */}}
 {{- define "nri-image-policy.containerdConfigMode" -}}
 {{- if eq .Values.distro "rke2" -}}
@@ -116,7 +150,9 @@ patch
 {{- end -}}
 {{- end -}}
 
-{{/* Host service restart that makes containerd re-read its config. */}}
+{{/*
+Host service restart that makes containerd re-read its config.
+*/}}
 {{- define "nri-image-policy.restartCommand" -}}
 {{- if .Values.containerd.restartCommand -}}
 {{ .Values.containerd.restartCommand }}
@@ -127,7 +163,9 @@ systemctl restart containerd
 {{- end -}}
 {{- end -}}
 
-{{/* Host containerd socket the plugin connects to. */}}
+{{/*
+Host containerd socket the plugin connects to.
+*/}}
 {{- define "nri-image-policy.containerdSocket" -}}
 {{- if .Values.containerd.socket -}}
 {{ .Values.containerd.socket }}

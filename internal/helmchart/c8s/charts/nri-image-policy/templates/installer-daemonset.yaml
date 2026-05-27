@@ -1,0 +1,124 @@
+{{/*
+Two installer DaemonSets share the same pod spec. The CDS-node DS pins
+to cds.node.selector (operator: In) and writes push-mode boot config;
+the worker DS NotIns the same label and writes pull-mode boot config.
+*/}}
+{{- range $archetype := list "cds" "worker" }}
+{{- $cds := eq $archetype "cds" }}
+{{- $op := ternary "In" "NotIn" $cds }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "nri-image-policy.fullname" $ }}-{{ $archetype }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "nri-image-policy.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: nri-installer-{{ $archetype }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "nri-image-policy.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: nri-installer-{{ $archetype }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        {{- include "nri-image-policy.selectorLabels" $ | nindent 8 }}
+        app.kubernetes.io/component: nri-installer-{{ $archetype }}
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      hostPID: true
+      {{- with $.Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and $cds $.Values.cds.node.tolerations }}
+      tolerations:
+        {{- toYaml $.Values.cds.node.tolerations | nindent 8 }}
+      {{- else }}
+      tolerations:
+        - operator: "Exists"
+          effect: "NoExecute"
+        - operator: "Exists"
+          effect: "NoSchedule"
+      {{- end }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values:
+                      - linux
+                  - key: {{ include "nri-image-policy.cdsNodeKey" $ | quote }}
+                    operator: {{ $op }}
+                    values:
+                      - {{ include "nri-image-policy.cdsNodeValue" $ | quote }}
+                  {{- range $.Values.nodeAffinity.excludeLabels }}
+                  - key: {{ .key }}
+                    operator: NotIn
+                    values:
+                      {{- toYaml .values | nindent 22 }}
+                  {{- end }}
+      initContainers:
+        {{- if eq $.Values.distro "rke2" }}
+        - name: containerd-prep
+          image: {{ include "c8s-common.image" $.Values.containerdPrep.image }}
+          imagePullPolicy: {{ $.Values.containerdPrep.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          env:
+            - name: HOST_CONTAINERD_DIR
+              value: {{ include "nri-image-policy.containerdConfigDir" $ | quote }}
+            # The literal RKE2 base-config include, written verbatim into a
+            # freshly created config template. Escaped so Helm emits it as-is.
+            - name: BASE_DIRECTIVE
+              value: '{{ "{{ template \"base\" . }}" }}'
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+{{ $.Files.Get "files/scripts/containerd-prep.sh" | indent 14 }}
+          volumeMounts:
+            - name: host-containerd-config
+              mountPath: /host{{ include "nri-image-policy.containerdConfigDir" $ }}
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+        {{- end }}
+        - name: install
+          image: {{ include "nri-image-policy.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+{{ include "nri-image-policy.installScript" (dict "root" $ "archetype" $archetype "bootConfig" (include "nri-image-policy.bootConfig" (dict "root" $ "archetype" $archetype))) | indent 14 }}
+          volumeMounts:
+            {{- include "nri-image-policy.hostVolumeMounts" $ | nindent 12 }}
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+      containers:
+        - name: pause
+          image: {{ include "nri-image-policy.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      volumes:
+        {{- include "nri-image-policy.hostVolumes" $ | nindent 8 }}
+{{- end }}

@@ -1,0 +1,83 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "nri-image-policy.fullname" . }}-push
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nri-image-policy.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cds-digest-push
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: hook-succeeded,before-hook-creation
+spec:
+  backoffLimit: {{ .Values.push.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.push.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "nri-image-policy.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: cds-digest-push
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.cds.node.selector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.cds.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: push
+          image: {{ include "nri-image-policy.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: SOCKET
+              value: {{ printf "%s/%s" .Values.hostPaths.runtimeDir .Values.healthSocketName | quote }}
+            - name: PAYLOAD
+              value: |-
+                {"version":"1","digests":{ {{ required "cds.image.digest is required" .Values.cds.image.digest | quote }}: {{ required "cds.image.reference is required" .Values.cds.image.reference | quote }} }}
+            - name: MAX_TIME
+              value: {{ .Values.push.curlMaxTime | quote }}
+            - name: RETRIES
+              value: {{ .Values.push.retries | quote }}
+            - name: RETRY_DELAY
+              value: {{ .Values.push.retryDelay | quote }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              i=0
+              while [ "$i" -lt "$RETRIES" ]; do
+                if curl --unix-socket "$SOCKET" \
+                        --fail --silent --show-error \
+                        --max-time "$MAX_TIME" \
+                        -X PUT http://localhost/whitelist \
+                        -H 'Content-Type: application/json' \
+                        --data "$PAYLOAD"; then
+                  echo "push succeeded"
+                  exit 0
+                fi
+                i=$((i + 1))
+                echo "push attempt $i failed; sleeping $RETRY_DELAY s"
+                sleep "$RETRY_DELAY"
+              done
+              echo "push failed after $RETRIES attempts" >&2
+              exit 1
+          volumeMounts:
+            - name: nri-socket
+              mountPath: {{ .Values.hostPaths.runtimeDir | quote }}
+          resources:
+            {{- toYaml .Values.push.resources | nindent 12 }}
+      volumes:
+        - name: nri-socket
+          hostPath:
+            path: {{ .Values.hostPaths.runtimeDir | quote }}
+            type: Directory

@@ -1,14 +1,12 @@
 apiVersion: v2
 name: nri-image-policy
-description: NRI plugin for container image whitelisting and label-based admission
+description: |
+  Installs the NRI image-policy plugin onto every node via two
+  installer DaemonSets (CDS-node in push mode, workers in pull mode)
+  and pushes the deployment-specific CDS image digest to the CDS-node
+  plugin via a post-install/post-upgrade hook Job.
 type: application
-# 0.2.0: breaking schema change — plugin runs as a containerd-managed host
-# process (not a long-running pod), default_validator + required_plugins
-# enforced via patched containerd config, whitelist refresh moved to disk
-# cache, KBS/TPM mode removed, healthPort replaced by healthSocket.
-# Helm only treats templates/NOTES.txt as post-install notes; durable
-# operator guidance lives in README.md.
-version: 0.2.0
+version: 0.3.0
 home: https://github.com/lunal-dev/c8s-charts
 maintainers:
   - name: lunal

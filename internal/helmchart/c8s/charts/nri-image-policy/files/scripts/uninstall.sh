@@ -8,12 +8,12 @@
 #
 # Env (all required; chart pod spec wires them via .Values):
 #   HOST_PLUGIN_PATH       — host path of the plugin binary
-#   HOST_BOOTSTRAP_PATH    — host path of bootstrap.yaml
 #   HOST_CONFIG_PATH       — host path of the runtime config
 #   HOST_CONTAINERD_DIR    — host containerd config directory, mounted at
 #                            /host<dir>
 #   CONTAINERD_CONFIG_MODE — "patch" or "dropin", matching install.sh
 #   HOST_CACHE_DIR         — host cache directory the plugin wrote into
+#   HOST_HEALTH_SOCKET     — host path of the plugin health/push unix socket
 #   RESTART_COMMAND        — `systemctl restart …` run via nsenter into PID 1
 set -eu
 
@@ -68,8 +68,8 @@ fi
 # 3. Remove host artifacts. Cache last so a partial-failure re-run still
 #    has the binary/config to retry against.
 rm -f "/host${HOST_PLUGIN_PATH}"
-rm -f "/host${HOST_BOOTSTRAP_PATH}"
 rm -f "/host${HOST_CONFIG_PATH}"
+rm -f "/host${HOST_HEALTH_SOCKET}"
 rm -rf "/host${HOST_CACHE_DIR}"
 echo "host artifacts removed"
 

@@ -1,18 +1,26 @@
+# nri-image-policy chart values.
+#
+# Transitional chart: installs the plugin onto every node via two installer
+# DaemonSets (one for the CDS node in push mode, one for workers in pull mode),
+# then pushes the deployment-specific CDS digest to the CDS-node plugin via a
+# post-install/post-upgrade hook.
+#
+# Once node images bake the plugin directly, the operator disables this whole
+# chart at the umbrella level (`nri-image-policy.enabled: false`) and a future
+# chart handles digest delivery.
+
+# Install image (ships the plugin binary plus curl/nsenter/awk/install/cmp for
+# the privileged init container's host-side work).
 image:
   repository: ghcr.io/lunal-dev/nri-image-policy
-  # -- Image tag. Required: the chart does not pin a default; the consumer
-  #    (HelmRelease values or cluster overlay) must set tag or digest. The
-  #    image must contain both the host plugin binary at
-  #    /usr/local/bin/nri-image-policy and the install scripts the
-  #    DaemonSet executes (install-host-plugin.sh, patch-containerd.sh).
   tag: ""
   digest: ""
   pullPolicy: IfNotPresent
 
-# RKE2-only containerd-prep initContainer. Runs `privileged: true` with the
-# host root mounted to wire up the drop-in import before the install
-# container runs. Any minimal POSIX image works — but a repointed tag would
-# be root on every node, so digest-pin it.
+# RKE2-only containerd-prep initContainer. Runs privileged with the host
+# containerd config directory mounted to wire up the drop-in import before the
+# installer writes its NRI drop-in. Digest-pin this image because it runs as root
+# on every selected node.
 containerdPrep:
   image:
     repository: busybox
@@ -22,151 +30,113 @@ containerdPrep:
 
 imagePullSecrets: []
 
-# Pin this DaemonSet to a subset of nodes. Empty (default) installs on all
-# nodes the existing nodeAffinity allows.
-nodeSelector: {}
-
-# Plugin name. Must match the name the host binary registers with at the NRI
-# socket and the entry written to containerd's default_validator.required_plugins.
-# Renaming this is a coordinated change — once a cluster has required_plugins
-# set, the new name must be deployed before old nodes restart, or the
-# default_validator will reject all container creates.
+# Plugin name. Must match the name the binary registers with at the NRI socket
+# and the entry written to containerd's default_validator.required_plugins.
 pluginName: nri-image-policy
-
-# Host paths the install DaemonSet writes to. These are the paths containerd
-# reads at runtime; changing them requires a coordinated containerd config
-# update.
-hostPaths:
-  # Where the install-DaemonSet drops the plugin binary. Containerd's
-  # plugin_path must match.
-  pluginDir: /opt/nri/plugins
-  # Where bootstrap.yaml and image-policy.yaml are written. Containerd's
-  # plugin_config_path must match.
-  configDir: /etc/nri/conf.d
-  # Where the plugin caches the signed whitelist between refreshes.
-  cacheDir: /var/lib/nri-image-policy
-  # Where the plugin's health unix socket is created. The install-DaemonSet
-  # mounts this so it can probe the plugin without hostNetwork.
-  runtimeDir: /var/run/nri-image-policy
 
 # Plugin filename inside hostPaths.pluginDir. The "10-" prefix sets sort order
 # relative to other NRI plugins.
 pluginFilename: 10-nri-image-policy
 
-# Host Kubernetes distro. Selects the containerd config layout the install
-# DaemonSet targets:
-#   k8s  — vanilla / kubeadm: the NRI block is patched into
-#          /etc/containerd/config.toml in place, delimited by sentinel markers.
-#   rke2 — RKE2 regenerates its containerd config from a template on every
-#          supervisor restart, so an in-place patch does not survive. The
-#          installer writes a standalone config-v3.toml.d/ drop-in instead
-#          (the dir tracks the containerd config schema version); the
-#          DaemonSet's containerd-prep initContainer adds the matching import.
+# CDS coordinates used by the split installer model.
+cds:
+  # CDS image to whitelist on the CDS-node plugin. Required. The push hook PUTs
+  # a single-entry whitelist containing image.digest into the CDS-node plugin's
+  # unix socket; image.reference is recorded for audit.
+  image:
+    digest: ""    # e.g. "sha256:abc...64hex"
+    reference: "" # human image reference recorded alongside the digest
+  # CDS service URL the worker installer writes into pull-mode boot config.
+  # Workers poll this endpoint with ETag. Required.
+  url: ""         # e.g. "http://c8s-cds.c8s-system.svc:8080"
+  # CDS node identity. The CDS installer and push hook pin to this selector;
+  # the worker installer NotIns against the same key/value. Must be exactly one
+  # key/value pair, e.g. {role: cds-node}.
+  node:
+    selector: {}
+    tolerations: []
+
+# Push hook tuning. The hook uses the install image; image.digest is rendered
+# into always_allow so the hook Pod can be admitted by the CDS-node plugin.
+push:
+  curlMaxTime: "10"
+  retries: "30"
+  retryDelay: "2"
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 32Mi
+
+# Host paths the installer DaemonSets write to.
+hostPaths:
+  pluginDir: /opt/nri/plugins
+  configDir: /etc/nri/conf.d
+  cacheDir: /var/lib/nri-image-policy
+  runtimeDir: /var/run/nri-image-policy
+
+# Host Kubernetes distro. Selects the containerd config layout the installer
+# targets:
+#   k8s  - vanilla/kubeadm: patch /etc/containerd/config.toml in place.
+#   rke2 - write a schema-versioned drop-in and run containerd-prep first.
 distro: k8s
 
-# Containerd configuration the install DaemonSet targets. The config
-# directory, socket, and restart command default from `distro`; set the
-# fields below only for a distro `distro` does not cover.
+# Containerd configuration the installer targets. The config directory, socket,
+# and restart command default from distro; set the fields below only for a
+# distro the built-in values do not cover.
 containerd:
   # Explicit override for the host containerd config directory. Empty derives
-  # it from `distro` (k8s -> /etc/containerd, rke2 ->
+  # it from distro (k8s -> /etc/containerd, rke2 ->
   # /var/lib/rancher/rke2/agent/etc/containerd).
   configDir: ""
-  # Host path to the containerd socket the plugin connects to. Empty derives
-  # it from `distro` (k8s -> /run/containerd/containerd.sock,
+  # Host path to the containerd socket the plugin connects to. Empty derives it
+  # from distro (k8s -> /run/containerd/containerd.sock,
   # rke2 -> /run/k3s/containerd/containerd.sock).
   socket: ""
   namespace: k8s.io
-  # Command the install pod runs (via nsenter into PID 1) to make containerd
-  # re-read its config and (re-)launch the plugin from plugin_path. NRI does
-  # not auto-respawn pre-registered plugins on exit, so any binary or config
-  # change requires this restart. Empty derives it from `distro`
-  # (k8s -> "systemctl restart containerd",
-  # rke2 -> "systemctl restart rke2-agent"). Override for a distro neither
-  # value covers, e.g. k3s -> "systemctl restart k3s",
-  # k0s -> "systemctl restart k0scontroller".
+  # Host restart command. Empty derives it from distro (k8s ->
+  # "systemctl restart containerd", rke2 -> "systemctl restart rke2-agent").
   restartCommand: ""
 
-# Policy enforcement applied by the plugin.
+# Pull-mode polling cadence (worker boot config only).
+refresh:
+  interval: 30s
+
+# Policy enforcement (same on both archetypes).
 policy:
-  mode: fail-closed  # audit | fail-closed
+  mode: fail-closed       # fail-closed | audit
   enforceExisting: true
   denyMissingAnnotation: true
-  exemptNamespaces: []
-  # labelRules: Kubernetes-style label selectors evaluated against pod
-  # labels at container creation time. With the host-process model there
-  # is one plugin per node, so these rules apply globally on each node;
-  # multi-tenant isolation needs node-level (not pod-label) partitioning
-  # plus per-node values. Leaving empty disables label-based filtering.
+  exemptNamespaces:
+    - kube-system
+  # Kubernetes-style label selectors evaluated against pod labels at container
+  # creation time. Empty disables label-based filtering.
   labelRules: []
 
-# Logging
-logLevel: info
-
-# --- Whitelist delivery ---
-# The host plugin reads its policy data from disk and refreshes from assam
-# via NodePort (see assam.nodePort below). The control plane is not in the
-# trust path: the install-DaemonSet writes bootstrap.yaml at install time;
-# the plugin process — running outside kubelet's reach — owns refreshes.
-assam:
-  # Scheme Assam serves on the NodePort below. Parent c8s defaults this to
-  # https because chart-managed Assam serves RA-TLS unless explicitly disabled.
-  scheme: http
-  # NodePort that the assam Service exposes on every node. The plugin
-  # connects to 127.0.0.1:<nodePort>; kube-proxy iptables rules route to an
-  # assam pod. The assam chart must be deployed with serviceType=NodePort
-  # and a matching nodePort value.
-  nodePort: 30808
-  # SHA-384 hex launch measurements accepted for Assam's RA-TLS certificate.
-  # Empty means any attested Assam measurement is accepted; set this in
-  # production once the Assam launch digest is known.
-  measurements: []
-
-ratls:
-  # Optional local attestation-service URL used by RA-TLS verification for
-  # evidence formats that require online verification. Bare SNP reports do not
-  # need it. Keep this host-reachable because the plugin runs as a host process.
-  attestationServiceURL: ""
-
-refresh:
-  # How often the plugin pulls the current whitelist from assam.
-  interval: 30s
-  # Maximum age of the on-disk cache before the plugin fails closed for any
-  # image not in the bootstrap allowlist. Sustained assam unreachability is
-  # treated as suspicious past this point.
-  staleTTL: 1h
-
-# --- Bootstrap allowlist ---
-# Digests that must be allowed for the cluster to bring itself up before
-# assam is reachable (assam itself, kube-proxy, coredns, kubelet static
-# pods, this chart's install-DaemonSet image, the plugin image).
-#
-# Populated by the c8s-fleet whitelist-sync workflow, which resolves digests
-# via crane and writes them into the per-cluster HelmRelease values.
-#
-# Format: map of "sha256:<hex>" -> "<image reference>"
+# Extra always-allow entries beyond the chart's own install image (which is
+# templated in automatically from image.digest). Rarely needed; most cluster
+# bootstrap dependencies live in kube-system, which is exempt by default.
 bootstrapWhitelist:
   digests: {}
-  # sha256:abc123...: "ghcr.io/lunal-dev/assam:v0.1.0"
 
-whitelist:
-  digests: {}
+# Logging.
+logLevel: info
 
-# --- Uninstall hook ---
-# Pre-delete DaemonSet that reverts the containerd config patch and removes
-# host artifacts. Helm waits for the DS to be Ready before continuing the
-# uninstall, so cleanup is observable. Disable to leave host artifacts in
-# place (rare; mostly forensic use).
+# Filename of the plugin's unix health/push socket inside hostPaths.runtimeDir.
+healthSocketName: health.sock
+
+# Pre-delete DaemonSet that reverts the containerd patch/drop-in and removes
+# host artifacts on `helm uninstall`. Disable to leave host state in place for
+# forensic inspection.
 uninstall:
   enabled: true
 
-# Node affinity — exclude edge nodes by default
-nodeAffinity:
-  excludeLabels: []
-
-# Resources for the install-DaemonSet pod itself (init container that
-# copies files and patches containerd, then sleeps idle). Not the host
-# plugin process, which runs outside K8s and has no resource limits.
+# Init container resources for the installer DaemonSets. Not the plugin process,
+# which runs outside Kubernetes and has no resource limits.
 resources:
   requests:
     cpu: 50m
@@ -175,14 +145,8 @@ resources:
     cpu: 200m
     memory: 64Mi
 
-# Priority class for the install-DaemonSet pod.
 priorityClassName: system-node-critical
 
-# Health probe socket on the host. The host plugin listens on this unix
-# domain socket inside hostPaths.runtimeDir; the install-DaemonSet probes
-# it after install to verify the plugin came up. Unix socket avoids
-# hostNetwork and the port-conflict surface that comes with it.
-#
-# The plugin source must support binding to a unix socket via the
-# plugin.health_addr config field (rendered as "unix://<path>").
-healthSocket: health.sock
+# Exclude nodes by label from BOTH installer DaemonSets and the uninstall hook.
+nodeAffinity:
+  excludeLabels: []

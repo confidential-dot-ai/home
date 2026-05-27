@@ -424,24 +424,23 @@ nri-image-policy:
   ## values.yaml. `c8s install --distro` sets this.
   distro: k8s
 
-  assam:
-    scheme: https
-    ## Mirror the parent `assam.measurements` value here so the host plugin
-    ## can verify Assam's RA-TLS serving certificate directly. Helm does not
-    ## pass parent values into subcharts automatically; operators must keep
-    ## these two in sync.
-    measurements: []
-  ratls:
-    ## Host-process NRI plugins cannot rely on Kubernetes DNS. Leave this empty
-    ## for bare SNP evidence, or set a host-reachable local verifier URL for
-    ## platforms whose RA-TLS evidence requires online verification.
-    attestationServiceURL: ""
   image:
     repository: ghcr.io/lunal-dev/nri-image-policy
     tag: ""
     digest: ""
     pullPolicy: IfNotPresent
   imagePullSecrets: []
+  # CDS coordinates. The chart uses cds.node.selector three ways:
+  # cds-installer affinity (In), worker-installer anti-affinity (NotIn),
+  # push hook nodeSelector. Set to whatever label the CDS chart uses to
+  # pin its Pod.
+  cds:
+    image:
+      digest: ""
+      reference: ""
+    url: "http://c8s-cds.c8s-system.svc:8080"
+    node:
+      selector: {}
   policy:
     mode: audit
     exemptNamespaces:
