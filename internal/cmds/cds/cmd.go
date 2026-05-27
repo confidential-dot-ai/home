@@ -41,6 +41,8 @@ func NewCmd() *cobra.Command {
 	flags.StringSliceVar(&cfg.measurements, "measurements", nil, "SHA-384 hex launch measurements allowed to call /attest (empty = no pinning, UNSAFE)")
 
 	flags.StringVar(&cfg.earIssuerName, "ear-issuer", "cds", "")
+	flags.StringVar(&cfg.expectedIssuer, "expected-issuer", "", "EAR JWT issuer claim required on /sign-csr (empty disables)")
+	flags.DurationVar(&cfg.maxTTL, "max-ttl", 24*time.Hour, "upper bound on /sign-csr leaf TTL")
 	flags.DurationVar(&cfg.certTTL, "cert-ttl", 24*time.Hour, "")
 	flags.DurationVar(&cfg.challengeTTL, "challenge-ttl", 60*time.Second, "")
 	flags.DurationVar(&cfg.requestTimeout, "request-timeout", 5*time.Second, "per-request /attest timeout (0 disables)")
@@ -80,6 +82,8 @@ type config struct {
 	caCertValidity    time.Duration
 	measurements      []string
 	earIssuerName     string
+	expectedIssuer    string
+	maxTTL            time.Duration
 	certTTL           time.Duration
 	challengeTTL      time.Duration
 	requestTimeout    time.Duration

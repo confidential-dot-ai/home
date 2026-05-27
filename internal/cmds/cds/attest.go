@@ -65,39 +65,39 @@ func (h AttestHandler) HandleAttest(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		attestation.WriteError(w, http.StatusUnprocessableEntity, "invalid_request", err.Error())
+		attestation.WriteError(w, http.StatusUnprocessableEntity, types.ErrorCodeInvalidRequest, err.Error())
 		return
 	}
 
 	challengeBytes, err := base64.StdEncoding.DecodeString(req.Challenge)
 	if err != nil {
-		attestation.WriteError(w, http.StatusBadRequest, "invalid_challenge", "invalid or expired challenge")
+		attestation.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidChallenge, "invalid or expired challenge")
 		return
 	}
 	if !h.Challenges.Consume(challengeBytes) {
-		attestation.WriteError(w, http.StatusBadRequest, "invalid_challenge", "invalid or expired challenge")
+		attestation.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidChallenge, "invalid or expired challenge")
 		return
 	}
 
 	csr, err := attestation.ParseAndVerifyCSR(req.CSR)
 	if err != nil {
-		attestation.WriteError(w, http.StatusBadRequest, "invalid_csr", err.Error())
+		attestation.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidCSR, err.Error())
 		return
 	}
 	csrPubKey, err := attestation.ECDSAPublicKeyFromCSR(csr)
 	if err != nil {
-		attestation.WriteError(w, http.StatusBadRequest, "invalid_csr", err.Error())
+		attestation.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidCSR, err.Error())
 		return
 	}
 	expectedReportData, err := ratls.ReportDataForKey(csrPubKey, challengeBytes)
 	if err != nil {
-		attestation.WriteError(w, http.StatusBadRequest, "invalid_csr", err.Error())
+		attestation.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidCSR, err.Error())
 		return
 	}
 
 	evidenceJSON, err := json.Marshal(req.Evidence)
 	if err != nil {
-		attestation.WriteError(w, http.StatusUnprocessableEntity, "invalid_request",
+		attestation.WriteError(w, http.StatusUnprocessableEntity, types.ErrorCodeInvalidRequest,
 			fmt.Sprintf("invalid evidence: %s", err))
 		return
 	}
@@ -113,18 +113,18 @@ func (h AttestHandler) HandleAttest(w http.ResponseWriter, r *http.Request) {
 	verifyResp, err := h.AttestationClient.Verify(ctx, verifyReq)
 	if err != nil {
 		slog.Warn("attestation service error", "error", err)
-		attestation.WriteError(w, http.StatusBadGateway, "attestation_service_unreachable",
+		attestation.WriteError(w, http.StatusBadGateway, types.ErrorCodeAttestationServiceUnreachable,
 			fmt.Sprintf("failed to reach attestation service: %s", err))
 		return
 	}
 	if !verifyResp.Result.SignatureValid {
 		slog.Warn("attestation signature invalid")
-		attestation.WriteError(w, http.StatusUnauthorized, "verification_failed", "attestation signature invalid")
+		attestation.WriteError(w, http.StatusUnauthorized, types.ErrorCodeVerificationFailed, "attestation signature invalid")
 		return
 	}
 	if verifyResp.Result.ReportDataMatch == nil || !*verifyResp.Result.ReportDataMatch {
 		slog.Warn("challenge did not match attestation evidence")
-		attestation.WriteError(w, http.StatusUnauthorized, "verification_failed", "challenge mismatch in attestation evidence")
+		attestation.WriteError(w, http.StatusUnauthorized, types.ErrorCodeVerificationFailed, "challenge mismatch in attestation evidence")
 		return
 	}
 
@@ -132,7 +132,7 @@ func (h AttestHandler) HandleAttest(w http.ResponseWriter, r *http.Request) {
 		digest := strings.ToLower(verifyResp.Result.Claims.LaunchDigest)
 		if !h.Measurements[digest] {
 			slog.Warn("measurement not in allowlist", "launch_digest", digest)
-			attestation.WriteError(w, http.StatusForbidden, "measurement_denied", "launch measurement not allowed")
+			attestation.WriteError(w, http.StatusForbidden, types.ErrorCodeMeasurementDenied, "launch measurement not allowed")
 			return
 		}
 	}
@@ -143,7 +143,12 @@ func (h AttestHandler) HandleAttest(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := issuer.ValidateCSR(csr, policy); err != nil {
 		slog.Warn("CSR validation failed", "error", err, "remote_addr", r.RemoteAddr)
-		attestation.WriteError(w, http.StatusForbidden, "csr_denied", err.Error())
+		attestation.WriteError(w, http.StatusForbidden, types.ErrorCodeCSRDenied, err.Error())
+		return
+	}
+
+	if ctx.Err() != nil {
+		attestation.WriteError(w, http.StatusGatewayTimeout, types.ErrorCodeTimeout, "request timeout")
 		return
 	}
 
@@ -154,13 +159,13 @@ func (h AttestHandler) HandleAttest(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Error("in-process sign failed", "error", err)
-		attestation.WriteError(w, http.StatusInternalServerError, "sign_failed", err.Error())
+		attestation.WriteError(w, http.StatusInternalServerError, types.ErrorCodeSignFailed, err.Error())
 		return
 	}
 	caChainPEM := h.caChainPEM()
 	if len(caChainPEM) == 0 {
 		slog.Error("in-process sign failed: CA chain unavailable")
-		attestation.WriteError(w, http.StatusInternalServerError, "sign_failed", "CA chain unavailable")
+		attestation.WriteError(w, http.StatusInternalServerError, types.ErrorCodeSignFailed, "CA chain unavailable")
 		return
 	}
 

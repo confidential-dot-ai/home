@@ -159,23 +159,36 @@ func TestNewHTTPServerSetsTimeouts(t *testing.T) {
 	}
 }
 
-func TestValidateHTTPServerConfigRejectsUnsafeValues(t *testing.T) {
-	valid := config{maxHeaderBytes: 1}
-	if err := validateHTTPServerConfig(valid); err != nil {
+func TestValidateConfigRejectsUnsafeValues(t *testing.T) {
+	valid := config{
+		maxHeaderBytes:    1,
+		maxTTL:            time.Hour,
+		maxRequestSize:    1,
+		readinessInterval: time.Second,
+	}
+	if err := validateConfig(valid); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
 	for _, tc := range []struct {
 		name string
-		cfg  config
+		edit func(*config)
 	}{
-		{name: "negative read timeout", cfg: config{readTimeout: -time.Second, maxHeaderBytes: 1}},
-		{name: "negative read header timeout", cfg: config{readHeaderTimeout: -time.Second, maxHeaderBytes: 1}},
-		{name: "negative write timeout", cfg: config{writeTimeout: -time.Second, maxHeaderBytes: 1}},
-		{name: "negative idle timeout", cfg: config{idleTimeout: -time.Second, maxHeaderBytes: 1}},
-		{name: "negative max header bytes", cfg: config{maxHeaderBytes: -1}},
+		{name: "negative read timeout", edit: func(c *config) { c.readTimeout = -time.Second }},
+		{name: "negative read header timeout", edit: func(c *config) { c.readHeaderTimeout = -time.Second }},
+		{name: "negative write timeout", edit: func(c *config) { c.writeTimeout = -time.Second }},
+		{name: "negative idle timeout", edit: func(c *config) { c.idleTimeout = -time.Second }},
+		{name: "negative max header bytes", edit: func(c *config) { c.maxHeaderBytes = -1 }},
+		{name: "zero max ttl", edit: func(c *config) { c.maxTTL = 0 }},
+		{name: "negative max ttl", edit: func(c *config) { c.maxTTL = -time.Hour }},
+		{name: "zero max request size", edit: func(c *config) { c.maxRequestSize = 0 }},
+		{name: "negative max request size", edit: func(c *config) { c.maxRequestSize = -1 }},
+		{name: "zero readiness interval", edit: func(c *config) { c.readinessInterval = 0 }},
+		{name: "negative readiness interval", edit: func(c *config) { c.readinessInterval = -time.Second }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := validateHTTPServerConfig(tc.cfg); err == nil {
+			cfg := valid
+			tc.edit(&cfg)
+			if err := validateConfig(cfg); err == nil {
 				t.Fatalf("expected error, got nil")
 			}
 		})

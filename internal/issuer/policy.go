@@ -1,11 +1,15 @@
 package issuer
 
 import (
+	"bytes"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"regexp"
 	"strings"
+
+	"github.com/lunal-dev/c8s/internal/earclaims"
 )
 
 // CSRPolicy describes the requested-name and source-IP constraints a CSR
@@ -86,4 +90,31 @@ func SourceIPFromRemoteAddr(remoteAddr string) string {
 		return remoteAddr
 	}
 	return host
+}
+
+// VerifyKeyBinding asserts that the CSR's public key is the same key the EAR
+// claims as TEE-attested. Without this, an attacker who replays a stolen EAR
+// could request a leaf for a key the TEE never attested.
+func VerifyKeyBinding(csr *x509.CertificateRequest, claims *EARClaims) error {
+	if claims.TEEPubKey == "" {
+		return fmt.Errorf("EAR is missing %s claim", earclaims.TEEPublicKey)
+	}
+	csrPubDER, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
+	if err != nil {
+		return fmt.Errorf("marshal CSR public key: %w", err)
+	}
+	claimPubDER, err := base64.RawURLEncoding.DecodeString(claims.TEEPubKey)
+	if err != nil {
+		return fmt.Errorf("decode %s claim: %w", earclaims.TEEPublicKey, err)
+	}
+	if len(claimPubDER) == 0 {
+		return fmt.Errorf("EAR %s claim decodes to an empty public key", earclaims.TEEPublicKey)
+	}
+	if len(claimPubDER) != len(csrPubDER) {
+		return fmt.Errorf("EAR %s claim length %d does not match CSR public key length %d", earclaims.TEEPublicKey, len(claimPubDER), len(csrPubDER))
+	}
+	if !bytes.Equal(csrPubDER, claimPubDER) {
+		return fmt.Errorf("CSR public key does not match TEE-attested key")
+	}
+	return nil
 }

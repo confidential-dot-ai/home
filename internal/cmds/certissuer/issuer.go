@@ -5,7 +5,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -23,10 +22,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jws"
-
-	"github.com/lunal-dev/c8s/internal/earclaims"
 	"github.com/lunal-dev/c8s/internal/issuer"
 	"github.com/lunal-dev/c8s/pkg/certutil"
 	"github.com/lunal-dev/c8s/pkg/issuerapi"
@@ -53,7 +48,6 @@ type Issuer struct {
 	AllowedCNPattern *regexp.Regexp // When set, CSR CN must match this pattern. Nil = no CN restriction.
 	ExpectedIssuer   string         // When non-empty, validates the EAR issuer claim.
 	RequestTimeout   time.Duration  // Per-request timeout. Zero = no timeout.
-	JWTClockSkew     int64          // Maximum acceptable clock difference (seconds) for JWT validation.
 	MinCAValidity    time.Duration  // Minimum remaining CA cert validity for readiness.
 	Logger           *slog.Logger
 	tracker          *nodeTracker
@@ -71,15 +65,6 @@ func (iss *Issuer) getBundle() *certBundle {
 // Type aliases for the shared wire types, kept for local readability.
 type signCSRRequest = issuerapi.SignCSRRequest
 type signCSRResponse = issuerapi.SignCSRResponse
-
-// tokenValidationError classifies token validation failures for metrics.
-type tokenValidationError struct {
-	Reason string // "expired", "invalid_signature", "malformed", "invalid_issuer"
-	Err    error
-}
-
-func (e *tokenValidationError) Error() string { return e.Err.Error() }
-func (e *tokenValidationError) Unwrap() error { return e.Err }
 
 // HandleSignCSR handles POST /sign-csr.
 func (iss *Issuer) HandleSignCSR(w http.ResponseWriter, r *http.Request) {
@@ -138,12 +123,12 @@ func (iss *Issuer) HandleSignCSR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate EAR JWT token.
-	claims, err := validateEARToken(req.EAR, iss.keyProvider, iss.ExpectedIssuer, iss.JWTClockSkew)
+	claims, err := issuer.ValidateEARToken(req.EAR, iss.keyProvider, iss.ExpectedIssuer)
 	if err != nil {
 		iss.Logger.Warn("EAR token validation failed", "error", err)
-		var tve *tokenValidationError
+		var tve *issuer.TokenValidationError
 		if errors.As(err, &tve) {
-			tokenValidationFailuresTotal.WithLabelValues(tve.Reason).Inc()
+			tokenValidationFailuresTotal.WithLabelValues(string(tve.Reason)).Inc()
 		}
 		http.Error(w, "unauthorized: invalid attestation token", http.StatusUnauthorized)
 		signRequestsTotal.WithLabelValues("unauthorized").Inc()
@@ -151,7 +136,7 @@ func (iss *Issuer) HandleSignCSR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check measurement allowlist.
-	if err := checkMeasurement(claims, iss.SignCSRMeasurements, "sign-csr"); err != nil {
+	if err := issuer.CheckMeasurement(claims, iss.SignCSRMeasurements, "sign-csr"); err != nil {
 		iss.Logger.Warn("measurement check failed", "error", err)
 		measurementDeniedTotal.WithLabelValues("sign-csr").Inc()
 		http.Error(w, "forbidden: measurement not allowed", http.StatusForbidden)
@@ -177,7 +162,7 @@ func (iss *Issuer) HandleSignCSR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify key binding: CSR public key must match the tee_public_key in EAR claims.
-	if err := verifyKeyBinding(csr, claims); err != nil {
+	if err := issuer.VerifyKeyBinding(csr, claims); err != nil {
 		iss.Logger.Warn("key binding failed", "error", err)
 		http.Error(w, "forbidden: certificate request denied", http.StatusForbidden)
 		tokenValidationFailuresTotal.WithLabelValues("key_binding").Inc()
@@ -320,7 +305,7 @@ func (iss *Issuer) caBundlePEMForResponse(b *certBundle) []byte {
 
 // signCSR creates a CA-signed certificate from the CSR using the current cert bundle.
 // Subject is constructed from validated CN only — O, OU, and other fields are stripped.
-func (iss *Issuer) signCSR(csr *x509.CertificateRequest, claims *earClaims, ttl time.Duration) ([]byte, *big.Int, error) {
+func (iss *Issuer) signCSR(csr *x509.CertificateRequest, claims *issuer.EARClaims, ttl time.Duration) ([]byte, *big.Int, error) {
 	b := iss.getBundle()
 	if b == nil {
 		return nil, nil, fmt.Errorf("no certificate bundle loaded")
@@ -328,7 +313,7 @@ func (iss *Issuer) signCSR(csr *x509.CertificateRequest, claims *earClaims, ttl 
 	return iss.signCSRWithBundle(b, csr, claims, ttl)
 }
 
-func (iss *Issuer) signCSRWithBundle(b *certBundle, csr *x509.CertificateRequest, claims *earClaims, ttl time.Duration) ([]byte, *big.Int, error) {
+func (iss *Issuer) signCSRWithBundle(b *certBundle, csr *x509.CertificateRequest, claims *issuer.EARClaims, ttl time.Duration) ([]byte, *big.Int, error) {
 	ca, err := issuer.WrapCA(b.caCert, b.caKey)
 	if err != nil {
 		return nil, nil, err
@@ -338,106 +323,6 @@ func (iss *Issuer) signCSRWithBundle(b *certBundle, csr *x509.CertificateRequest
 		TTL:      ttl,
 		Evidence: claims.RawEvidence,
 	})
-}
-
-// earClaims represents the relevant claims from an EAR (Entity Attestation
-// Result) JWT token issued by assam after successful TEE attestation.
-type earClaims struct {
-	// Issuer is matched against --expected-issuer at startup.
-	Issuer string
-	// IssuedAt is a Unix timestamp.
-	IssuedAt int64
-	// Expiry is a Unix timestamp.
-	Expiry int64
-	// TEEPubKey is the base64url-encoded DER PKIX public key from the TEE,
-	// bound to the attestation report via REPORTDATA.
-	TEEPubKey string
-	// RawEvidence is the raw attestation evidence for audit hashing.
-	// EAR carries submods as a JSON object, so we use json.RawMessage.
-	RawEvidence json.RawMessage
-}
-
-func (claims *earClaims) UnmarshalJSON(raw []byte) error {
-	*claims = earClaims{RawEvidence: append(json.RawMessage(nil), raw...)}
-	var rawEvidence json.RawMessage
-	if err := earclaims.UnmarshalObject(raw,
-		earclaims.Bind(earclaims.Issuer, &claims.Issuer),
-		earclaims.Bind(earclaims.IssuedAt, &claims.IssuedAt),
-		earclaims.Bind(earclaims.ExpiresAt, &claims.Expiry),
-		earclaims.Bind(earclaims.TEEPublicKey, &claims.TEEPubKey),
-		earclaims.Bind(earclaims.Submods, &rawEvidence),
-	); err != nil {
-		return err
-	}
-	if len(rawEvidence) > 0 {
-		claims.RawEvidence = rawEvidence
-	}
-	return nil
-}
-
-// validateEARToken validates the EAR JWT signature, claims, and issuer.
-func validateEARToken(tokenStr string, provider KeyProvider, expectedIssuer string, clockSkew int64) (*earClaims, error) {
-	claims, err := parseAndVerifyJWT(tokenStr, provider)
-	if err != nil {
-		return nil, err
-	}
-
-	now := time.Now().Unix()
-
-	if claims.Expiry == 0 {
-		return nil, &tokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("token missing exp claim"),
-		}
-	}
-
-	// Check expiry with clock skew tolerance.
-	if now > claims.Expiry+clockSkew {
-		return nil, &tokenValidationError{
-			Reason: "expired",
-			Err:    fmt.Errorf("token expired at %d, now %d (skew tolerance %ds)", claims.Expiry, now, clockSkew),
-		}
-	}
-
-	// Check issued-at: reject tokens claiming to be from the future.
-	if claims.IssuedAt > 0 && claims.IssuedAt > now+clockSkew {
-		return nil, &tokenValidationError{
-			Reason: "expired",
-			Err:    fmt.Errorf("token issued in the future: iat %d, now %d (skew tolerance %ds)", claims.IssuedAt, now, clockSkew),
-		}
-	}
-
-	// Validate issuer claim.
-	if expectedIssuer != "" && claims.Issuer != expectedIssuer {
-		return nil, &tokenValidationError{
-			Reason: "invalid_issuer",
-			Err:    fmt.Errorf("token issuer %q does not match expected %q", claims.Issuer, expectedIssuer),
-		}
-	}
-
-	return claims, nil
-}
-
-// checkMeasurement validates that the EAR token's attestation evidence contains
-// a measurement in the allowed set. Returns nil if allowed is empty (opt-in).
-func checkMeasurement(claims *earClaims, allowed map[string]bool, endpoint string) error {
-	if len(allowed) == 0 {
-		return nil
-	}
-	measurement, err := earclaims.LaunchDigestFromSubmods(claims.RawEvidence)
-	if err != nil {
-		return &tokenValidationError{
-			Reason: "measurement_denied",
-			Err:    fmt.Errorf("extract measurement for %s: %w", endpoint, err),
-		}
-	}
-	if !allowed[measurement] {
-		return &tokenValidationError{
-			Reason: "measurement_denied",
-			Err:    fmt.Errorf("measurement not allowed for %s", endpoint),
-		}
-	}
-	return nil
 }
 
 // loadResourceMap reads a JSON resource map file and returns the parsed map.
@@ -479,6 +364,10 @@ func buildEndpointAllowlists(rm resources.Map) (signCSR, handoff map[string]bool
 	}
 
 	for measurement, globs := range rm {
+		measurement = issuer.NormalizeMeasurement(measurement)
+		if measurement == "" {
+			continue
+		}
 		for _, pattern := range globs {
 			for _, resource := range certIssuerResources {
 				matched, err := path.Match(string(pattern), string(resource))
@@ -504,32 +393,6 @@ func buildEndpointAllowlists(rm resources.Map) (signCSR, handoff map[string]bool
 	return signCSR, handoff, nil
 }
 
-// verifyKeyBinding checks that the CSR's public key matches the TEE-bound key
-// in the EAR claims.
-func verifyKeyBinding(csr *x509.CertificateRequest, claims *earClaims) error {
-	if claims.TEEPubKey == "" {
-		return fmt.Errorf("EAR is missing %s claim", earclaims.TEEPublicKey)
-	}
-
-	csrPubDER, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
-	if err != nil {
-		return fmt.Errorf("marshal CSR public key: %w", err)
-	}
-
-	claimPubDER, err := base64.RawURLEncoding.DecodeString(claims.TEEPubKey)
-	if err != nil {
-		return fmt.Errorf("decode %s claim: %w", earclaims.TEEPublicKey, err)
-	}
-
-	csrHash := sha256.Sum256(csrPubDER)
-	claimHash := sha256.Sum256(claimPubDER)
-	if csrHash != claimHash {
-		return fmt.Errorf("CSR public key does not match TEE-attested key")
-	}
-
-	return nil
-}
-
 func capTTL(d time.Duration, maxTTL time.Duration) time.Duration {
 	if d <= 0 {
 		return maxTTL
@@ -538,62 +401,6 @@ func capTTL(d time.Duration, maxTTL time.Duration) time.Duration {
 		return maxTTL
 	}
 	return d
-}
-
-// parseAndVerifyJWT is a minimal JWT parser for ES256/ES384 tokens.
-func parseAndVerifyJWT(tokenStr string, provider KeyProvider) (*earClaims, error) {
-	tokenBytes := []byte(tokenStr)
-	msg, err := jws.Parse(tokenBytes)
-	if err != nil {
-		return nil, &tokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("parse JWT: %w", err),
-		}
-	}
-	sigs := msg.Signatures()
-	if len(sigs) != 1 {
-		return nil, &tokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("JWT has %d signatures, expected 1", len(sigs)),
-		}
-	}
-	header := sigs[0].ProtectedHeaders()
-	alg := header.Algorithm()
-	if alg != jwa.ES256 && alg != jwa.ES384 {
-		return nil, &tokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("unsupported JWT algorithm: %s (need ES256 or ES384)", alg),
-		}
-	}
-
-	ecPub, err := provider.PublicKey(header.KeyID())
-	if err != nil {
-		return nil, &tokenValidationError{
-			Reason: "invalid_signature",
-			Err:    fmt.Errorf("resolve signing key: %w", err),
-		}
-	}
-
-	if _, err := jws.Verify(tokenBytes, jws.WithKey(alg, ecPub)); err != nil {
-		return nil, &tokenValidationError{
-			Reason: "invalid_signature",
-			Err:    fmt.Errorf("JWT signature verification failed: %w", err),
-		}
-	}
-
-	payload := msg.Payload()
-	var claims earClaims
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return nil, &tokenValidationError{
-			Reason: "malformed",
-			Err:    fmt.Errorf("parse JWT claims: %w", err),
-		}
-	}
-	if len(claims.RawEvidence) == 0 {
-		claims.RawEvidence = payload
-	}
-
-	return &claims, nil
 }
 
 // nodeTracker tracks aggregate certificate issuance metrics without per-IP cardinality.

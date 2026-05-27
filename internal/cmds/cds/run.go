@@ -39,7 +39,7 @@ func run(cfg config) error {
 	if err := cmdsutil.ValidateHTTPURL("--attestation-service-url", cfg.attestationSvcURL); err != nil {
 		return err
 	}
-	if err := validateHTTPServerConfig(cfg); err != nil {
+	if err := validateConfig(cfg); err != nil {
 		return err
 	}
 	cfg.ratlsPlatform = normalizeRATLSPlatform(cfg.ratlsPlatform)
@@ -82,17 +82,14 @@ func run(cfg config) error {
 		return fmt.Errorf("create EAR issuer: %w", err)
 	}
 
-	var rotator *earsigner.Rotator
-	if cfg.rotationInterval > 0 {
-		rotator, err = earsigner.NewRotator(earsigner.RotatorConfig{
-			Interval: cfg.rotationInterval,
-			Overlap:  cfg.rotationOverlap,
-			Jitter:   cfg.rotationJitter,
-			Logger:   slog.Default(),
-		}, earKeyPEM, earIssuer.SwapKey)
-		if err != nil {
-			return fmt.Errorf("create EAR key rotator: %w", err)
-		}
+	rotator, err := earsigner.NewRotator(earsigner.RotatorConfig{
+		Interval: cfg.rotationInterval,
+		Overlap:  cfg.rotationOverlap,
+		Jitter:   cfg.rotationJitter,
+		Logger:   slog.Default(),
+	}, earKeyPEM, earIssuer.SwapKey)
+	if err != nil {
+		return fmt.Errorf("create EAR key rotator: %w", err)
 	}
 
 	asClient := attestationclient.NewClient(cfg.attestationSvcURL)
@@ -112,6 +109,10 @@ func run(cfg config) error {
 		return fmt.Errorf("whitelist mutations require an EAR authorizer (see cds #2c)")
 	}
 
+	policy := issuer.CSRPolicy{
+		DNSSANPattern:    dnsPattern,
+		AllowedCNPattern: cnPattern,
+	}
 	deps := dependencies{
 		AttestHandler: AttestHandler{
 			Challenges:        &challengeStore,
@@ -122,10 +123,18 @@ func run(cfg config) error {
 			RequestTimeout:    cfg.requestTimeout,
 			Measurements:      measurements,
 			SANValidation:     cfg.sanValidation,
-			Policy: issuer.CSRPolicy{
-				DNSSANPattern:    dnsPattern,
-				AllowedCNPattern: cnPattern,
-			},
+			Policy:            policy,
+		},
+		SignCSRHandler: SignCSRHandler{
+			CA:             mesh,
+			CAChainPEM:     caChainPEM,
+			MaxTTL:         cfg.maxTTL,
+			KeyProvider:    rotator,
+			ExpectedIssuer: cfg.expectedIssuer,
+			RequestTimeout: cfg.requestTimeout,
+			Measurements:   measurements,
+			Policy:         policy,
+			SANValidation:  cfg.sanValidation,
 		},
 		WhitelistHandler: whitelist.Handler{
 			Store:           &whitelistStore,
@@ -133,11 +142,11 @@ func run(cfg config) error {
 		},
 		ReadyFn:        readinessFn(checker.Ready, mesh.Cert, cfg.minCAValidity),
 		EarIssuer:      earIssuer,
+		JWKSFunc:       rotator.JWKSetJSON,
 		CACertPEM:      caChainPEM,
 		MaxRequestSize: cfg.maxRequestSize,
 	}
-	if rotator != nil {
-		deps.JWKSFunc = rotator.JWKSetJSON
+	if cfg.rotationInterval > 0 {
 		go rotator.Run(ctx)
 	}
 
@@ -219,7 +228,7 @@ func normalizeHTTPServerConfig(cfg config) config {
 	return cfg
 }
 
-func validateHTTPServerConfig(cfg config) error {
+func validateConfig(cfg config) error {
 	for _, timeout := range []struct {
 		name  string
 		value time.Duration
@@ -235,6 +244,15 @@ func validateHTTPServerConfig(cfg config) error {
 	}
 	if cfg.maxHeaderBytes < 0 {
 		return fmt.Errorf("--max-header-bytes must be non-negative")
+	}
+	if cfg.maxTTL <= 0 {
+		return fmt.Errorf("--max-ttl must be positive")
+	}
+	if cfg.maxRequestSize <= 0 {
+		return fmt.Errorf("--max-request-size must be positive")
+	}
+	if cfg.readinessInterval <= 0 {
+		return fmt.Errorf("--readiness-interval must be positive")
 	}
 	return nil
 }
@@ -256,7 +274,7 @@ func parseMeasurementAllowlist(raw []string) map[string]bool {
 	}
 	allowed := make(map[string]bool, len(raw))
 	for _, m := range raw {
-		m = strings.TrimSpace(strings.ToLower(m))
+		m = issuer.NormalizeMeasurement(m)
 		if m != "" {
 			allowed[m] = true
 		}

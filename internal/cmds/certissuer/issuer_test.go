@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/lunal-dev/c8s/internal/earclaims"
+	"github.com/lunal-dev/c8s/internal/issuer"
 	"github.com/lunal-dev/c8s/pkg/certutil"
 	"github.com/lunal-dev/c8s/pkg/issuerapi"
 	"github.com/lunal-dev/c8s/pkg/ratls"
@@ -74,7 +75,6 @@ func testIssuer(t *testing.T) (*Issuer, *ecdsa.PrivateKey) {
 	iss := &Issuer{
 		keyProvider:   mustCertKeyProvider(t, tokenCert),
 		MaxTTL:        24 * time.Hour,
-		JWTClockSkew:  30,
 		MinCAValidity: time.Hour,
 		Logger:        slog.Default(),
 		tracker:       newNodeTracker(24 * time.Hour),
@@ -450,7 +450,7 @@ func TestSignCSRWithBundleUsesCapturedSigner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claims := &earClaims{RawEvidence: json.RawMessage(`{"test":true}`)}
+	claims := &issuer.EARClaims{RawEvidence: json.RawMessage(`{"test":true}`)}
 
 	certPEM, _, err := iss.signCSRWithBundle(captured, csr, claims, time.Hour)
 	if err != nil {
@@ -585,7 +585,6 @@ func TestHandleSignCSR_ES384(t *testing.T) {
 	iss := &Issuer{
 		keyProvider:   mustCertKeyProvider(t, tokenCert384),
 		MaxTTL:        24 * time.Hour,
-		JWTClockSkew:  30,
 		MinCAValidity: time.Hour,
 		SANValidation: true,
 		Logger:        slog.Default(),
@@ -903,7 +902,7 @@ func TestSignCSR_ReturnsSerial(t *testing.T) {
 		earclaims.Submods:      "test-evidence",
 		earclaims.TEEPublicKey: teePubKeyB64(t, csrKey),
 	})
-	claims, err := validateEARToken(ear, mustCertKeyProvider(t, iss.getBundle().tokenSignerCert), "", 30)
+	claims, err := issuer.ValidateEARToken(ear, mustCertKeyProvider(t, iss.getBundle().tokenSignerCert), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -999,16 +998,16 @@ func TestTokenValidationError_Typed(t *testing.T) {
 	iss, _ := testIssuer(t)
 
 	// Completely garbage JWT.
-	_, err := validateEARToken("not.a.jwt", mustCertKeyProvider(t, iss.getBundle().tokenSignerCert), "", 30)
+	_, err := issuer.ValidateEARToken("not.a.jwt", mustCertKeyProvider(t, iss.getBundle().tokenSignerCert), "")
 	if err == nil {
 		t.Fatal("expected error for garbage JWT")
 	}
 
-	var tve *tokenValidationError
+	var tve *issuer.TokenValidationError
 	if !errors.As(err, &tve) {
 		t.Fatalf("expected tokenValidationError, got %T: %v", err, err)
 	}
-	if tve.Reason != "malformed" && tve.Reason != "invalid_signature" {
+	if tve.Reason != issuer.ReasonMalformed && tve.Reason != issuer.ReasonInvalidSignature {
 		t.Errorf("unexpected reason %q", tve.Reason)
 	}
 }
@@ -1019,15 +1018,15 @@ func TestValidateEARTokenRequiresExpiry(t *testing.T) {
 		earclaims.IssuedAt: time.Now().Unix(),
 	})
 
-	_, err := validateEARToken(token, mustCertKeyProvider(t, iss.getBundle().tokenSignerCert), "", 30)
+	_, err := issuer.ValidateEARToken(token, mustCertKeyProvider(t, iss.getBundle().tokenSignerCert), "")
 	if err == nil {
 		t.Fatal("expected missing expiry error")
 	}
-	var tve *tokenValidationError
+	var tve *issuer.TokenValidationError
 	if !errors.As(err, &tve) {
 		t.Fatalf("expected tokenValidationError, got %T: %v", err, err)
 	}
-	if tve.Reason != "malformed" {
+	if tve.Reason != issuer.ReasonMalformed {
 		t.Errorf("unexpected reason %q", tve.Reason)
 	}
 }
@@ -1402,6 +1401,20 @@ func TestBuildEndpointAllowlists_HandoffOnly(t *testing.T) {
 	}
 }
 
+func TestBuildEndpointAllowlistsNormalizesMeasurements(t *testing.T) {
+	rm := resources.Map{
+		"DEADBEEF": {resources.CertIssuerSignCSR},
+	}
+
+	signCSR, _, err := buildEndpointAllowlists(rm)
+	if err != nil {
+		t.Fatalf("buildEndpointAllowlists: %v", err)
+	}
+	if !signCSR["deadbeef"] {
+		t.Fatalf("expected lowercase measurement key, got %v", signCSR)
+	}
+}
+
 func TestCheckMeasurement_WithResourceMap(t *testing.T) {
 	rm := resources.Map{
 		"allowed_measurement": {resources.CertIssuerSignCSR},
@@ -1415,9 +1428,9 @@ func TestCheckMeasurement_WithResourceMap(t *testing.T) {
 		},
 	}
 	rawEvidence, _ := json.Marshal(evidence)
-	claims := &earClaims{RawEvidence: rawEvidence}
+	claims := &issuer.EARClaims{RawEvidence: rawEvidence}
 
-	if err := checkMeasurement(claims, signCSR, "sign-csr"); err != nil {
+	if err := issuer.CheckMeasurement(claims, signCSR, "sign-csr"); err != nil {
 		t.Errorf("expected allowed for sign-csr, got: %v", err)
 	}
 
@@ -1427,9 +1440,9 @@ func TestCheckMeasurement_WithResourceMap(t *testing.T) {
 		},
 	}
 	rawDenied, _ := json.Marshal(evidenceDenied)
-	claimsDenied := &earClaims{RawEvidence: rawDenied}
+	claimsDenied := &issuer.EARClaims{RawEvidence: rawDenied}
 
-	if err := checkMeasurement(claimsDenied, signCSR, "sign-csr"); err == nil {
+	if err := issuer.CheckMeasurement(claimsDenied, signCSR, "sign-csr"); err == nil {
 		t.Error("expected denial for unknown measurement on sign-csr")
 	}
 }
@@ -1447,9 +1460,9 @@ func TestCheckMeasurement_WithChartManagedAssamLaunchDigest(t *testing.T) {
 		},
 	}
 	rawEvidence, _ := json.Marshal(evidence)
-	claims := &earClaims{RawEvidence: rawEvidence}
+	claims := &issuer.EARClaims{RawEvidence: rawEvidence}
 
-	if err := checkMeasurement(claims, signCSR, "sign-csr"); err != nil {
+	if err := issuer.CheckMeasurement(claims, signCSR, "sign-csr"); err != nil {
 		t.Errorf("expected chart-managed Assam launch_digest to be allowed, got: %v", err)
 	}
 }

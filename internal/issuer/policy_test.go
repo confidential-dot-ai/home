@@ -1,8 +1,12 @@
 package issuer_test
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"net"
 	"regexp"
 	"strings"
@@ -131,4 +135,35 @@ func TestSourceIPFromRemoteAddr(t *testing.T) {
 			t.Errorf("SourceIPFromRemoteAddr(%q): got %q, want %q", tc.in, got, tc.want)
 		}
 	}
+}
+
+func TestVerifyKeyBindingRejectsMalformedClaimKey(t *testing.T) {
+	csr := csrForKeyBindingTest(t)
+
+	err := issuer.VerifyKeyBinding(csr, &issuer.EARClaims{
+		TEEPubKey: base64.RawURLEncoding.EncodeToString([]byte{0}),
+	})
+	if err == nil {
+		t.Fatal("expected malformed attested key claim to be rejected")
+	}
+	if !strings.Contains(err.Error(), "claim length") {
+		t.Fatalf("error = %q, want claim length rejection", err)
+	}
+}
+
+func csrForKeyBindingTest(t *testing.T) *x509.CertificateRequest {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{}, key)
+	if err != nil {
+		t.Fatalf("create CSR: %v", err)
+	}
+	csr, err := x509.ParseCertificateRequest(der)
+	if err != nil {
+		t.Fatalf("parse CSR: %v", err)
+	}
+	return csr
 }

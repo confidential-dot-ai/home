@@ -2,6 +2,7 @@ package cds
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +26,12 @@ import (
 	"github.com/lunal-dev/c8s/pkg/certutil"
 	"github.com/lunal-dev/c8s/pkg/types"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
 
 func newMockAttestationService(t *testing.T, launchDigest string) *httptest.Server {
 	t.Helper()
@@ -220,6 +228,55 @@ func TestAttest_LaunchDigestAllowlistDenied(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "measurement_denied") {
 		t.Errorf("body should mention measurement_denied; got %s", w.Body.String())
+	}
+}
+
+func TestAttest_TimeoutBeforeSigningReturns504(t *testing.T) {
+	h := newTestAttestHandler(t, "http://attestation.test", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	h.AttestationClient = attestationclient.NewClientWithHTTP("http://attestation.test", &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			cancel()
+			match := true
+			resp := types.VerifyResponse{
+				Result: types.VerificationResult{
+					Platform:        "snp",
+					SignatureValid:  true,
+					ReportDataMatch: &match,
+					Claims:          types.Claims{LaunchDigest: "deadbeef"},
+				},
+			}
+			var body bytes.Buffer
+			if err := json.NewEncoder(&body).Encode(resp); err != nil {
+				t.Fatalf("encode verify response: %v", err)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(&body),
+				Request:    req,
+			}, nil
+		}),
+	})
+	challenge := issueChallenge(t, h)
+	csrPEM, _ := generateCSR(t)
+	body, err := json.Marshal(types.AttestRequestBody{
+		Challenge: challenge,
+		Evidence:  types.AttestationEvidence{Platform: "snp", Evidence: json.RawMessage(`{"test":true}`)},
+		CSR:       csrPEM,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/attest", bytes.NewReader(body)).WithContext(ctx)
+	w := httptest.NewRecorder()
+	h.HandleAttest(w, req)
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status: got %d, want 504; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), types.ErrorCodeTimeout) {
+		t.Errorf("body should mention timeout; got %s", w.Body.String())
 	}
 }
 

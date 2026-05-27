@@ -1,0 +1,111 @@
+package issuer_test
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/lunal-dev/c8s/internal/earclaims"
+	"github.com/lunal-dev/c8s/internal/issuer"
+)
+
+type testKeyProvider struct{ pub *ecdsa.PublicKey }
+
+func (p testKeyProvider) PublicKey(string) (*ecdsa.PublicKey, error) {
+	return p.pub, nil
+}
+
+func signEARJWT(t *testing.T, key *ecdsa.PrivateKey, claims map[string]any) string {
+	t.Helper()
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims(claims))
+	signed, err := token.SignedString(key)
+	if err != nil {
+		t.Fatalf("sign JWT: %v", err)
+	}
+	return signed
+}
+
+func TestValidateEARTokenRejectsFutureIssuedAt(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	now := time.Now().Unix()
+	token := signEARJWT(t, key, map[string]any{
+		earclaims.Issuer:    "cds",
+		earclaims.IssuedAt:  now + 120,
+		earclaims.ExpiresAt: now + 600,
+	})
+
+	_, err = issuer.ValidateEARToken(token, testKeyProvider{pub: &key.PublicKey}, "cds")
+	if err == nil {
+		t.Fatal("expected future iat to be rejected")
+	}
+	var validationErr *issuer.TokenValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("error = %T %[1]v, want TokenValidationError", err)
+	}
+	if validationErr.Reason != issuer.ReasonNotYetValid {
+		t.Fatalf("reason = %q, want not_yet_valid", validationErr.Reason)
+	}
+}
+
+func TestValidateEARTokenRejectsFutureNotBefore(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	now := time.Now().Unix()
+	token := signEARJWT(t, key, map[string]any{
+		earclaims.Issuer:    "cds",
+		earclaims.IssuedAt:  now,
+		earclaims.NotBefore: now + 120,
+		earclaims.ExpiresAt: now + 600,
+	})
+
+	_, err = issuer.ValidateEARToken(token, testKeyProvider{pub: &key.PublicKey}, "cds")
+	if err == nil {
+		t.Fatal("expected future nbf to be rejected")
+	}
+	var validationErr *issuer.TokenValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("error = %T %[1]v, want TokenValidationError", err)
+	}
+	if validationErr.Reason != issuer.ReasonNotYetValid {
+		t.Fatalf("reason = %q, want not_yet_valid", validationErr.Reason)
+	}
+}
+
+func TestValidateEARTokenRejectsAudienceClaim(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	now := time.Now().Unix()
+	token := signEARJWT(t, key, map[string]any{
+		earclaims.Issuer:    "cds",
+		earclaims.IssuedAt:  now,
+		earclaims.ExpiresAt: now + 600,
+		"aud":               "other-service",
+	})
+
+	_, err = issuer.ValidateEARToken(token, testKeyProvider{pub: &key.PublicKey}, "cds")
+	if err == nil {
+		t.Fatal("expected aud claim to be rejected")
+	}
+	var validationErr *issuer.TokenValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("error = %T %[1]v, want TokenValidationError", err)
+	}
+	if validationErr.Reason != issuer.ReasonInvalidAudience {
+		t.Fatalf("reason = %q, want invalid_audience", validationErr.Reason)
+	}
+}

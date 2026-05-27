@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/lunal-dev/c8s/internal/earclaims"
+	"github.com/lunal-dev/c8s/internal/issuer"
 	"github.com/lunal-dev/c8s/pkg/certutil"
 	"github.com/lunal-dev/c8s/pkg/issuerapi"
 	"github.com/lunal-dev/c8s/pkg/resources"
@@ -100,7 +101,7 @@ func handoffEARExpiry(token string) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, fmt.Errorf("decode JWT claims: %w", err)
 	}
-	var c earClaims
+	var c issuer.EARClaims
 	if err := json.Unmarshal(claimsBytes, &c); err != nil {
 		return time.Time{}, fmt.Errorf("parse JWT claims: %w", err)
 	}
@@ -191,7 +192,7 @@ func (hh *handoffHandler) HandleHandoff(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	claims, err := validateEARToken(req.EAR, hh.issuer.keyProvider, hh.issuer.ExpectedIssuer, hh.issuer.JWTClockSkew)
+	claims, err := issuer.ValidateEARToken(req.EAR, hh.issuer.keyProvider, hh.issuer.ExpectedIssuer)
 	if err != nil {
 		recordTokenValidationFailure(err)
 		http.Error(w, "unauthorized: invalid requester attestation token", http.StatusUnauthorized)
@@ -313,14 +314,14 @@ func (hh *handoffHandler) wrap(req HandoffRequest, b *certBundle, issuerEAR stri
 	}, nil
 }
 
-func requestHandoff(ctx context.Context, peerURL, requesterEAR string, signer *ecdsa.PrivateKey, issuer *Issuer, client *http.Client) (*handoffMaterial, error) {
+func requestHandoff(ctx context.Context, peerURL, requesterEAR string, signer *ecdsa.PrivateKey, iss *Issuer, client *http.Client) (*handoffMaterial, error) {
 	if strings.TrimSpace(requesterEAR) == "" {
 		return nil, fmt.Errorf("handoff requester EAR is required")
 	}
 	if signer == nil {
 		return nil, fmt.Errorf("handoff requester signing key is required")
 	}
-	if len(issuer.HandoffMeasurements) == 0 {
+	if len(iss.HandoffMeasurements) == 0 {
 		return nil, fmt.Errorf("handoff requires %s measurement allowlist", resources.CertIssuerHandoff)
 	}
 	if client == nil {
@@ -365,20 +366,20 @@ func requestHandoff(ctx context.Context, peerURL, requesterEAR string, signer *e
 	if err := json.NewDecoder(resp.Body).Decode(&hr); err != nil {
 		return nil, fmt.Errorf("decode handoff response: %w", err)
 	}
-	return unwrapHandoffResponse(hr, requesterEAR, pub, priv, issuer)
+	return unwrapHandoffResponse(hr, requesterEAR, pub, priv, iss)
 }
 
-func unwrapHandoffResponse(resp HandoffResponse, requesterEAR, requesterPub string, requesterKey *ecdh.PrivateKey, issuer *Issuer) (*handoffMaterial, error) {
+func unwrapHandoffResponse(resp HandoffResponse, requesterEAR, requesterPub string, requesterKey *ecdh.PrivateKey, iss *Issuer) (*handoffMaterial, error) {
 	if resp.IssuerEAR == "" || resp.PublicKey == "" || resp.Signature == "" || resp.Nonce == "" || resp.Ciphertext == "" {
 		return nil, fmt.Errorf("handoff response missing issuer_ear, public_key, signature, nonce, or ciphertext")
 	}
 
-	claims, err := validateEARToken(resp.IssuerEAR, issuer.keyProvider, issuer.ExpectedIssuer, issuer.JWTClockSkew)
+	claims, err := issuer.ValidateEARToken(resp.IssuerEAR, iss.keyProvider, iss.ExpectedIssuer)
 	if err != nil {
 		recordTokenValidationFailure(err)
 		return nil, fmt.Errorf("validate handoff issuer EAR: %w", err)
 	}
-	if err := checkRequiredMeasurement(claims, issuer.HandoffMeasurements, "handoff"); err != nil {
+	if err := checkRequiredMeasurement(claims, iss.HandoffMeasurements, "handoff"); err != nil {
 		recordTokenValidationFailure(err)
 		measurementDeniedTotal.WithLabelValues("handoff").Inc()
 		return nil, fmt.Errorf("validate handoff issuer measurement: %w", err)
@@ -498,14 +499,14 @@ func validateCAKeyPair(cert *x509.Certificate, key *ecdsa.PrivateKey) error {
 	return nil
 }
 
-func checkRequiredMeasurement(claims *earClaims, allowed map[string]bool, endpoint string) error {
+func checkRequiredMeasurement(claims *issuer.EARClaims, allowed map[string]bool, endpoint string) error {
 	if len(allowed) == 0 {
-		return &tokenValidationError{
+		return &issuer.TokenValidationError{
 			Reason: "measurement_denied",
 			Err:    fmt.Errorf("measurement allowlist required for %s", endpoint),
 		}
 	}
-	return checkMeasurement(claims, allowed, endpoint)
+	return issuer.CheckMeasurement(claims, allowed, endpoint)
 }
 
 func signHandoffMessage(key *ecdsa.PrivateKey, message []byte) (string, error) {
@@ -517,7 +518,7 @@ func signHandoffMessage(key *ecdsa.PrivateKey, message []byte) (string, error) {
 	return encodeB64(sig), nil
 }
 
-func verifyHandoffSignature(claims *earClaims, signature string, message []byte, label string) error {
+func verifyHandoffSignature(claims *issuer.EARClaims, signature string, message []byte, label string) error {
 	if claims.TEEPubKey == "" {
 		return fmt.Errorf("%s EAR is missing %s claim", label, earclaims.TEEPublicKey)
 	}

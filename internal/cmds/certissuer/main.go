@@ -83,6 +83,11 @@ func Run(args []string) error {
 	}
 	slog.SetDefault(logger)
 
+	if *jwtClockSkew < 0 {
+		return fmt.Errorf("--jwt-clock-skew must be non-negative")
+	}
+	issuer.JWTClockSkew = time.Duration(*jwtClockSkew) * time.Second
+
 	if *caRotationInterval <= 0 {
 		return fmt.Errorf("--ca-rotation-interval must be positive")
 	}
@@ -179,7 +184,6 @@ func Run(args []string) error {
 		AllowedCNPattern:    compiledCNPattern,
 		ExpectedIssuer:      *expectedIssuer,
 		RequestTimeout:      *requestTimeout,
-		JWTClockSkew:        *jwtClockSkew,
 		MinCAValidity:       *minCAValidity,
 		Logger:              logger,
 		tracker:             newNodeTracker(*maxTTLF),

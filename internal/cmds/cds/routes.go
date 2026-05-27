@@ -14,6 +14,7 @@ import (
 // dependencies bundles everything the cds router needs.
 type dependencies struct {
 	AttestHandler    AttestHandler
+	SignCSRHandler   SignCSRHandler
 	WhitelistHandler whitelist.Handler
 	ReadyFn          attestation.ReadinessFunc
 	EarIssuer        ear.Issuer
@@ -34,6 +35,7 @@ func newRouter(deps dependencies) http.Handler {
 
 	r.Post("/authenticate", attestation.HandleAuthenticate(deps.AttestHandler.Challenges))
 	r.Method(http.MethodPost, "/attest", capBody(deps.MaxRequestSize, http.HandlerFunc(deps.AttestHandler.HandleAttest)))
+	r.Method(http.MethodPost, "/sign-csr", capBody(deps.MaxRequestSize, http.HandlerFunc(deps.SignCSRHandler.HandleSignCSR)))
 
 	r.Get("/whitelist", deps.WhitelistHandler.HandleList)
 	r.Method(http.MethodPost, "/whitelist", capBody(deps.MaxRequestSize, http.HandlerFunc(deps.WhitelistHandler.HandleAdd)))

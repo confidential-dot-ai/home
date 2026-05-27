@@ -2,7 +2,10 @@ package certissuer
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
+
+	"github.com/lunal-dev/c8s/internal/issuer"
 )
 
 func handlePublicCA(bm *bundleManager) http.HandlerFunc {
@@ -17,8 +20,10 @@ func handlePublicCA(bm *bundleManager) http.HandlerFunc {
 }
 
 func recordTokenValidationFailure(err error) {
-	var tve *tokenValidationError
+	var tve *issuer.TokenValidationError
 	if errors.As(err, &tve) {
-		tokenValidationFailuresTotal.WithLabelValues(tve.Reason).Inc()
+		tokenValidationFailuresTotal.WithLabelValues(string(tve.Reason)).Inc()
+		return
 	}
+	slog.Warn("token validation failed without typed reason", "error", err)
 }

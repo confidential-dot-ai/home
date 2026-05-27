@@ -3,7 +3,9 @@ package earclaims
 const (
 	EATProfile               = "eat_profile"
 	Issuer                   = "iss"
+	Audience                 = "aud"
 	IssuedAt                 = "iat"
+	NotBefore                = "nbf"
 	ExpiresAt                = "exp"
 	EARVerifierID            = "ear_verifier_id"
 	Submods                  = "submods"

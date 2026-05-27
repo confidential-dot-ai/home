@@ -49,7 +49,6 @@ func TestAttestedHandoffTransfersCAKeyToAllowedReplica(t *testing.T) {
 
 	joining := &Issuer{
 		keyProvider:         active.keyProvider,
-		JWTClockSkew:        30,
 		Logger:              slog.Default(),
 		HandoffMeasurements: map[string]bool{"allowed_measurement": true},
 	}
@@ -103,7 +102,6 @@ func TestHandoffBundleStartsWithHandedOffActiveCA(t *testing.T) {
 
 	joining := &Issuer{
 		keyProvider:         active.keyProvider,
-		JWTClockSkew:        30,
 		Logger:              slog.Default(),
 		HandoffMeasurements: map[string]bool{"allowed_measurement": true},
 	}

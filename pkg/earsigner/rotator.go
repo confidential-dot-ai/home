@@ -95,6 +95,31 @@ func (r *Rotator) JWKSetJSON() []byte {
 	return *p
 }
 
+// PublicKey returns the ECDSA public key matching kid from the active or
+// retiring set. Empty kid returns the active key (legacy tokens issued
+// before the JWKS rollout carried no kid header). Satisfies the
+// issuer.KeyProvider interface so callers can verify EAR JWTs against the
+// rotator's in-memory key state without an out-of-process JWKS fetch.
+func (r *Rotator) PublicKey(kid string) (*ecdsa.PublicKey, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if kid == "" {
+		if r.active == nil {
+			return nil, fmt.Errorf("no active token-signer key")
+		}
+		return &r.active.key.PublicKey, nil
+	}
+	if r.active != nil && r.active.kid == kid {
+		return &r.active.key.PublicKey, nil
+	}
+	for _, k := range r.retiring {
+		if k.kid == kid {
+			return &k.key.PublicKey, nil
+		}
+	}
+	return nil, fmt.Errorf("no token-signer key for kid %q", kid)
+}
+
 // Run starts the rotation loop. Blocks until ctx is cancelled.
 func (r *Rotator) Run(ctx context.Context) {
 	// Jitter the first tick to avoid thundering-herd after fleet restarts.
