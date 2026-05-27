@@ -96,19 +96,17 @@ func (r *Rotator) JWKSetJSON() []byte {
 }
 
 // PublicKey returns the ECDSA public key matching kid from the active or
-// retiring set. Empty kid returns the active key (legacy tokens issued
-// before the JWKS rollout carried no kid header). Satisfies the
+// retiring set. A kid is always required: with an overlap window the active
+// and retiring keys coexist, and routing every kid-less token to "active"
+// would silently mis-verify tokens signed by a retiring key. Satisfies the
 // issuer.KeyProvider interface so callers can verify EAR JWTs against the
 // rotator's in-memory key state without an out-of-process JWKS fetch.
 func (r *Rotator) PublicKey(kid string) (*ecdsa.PublicKey, error) {
+	if kid == "" {
+		return nil, fmt.Errorf("token-signer lookup requires a kid header")
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if kid == "" {
-		if r.active == nil {
-			return nil, fmt.Errorf("no active token-signer key")
-		}
-		return &r.active.key.PublicKey, nil
-	}
 	if r.active != nil && r.active.kid == kid {
 		return &r.active.key.PublicKey, nil
 	}

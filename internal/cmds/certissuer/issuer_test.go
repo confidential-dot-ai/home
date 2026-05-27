@@ -88,9 +88,9 @@ func testIssuer(t *testing.T) (*Issuer, *ecdsa.PrivateKey) {
 	return iss, tokenKey
 }
 
-func mustCertKeyProvider(t *testing.T, cert *x509.Certificate) *certKeyProvider {
+func mustCertKeyProvider(t *testing.T, cert *x509.Certificate) *issuer.CertKeyProvider {
 	t.Helper()
-	p, err := newCertKeyProvider(cert)
+	p, err := issuer.NewCertKeyProvider(cert)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,10 +141,49 @@ func selfSignedLeaf(t *testing.T, key *ecdsa.PrivateKey, cn string) *x509.Certif
 	return cert
 }
 
-// signJWT creates a minimal ES256 JWT signed by the given key.
+func validTestEARClaims(claims map[string]any) map[string]any {
+	out := make(map[string]any, len(claims)+3)
+	for k, v := range claims {
+		out[k] = v
+	}
+	if _, ok := out[earclaims.EATProfile]; !ok {
+		out[earclaims.EATProfile] = earclaims.EARProfileTag
+	}
+	if _, ok := out[earclaims.EARVerifierID]; !ok {
+		out[earclaims.EARVerifierID] = map[string]any{
+			earclaims.Developer: "test",
+			earclaims.Build:     "test",
+		}
+	}
+	if !hasNonEmptyObjectClaim(out[earclaims.Submods]) {
+		out[earclaims.Submods] = map[string]any{
+			earclaims.SubmodAttester: map[string]any{
+				earclaims.EARStatus: 2,
+			},
+		}
+	}
+	return out
+}
+
+func hasNonEmptyObjectClaim(v any) bool {
+	switch typed := v.(type) {
+	case map[string]any:
+		return len(typed) > 0
+	case map[string]string:
+		return len(typed) > 0
+	case map[string]json.RawMessage:
+		return len(typed) > 0
+	default:
+		return false
+	}
+}
+
+// signJWT creates an ES256 JWT signed by the given key, adding mandatory EAR
+// shape fields unless the caller provided them.
 func signJWT(t *testing.T, key *ecdsa.PrivateKey, claims map[string]any) string {
 	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256","typ":"JWT"}`))
+	claims = validTestEARClaims(claims)
 	claimsJSON, _ := json.Marshal(claims)
 	payload := base64.RawURLEncoding.EncodeToString(claimsJSON)
 	signingInput := header + "." + payload
@@ -496,8 +535,8 @@ func TestHandleCA(t *testing.T) {
 
 func TestHandlePublicCA_Public(t *testing.T) {
 	iss, _ := testIssuer(t)
-	bm := newBundleManager(iss.MaxTTL, "", "default/mesh/ca-bundle", slog.Default())
-	bm.setInitial(iss.getBundle().caCert)
+	bm := issuer.NewBundleManager(iss.MaxTTL, "", "default/mesh/ca-bundle", slog.Default())
+	bm.SetInitial(iss.getBundle().caCert)
 
 	req := httptest.NewRequest("GET", "/ca", nil)
 	w := httptest.NewRecorder()
@@ -543,10 +582,12 @@ func TestLiveEndpoint(t *testing.T) {
 	}
 }
 
-// signJWT384 creates a minimal ES384 JWT signed by the given P-384 key.
+// signJWT384 creates an ES384 JWT signed by the given P-384 key, adding
+// mandatory EAR shape fields unless the caller provided them.
 func signJWT384(t *testing.T, key *ecdsa.PrivateKey, claims map[string]any) string {
 	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES384","typ":"JWT"}`))
+	claims = validTestEARClaims(claims)
 	claimsJSON, _ := json.Marshal(claims)
 	payload := base64.RawURLEncoding.EncodeToString(claimsJSON)
 	signingInput := header + "." + payload

@@ -2,11 +2,14 @@ package issuer
 
 import (
 	"crypto/ecdsa"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/lunal-dev/c8s/internal/earclaims"
 )
 
 // JWTClockSkew is the package-level leeway for EAR JWT time validation.
@@ -14,8 +17,9 @@ import (
 var JWTClockSkew = 30 * time.Second
 
 // KeyProvider resolves the ECDSA public key for verifying an EAR JWT
-// signature. kid may be empty for legacy tokens issued before the JWKS
-// rollout — implementations may return the active key in that case.
+// signature. Single-key implementations (e.g. cert-pinned mode) may ignore
+// kid; multi-key implementations (JWKS, in-process rotator) must require it
+// to prevent token-confusion across the active and retiring keys.
 type KeyProvider interface {
 	PublicKey(kid string) (*ecdsa.PublicKey, error)
 }
@@ -81,7 +85,51 @@ func ValidateEARToken(tokenStr string, provider KeyProvider, expectedIssuer stri
 		}
 	}
 
+	if err := validateEARClaims(claims); err != nil {
+		return nil, err
+	}
+
 	return claims, nil
+}
+
+// validateEARClaims rejects a signed JWT that is not a structurally valid EAR:
+// the time/issuer/audience checks above only prove the token is a well-formed
+// JWT from the expected signer, not that it carries the mandatory EAR shape.
+func validateEARClaims(claims *EARClaims) error {
+	if claims == nil {
+		return malformedEAR("EAR claims are required")
+	}
+	if claims.Profile != earclaims.EARProfileTag {
+		return malformedEAR("EAR %s claim must be %q", earclaims.EATProfile, earclaims.EARProfileTag)
+	}
+	if claims.IssuedAt == 0 {
+		return malformedEAR("EAR %s claim is required", earclaims.IssuedAt)
+	}
+	if err := requireNonEmptyJSONObject(earclaims.EARVerifierID, claims.VerifierID); err != nil {
+		return err
+	}
+	return requireNonEmptyJSONObject(earclaims.Submods, claims.Submods)
+}
+
+func requireNonEmptyJSONObject(name string, raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return malformedEAR("EAR %s claim is required", name)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return malformedEAR("EAR %s claim must be a JSON object: %w", name, err)
+	}
+	if len(object) == 0 {
+		return malformedEAR("EAR %s claim must be a non-empty JSON object", name)
+	}
+	return nil
+}
+
+func malformedEAR(format string, args ...any) error {
+	return &TokenValidationError{
+		Reason: ReasonMalformed,
+		Err:    fmt.Errorf(format, args...),
+	}
 }
 
 func keyForEARToken(provider KeyProvider, token *jwt.Token) (any, error) {

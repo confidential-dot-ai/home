@@ -54,8 +54,8 @@ func NewCmd() *cobra.Command {
 	flags.IntVar(&cfg.maxHeaderBytes, "max-header-bytes", defaultHTTPMaxHeaderBytes, "maximum HTTP request header bytes")
 
 	flags.BoolVar(&cfg.sanValidation, "san-validation", true, "require CSR IP SANs to equal the request source IP (false rejects CSRs carrying IP SANs)")
-	flags.StringVar(&cfg.dnsSANPattern, "dns-san-pattern", "", "regex DNS SANs must match (empty rejects any DNS SAN)")
-	flags.StringVar(&cfg.allowedCNPattern, "allowed-cn-pattern", "", "regex the CSR Subject CN must match (empty disables)")
+	flags.StringVar(&cfg.dnsSANPattern, "dns-san-pattern", "", "regex DNS SANs must match in full (empty rejects any DNS SAN)")
+	flags.StringVar(&cfg.allowedCNPattern, "allowed-cn-pattern", "", "regex the CSR Subject CN must match in full (empty disables)")
 	flags.DurationVar(&cfg.readinessInterval, "readiness-interval", 10*time.Second, "")
 	flags.DurationVar(&cfg.minCAValidity, "min-ca-validity", time.Hour, "/readyz fails when the loaded mesh CA has less than this remaining lifetime")
 	flags.StringVar(&cfg.whitelistDB, "whitelist-db", "", "Path to the whitelist SQLite database")

@@ -18,7 +18,7 @@ import (
 	"github.com/lunal-dev/c8s/pkg/jwks"
 )
 
-const earProfile = "tag:ietf.org,2026:rats/ear#03"
+const earProfile = earclaims.EARProfileTag
 
 // statusAffirming is the EAR trustworthiness tier value meaning
 // "recognised and not compromised" (draft-ietf-rats-ear).

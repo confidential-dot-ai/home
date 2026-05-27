@@ -16,12 +16,12 @@ import (
 // must satisfy before its presented Subject/SANs are signed onto a leaf
 // certificate. Empty fields disable the corresponding check.
 type CSRPolicy struct {
-	// DNSSANPattern is the regex DNS SANs must match. Nil rejects any CSR
-	// carrying DNS SANs.
+	// DNSSANPattern is the regex DNS SANs must match in full. Nil rejects any
+	// CSR carrying DNS SANs.
 	DNSSANPattern *regexp.Regexp
 
-	// AllowedCNPattern restricts the CSR's Subject CN to this regex. Nil
-	// disables CN validation.
+	// AllowedCNPattern restricts the CSR's Subject CN to a full regex match.
+	// Nil disables CN validation.
 	AllowedCNPattern *regexp.Regexp
 
 	// SourceIP, when non-empty, requires the CSR to carry at most one IP SAN,
@@ -40,13 +40,13 @@ func ValidateCSR(csr *x509.CertificateRequest, p CSRPolicy) error {
 			return fmt.Errorf("CSR contains DNS SANs %v but no DNS SAN pattern configured", csr.DNSNames)
 		}
 		for _, dns := range csr.DNSNames {
-			if !p.DNSSANPattern.MatchString(dns) {
+			if !fullRegexMatch(p.DNSSANPattern, dns) {
 				return fmt.Errorf("CSR DNS SAN %q does not match allowed pattern", dns)
 			}
 		}
 	}
 	if p.AllowedCNPattern != nil && csr.Subject.CommonName != "" {
-		if !p.AllowedCNPattern.MatchString(csr.Subject.CommonName) {
+		if !fullRegexMatch(p.AllowedCNPattern, csr.Subject.CommonName) {
 			return fmt.Errorf("CSR CN %q does not match allowed pattern", csr.Subject.CommonName)
 		}
 	}
@@ -80,6 +80,13 @@ func parseSourceIP(host string) net.IP {
 		host = host[:i]
 	}
 	return net.ParseIP(host)
+}
+
+// fullRegexMatch reports whether re matches value in its entirety (anchored at
+// both ends), so a pattern like "foo" does not admit "foobar".
+func fullRegexMatch(re *regexp.Regexp, value string) bool {
+	match := re.FindStringIndex(value)
+	return match != nil && match[0] == 0 && match[1] == len(value)
 }
 
 // SourceIPFromRemoteAddr extracts the IP portion of an http.Request.RemoteAddr.

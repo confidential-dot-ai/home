@@ -14,6 +14,8 @@ import (
 // set that the c8s control-plane consumes: the issuer, validity window, the
 // TEE-attested public key, and the raw attestation evidence (under submods).
 type EARClaims struct {
+	// Profile identifies the EAR profile version this token claims to follow.
+	Profile string
 	// Issuer is matched against the caller-supplied expected issuer.
 	Issuer string
 	// IssuedAt is a Unix timestamp.
@@ -25,6 +27,10 @@ type EARClaims struct {
 	// TEEPubKey is the base64url-encoded DER PKIX public key from the TEE,
 	// bound to the attestation report via REPORTDATA.
 	TEEPubKey string
+	// VerifierID identifies the verifier that appraised the evidence.
+	VerifierID json.RawMessage
+	// Submods is the raw EAR submodule map.
+	Submods json.RawMessage
 	// RawEvidence is the raw attestation evidence for audit hashing.
 	// EAR carries submods as a JSON object, so we use json.RawMessage.
 	RawEvidence json.RawMessage
@@ -36,10 +42,12 @@ func (c *EARClaims) UnmarshalJSON(raw []byte) error {
 	*c = EARClaims{RawEvidence: append(json.RawMessage(nil), raw...)}
 	var rawEvidence json.RawMessage
 	if err := earclaims.UnmarshalObject(raw,
+		earclaims.Bind(earclaims.EATProfile, &c.Profile),
 		earclaims.Bind(earclaims.Issuer, &c.Issuer),
 		earclaims.Bind(earclaims.IssuedAt, &c.IssuedAt),
 		earclaims.Bind(earclaims.NotBefore, &c.NotBefore),
 		earclaims.Bind(earclaims.ExpiresAt, &c.Expiry),
+		earclaims.Bind(earclaims.EARVerifierID, &c.VerifierID),
 		earclaims.Bind(earclaims.TEEPublicKey, &c.TEEPubKey),
 		earclaims.Bind(earclaims.Submods, &rawEvidence),
 		earclaims.Bind(earclaims.Audience, &c.audience),
@@ -47,6 +55,7 @@ func (c *EARClaims) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	if len(rawEvidence) > 0 {
+		c.Submods = append(json.RawMessage(nil), rawEvidence...)
 		c.RawEvidence = rawEvidence
 	}
 	return nil

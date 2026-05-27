@@ -42,6 +42,7 @@ func newStubRouter(t *testing.T) http.Handler {
 		ReadyFn:          func() bool { return true },
 		EarIssuer:        earIss,
 		CACertPEM:        certutil.EncodeCertPEM(ca.Cert.Raw),
+		MaxRequestSize:   65536,
 	}
 	return newRouter(deps)
 }

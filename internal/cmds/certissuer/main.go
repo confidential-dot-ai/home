@@ -36,8 +36,8 @@ func Run(args []string) error {
 	rateLimit := fs.Float64("rate-limit", 10, "maximum requests per second per source IP")
 	rateBurst := fs.Int("rate-burst", 20, "maximum burst size per source IP")
 	sanValidation := fs.Bool("san-validation", true, "validate CSR IP SANs match request source IP (false rejects CSRs carrying IP SANs)")
-	dnsSANPattern := fs.String("dns-san-pattern", "", "regex pattern for allowed DNS SANs in CSRs (empty = reject all DNS SANs)")
-	allowedCNPattern := fs.String("allowed-cn-pattern", "", "regex pattern for allowed CN in CSRs (empty = no restriction)")
+	dnsSANPattern := fs.String("dns-san-pattern", "", "regex pattern that must match allowed DNS SANs in full (empty = reject all DNS SANs)")
+	allowedCNPattern := fs.String("allowed-cn-pattern", "", "regex pattern that must match allowed CNs in full (empty = no restriction)")
 	expectedIssuer := fs.String("expected-issuer", "", "expected JWT issuer claim (empty = skip validation, with warning)")
 	rateLimiterMax := fs.Int("rate-limiter-max-entries", 10000, "maximum entries in per-IP rate limiter")
 	requestTimeout := fs.Duration("request-timeout", 5*time.Second, "per-request timeout for sign-csr handler")
@@ -88,6 +88,11 @@ func Run(args []string) error {
 	}
 	issuer.JWTClockSkew = time.Duration(*jwtClockSkew) * time.Second
 
+	if *jwtClockSkew < 0 {
+		return fmt.Errorf("--jwt-clock-skew must be non-negative")
+	}
+	issuer.JWTClockSkew = time.Duration(*jwtClockSkew) * time.Second
+
 	if *caRotationInterval <= 0 {
 		return fmt.Errorf("--ca-rotation-interval must be positive")
 	}
@@ -100,13 +105,13 @@ func Run(args []string) error {
 	defer stop()
 
 	var tokenSignerCert *x509.Certificate
-	var kp KeyProvider
+	var kp issuer.KeyProvider
 	if *jwksURL != "" {
 		jwksClient, err := buildJWKSHTTPClient(*jwksURL, *assamMeasurementsRaw, *ratlsAttestationServiceURL, logger)
 		if err != nil {
 			return err
 		}
-		provider, err := newJWKSKeyProvider(ctx, *jwksURL, *jwksCacheTTL, jwksClient, logger)
+		provider, err := issuer.NewJWKSKeyProvider(ctx, *jwksURL, *jwksCacheTTL, jwksClient, logger)
 		if err != nil {
 			return fmt.Errorf("init JWKS key provider: %w", err)
 		}
@@ -117,7 +122,7 @@ func Run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("load token-signer certificate: %w", err)
 		}
-		provider, err := newCertKeyProvider(cert)
+		provider, err := issuer.NewCertKeyProvider(cert)
 		if err != nil {
 			return fmt.Errorf("invalid token-signer certificate: %w", err)
 		}
@@ -210,29 +215,27 @@ func Run(args []string) error {
 	rl := newIPRateLimiter(rate.Limit(*rateLimit), *rateBurst, *rateLimiterMax)
 
 	// Initialize public bundle manager.
-	bm := newBundleManager(*maxTTLF, *caRepoDir, *caBundlePath, logger)
+	bm := issuer.NewBundleManager(*maxTTLF, *caRepoDir, *caBundlePath, logger)
 
 	// Try to load existing public bundle from the repo (restart recovery).
-	existingBundle, err := bm.loadFromRepo()
+	existingBundle, err := bm.LoadFromRepo()
 	if err != nil {
 		logger.Warn("failed to load existing public CA bundle", "error", err)
 	}
 	if existingBundle != nil {
-		bm.setWithCurrent(caCert, existingBundle)
+		bm.SetWithCurrent(caCert, existingBundle)
 		logger.Info("loaded existing public CA bundle", "count", len(existingBundle))
 	} else {
-		bm.setInitial(caCert)
+		bm.SetInitial(caCert)
 	}
-	if err := bm.persistCurrent(); err != nil {
+	if err := bm.PersistCurrent(); err != nil {
 		return fmt.Errorf("persist initial public CA bundle: %w", err)
 	}
 	iss.caBundle = bm
 
-	rotator := &caRotator{
-		issuer:         iss,
-		bundle:         bm,
-		caCertValidity: *caCertValidity,
-		caCommonName:   *caCommonName,
+	rotator, err := issuer.NewCARotator(newCARotatorDeps(iss, bm, *caCertValidity, *caCommonName))
+	if err != nil {
+		return fmt.Errorf("init CA rotator: %w", err)
 	}
 
 	mux := http.NewServeMux()
@@ -316,7 +319,7 @@ func Run(args []string) error {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
 	}
 
-	go rotator.run(ctx, *caRotationInterval)
+	go rotator.Run(ctx, *caRotationInterval)
 	logger.Info("scheduled CA rotation enabled", "interval", caRotationInterval.String())
 
 	// Update cert expiry gauges periodically.

@@ -1,6 +1,7 @@
 package earclaims
 
 const (
+	EARProfileTag            = "tag:ietf.org,2026:rats/ear#03"
 	EATProfile               = "eat_profile"
 	Issuer                   = "iss"
 	Audience                 = "aud"

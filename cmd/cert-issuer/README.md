@@ -38,8 +38,8 @@ cert-issuer \
 | `--ca-cert-validity` | `8760h` | Validity for generated/rotated CA certificates |
 | `--min-ca-validity` | `1h` | Minimum remaining CA validity for readiness |
 | `--san-validation` | `true` | Validate CSR IP SANs against request source IP |
-| `--dns-san-pattern` | empty | Regex for allowed DNS SANs; empty rejects DNS SANs |
-| `--allowed-cn-pattern` | empty | Regex for allowed CNs |
+| `--dns-san-pattern` | empty | Regex that allowed DNS SANs must match in full; empty rejects DNS SANs |
+| `--allowed-cn-pattern` | empty | Regex that allowed CNs must match in full |
 
 ## Resources
 

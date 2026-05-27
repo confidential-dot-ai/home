@@ -20,10 +20,13 @@ type dependencies struct {
 	EarIssuer        ear.Issuer
 	JWKSFunc         func() []byte
 	CACertPEM        []byte
-	MaxRequestSize   int64 // applied to write endpoints; <=0 disables capping
+	MaxRequestSize   int64 // applied to write endpoints; must be > 0
 }
 
 func newRouter(deps dependencies) http.Handler {
+	if deps.MaxRequestSize <= 0 {
+		panic("cds: dependencies.MaxRequestSize must be positive")
+	}
 	r := chi.NewRouter()
 	r.Use(server.RequestLogger)
 
@@ -47,9 +50,6 @@ func newRouter(deps dependencies) http.Handler {
 }
 
 func capBody(max int64, next http.Handler) http.Handler {
-	if max <= 0 {
-		return next
-	}
 	return http.MaxBytesHandler(next, max)
 }
 

@@ -137,4 +137,3 @@ systemctl restart containerd
 /run/containerd/containerd.sock
 {{- end -}}
 {{- end -}}
-

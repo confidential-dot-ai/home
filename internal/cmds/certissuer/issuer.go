@@ -41,17 +41,17 @@ type certBundle struct {
 // Issuer validates EAR JWT tokens (issued by assam) and signs CSRs with its CA key.
 type Issuer struct {
 	bundle           atomic.Pointer[certBundle]
-	keyProvider      KeyProvider
+	keyProvider      issuer.KeyProvider
 	MaxTTL           time.Duration
 	SANValidation    bool           // When true, CSR IP SANs must match the request source IP; when false, CSRs carrying IP SANs are rejected.
-	DNSSANPattern    *regexp.Regexp // When set, DNS SANs matching this pattern are allowed. Nil = reject all DNS SANs.
-	AllowedCNPattern *regexp.Regexp // When set, CSR CN must match this pattern. Nil = no CN restriction.
+	DNSSANPattern    *regexp.Regexp // When set, DNS SANs matching this pattern in full are allowed. Nil = reject all DNS SANs.
+	AllowedCNPattern *regexp.Regexp // When set, CSR CN must match this pattern in full. Nil = no CN restriction.
 	ExpectedIssuer   string         // When non-empty, validates the EAR issuer claim.
 	RequestTimeout   time.Duration  // Per-request timeout. Zero = no timeout.
 	MinCAValidity    time.Duration  // Minimum remaining CA cert validity for readiness.
 	Logger           *slog.Logger
 	tracker          *nodeTracker
-	caBundle         *bundleManager // Optional public CA bundle source for sign-csr responses.
+	caBundle         *issuer.BundleManager // Optional public CA bundle source for sign-csr responses.
 
 	// Per-endpoint measurement allowlists. Empty map = skip check (opt-in).
 	SignCSRMeasurements map[string]bool
@@ -291,7 +291,7 @@ func (iss *Issuer) caBundlePEMForResponse(b *certBundle) []byte {
 		return nil
 	}
 	if iss.caBundle != nil {
-		if bundlePEM := iss.caBundle.bundlePEMForCurrent(b.caCert); len(bundlePEM) > 0 {
+		if bundlePEM := iss.caBundle.BundlePEMForCurrent(b.caCert); len(bundlePEM) > 0 {
 			return bundlePEM
 		}
 	}

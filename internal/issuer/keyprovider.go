@@ -1,4 +1,4 @@
-package certissuer
+package issuer
 
 import (
 	"context"
@@ -15,27 +15,21 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// KeyProvider resolves the ECDSA public key for verifying an EAR JWT.
-// kid may be empty for tokens issued before the JWKS rollout.
-type KeyProvider interface {
-	PublicKey(kid string) (*ecdsa.PublicKey, error)
-}
-
-// certKeyProvider wraps a certificate-based public key (the legacy path).
+// CertKeyProvider wraps a certificate-based public key (the legacy path).
 // It ignores the kid and always returns the same key.
-type certKeyProvider struct {
+type CertKeyProvider struct {
 	pub *ecdsa.PublicKey
 }
 
-func newCertKeyProvider(cert *x509.Certificate) (*certKeyProvider, error) {
+func NewCertKeyProvider(cert *x509.Certificate) (*CertKeyProvider, error) {
 	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
 	if !ok {
 		return nil, fmt.Errorf("token-signer cert has non-ECDSA key: %T", cert.PublicKey)
 	}
-	return &certKeyProvider{pub: pub}, nil
+	return &CertKeyProvider{pub: pub}, nil
 }
 
-func (p *certKeyProvider) PublicKey(_ string) (*ecdsa.PublicKey, error) {
+func (p *CertKeyProvider) PublicKey(_ string) (*ecdsa.PublicKey, error) {
 	return p.pub, nil
 }
 
@@ -44,10 +38,10 @@ var jwksRefreshesTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Total JWKS endpoint refreshes.",
 })
 
-// jwksKeyProvider resolves EAR signing keys from a JWKS endpoint via
+// JWKSKeyProvider resolves EAR signing keys from a JWKS endpoint via
 // jwx's background-refreshing cache. On a kid miss we force-refresh once
 // per second to pick up an Assam key rotation between scheduled refreshes.
-type jwksKeyProvider struct {
+type JWKSKeyProvider struct {
 	url    string
 	cache  *jwk.Cache
 	logger *slog.Logger
@@ -56,7 +50,7 @@ type jwksKeyProvider struct {
 	lastForce time.Time
 }
 
-func newJWKSKeyProvider(ctx context.Context, url string, cacheTTL time.Duration, client *http.Client, logger *slog.Logger) (*jwksKeyProvider, error) {
+func NewJWKSKeyProvider(ctx context.Context, url string, cacheTTL time.Duration, client *http.Client, logger *slog.Logger) (*JWKSKeyProvider, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
@@ -73,16 +67,19 @@ func newJWKSKeyProvider(ctx context.Context, url string, cacheTTL time.Duration,
 	} else {
 		jwksRefreshesTotal.Inc()
 	}
-	return &jwksKeyProvider{url: url, cache: cache, logger: logger}, nil
+	return &JWKSKeyProvider{url: url, cache: cache, logger: logger}, nil
 }
 
-func (p *jwksKeyProvider) PublicKey(kid string) (*ecdsa.PublicKey, error) {
+func (p *JWKSKeyProvider) PublicKey(kid string) (*ecdsa.PublicKey, error) {
+	if kid == "" {
+		return nil, fmt.Errorf("JWKS verification requires a kid header")
+	}
 	ctx := context.Background()
 	set, err := p.cache.Get(ctx, p.url)
 	if err != nil {
 		return nil, fmt.Errorf("JWKS cache lookup: %w", err)
 	}
-	if key, ok := lookupECDSA(set, kid, p.logger); ok {
+	if key, ok := lookupECDSA(set, kid); ok {
 		return key, nil
 	}
 	if !p.tryForceRefresh(ctx) {
@@ -92,13 +89,13 @@ func (p *jwksKeyProvider) PublicKey(kid string) (*ecdsa.PublicKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("JWKS cache lookup after refresh: %w", err)
 	}
-	if key, ok := lookupECDSA(set, kid, p.logger); ok {
+	if key, ok := lookupECDSA(set, kid); ok {
 		return key, nil
 	}
 	return nil, fmt.Errorf("JWKS key not found for kid %q after refresh", kid)
 }
 
-func (p *jwksKeyProvider) tryForceRefresh(ctx context.Context) bool {
+func (p *JWKSKeyProvider) tryForceRefresh(ctx context.Context) bool {
 	p.mu.Lock()
 	if time.Since(p.lastForce) < time.Second {
 		p.mu.Unlock()
@@ -115,24 +112,18 @@ func (p *jwksKeyProvider) tryForceRefresh(ctx context.Context) bool {
 	return true
 }
 
-// lookupECDSA returns the ECDSA public key for kid, or the first ECDSA key
-// in the set when kid is empty (legacy tokens issued before the JWKS rollout).
-func lookupECDSA(set jwk.Set, kid string, logger *slog.Logger) (*ecdsa.PublicKey, bool) {
-	if kid != "" {
-		key, ok := set.LookupKeyID(kid)
-		if !ok {
-			return nil, false
-		}
-		return rawECDSA(key)
+func lookupECDSA(set jwk.Set, kid string) (*ecdsa.PublicKey, bool) {
+	// jwk.Set.LookupKeyID does exact string match including "", which would
+	// match any key in the set whose kid field is unset or empty. Refuse to
+	// resolve a kid-less token even if the caller forgot to pre-validate.
+	if kid == "" {
+		return nil, false
 	}
-	for i := 0; i < set.Len(); i++ {
-		key, _ := set.Key(i)
-		if pub, ok := rawECDSA(key); ok {
-			logger.Debug("EAR token has no kid header, using first JWKS key")
-			return pub, true
-		}
+	key, ok := set.LookupKeyID(kid)
+	if !ok {
+		return nil, false
 	}
-	return nil, false
+	return rawECDSA(key)
 }
 
 func rawECDSA(key jwk.Key) (*ecdsa.PublicKey, bool) {

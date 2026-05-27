@@ -62,9 +62,14 @@ type earClaimsLite struct {
 func signEAR(t *testing.T, key *ecdsa.PrivateKey, claims earClaimsLite) string {
 	t.Helper()
 	tokenClaims := jwt.MapClaims{
-		earclaims.Issuer:    claims.Issuer,
-		earclaims.IssuedAt:  claims.IssuedAt,
-		earclaims.ExpiresAt: claims.Expiry,
+		earclaims.EATProfile: earclaims.EARProfileTag,
+		earclaims.Issuer:     claims.Issuer,
+		earclaims.IssuedAt:   claims.IssuedAt,
+		earclaims.ExpiresAt:  claims.Expiry,
+		earclaims.EARVerifierID: map[string]any{
+			earclaims.Developer: "test",
+			earclaims.Build:     "test",
+		},
 	}
 	if claims.NotBefore != 0 {
 		tokenClaims[earclaims.NotBefore] = claims.NotBefore
@@ -74,6 +79,10 @@ func signEAR(t *testing.T, key *ecdsa.PrivateKey, claims earClaimsLite) string {
 	}
 	if claims.Submods != nil {
 		tokenClaims[earclaims.Submods] = claims.Submods
+	} else {
+		tokenClaims[earclaims.Submods] = map[string]any{
+			earclaims.SubmodAttester: map[string]any{earclaims.EARStatus: 2},
+		}
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, tokenClaims)
 	signed, err := token.SignedString(key)

@@ -35,8 +35,8 @@ func TestAttestedHandoffTransfersCAKeyToAllowedReplica(t *testing.T) {
 	activeEAR := handoffTestEARWithKey(t, tokenKey, "allowed_measurement", activeHandoffKey)
 	requesterEAR := handoffTestEARWithKey(t, tokenKey, "allowed_measurement", requesterHandoffKey)
 
-	bm := newBundleManager(active.MaxTTL, "", "default/mesh/ca-bundle", slog.Default())
-	bm.setInitial(active.getBundle().caCert)
+	bm := issuerpkg.NewBundleManager(active.MaxTTL, "", "default/mesh/ca-bundle", slog.Default())
+	bm.SetInitial(active.getBundle().caCert)
 
 	hh := &handoffHandler{
 		issuer:          active,
@@ -88,8 +88,8 @@ func TestHandoffBundleStartsWithHandedOffActiveCA(t *testing.T) {
 
 	// Simulate the small rotation window where /ca has published the next
 	// bundle before the active signer pointer is swapped.
-	bm := newBundleManager(active.MaxTTL, "", "default/mesh/ca-bundle", slog.Default())
-	bm.certs = []*x509.Certificate{rotated.Cert, activeBundle.caCert}
+	bm := issuerpkg.NewBundleManager(active.MaxTTL, "", "default/mesh/ca-bundle", slog.Default())
+	bm.SetWithCurrent(rotated.Cert, []*x509.Certificate{activeBundle.caCert})
 
 	hh := &handoffHandler{
 		issuer:          active,
@@ -112,10 +112,10 @@ func TestHandoffBundleStartsWithHandedOffActiveCA(t *testing.T) {
 	if len(material.bundle) != 2 {
 		t.Fatalf("handoff bundle count = %d, want active + published next CA", len(material.bundle))
 	}
-	if !sameCert(material.caCert, activeBundle.caCert) || !sameCert(material.bundle[0], activeBundle.caCert) {
+	if !material.caCert.Equal(activeBundle.caCert) || !material.bundle[0].Equal(activeBundle.caCert) {
 		t.Fatalf("handoff bundle first CA must match handed-off active signer")
 	}
-	if !sameCert(material.bundle[1], rotated.Cert) {
+	if !material.bundle[1].Equal(rotated.Cert) {
 		t.Fatalf("handoff bundle should retain the published next CA after active signer")
 	}
 }
@@ -474,8 +474,8 @@ func TestHandoffEARExpiryUpdaterMarksInvalidSourceNegative(t *testing.T) {
 
 func TestNewHandoffHandlerValidatesInputs(t *testing.T) {
 	iss, _ := testIssuer(t)
-	bm := newBundleManager(iss.MaxTTL, "", "ca-bundle", slog.Default())
-	bm.setInitial(iss.getBundle().caCert)
+	bm := issuerpkg.NewBundleManager(iss.MaxTTL, "", "ca-bundle", slog.Default())
+	bm.SetInitial(iss.getBundle().caCert)
 
 	signer := handoffTestKey(t)
 	src := staticHandoffEARSource{ear: "ear-token"}
@@ -525,8 +525,8 @@ func (erroringHandoffEARSource) Current() (string, error) {
 // at startup" case after the non-blocking bootstrap fix.
 func TestHandoffReturns503BeforeBootstrap(t *testing.T) {
 	iss, _ := testIssuer(t)
-	bm := newBundleManager(iss.MaxTTL, "", "ca-bundle", slog.Default())
-	bm.setInitial(iss.getBundle().caCert)
+	bm := issuerpkg.NewBundleManager(iss.MaxTTL, "", "ca-bundle", slog.Default())
+	bm.SetInitial(iss.getBundle().caCert)
 	iss.HandoffMeasurements = map[string]bool{"m": true}
 
 	hh, err := newHandoffHandler(iss, bm, handoffTestKey(t), erroringHandoffEARSource{})

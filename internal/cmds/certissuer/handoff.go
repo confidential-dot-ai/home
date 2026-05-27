@@ -42,7 +42,7 @@ type HandoffResponse = issuerapi.HandoffResponse
 // handoffHandler wraps the active in-memory CA to attested cert-issuer replicas.
 type handoffHandler struct {
 	issuer          *Issuer
-	bundle          *bundleManager
+	bundle          *issuer.BundleManager
 	issuerEARSource handoffEARSource
 	signer          *ecdsa.PrivateKey
 }
@@ -58,7 +58,7 @@ type handoffHandler struct {
 // /attest-key call has completed. This keeps cert-issuer's startup
 // independent of Assam's reachability — a transient outage at the wrong
 // moment doesn't crash-loop the cert-issuer pod.
-func newHandoffHandler(iss *Issuer, bm *bundleManager, signer *ecdsa.PrivateKey, src handoffEARSource) (*handoffHandler, error) {
+func newHandoffHandler(iss *Issuer, bm *issuer.BundleManager, signer *ecdsa.PrivateKey, src handoffEARSource) (*handoffHandler, error) {
 	if signer == nil {
 		return nil, fmt.Errorf("handoff signer key is required to enable /handoff")
 	}
@@ -256,7 +256,7 @@ func (hh *handoffHandler) wrap(req HandoffRequest, b *certBundle, issuerEAR stri
 
 	bundlePEM := certutil.EncodeCertPEM(b.caCert.Raw)
 	if hh.bundle != nil {
-		bundlePEM = hh.bundle.bundlePEMForCurrent(b.caCert)
+		bundlePEM = hh.bundle.BundlePEMForCurrent(b.caCert)
 	}
 
 	payload := handoffPayload{

@@ -1,4 +1,4 @@
-package certissuer
+package issuer
 
 import (
 	"bytes"
@@ -14,9 +14,9 @@ import (
 	"github.com/lunal-dev/c8s/pkg/certutil"
 )
 
-// bundleManager maintains the public CA certificate bundle. Private CA keys
+// BundleManager maintains the public CA certificate bundle. Private CA keys
 // remain in process memory; this manager only persists public trust anchors.
-type bundleManager struct {
+type BundleManager struct {
 	mu        sync.RWMutex
 	certs     []*x509.Certificate  // current CA cert first, then retained old ones
 	retiredAt map[string]time.Time // CA fingerprint -> time it stopped being the active signer
@@ -29,8 +29,8 @@ type bundleManager struct {
 	logger     *slog.Logger
 }
 
-func newBundleManager(maxTTL time.Duration, repoDir, bundlePath string, logger *slog.Logger) *bundleManager {
-	return &bundleManager{
+func NewBundleManager(maxTTL time.Duration, repoDir, bundlePath string, logger *slog.Logger) *BundleManager {
+	return &BundleManager{
 		maxTTL:     maxTTL,
 		retiredAt:  make(map[string]time.Time),
 		repoDir:    repoDir,
@@ -39,24 +39,24 @@ func newBundleManager(maxTTL time.Duration, repoDir, bundlePath string, logger *
 	}
 }
 
-// setInitial sets the initial CA certificate bundle. Called once at startup.
-func (bm *bundleManager) setInitial(caCert *x509.Certificate) {
+// SetInitial sets the initial CA certificate bundle. Called once at startup.
+func (bm *BundleManager) SetInitial(caCert *x509.Certificate) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 	bm.certs = []*x509.Certificate{caCert}
 	bm.retiredAt = make(map[string]time.Time)
 }
 
-func (bm *bundleManager) setWithCurrent(current *x509.Certificate, retained []*x509.Certificate) {
+func (bm *BundleManager) SetWithCurrent(current *x509.Certificate, retained []*x509.Certificate) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 	bm.certs = prependCurrentCA(current, retained)
 	bm.retiredAt = bm.retirementsForCurrentLocked(current, time.Now())
 }
 
-// loadFromRepo loads the public CA bundle from the repository directory.
+// LoadFromRepo loads the public CA bundle from the repository directory.
 // Returns nil if the bundle file doesn't exist.
-func (bm *bundleManager) loadFromRepo() ([]*x509.Certificate, error) {
+func (bm *BundleManager) LoadFromRepo() ([]*x509.Certificate, error) {
 	if bm.repoDir == "" {
 		return nil, nil
 	}
@@ -88,9 +88,9 @@ func (bm *bundleManager) loadFromRepo() ([]*x509.Certificate, error) {
 	return certs, nil
 }
 
-// rotate adds a new CA cert to the front of the bundle, retains old certs
+// Rotate adds a new CA cert to the front of the bundle, retains old certs
 // subject to 2x maxTTL trimming, and persists the public bundle.
-func (bm *bundleManager) rotate(newCACert *x509.Certificate) error {
+func (bm *BundleManager) Rotate(newCACert *x509.Certificate) error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 
@@ -118,29 +118,29 @@ func (bm *bundleManager) rotate(newCACert *x509.Certificate) error {
 	return nil
 }
 
-// persistCurrent writes the currently published public CA bundle to the
+// PersistCurrent writes the currently published public CA bundle to the
 // repository. It no-ops when repoDir is empty.
-func (bm *bundleManager) persistCurrent() error {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
+func (bm *BundleManager) PersistCurrent() error {
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
 	return bm.persistLocked(bm.certs, bm.retirementsForCurrentLocked(firstCert(bm.certs), time.Now()))
 }
 
-// bundlePEM returns the full CA bundle as PEM bytes.
-func (bm *bundleManager) bundlePEM() []byte {
+// BundlePEM returns the full CA bundle as PEM bytes.
+func (bm *BundleManager) BundlePEM() []byte {
 	bm.mu.RLock()
 	defer bm.mu.RUnlock()
 	return bm.encodePEMLocked()
 }
 
-func (bm *bundleManager) bundlePEMForCurrent(current *x509.Certificate) []byte {
+func (bm *BundleManager) BundlePEMForCurrent(current *x509.Certificate) []byte {
 	bm.mu.RLock()
 	defer bm.mu.RUnlock()
 	return encodeCertBundlePEM(prependCurrentCA(current, bm.certs))
 }
 
 // encodePEMLocked encodes all certs as PEM. Caller must hold bm.mu.
-func (bm *bundleManager) encodePEMLocked() []byte {
+func (bm *BundleManager) encodePEMLocked() []byte {
 	return encodeCertBundlePEM(bm.certs)
 }
 
@@ -153,7 +153,7 @@ func encodeCertBundlePEM(certs []*x509.Certificate) []byte {
 }
 
 // persistLocked writes the public bundle. Caller must hold bm.mu.
-func (bm *bundleManager) persistLocked(certs []*x509.Certificate, retiredAt map[string]time.Time) error {
+func (bm *BundleManager) persistLocked(certs []*x509.Certificate, retiredAt map[string]time.Time) error {
 	if bm.repoDir == "" {
 		return nil
 	}
@@ -188,12 +188,12 @@ type bundleRetirementsFile struct {
 	RetiredAt map[string]string `json:"retired_at"`
 }
 
-func (bm *bundleManager) retainedRetiredCAsLocked(newCurrent *x509.Certificate, now time.Time) ([]*x509.Certificate, map[string]time.Time, []retiredCA) {
+func (bm *BundleManager) retainedRetiredCAsLocked(newCurrent *x509.Certificate, now time.Time) ([]*x509.Certificate, map[string]time.Time, []retiredCA) {
 	nextRetiredAt := make(map[string]time.Time)
 	retained := make([]*x509.Certificate, 0, len(bm.certs))
 	var dropped []retiredCA
 	for i, cert := range bm.certs {
-		if cert == nil || sameCert(cert, newCurrent) {
+		if cert == nil || cert.Equal(newCurrent) {
 			continue
 		}
 		fp := certutil.CertFingerprint(cert.Raw)
@@ -214,7 +214,7 @@ func (bm *bundleManager) retainedRetiredCAsLocked(newCurrent *x509.Certificate, 
 	return retained, nextRetiredAt, dropped
 }
 
-func (bm *bundleManager) shouldDropRetiredCA(cert *x509.Certificate, retiredAt, now time.Time) bool {
+func (bm *BundleManager) shouldDropRetiredCA(cert *x509.Certificate, retiredAt, now time.Time) bool {
 	if !cert.NotAfter.After(now) {
 		return true
 	}
@@ -224,7 +224,7 @@ func (bm *bundleManager) shouldDropRetiredCA(cert *x509.Certificate, retiredAt, 
 	return !retiredAt.Add(2 * bm.maxTTL).After(now)
 }
 
-func (bm *bundleManager) retirementsForCurrentLocked(current *x509.Certificate, fallback time.Time) map[string]time.Time {
+func (bm *BundleManager) retirementsForCurrentLocked(current *x509.Certificate, fallback time.Time) map[string]time.Time {
 	out := make(map[string]time.Time)
 	currentFP := ""
 	if current != nil {
@@ -247,7 +247,7 @@ func (bm *bundleManager) retirementsForCurrentLocked(current *x509.Certificate, 
 	return out
 }
 
-func (bm *bundleManager) loadRetirementsFromRepo() (map[string]time.Time, error) {
+func (bm *BundleManager) loadRetirementsFromRepo() (map[string]time.Time, error) {
 	out := make(map[string]time.Time)
 	if bm.repoDir == "" {
 		return out, nil
@@ -273,7 +273,7 @@ func (bm *bundleManager) loadRetirementsFromRepo() (map[string]time.Time, error)
 	return out, nil
 }
 
-func (bm *bundleManager) persistRetirementsLocked(retiredAt map[string]time.Time) error {
+func (bm *BundleManager) persistRetirementsLocked(retiredAt map[string]time.Time) error {
 	file := bundleRetirementsFile{
 		Version:   1,
 		RetiredAt: make(map[string]string, len(retiredAt)),
@@ -318,7 +318,7 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return os.Rename(tmpName, path)
 }
 
-func (bm *bundleManager) retirementsFile() string {
+func (bm *BundleManager) retirementsFile() string {
 	return filepath.Join(bm.repoDir, bm.bundlePath+".retirements.json")
 }
 
@@ -327,10 +327,6 @@ func firstCert(certs []*x509.Certificate) *x509.Certificate {
 		return nil
 	}
 	return certs[0]
-}
-
-func sameCert(a, b *x509.Certificate) bool {
-	return a != nil && b != nil && bytes.Equal(a.Raw, b.Raw)
 }
 
 func prependCurrentCA(current *x509.Certificate, certs []*x509.Certificate) []*x509.Certificate {

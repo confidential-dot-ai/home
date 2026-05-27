@@ -31,12 +31,8 @@ func newTestRotator(t *testing.T) (*earsigner.Rotator, *ecdsa.PrivateKey) {
 func TestRotator_PublicKey(t *testing.T) {
 	r, _ := newTestRotator(t)
 
-	got, err := r.PublicKey("")
-	if err != nil {
-		t.Fatalf("empty kid: %v", err)
-	}
-	if got == nil {
-		t.Fatal("empty kid: returned nil key")
+	if _, err := r.PublicKey(""); err == nil {
+		t.Error("empty kid: expected error, got nil")
 	}
 
 	if _, err := r.PublicKey("does-not-exist"); err == nil {
