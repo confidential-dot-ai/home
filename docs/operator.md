@@ -103,6 +103,30 @@ advisory and not required for pod injection. That path also disables the
 CRD-backed status mirror controller; if CRDs are absent at runtime, the
 operator skips that controller rather than failing startup.
 
+## Kata runtime installation and enforcement
+
+`c8s install --kata` additionally installs the Kata Containers runtime onto
+the cluster: the embedded chart renders the upstream `kata-deploy` DaemonSet
+(which installs QEMU, the kata runtime, and the `containerd-shim-kata-v2`
+shim onto every node) and the `kata-qemu` / `kata-clh` / `kata-qemu-snp`
+RuntimeClass objects. `--distro` (`k8s` or `rke2`) selects the host
+containerd config path.
+
+`c8s install --kata-enforce` also turns on enforcement (it implies `--kata`):
+
+- the operator's pod webhook injects a `runtimeClassName` into workload pods
+  that don't request one — `kata-qemu`, or `kata-qemu-snp` for pods annotated
+  `confidential.ai/cw`;
+- a `ValidatingAdmissionPolicy` rejects workload pods that request a non-kata
+  `runtimeClassName`.
+
+Host-namespace pods and system namespaces are exempt. The Kata stack is off
+by default — a plain `c8s install` is unchanged.
+
+See [`docs/kata.md`](kata.md) for the design (why it wraps upstream
+kata-deploy), the threat model, distro support, the one-shot bootstrap-window
+caveat, and the SEV-SNP-host / GPU constraints.
+
 ## Chart-managed Assam
 
 The supported deployment is chart-managed Assam plus cert-issuer running inside

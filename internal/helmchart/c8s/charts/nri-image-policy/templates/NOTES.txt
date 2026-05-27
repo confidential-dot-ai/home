@@ -3,7 +3,7 @@
 Plugin name (must match required_plugins): {{ .Values.pluginName }}
 Mode:                                     {{ .Values.policy.mode }}
 Bootstrap digests:                        {{ len (default dict .Values.bootstrapWhitelist.digests) }}
-Restart command:                          {{ .Values.containerd.restartCommand }}
+Restart command:                          {{ include "nri-image-policy.restartCommand" . }}
 
 Verify the install rolled out cleanly:
 

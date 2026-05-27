@@ -77,6 +77,13 @@ const defaultGetCertRunAsNonRoot = true
 const discoveryPublicTLSModeCDS = "cds"
 const discoveryPublicTLSModeWebPKI = "webpki"
 
+// Default runtimeClassName values injected by kata enforcement. kata-qemu is
+// a VM-isolated (non-confidential) pod; kata-qemu-snp is a confidential VM.
+// Both names are a fixed contract with the RuntimeClasses the c8s chart
+// installs via kata-deploy (internal/helmchart/c8s/templates/kata.yaml).
+const defaultKataRuntimeClass = "kata-qemu"
+const defaultKataConfidentialRuntimeClass = "kata-qemu-snp"
+
 // Config tunes the injector.
 type Config struct {
 	// GetCertImage is the c8s multi-mode binary image used for the
@@ -107,6 +114,22 @@ type Config struct {
 	GetCertRunAsUser    *int64
 	GetCertRunAsGroup   *int64
 	GetCertRunAsNonRoot *bool
+
+	// KataEnforce turns on kata runtimeClass injection. When set, the webhook
+	// injects a runtimeClassName into every in-scope workload pod that does
+	// not already request one. Independent of get-cert injection — a pod with
+	// no confidential.ai/cw annotation is still given a runtimeClassName.
+	KataEnforce bool
+
+	// KataRuntimeClass is injected into in-scope workload pods that do not
+	// request a runtimeClassName. Defaults to "kata-qemu".
+	KataRuntimeClass string
+
+	// KataConfidentialRuntimeClass is injected instead of KataRuntimeClass
+	// when the pod carries the confidential.ai/cw annotation — a pod opted in
+	// to a c8s workload identity also gets a confidential VM. Defaults to
+	// "kata-qemu-snp".
+	KataConfidentialRuntimeClass string
 }
 
 // Register wires the pod mutator onto the manager's webhook server.
@@ -398,21 +421,84 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 	if err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
 	}
-	if inj == nil {
+
+	// confidential.ai/cw drives both get-cert injection and kata-qemu-snp
+	// class selection: a pod that opts in to a c8s workload identity also
+	// gets a confidential VM. Kata-only injection (no annotation) under
+	// --kata-enforce gives kata-qemu, not kata-qemu-snp. An operator-set
+	// runtimeClassName is always honored — an explicit kata-qemu-snp
+	// without the annotation runs as a confidential VM without c8s
+	// identity (the bring-your-own-attestation path; see docs/kata.md).
+	_, alreadyInjected := pod.Annotations[AnnotationInjected]
+	getCertNeeded := inj != nil && m.cfg.GetCertImage != "" && !alreadyInjected
+	kataClass := kataRuntimeClassFor(pod, m.cfg)
+
+	if inj == nil && kataClass == "" {
 		return admission.Allowed("no c8s annotation — passthrough")
 	}
-	if _, already := pod.Annotations[AnnotationInjected]; already {
-		return admission.Allowed("already injected")
+	if !getCertNeeded && kataClass == "" {
+		if alreadyInjected {
+			return admission.Allowed("already injected")
+		}
+		return admission.Allowed("nothing to inject")
 	}
 
-	l.Info("injecting c8s get-cert containers", "workload", inj.WorkloadID)
-	mutatePod(pod, inj, m.cfg)
+	if getCertNeeded {
+		l.Info("injecting c8s get-cert containers", "workload", inj.WorkloadID)
+		mutatePod(pod, inj, m.cfg)
+	}
+	if kataClass != "" {
+		l.Info("injecting kata runtimeClassName", "runtimeClass", kataClass)
+		pod.Spec.RuntimeClassName = &kataClass
+		// Stamp AnnotationInjected here too — mutatePod only runs when
+		// get-cert is needed, but a kata-only mutation is still a mutation
+		// and the alreadyInjected short-circuit above must see it on
+		// reinvocation (reinvocationPolicy: IfNeeded).
+		if pod.Annotations == nil {
+			pod.Annotations = map[string]string{}
+		}
+		pod.Annotations[AnnotationInjected] = "true"
+	}
 
 	raw, err := json.Marshal(pod)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	return admission.PatchResponseFromRaw(req.Object.Raw, raw)
+}
+
+// kataRuntimeClassFor returns the runtimeClassName the webhook should inject
+// into pod, or "" to leave the pod's runtime unchanged. It returns "" when
+// kata enforcement is off, when the pod already requests a runtimeClassName
+// (an explicit operator choice the ValidatingAdmissionPolicy still checks),
+// or when the pod uses a host namespace (a VM cannot share the host's
+// namespaces, so such a pod can only run as an ordinary container).
+//
+// A pod annotated confidential.ai/cw gets the confidential runtime class:
+// opting in to a c8s workload identity also means running as a confidential
+// VM. Any other in-scope pod gets the non-confidential kata class.
+func kataRuntimeClassFor(pod *corev1.Pod, cfg Config) string {
+	if !cfg.KataEnforce {
+		return ""
+	}
+	if pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName != "" {
+		return ""
+	}
+	if kataIncompatible(pod) {
+		return ""
+	}
+	if pod.Annotations[AnnotationWorkload] != "" {
+		return cfg.KataConfidentialRuntimeClass
+	}
+	return cfg.KataRuntimeClass
+}
+
+// kataIncompatible reports whether pod uses a host namespace. Kata launches
+// each pod as its own VM, which cannot join the host's network, PID, or IPC
+// namespace — such a pod can only run as an ordinary container, so kata
+// enforcement leaves it alone instead of forcing a class it cannot honor.
+func kataIncompatible(pod *corev1.Pod) bool {
+	return pod.Spec.HostNetwork || pod.Spec.HostPID || pod.Spec.HostIPC
 }
 
 // mutatePod is pure — easy to unit test.
@@ -615,6 +701,12 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.GetCertRunAsNonRoot == nil {
 		cfg.GetCertRunAsNonRoot = boolPtr(defaultGetCertRunAsNonRoot)
+	}
+	if cfg.KataRuntimeClass == "" {
+		cfg.KataRuntimeClass = defaultKataRuntimeClass
+	}
+	if cfg.KataConfidentialRuntimeClass == "" {
+		cfg.KataConfidentialRuntimeClass = defaultKataConfidentialRuntimeClass
 	}
 	return cfg
 }

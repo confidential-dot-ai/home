@@ -1,0 +1,90 @@
+{{- if and .Values.kata.enabled .Values.kata.enforce.enabled }}
+{{- /*
+  Kata enforcement — the cluster-side half of "workload pods run as kata VMs".
+
+  Two pieces work together:
+   - the c8s operator's pod webhook (operator.yaml passes --kata-enforce)
+     injects a runtimeClassName into workload pods that do not request one:
+     kata-qemu, or kata-qemu-snp for pods annotated confidential.ai/cw;
+   - the ValidatingAdmissionPolicy below rejects a workload pod that requests
+     a non-kata runtimeClassName.
+
+  ValidatingAdmissionPolicy is built into Kubernetes (CEL, no webhook server,
+  no TLS) and is v1/GA from Kubernetes 1.30. The base chart requires >= 1.29;
+  enforcement additionally requires >= 1.30.
+
+  Host-namespace pods (hostNetwork/hostPID/hostIPC) are exempt: a VM cannot
+  share the host's namespaces, so the webhook does not inject a class for
+  them and the policy does not reject them. System namespaces and any
+  namespace in webhook.extraExcluded are exempt via the binding's
+  namespaceSelector.
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "c8s.fullname" . }}-kata-enforcement
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-enforcement
+spec:
+  # Fail closed: a CEL evaluation error denies the pod. The expression is
+  # has()-guarded so it should not error in practice.
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        # runtimeClassName is immutable after creation, so CREATE is the only
+        # operation that can introduce a disallowed value.
+        operations: [CREATE]
+        resources: [pods]
+  validations:
+    # Allow a pod when it requests one of the kata RuntimeClasses this chart
+    # installs, or when it uses a host namespace (kata cannot run those — the
+    # webhook leaves them as ordinary containers). Reject everything else,
+    # including a pod with no runtimeClassName: with enforcement on the
+    # webhook injects one, so a pod reaching validation without a class means
+    # the webhook did not run.
+    - expression: >-
+        (has(object.spec.runtimeClassName) && object.spec.runtimeClassName in ['kata-qemu', 'kata-clh', 'kata-qemu-snp'])
+        || (has(object.spec.hostNetwork) && object.spec.hostNetwork)
+        || (has(object.spec.hostPID) && object.spec.hostPID)
+        || (has(object.spec.hostIPC) && object.spec.hostIPC)
+      message: >-
+        c8s kata enforcement: workload pods must run under a kata RuntimeClass
+        (kata-qemu, kata-clh, or kata-qemu-snp). The c8s operator webhook
+        injects one automatically for pods that do not set runtimeClassName;
+        a rejection here means the pod explicitly set a non-kata
+        runtimeClassName, or the c8s operator is not running. Host-namespace
+        pods are exempt.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "c8s.fullname" . }}-kata-enforcement
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-enforcement
+spec:
+  policyName: {{ include "c8s.fullname" . }}-kata-enforcement
+  validationActions: [Deny]
+  matchResources:
+    # Mirror the namespace exclusions of the pod webhook
+    # (templates/webhook.yaml, the pods.c8s.confidential.ai entry) so the
+    # webhook's injection scope and this policy's rejection scope stay
+    # identical. A namespace the webhook skips but the policy covers would
+    # reject every pod in it.
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - {{ .Release.Namespace }}
+            - kube-system
+            - kube-public
+            - kube-node-lease
+            {{- range .Values.webhook.extraExcluded }}
+            - {{ . }}
+            {{- end }}
+{{- end }}

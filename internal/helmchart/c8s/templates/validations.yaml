@@ -3,3 +3,9 @@
 {{- if and $tlsLB.enabled $teeProxy.enabled (eq $tlsLB.upstream.protocol "https") (eq $tlsLB.upstream.address "c8s-tee-proxy:443") (not (or $teeProxy.tls.enabled $teeProxy.domain)) -}}
 {{- fail "tls-lb.upstream.protocol=https with the chart-managed tee-proxy requires tee-proxy.tls.enabled=true or tee-proxy.domain to enable the HTTPS listener" -}}
 {{- end -}}
+{{- if and .Values.kata.enforce.enabled (not .Values.kata.enabled) -}}
+{{- fail "kata.enforce.enabled=true requires kata.enabled=true: enforcement injects and validates the kata RuntimeClasses that kata.enabled installs" -}}
+{{- end -}}
+{{- if and .Values.kata.enforce.enabled (ne .Values.webhook.failurePolicy "Fail") -}}
+{{- fail (printf "kata.enforce.enabled=true requires webhook.failurePolicy=Fail (got %q): the ValidatingAdmissionPolicy rejects pods that reach validation without a kata RuntimeClass, so the mutating webhook that injects that class must also fail closed — otherwise an operator-down event silently bypasses enforcement" .Values.webhook.failurePolicy) -}}
+{{- end -}}

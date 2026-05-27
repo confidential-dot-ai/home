@@ -64,63 +64,25 @@ spec:
               value: {{ include "nri-image-policy.hostBootstrapPath" . | quote }}
             - name: HOST_CONFIG_PATH
               value: {{ include "nri-image-policy.hostConfigPath" . | quote }}
-            - name: HOST_CONTAINERD_CONFIG
-              value: {{ .Values.containerd.configPath | quote }}
+            - name: HOST_CONTAINERD_DIR
+              value: {{ include "nri-image-policy.containerdConfigDir" . | quote }}
+            - name: CONTAINERD_CONFIG_MODE
+              value: {{ include "nri-image-policy.containerdConfigMode" . | quote }}
             - name: HOST_CACHE_DIR
               value: {{ .Values.hostPaths.cacheDir | quote }}
             - name: RESTART_COMMAND
-              value: {{ .Values.containerd.restartCommand | quote }}
+              value: {{ include "nri-image-policy.restartCommand" . | quote }}
           command: ["/bin/sh", "-c"]
           args:
             - |
-              set -eu
-
-              echo "==> nri-image-policy uninstaller starting"
-
-              CONFIG=/host${HOST_CONTAINERD_CONFIG}
-              MARK_BEGIN='# BEGIN c8s-nri-image-policy (managed)'
-              MARK_END='# END c8s-nri-image-policy (managed)'
-
-              # 1. Strip the managed block from containerd config (idempotent).
-              if [ -f "$CONFIG" ] && grep -qF "$MARK_BEGIN" "$CONFIG"; then
-                awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
-                  $0==b { skip=1; next }
-                  $0==e { skip=0; next }
-                  !skip { print }
-                ' "$CONFIG" > "$CONFIG.tmp"
-                mv -f "$CONFIG.tmp" "$CONFIG"
-                echo "containerd config block removed from ${HOST_CONTAINERD_CONFIG}"
-                config_changed=1
-              else
-                echo "containerd config block already absent"
-                config_changed=0
-              fi
-
-              # 2. Restart containerd if we changed config. After this, NRI
-              #    no longer references plugin_path or default_validator;
-              #    the host plugin process exits and is not re-launched.
-              if [ "$config_changed" = "1" ]; then
-                echo "restarting containerd: ${RESTART_COMMAND}"
-                # shellcheck disable=SC2086
-                nsenter -t 1 -m -u -i -n -p -- sh -c "${RESTART_COMMAND}"
-              fi
-
-              # 3. Remove host artifacts. Cache last so a partial-failure
-              #    re-run still has the binary/config to retry against.
-              rm -f "/host${HOST_PLUGIN_PATH}"
-              rm -f "/host${HOST_BOOTSTRAP_PATH}"
-              rm -f "/host${HOST_CONFIG_PATH}"
-              rm -rf "/host${HOST_CACHE_DIR}"
-              echo "host artifacts removed"
-
-              echo "==> nri-image-policy uninstaller finished"
+{{ .Files.Get "files/scripts/uninstall.sh" | indent 14 }}
           volumeMounts:
             - name: host-plugin-dir
               mountPath: /host{{ .Values.hostPaths.pluginDir }}
             - name: host-config-dir
               mountPath: /host{{ .Values.hostPaths.configDir }}
             - name: host-containerd-config
-              mountPath: /host{{ dir .Values.containerd.configPath }}
+              mountPath: /host{{ include "nri-image-policy.containerdConfigDir" . }}
             - name: host-cache-dir
               mountPath: /host{{ .Values.hostPaths.cacheDir }}
           resources:
@@ -163,7 +125,7 @@ spec:
             type: DirectoryOrCreate
         - name: host-containerd-config
           hostPath:
-            path: {{ dir .Values.containerd.configPath }}
+            path: {{ include "nri-image-policy.containerdConfigDir" . }}
             type: Directory
         - name: host-cache-dir
           hostPath:

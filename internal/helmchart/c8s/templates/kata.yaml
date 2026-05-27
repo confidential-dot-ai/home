@@ -1,0 +1,266 @@
+{{- if .Values.kata.enabled }}
+{{- /*
+  Kata Containers runtime installation.
+
+  This wraps the upstream kata-deploy DaemonSet. kata-deploy runs on every
+  selected node and installs, onto the host:
+    - the kata-containers runtime and the containerd-shim-kata-v2 shim,
+    - QEMU and Cloud Hypervisor (bundled in the kata-static payload — kata
+      does not use a host QEMU),
+    - the guest kernel / guest images / OVMF firmware,
+    - a containerd runtime drop-in registering the kata-qemu, kata-clh and
+      kata-qemu-snp runtimes,
+  then restarts containerd (or RKE2) so the runtimes become usable. Running
+  pods survive the restart — containerd shims outlive the daemon.
+
+  kata-deploy's install binary does NOT create RuntimeClass objects; only
+  its own Helm chart does. This is not that chart, so the RuntimeClasses are
+  rendered here (bottom of the file). The names are a fixed contract with
+  SHIMS_X86_64 below and the enforcement policy in kata-enforcement.yaml.
+
+  THREAT MODEL: kata-deploy is privileged — `privileged: true`, hostPID, the
+  host root filesystem bind-mounted at /host. That is inherent to installing
+  a runtime onto a host. For pod-as-kata-cvm it does not weaken the threat
+  model: the host is outside the trust boundary, and a host that swapped the
+  kata shim/QEMU would produce a launch measurement that fails attestation,
+  so clients would refuse the pod. See docs/kata.md.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "c8s.kataName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-deploy
+{{ include "c8s.serviceAccountImagePullSecrets" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  # Release-scoped name: a cluster may already carry an unrelated
+  # `kata-deploy` ClusterRole (e.g. from upstream's own chart or Ansible).
+  name: {{ include "c8s.kataName" . }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-deploy
+rules:
+  # kata-deploy labels each node katacontainers.io/kata-runtime=true once the
+  # runtime is installed.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, patch, watch]
+  # RuntimeClass read-only: the chart owns the kata RuntimeClass objects
+  # (below) and the kube-kata container is started with
+  # CREATE_RUNTIMECLASSES=false so kata-deploy does not try to create,
+  # update, or delete them. A compromised kata-deploy with patch/update
+  # could rewrite the kata-qemu-snp handler to a non-confidential shim while
+  # the kata-enforcement allowlist still accepts the class name — keeping
+  # this read-only closes that bypass. If a kata-deploy version probe
+  # legitimately needs write verbs, scope by resourceNames to the three
+  # chart-owned classes rather than re-granting cluster-wide.
+  - apiGroups: [node.k8s.io]
+    resources: [runtimeclasses]
+    verbs: [get, list, watch]
+  # kata-deploy 3.30 probes for Node Feature Discovery by listing CRDs and
+  # creates NodeFeatureRule objects when NFD is present. The probe needs the
+  # get/list permission even on clusters without NFD.
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    verbs: [get, list, watch]
+  - apiGroups: [nfd.k8s-sigs.io]
+    resources: [nodefeaturerules]
+    verbs: [create, delete, get, list, patch, update, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "c8s.kataName" . }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-deploy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "c8s.kataName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "c8s.kataName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "c8s.kataName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-deploy
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: c8s-operator
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: kata-deploy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: c8s-operator
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: kata-deploy
+    spec:
+      serviceAccountName: {{ include "c8s.kataName" . }}
+      # hostPID: kata-deploy nsenters into PID 1 to restart the runtime.
+      hostPID: true
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/os: linux
+        {{- with .Values.kata.nodeSelector }}
+{{ toYaml . | indent 8 }}
+        {{- end }}
+      # Install kata everywhere by default — including control-plane and
+      # otherwise-tainted nodes (the one-shot install posture). Scope it with
+      # kata.nodeSelector to limit which nodes get the runtime.
+      tolerations:
+        - operator: Exists
+      {{- if eq .Values.kata.distro "rke2" }}
+      # RKE2 renders containerd's config from a template and does not import
+      # the drop-in dir kata-deploy writes its runtime config into; kata-deploy
+      # bails unless the import is already present. This initContainer adds it
+      # (rendered config + RKE2 template) before kube-kata runs. See
+      # docs/kata.md. Not needed on vanilla k8s — kata-deploy edits
+      # /etc/containerd/config.toml directly there.
+      initContainers:
+        - name: containerd-prep
+          # Pure-shell prep — any minimal POSIX image works — but it runs
+          # privileged with host root mounted, so the image is digest-pinned
+          # via kata.containerdPrep.image just like kata-deploy itself.
+          image: {{ include "c8s.kataContainerdPrepImage" . }}
+          imagePullPolicy: {{ .Values.kata.containerdPrep.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          env:
+            - name: HOST_CONTAINERD_DIR
+              value: {{ include "c8s.kataContainerdConfigDir" . | quote }}
+            # The literal RKE2 base-config include, written verbatim into a
+            # freshly created config template. Escaped so Helm emits it as-is.
+            - name: BASE_DIRECTIVE
+              value: '{{ "{{ template \"base\" . }}" }}'
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+{{ .Files.Get "files/scripts/containerd-prep.sh" | indent 14 }}
+          volumeMounts:
+            - name: containerd-conf
+              mountPath: /host{{ include "c8s.kataContainerdConfigDir" . }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+      {{- end }}
+      containers:
+        - name: kube-kata
+          image: {{ include "c8s.kataDeployImage" . }}
+          imagePullPolicy: {{ .Values.kata.image.pullPolicy }}
+          args: [install]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Non-GPU shims only. GPU / confidential-GPU runtimes
+            # (kata-qemu-nvidia-gpu*) are out of scope — see docs/kata.md.
+            - name: SHIMS_X86_64
+              value: "qemu clh qemu-snp"
+            - name: DEFAULT_SHIM_X86_64
+              value: "qemu"
+            - name: ALLOWED_HYPERVISOR_ANNOTATIONS
+              value: ""
+            # The chart owns the kata RuntimeClass objects; tell kata-deploy
+            # not to create, update, or delete them so the ClusterRole above
+            # can stay read-only on runtimeclasses.
+            - name: CREATE_RUNTIMECLASSES
+              value: "false"
+          lifecycle:
+            preStop:
+              exec:
+                # Remove kata from the host when the DaemonSet is deleted
+                # (helm uninstall). Best-effort — kata-deploy's own SIGTERM
+                # handler also runs cleanup.
+                command: [/usr/bin/kata-deploy, cleanup]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            # kata-deploy reads the host's rendered containerd config at the
+            # literal in-container path /etc/containerd/config.toml and
+            # writes the runtime drop-in beside it. Bind the host's real
+            # containerd config directory there — it differs by distro.
+            - name: containerd-conf
+              mountPath: /etc/containerd/
+            # Everything outside /etc/containerd: /opt/kata for the runtime
+            # artifacts, /proc/1 for the nsenter-driven runtime restart.
+            - name: host
+              mountPath: /host/
+            # Mounted unconditionally by upstream kata-deploy even on
+            # containerd-only hosts; harmless.
+            - name: crio-conf
+              mountPath: /etc/crio/
+          resources:
+{{ toYaml .Values.kata.resources | indent 12 }}
+      volumes:
+        - name: containerd-conf
+          hostPath:
+            path: {{ include "c8s.kataContainerdConfigDir" . }}
+        - name: host
+          hostPath:
+            path: /
+        - name: crio-conf
+          hostPath:
+            path: /etc/crio/
+            type: DirectoryOrCreate
+{{- /*
+  RuntimeClass objects. `handler` == the containerd runtime name kata-deploy
+  registers (kata-<shim>); the shim binary containerd-shim-kata-<shim>-v2 is a
+  symlink to containerd-shim-kata-v2. These names are a fixed contract with
+  SHIMS_X86_64 above and the allowlist in kata-enforcement.yaml — keep all
+  three in sync.
+
+  kata-qemu      QEMU microVM.      VM isolation, NOT confidential.
+  kata-clh       Cloud Hypervisor.  VM isolation, NOT confidential.
+  kata-qemu-snp  QEMU + SEV-SNP.    The pod is a confidential VM — its memory
+                                    is encrypted against the host. Needs an
+                                    SEV-SNP host; on a non-SNP node these
+                                    pods fail to start while kata-qemu and
+                                    kata-clh still work.
+*/}}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-deploy
+handler: kata-qemu
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-clh
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-deploy
+handler: kata-clh
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu-snp
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-deploy
+handler: kata-qemu-snp
+{{- end }}

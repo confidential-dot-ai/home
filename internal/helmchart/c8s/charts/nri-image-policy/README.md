@@ -11,9 +11,11 @@ hook available for uninstall.
   plugin directory.
 - Writes runtime policy and bootstrap whitelist files under the configured host
   config directory.
-- Patches `containerd.configPath` with the managed NRI plugin block and
-  `default_validator.required_plugins`.
-- Restarts containerd through `containerd.restartCommand`.
+- Registers the NRI plugin and `default_validator.required_plugins` in
+  containerd's config — patched into `config.toml` in place on `k8s`, or
+  written as a `config-v3.toml.d/` drop-in on `rke2` (see Node distro
+  compatibility).
+- Restarts containerd (or the RKE2 supervisor) so the change takes effect.
 
 ## Install verification
 
@@ -114,13 +116,29 @@ The install image must ship these tools on `PATH`:
 
 ## Node distro compatibility
 
-`containerd.restartCommand` defaults to `systemctl restart containerd`.
-Override it on distros where the parent service owns containerd:
+`distro` selects the containerd config layout the installer targets:
 
-| Distro | Example value |
-| ------ | ------------- |
-| k3s | `systemctl restart k3s` |
-| k0s | `systemctl restart k0scontroller` or `systemctl restart k0sworker` |
-| rke2 | `systemctl restart rke2-agent` |
+- **`k8s`** (default) — vanilla / kubeadm. The NRI block is patched into
+  `/etc/containerd/config.toml` in place, between sentinel markers.
+  Restart: `systemctl restart containerd`.
+- **`rke2`** — RKE2 regenerates its containerd config from a template on
+  every supervisor restart, so an in-place patch would not survive. The
+  installer writes a standalone `config-v3.toml.d/nri-image-policy.toml`
+  drop-in instead (the directory tracks the containerd config schema
+  version, `config.toml.d` on the legacy v2 schema — the same directory
+  kata-deploy uses). A drop-in loads only if the config `imports` that
+  directory; neither RKE2 nor kata-deploy adds the import, so the DaemonSet's
+  `containerd-prep` initContainer adds it — to both the rendered config and
+  the RKE2 template — before `install` runs. Restart:
+  `systemctl restart rke2-agent`.
 
-Verify the command on a non-production node before rolling the chart fleet-wide.
+`c8s install --distro <k8s|rke2>` sets this; it also drives kata-deploy.
+
+For a distro neither value covers, pick the `distro` whose patch strategy
+fits — `k8s` for in-place, `rke2` for a drop-in — and override the path
+specifics: `containerd.configDir`, `containerd.socket`,
+`containerd.restartCommand`. E.g. k3s: `distro: rke2`,
+`containerd.configDir: /var/lib/rancher/k3s/agent/etc/containerd`,
+`containerd.restartCommand: systemctl restart k3s`.
+
+Verify on a non-production node before rolling the chart fleet-wide.

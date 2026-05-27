@@ -332,3 +332,70 @@ func hasMount(mounts []corev1.VolumeMount, name, path string, readOnly bool) boo
 	}
 	return false
 }
+
+// kataEnforceConfig is a withDefaults-resolved Config with kata enforcement
+// on, so the kata-qemu / kata-qemu-snp class defaults are exercised too.
+func kataEnforceConfig() Config {
+	return Config{KataEnforce: true}.withDefaults()
+}
+
+func TestKataRuntimeClassForInjectsDefaultClass(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}}}
+	if got := kataRuntimeClassFor(pod, kataEnforceConfig()); got != "kata-qemu" {
+		t.Fatalf("kataRuntimeClassFor = %q, want kata-qemu for a plain workload pod", got)
+	}
+}
+
+func TestKataRuntimeClassForConfidentialPodGetsSNP(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+	if got := kataRuntimeClassFor(pod, kataEnforceConfig()); got != "kata-qemu-snp" {
+		t.Fatalf("kataRuntimeClassFor = %q, want kata-qemu-snp for a confidential.ai/cw pod", got)
+	}
+}
+
+func TestKataRuntimeClassForRespectsExplicitRuntimeClass(t *testing.T) {
+	existing := "kata-clh"
+	pod := &corev1.Pod{Spec: corev1.PodSpec{
+		RuntimeClassName: &existing,
+		Containers:       []corev1.Container{{Name: "app"}},
+	}}
+	if got := kataRuntimeClassFor(pod, kataEnforceConfig()); got != "" {
+		t.Fatalf("kataRuntimeClassFor = %q, want \"\" — an operator's explicit runtimeClassName must not be overridden", got)
+	}
+}
+
+func TestKataRuntimeClassForExemptsHostNamespacePods(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec corev1.PodSpec
+	}{
+		{"hostNetwork", corev1.PodSpec{HostNetwork: true}},
+		{"hostPID", corev1.PodSpec{HostPID: true}},
+		{"hostIPC", corev1.PodSpec{HostIPC: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Also annotate confidential.ai/cw to prove the host-namespace
+			// exemption wins over the confidential-class path.
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+				Spec:       tc.spec,
+			}
+			if got := kataRuntimeClassFor(pod, kataEnforceConfig()); got != "" {
+				t.Fatalf("kataRuntimeClassFor = %q, want \"\" — a %s pod cannot run as a VM", got, tc.name)
+			}
+		})
+	}
+}
+
+func TestKataRuntimeClassForDisabled(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+	if got := kataRuntimeClassFor(pod, Config{KataEnforce: false}.withDefaults()); got != "" {
+		t.Fatalf("kataRuntimeClassFor = %q, want \"\" when kata enforcement is off", got)
+	}
+}

@@ -229,6 +229,85 @@ attestationService:
       cpu: 500m
       memory: 256Mi
 
+## Kata Containers runtime installation and enforcement.
+##
+## When kata.enabled is true the chart renders the upstream kata-deploy
+## DaemonSet, which installs onto every selected node: the kata-containers
+## runtime, the containerd-shim-kata-v2 shim, QEMU and Cloud Hypervisor
+## (bundled in the kata-static payload — kata does not use a host QEMU), the
+## guest kernel/images, and a containerd runtime drop-in. The chart also
+## renders the kata-qemu / kata-clh / kata-qemu-snp RuntimeClass objects
+## (kata-deploy's install binary does not create them).
+##
+## kata-deploy runs privileged with the host root filesystem mounted; the
+## image is digest-pinned for that reason. See docs/kata.md for the design,
+## threat model, and trade-offs.
+kata:
+  enabled: false
+  image:
+    repository: quay.io/kata-containers/kata-deploy
+    ## kata-deploy 3.30.0, digest-pinned. kata-deploy is privileged with the
+    ## host root mounted, so a repointed `:3.30.0` tag would be root on every
+    ## node — content-address it. Matches the kata 3.30.0 pinned across
+    ## bare-metal-infra-management and base-images. To bump: resolve the new
+    ## digest with
+    ##   curl -sS "https://quay.io/api/v1/repository/kata-containers/kata-deploy/tag/?specificTag=<ver>" | jq -r '.tags[0].manifest_digest'
+    tag: ""
+    digest: "sha256:b31cf13addbaf49af9e211bf6ab38335299015a754e2bc0341aa4ba47d8cb395"
+    pullPolicy: IfNotPresent
+  ## RKE2-only containerd-prep initContainer. Runs `privileged: true` with
+  ## the host root mounted to fix up containerd config before kata-deploy.
+  ## Pure POSIX shell, so any minimal busybox image works — but a repointed
+  ## tag would be root on every node, exactly like kata-deploy. Content-
+  ## address it. busybox:1.37 multi-arch manifest list digest, resolve a new
+  ## one with
+  ##   curl -sfI -H "Authorization: Bearer $(curl -s 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/busybox:pull' | jq -r .token)" \
+  ##     -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.index.v1+json" \
+  ##     https://registry-1.docker.io/v2/library/busybox/manifests/<ver> | grep -i docker-content-digest
+  containerdPrep:
+    image:
+      repository: busybox
+      tag: ""
+      digest: "sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+      pullPolicy: IfNotPresent
+  ## Host Kubernetes distro. Selects the on-host containerd config directory
+  ## kata-deploy binds and patches:
+  ##   k8s  -> /etc/containerd                                (vanilla / kubeadm)
+  ##   rke2 -> /var/lib/rancher/rke2/agent/etc/containerd     (RKE2)
+  ## kata-deploy auto-detects which service to restart (containerd vs RKE2);
+  ## only the config directory has to be told.
+  distro: k8s
+  ## Explicit override for the host containerd config directory. Empty means
+  ## derive it from `distro`. Set this for a distro `distro` does not cover.
+  containerdConfigDir: ""
+  ## nodeSelector for the kata-deploy DaemonSet (merged with
+  ## kubernetes.io/os=linux). Empty installs kata on every Linux node —
+  ## the one-shot install posture. kata-deploy labels each node
+  ## katacontainers.io/kata-runtime=true once install completes.
+  nodeSelector: {}
+  ## kata-deploy copies the full kata-static payload (runtime, QEMU + Cloud
+  ## Hypervisor, guest kernel and images) onto the host during install — peak
+  ## memory is large and payload-dependent, so no limits: a fixed cap
+  ## OOM-kills the installer mid-copy. bare-metal-infra-management's
+  ## kata-deploy DaemonSet runs unbounded for the same reason. Requests stay
+  ## modest — kata-deploy idles near-zero once install completes.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  ## Kata enforcement. When enforce.enabled is true:
+  ##  - the c8s operator's pod webhook injects a runtimeClassName into
+  ##    workload pods that don't request one — kata-qemu, or kata-qemu-snp
+  ##    for pods annotated confidential.ai/cw;
+  ##  - a ValidatingAdmissionPolicy rejects workload pods that request a
+  ##    non-kata runtimeClassName.
+  ## Host-namespace pods (hostNetwork/hostPID/hostIPC) are exempt from both —
+  ## a VM cannot share the host's namespaces. System namespaces and any
+  ## namespace in webhook.extraExcluded are also exempt. Requires kata.enabled
+  ## and Kubernetes 1.30+ (ValidatingAdmissionPolicy v1).
+  enforce:
+    enabled: false
+
 ## Vendored component charts from lunal-dev/c8s-charts. They are enabled by
 ## default so c8s can replace the previous per-component HelmReleases.
 ratls-mesh:
@@ -252,6 +331,11 @@ ratls-mesh:
 
 nri-image-policy:
   enabled: true
+  ## Host Kubernetes distro for the nri-image-policy installer: k8s | rke2.
+  ## Selects the containerd config layout it targets — see the subchart's
+  ## values.yaml. `c8s install --distro` sets this.
+  distro: k8s
+
   assam:
     scheme: https
     ## Mirror the parent `assam.measurements` value here so the host plugin

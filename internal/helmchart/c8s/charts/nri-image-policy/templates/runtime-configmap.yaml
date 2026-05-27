@@ -29,7 +29,7 @@ data:
 {{ end }}
 
     containerd:
-      socket: {{ .Values.containerd.socket | quote }}
+      socket: {{ include "nri-image-policy.containerdSocket" . | quote }}
       namespace: {{ .Values.containerd.namespace | quote }}
 
     policy:

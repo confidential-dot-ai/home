@@ -95,6 +95,8 @@ make clean
 - [Quickstart](docs/QUICKSTART.md) is the supported install entry point.
 - [Demo](docs/DEMO.md) shows the self-contained chart-managed Assam +
   cert-issuer path.
+- [Kata runtime](docs/kata.md) covers `c8s install --kata[-enforce]`: Kata
+  Containers installation and pod-as-kata-cvm enforcement.
 - [Threat model](docs/THREAT_MODEL.md) documents what is enforced today and
   what chart-managed bootstrap means.
 - [Gaps](docs/GAPS.md) tracks the CDS-shaped follow-up work.

@@ -27,6 +27,10 @@
 {{- printf "%s-cert-issuer" .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{- define "c8s.kataName" -}}
+{{- printf "%s-kata-deploy" .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{/*
   Image refs prefer digest when set — floating tags silently drift the
   binary running inside the TEE and invalidate the measurement allowlist.
@@ -71,6 +75,56 @@
 {{ .Values.certIssuer.image.repository }}:{{ .Values.certIssuer.image.tag }}
 {{- else -}}
 {{ fail "certIssuer.image.tag or certIssuer.image.digest must be set" }}
+{{- end -}}
+{{- end -}}
+
+{{- define "c8s.kataDeployImage" -}}
+{{- if and .Values.kata.image.digest .Values.kata.image.tag -}}
+{{ fail "kata.image.tag and kata.image.digest are mutually exclusive — set one, not both (digest wins silently otherwise, which surprises operators bumping versions)" }}
+{{- else if .Values.kata.image.digest -}}
+{{ .Values.kata.image.repository }}@{{ .Values.kata.image.digest }}
+{{- else if .Values.kata.image.tag -}}
+{{ .Values.kata.image.repository }}:{{ .Values.kata.image.tag }}
+{{- else -}}
+{{ fail "kata.image.tag or kata.image.digest must be set" }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+  Image used by the RKE2 containerd-prep initContainer. Pure shell — any
+  POSIX-shell image works — but the container runs `privileged: true` with
+  the host root mounted, so the same supply-chain rules as kata-deploy
+  apply: digest-pin the image. Same precedence as kata-deploy: digest wins,
+  setting both digest and tag fails the render so version bumps are loud.
+*/}}
+{{- define "c8s.kataContainerdPrepImage" -}}
+{{- $img := .Values.kata.containerdPrep.image -}}
+{{- if and $img.digest $img.tag -}}
+{{ fail "kata.containerdPrep.image.tag and kata.containerdPrep.image.digest are mutually exclusive — set one, not both" }}
+{{- else if $img.digest -}}
+{{ $img.repository }}@{{ $img.digest }}
+{{- else if $img.tag -}}
+{{ $img.repository }}:{{ $img.tag }}
+{{- else -}}
+{{ fail "kata.containerdPrep.image.tag or kata.containerdPrep.image.digest must be set" }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+  kata-deploy reads the host's rendered containerd config at the literal
+  in-container path /etc/containerd/config.toml and writes the runtime
+  drop-in beside it. The chart bind-mounts the host's real containerd config
+  directory there — which differs by distro.
+*/}}
+{{- define "c8s.kataContainerdConfigDir" -}}
+{{- if .Values.kata.containerdConfigDir -}}
+{{ .Values.kata.containerdConfigDir }}
+{{- else if eq .Values.kata.distro "rke2" -}}
+/var/lib/rancher/rke2/agent/etc/containerd
+{{- else if eq .Values.kata.distro "k8s" -}}
+/etc/containerd
+{{- else -}}
+{{ fail (printf "kata.distro must be \"k8s\" or \"rke2\" (got %q), or set kata.containerdConfigDir explicitly" .Values.kata.distro) }}
 {{- end -}}
 {{- end -}}
 

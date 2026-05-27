@@ -22,24 +22,27 @@ Pod-to-pod mTLS is handled by the node-level ratls-mesh DaemonSet, not
 by this command.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return controller.Run(cmd.Context(), controller.Options{
-			MetricsAddr:             metricsAddr,
-			HealthAddr:              healthAddr,
-			LeaderElection:          leaderElection,
-			LeaderElectionID:        "c8s-operator.confidential.ai",
-			LeaderElectionNS:        leaderElectionNS,
-			DisableStatusMirror:     !statusMirrorEnabled,
-			GetCertImage:            getCertImage,
-			AssamURL:                assamURL,
-			AttestationServiceURL:   attestationServiceURL,
-			WebhookConfigName:       webhookConfigName,
-			WebhookServiceName:      webhookServiceName,
-			WebhookServiceNamespace: webhookServiceNamespace,
-			CertFSGroup:             certFSGroup,
-			CertKeyMode:             certKeyMode,
-			CertRenewInterval:       certRenewInterval,
-			GetCertRunAsUser:        getCertRunAsUser,
-			GetCertRunAsGroup:       getCertRunAsGroup,
-			GetCertRunAsNonRoot:     getCertRunAsNonRoot,
+			MetricsAddr:                  metricsAddr,
+			HealthAddr:                   healthAddr,
+			LeaderElection:               leaderElection,
+			LeaderElectionID:             "c8s-operator.confidential.ai",
+			LeaderElectionNS:             leaderElectionNS,
+			DisableStatusMirror:          !statusMirrorEnabled,
+			GetCertImage:                 getCertImage,
+			AssamURL:                     assamURL,
+			AttestationServiceURL:        attestationServiceURL,
+			WebhookConfigName:            webhookConfigName,
+			WebhookServiceName:           webhookServiceName,
+			WebhookServiceNamespace:      webhookServiceNamespace,
+			CertFSGroup:                  certFSGroup,
+			CertKeyMode:                  certKeyMode,
+			CertRenewInterval:            certRenewInterval,
+			GetCertRunAsUser:             getCertRunAsUser,
+			GetCertRunAsGroup:            getCertRunAsGroup,
+			GetCertRunAsNonRoot:          getCertRunAsNonRoot,
+			KataEnforce:                  kataEnforce,
+			KataRuntimeClass:             kataRuntimeClass,
+			KataConfidentialRuntimeClass: kataConfidentialRuntimeClass,
 		})
 	},
 }
@@ -62,6 +65,10 @@ var (
 	getCertRunAsUser        int64
 	getCertRunAsGroup       int64
 	getCertRunAsNonRoot     bool
+
+	kataEnforce                  bool
+	kataRuntimeClass             string
+	kataConfidentialRuntimeClass string
 )
 
 func init() {
@@ -82,5 +89,8 @@ func init() {
 	operatorCmd.Flags().Int64Var(&getCertRunAsUser, "get-cert-run-as-user", 65532, "runAsUser for injected get-cert containers")
 	operatorCmd.Flags().Int64Var(&getCertRunAsGroup, "get-cert-run-as-group", 65532, "runAsGroup for injected get-cert containers")
 	operatorCmd.Flags().BoolVar(&getCertRunAsNonRoot, "get-cert-run-as-non-root", true, "set runAsNonRoot for injected get-cert containers")
+	operatorCmd.Flags().BoolVar(&kataEnforce, "kata-enforce", false, "inject a kata runtimeClassName into workload pods that don't request one and enforce kata RuntimeClasses")
+	operatorCmd.Flags().StringVar(&kataRuntimeClass, "kata-runtime-class", "kata-qemu", "runtimeClassName injected into workload pods that don't request one")
+	operatorCmd.Flags().StringVar(&kataConfidentialRuntimeClass, "kata-confidential-runtime-class", "kata-qemu-snp", "runtimeClassName injected into pods annotated confidential.ai/cw")
 	rootCmd.AddCommand(operatorCmd)
 }

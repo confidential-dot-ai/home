@@ -9,6 +9,17 @@ image:
   digest: ""
   pullPolicy: IfNotPresent
 
+# RKE2-only containerd-prep initContainer. Runs `privileged: true` with the
+# host root mounted to wire up the drop-in import before the install
+# container runs. Any minimal POSIX image works — but a repointed tag would
+# be root on every node, so digest-pin it.
+containerdPrep:
+  image:
+    repository: busybox
+    tag: ""
+    digest: "sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+    pullPolicy: IfNotPresent
+
 imagePullSecrets: []
 
 # Pin this DaemonSet to a subset of nodes. Empty (default) installs on all
@@ -42,22 +53,39 @@ hostPaths:
 # relative to other NRI plugins.
 pluginFilename: 10-nri-image-policy
 
-# Containerd configuration the install DaemonSet patches.
+# Host Kubernetes distro. Selects the containerd config layout the install
+# DaemonSet targets:
+#   k8s  — vanilla / kubeadm: the NRI block is patched into
+#          /etc/containerd/config.toml in place, delimited by sentinel markers.
+#   rke2 — RKE2 regenerates its containerd config from a template on every
+#          supervisor restart, so an in-place patch does not survive. The
+#          installer writes a standalone config-v3.toml.d/ drop-in instead
+#          (the dir tracks the containerd config schema version); the
+#          DaemonSet's containerd-prep initContainer adds the matching import.
+distro: k8s
+
+# Containerd configuration the install DaemonSet targets. The config
+# directory, socket, and restart command default from `distro`; set the
+# fields below only for a distro `distro` does not cover.
 containerd:
-  configPath: /etc/containerd/config.toml
-  # Host path to the containerd socket (k3s: /run/k3s/containerd/containerd.sock)
-  socket: /run/containerd/containerd.sock
+  # Explicit override for the host containerd config directory. Empty derives
+  # it from `distro` (k8s -> /etc/containerd, rke2 ->
+  # /var/lib/rancher/rke2/agent/etc/containerd).
+  configDir: ""
+  # Host path to the containerd socket the plugin connects to. Empty derives
+  # it from `distro` (k8s -> /run/containerd/containerd.sock,
+  # rke2 -> /run/k3s/containerd/containerd.sock).
+  socket: ""
   namespace: k8s.io
-  # Command the install pod runs (via nsenter into PID 1) to make
-  # containerd re-read its config and (re-)launch the plugin from
-  # plugin_path. NRI does not auto-respawn pre-registered plugins on
-  # exit, so any binary or config change requires this restart.
-  #
-  # Defaults assume systemd + a containerd.service unit. Override on:
-  #   - k3s   →  "systemctl restart k3s"
-  #   - k0s   →  "systemctl restart k0scontroller"  (or k0sworker)
-  #   - rke2  →  "systemctl restart rke2-agent"
-  restartCommand: "systemctl restart containerd"
+  # Command the install pod runs (via nsenter into PID 1) to make containerd
+  # re-read its config and (re-)launch the plugin from plugin_path. NRI does
+  # not auto-respawn pre-registered plugins on exit, so any binary or config
+  # change requires this restart. Empty derives it from `distro`
+  # (k8s -> "systemctl restart containerd",
+  # rke2 -> "systemctl restart rke2-agent"). Override for a distro neither
+  # value covers, e.g. k3s -> "systemctl restart k3s",
+  # k0s -> "systemctl restart k0scontroller".
+  restartCommand: ""
 
 # Policy enforcement applied by the plugin.
 policy:

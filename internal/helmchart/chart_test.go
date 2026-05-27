@@ -2069,6 +2069,284 @@ func TestChartRollsAttestationServiceOnConfigChange(t *testing.T) {
 	}
 }
 
+// --- Kata runtime installation and enforcement -------------------------
+
+// TestChartKataDisabledByDefault: the default render must carry no kata
+// resources, so installs that don't ask for kata are unchanged.
+func TestChartKataDisabledByDefault(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if renderedManifestHasNamedKind(t, out, "DaemonSet", "c8s-kata-deploy") {
+		t.Fatalf("kata-deploy DaemonSet rendered without kata.enabled\n%s", out)
+	}
+	if renderedManifestHasNamedKind(t, out, "RuntimeClass", "kata-qemu") {
+		t.Fatalf("kata RuntimeClass rendered without kata.enabled\n%s", out)
+	}
+	if renderedManifestHasNamedKind(t, out, "ValidatingAdmissionPolicy", "c8s-kata-enforcement") {
+		t.Fatalf("kata ValidatingAdmissionPolicy rendered without kata enforcement\n%s", out)
+	}
+}
+
+// TestChartKataEnabledRendersDeployStack: kata.enabled renders the
+// kata-deploy DaemonSet and the three RuntimeClasses, but no enforcement.
+func TestChartKataEnabledRendersDeployStack(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "kata.enabled=true")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	for _, rc := range []string{"kata-qemu", "kata-clh", "kata-qemu-snp"} {
+		if !renderedManifestHasNamedKind(t, out, "RuntimeClass", rc) {
+			t.Fatalf("kata.enabled missing RuntimeClass %q\n%s", rc, out)
+		}
+	}
+
+	ds := renderedDaemonSet(t, out, "c8s-kata-deploy")
+	if !ds.Spec.Template.Spec.HostPID {
+		t.Errorf("kata-deploy DaemonSet must set hostPID: true (kata-deploy nsenters PID 1)")
+	}
+	c, ok := findContainer(ds.Spec.Template.Spec.Containers, "kube-kata")
+	if !ok {
+		t.Fatalf("kata-deploy DaemonSet missing kube-kata container; have %v", containerNames(ds.Spec.Template.Spec.Containers))
+	}
+	if c.SecurityContext == nil || c.SecurityContext.Privileged == nil || !*c.SecurityContext.Privileged {
+		t.Errorf("kube-kata container must run privileged (it installs a runtime onto the host); got %+v", c.SecurityContext)
+	}
+
+	// kata.enabled on its own must not turn on enforcement.
+	if renderedManifestHasNamedKind(t, out, "ValidatingAdmissionPolicy", "c8s-kata-enforcement") {
+		t.Errorf("kata.enabled without kata.enforce.enabled should not render the enforcement policy")
+	}
+	if slices.Contains(renderedOperatorArgs(t, out), "--kata-enforce=true") {
+		t.Errorf("operator should not get --kata-enforce when enforcement is off")
+	}
+}
+
+// TestChartKataDistroSelectsContainerdConfigDir: the kata.distro value must
+// pick the right host containerd config dir for kata-deploy to bind.
+func TestChartKataDistroSelectsContainerdConfigDir(t *testing.T) {
+	for _, tc := range []struct {
+		distro string
+		want   string
+	}{
+		{"k8s", "/etc/containerd"},
+		{"rke2", "/var/lib/rancher/rke2/agent/etc/containerd"},
+	} {
+		t.Run(tc.distro, func(t *testing.T) {
+			out, err := helmTemplate(t, "--set", "kata.enabled=true", "--set-string", "kata.distro="+tc.distro)
+			if err != nil {
+				t.Fatalf("helm template: %v\n%s", err, out)
+			}
+			ds := renderedDaemonSet(t, out, "c8s-kata-deploy")
+			if got := hostPathVolume(t, ds, "containerd-conf"); got != tc.want {
+				t.Fatalf("distro %q: containerd-conf hostPath = %q, want %q", tc.distro, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestChartKataRejectsUnknownDistro(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "kata.enabled=true", "--set-string", "kata.distro=openshift")
+	if err == nil {
+		t.Fatalf("helm template succeeded for an unknown kata.distro, want failure\n%s", out)
+	}
+}
+
+// TestChartKataContainerdPrepInitContainer: on rke2 the kata-deploy DaemonSet
+// must carry a containerd-prep initContainer that wires up the drop-in import
+// before kube-kata runs; on k8s kata-deploy edits containerd directly, so the
+// prep must be absent.
+func TestChartKataContainerdPrepInitContainer(t *testing.T) {
+	t.Run("rke2", func(t *testing.T) {
+		out, err := helmTemplate(t, "--set", "kata.enabled=true", "--set-string", "kata.distro=rke2")
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		ds := renderedDaemonSet(t, out, "c8s-kata-deploy")
+		prep, ok := findContainer(ds.Spec.Template.Spec.InitContainers, "containerd-prep")
+		if !ok {
+			t.Fatalf("rke2: kata-deploy DaemonSet missing containerd-prep initContainer; have %v",
+				containerNames(ds.Spec.Template.Spec.InitContainers))
+		}
+		if prep.SecurityContext == nil || prep.SecurityContext.Privileged == nil || !*prep.SecurityContext.Privileged {
+			t.Errorf("containerd-prep must run privileged (it edits the host containerd config)")
+		}
+		env := initContainerEnv(t, ds, "containerd-prep")
+		if got := env["HOST_CONTAINERD_DIR"]; got != "/var/lib/rancher/rke2/agent/etc/containerd" {
+			t.Errorf("HOST_CONTAINERD_DIR = %q, want the rke2 containerd dir", got)
+		}
+		if got := env["BASE_DIRECTIVE"]; got != `{{ template "base" . }}` {
+			t.Errorf("BASE_DIRECTIVE = %q, want the literal RKE2 base include", got)
+		}
+	})
+
+	t.Run("k8s", func(t *testing.T) {
+		out, err := helmTemplate(t, "--set", "kata.enabled=true", "--set-string", "kata.distro=k8s")
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		ds := renderedDaemonSet(t, out, "c8s-kata-deploy")
+		if _, ok := findContainer(ds.Spec.Template.Spec.InitContainers, "containerd-prep"); ok {
+			t.Fatalf("k8s: kata-deploy must not carry a containerd-prep initContainer")
+		}
+	})
+}
+
+// TestChartKataEnforceRendersPolicyAndOperatorFlag: kata.enforce.enabled
+// renders the ValidatingAdmissionPolicy + binding and flips the operator's
+// --kata-enforce flag — the two halves of enforcement must move together.
+func TestChartKataEnforceRendersPolicyAndOperatorFlag(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "kata.enabled=true", "--set", "kata.enforce.enabled=true")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if !renderedManifestHasNamedKind(t, out, "ValidatingAdmissionPolicy", "c8s-kata-enforcement") {
+		t.Fatalf("kata enforcement missing ValidatingAdmissionPolicy\n%s", out)
+	}
+	if !renderedManifestHasNamedKind(t, out, "ValidatingAdmissionPolicyBinding", "c8s-kata-enforcement") {
+		t.Fatalf("kata enforcement missing ValidatingAdmissionPolicyBinding\n%s", out)
+	}
+	if !slices.Contains(renderedOperatorArgs(t, out), "--kata-enforce=true") {
+		t.Fatalf("operator missing --kata-enforce=true with enforcement on\n%s", out)
+	}
+}
+
+// TestChartKataEnforceRequiresEnabled: enforcement without the kata stack it
+// injects and validates is a misconfiguration — the chart must reject it.
+func TestChartKataEnforceRequiresEnabled(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "kata.enforce.enabled=true")
+	if err == nil {
+		t.Fatalf("helm template succeeded with kata.enforce.enabled but kata.enabled=false, want failure\n%s", out)
+	}
+}
+
+// TestChartNriImagePolicyDistroSelectsContainerdLayout: nri-image-policy.distro
+// drives the host containerd directory the installer binds and the patch
+// strategy. The drop-in file path itself is discovered at runtime (the config
+// file name varies), so it is not asserted here — only the dir, mode, restart.
+func TestChartNriImagePolicyDistroSelectsContainerdLayout(t *testing.T) {
+	for _, tc := range []struct {
+		distro      string
+		wantDir     string
+		wantMode    string
+		wantRestart string
+	}{
+		{
+			distro:      "k8s",
+			wantDir:     "/etc/containerd",
+			wantMode:    "patch",
+			wantRestart: "systemctl restart containerd",
+		},
+		{
+			distro:      "rke2",
+			wantDir:     "/var/lib/rancher/rke2/agent/etc/containerd",
+			wantMode:    "dropin",
+			wantRestart: "systemctl restart rke2-agent",
+		},
+	} {
+		t.Run(tc.distro, func(t *testing.T) {
+			out, err := helmTemplate(t, "--set-string", "nri-image-policy.distro="+tc.distro)
+			if err != nil {
+				t.Fatalf("helm template: %v\n%s", err, out)
+			}
+			ds := renderedDaemonSet(t, out, "c8s-nri-image-policy")
+			if got := hostPathVolume(t, ds, "host-containerd-config"); got != tc.wantDir {
+				t.Fatalf("distro %q: host-containerd-config hostPath = %q, want %q", tc.distro, got, tc.wantDir)
+			}
+			env := initContainerEnv(t, ds, "install")
+			for name, want := range map[string]string{
+				"HOST_CONTAINERD_DIR":    tc.wantDir,
+				"CONTAINERD_CONFIG_MODE": tc.wantMode,
+				"RESTART_COMMAND":        tc.wantRestart,
+			} {
+				if got := env[name]; got != want {
+					t.Fatalf("distro %q: install env %s = %q, want %q", tc.distro, name, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestChartNriImagePolicyRejectsUnknownDistro: an unsupported distro must fail
+// the render, not silently fall through to a wrong containerd layout.
+func TestChartNriImagePolicyRejectsUnknownDistro(t *testing.T) {
+	out, err := helmTemplate(t, "--set-string", "nri-image-policy.distro=openshift")
+	if err == nil {
+		t.Fatalf("helm template succeeded for an unknown nri-image-policy.distro, want failure\n%s", out)
+	}
+}
+
+// TestChartNriImagePolicyContainerdPrepInitContainer: on rke2 the installer
+// DaemonSet must run a containerd-prep initContainer before `install`, so the
+// drop-in import exists by the time `install` writes its drop-in. On k8s the
+// installer patches config.toml in place, so the prep must be absent.
+func TestChartNriImagePolicyContainerdPrepInitContainer(t *testing.T) {
+	t.Run("rke2", func(t *testing.T) {
+		out, err := helmTemplate(t, "--set-string", "nri-image-policy.distro=rke2")
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		ds := renderedDaemonSet(t, out, "c8s-nri-image-policy")
+		names := containerNames(ds.Spec.Template.Spec.InitContainers)
+		prepIdx, installIdx := slices.Index(names, "containerd-prep"), slices.Index(names, "install")
+		if prepIdx < 0 {
+			t.Fatalf("rke2: nri-image-policy DaemonSet missing containerd-prep initContainer; have %v", names)
+		}
+		// initContainers run in order — prep must precede install.
+		if prepIdx > installIdx {
+			t.Fatalf("containerd-prep must run before install; initContainers=%v", names)
+		}
+		env := initContainerEnv(t, ds, "containerd-prep")
+		if got := env["HOST_CONTAINERD_DIR"]; got != "/var/lib/rancher/rke2/agent/etc/containerd" {
+			t.Errorf("HOST_CONTAINERD_DIR = %q, want the rke2 containerd dir", got)
+		}
+	})
+
+	t.Run("k8s", func(t *testing.T) {
+		out, err := helmTemplate(t, "--set-string", "nri-image-policy.distro=k8s")
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		ds := renderedDaemonSet(t, out, "c8s-nri-image-policy")
+		if _, ok := findContainer(ds.Spec.Template.Spec.InitContainers, "containerd-prep"); ok {
+			t.Fatalf("k8s: nri-image-policy must not carry a containerd-prep initContainer")
+		}
+	})
+}
+
+// initContainerEnv returns the env name->value map of a DaemonSet init container.
+func initContainerEnv(t *testing.T, ds appsv1.DaemonSet, name string) map[string]string {
+	t.Helper()
+	for _, c := range ds.Spec.Template.Spec.InitContainers {
+		if c.Name != name {
+			continue
+		}
+		env := make(map[string]string, len(c.Env))
+		for _, e := range c.Env {
+			env[e.Name] = e.Value
+		}
+		return env
+	}
+	t.Fatalf("DaemonSet has no init container %q", name)
+	return nil
+}
+
+// hostPathVolume returns the hostPath of the named volume on a DaemonSet.
+func hostPathVolume(t *testing.T, ds appsv1.DaemonSet, name string) string {
+	t.Helper()
+	for _, v := range ds.Spec.Template.Spec.Volumes {
+		if v.Name == name {
+			if v.HostPath == nil {
+				t.Fatalf("DaemonSet volume %q is not a hostPath volume", name)
+			}
+			return v.HostPath.Path
+		}
+	}
+	t.Fatalf("DaemonSet has no volume %q", name)
+	return ""
+}
+
 func helmTemplate(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 	if _, err := exec.LookPath("helm"); err != nil {

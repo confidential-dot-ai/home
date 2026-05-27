@@ -57,6 +57,9 @@ spec:
             - --get-cert-run-as-user={{ .Values.webhook.getCert.runAsUser }}
             - --get-cert-run-as-group={{ .Values.webhook.getCert.runAsGroup }}
             - --get-cert-run-as-non-root={{ .Values.webhook.getCert.runAsNonRoot }}
+            {{- if and .Values.kata.enabled .Values.kata.enforce.enabled }}
+            - --kata-enforce=true
+            {{- end }}
             {{- range .Values.operator.extraArgs }}
             - {{ . | quote }}
             {{- end }}
