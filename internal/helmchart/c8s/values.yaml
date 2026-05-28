@@ -622,36 +622,6 @@ teeProxy:
   persistence:
     storageClass: ""
     size: 1Gi
-  # --- Edge Router (nginx sidecar) ---
-  router:
-    enabled: true
-    image:
-      repository: docker.io/library/nginx
-      digest: "sha256:1eff5a5f3fcf8431a0abb7eddf5471fec24e5e1905a2581aeacdb07a4479b92b"
-      tag: ""
-      pullPolicy: IfNotPresent
-    port: 8080
-    ## No extra host routes by default; CDS serves /whitelist directly.
-    routes: []
-    # DNS resolver for nginx dynamic upstream resolution
-    resolver: "kube-dns.kube-system.svc.cluster.local"
-    # Proxy timeouts (seconds)
-    proxyReadTimeout: 120
-    proxyConnectTimeout: 10
-    resources:
-      requests:
-        cpu: 25m
-        memory: 32Mi
-      limits:
-        cpu: 100m
-        memory: 64Mi
-    probes:
-      readiness:
-        initialDelaySeconds: 2
-        periodSeconds: 10
-      liveness:
-        initialDelaySeconds: 5
-        periodSeconds: 30
   # Probe timings
   probes:
     readiness:

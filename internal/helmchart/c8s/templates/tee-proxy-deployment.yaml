@@ -21,10 +21,6 @@ spec:
     metadata:
       labels:
         {{- include "tee-proxy.selectorLabels" . | nindent 8 }}
-      {{- if .Values.teeProxy.router.enabled }}
-      annotations:
-        checksum/router-config: {{ include (print $.Template.BasePath "/tee-proxy-configmap-router.yaml") . | sha256sum }}
-      {{- end }}
     spec:
       {{- with .Values.teeProxy.priorityClassName }}
       priorityClassName: {{ . }}
@@ -56,11 +52,7 @@ spec:
             - --host
             - {{ .Values.teeProxy.domain | quote }}
             - --upstream
-            {{- if .Values.teeProxy.router.enabled }}
-            - "http://127.0.0.1:{{ .Values.teeProxy.router.port }}"
-            {{- else }}
             - "http://{{ .Values.teeProxy.upstream }}"
-            {{- end }}
             - --platform
             - {{ .Values.teeProxy.platform | quote }}
             - --header-name
@@ -117,46 +109,6 @@ spec:
               port: {{ $probePort }}
             initialDelaySeconds: {{ .Values.teeProxy.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.teeProxy.probes.liveness.periodSeconds }}
-        {{- if .Values.teeProxy.router.enabled }}
-        - name: edge-router
-          image: {{ include "c8s-common.image" .Values.teeProxy.router.image }}
-          imagePullPolicy: {{ .Values.teeProxy.router.image.pullPolicy }}
-          ports:
-            - name: router
-              containerPort: {{ .Values.teeProxy.router.port }}
-              protocol: TCP
-          securityContext:
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-            runAsNonRoot: true
-            runAsUser: 101
-            capabilities:
-              drop:
-                - ALL
-          resources:
-            {{- toYaml .Values.teeProxy.router.resources | nindent 12 }}
-          readinessProbe:
-            httpGet:
-              path: /nginx-health
-              port: {{ .Values.teeProxy.router.port }}
-            initialDelaySeconds: {{ .Values.teeProxy.router.probes.readiness.initialDelaySeconds }}
-            periodSeconds: {{ .Values.teeProxy.router.probes.readiness.periodSeconds }}
-          livenessProbe:
-            httpGet:
-              path: /nginx-health
-              port: {{ .Values.teeProxy.router.port }}
-            initialDelaySeconds: {{ .Values.teeProxy.router.probes.liveness.initialDelaySeconds }}
-            periodSeconds: {{ .Values.teeProxy.router.probes.liveness.periodSeconds }}
-          volumeMounts:
-            - name: router-config
-              mountPath: /etc/nginx/nginx.conf
-              subPath: nginx.conf
-              readOnly: true
-            - name: router-tmp
-              mountPath: /tmp
-            - name: router-cache
-              mountPath: /var/cache/nginx
-        {{- end }}
       volumes:
         - name: autocert-cache
           persistentVolumeClaim:
@@ -170,15 +122,6 @@ spec:
                 path: localhost+2.pem
               - key: {{ .Values.teeProxy.tls.keyKey }}
                 path: localhost+2-key.pem
-        {{- end }}
-        {{- if .Values.teeProxy.router.enabled }}
-        - name: router-config
-          configMap:
-            name: {{ include "tee-proxy.fullname" . }}-router
-        - name: router-tmp
-          emptyDir: {}
-        - name: router-cache
-          emptyDir: {}
         {{- end }}
       nodeSelector:
         kubernetes.io/os: linux
