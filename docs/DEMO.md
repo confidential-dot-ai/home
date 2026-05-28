@@ -1,6 +1,6 @@
 # c8s demo
 
-This demo uses chart-managed Assam and cert-issuer so the certificate bootstrap
+This demo uses chart-managed CDS so the certificate bootstrap
 path is self-contained. It is intended for review and demos, not as the final
 production trust boundary.
 

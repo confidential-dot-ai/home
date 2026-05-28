@@ -13,7 +13,7 @@ This is the supported install path for the consolidated c8s chart.
 ## Install c8s
 
 This installs the supported chart-managed CVM shape: operator, RBAC, CRDs,
-webhook, attestation-service, Assam, and cert-issuer.
+webhook, attestation-service, and CDS.
 
 ```sh
 c8s install --namespace c8s-system
@@ -36,21 +36,19 @@ status-mirror controller is disabled.
 
 ## Certificate path
 
-The chart wires workload injection to chart-managed Assam, and Assam to
-chart-managed cert-issuer. Cert-issuer generates its mesh CA key in process
-memory and persists only the public CA bundle. The persisted bundle lets
-already-issued leaves keep verifying across cert-issuer restarts; it does
-not preserve issuance — a restart generates a new CA key, and workloads
-must re-bootstrap to trust new leaves. See docs/operator.md for the
-singleton-vs-handoff trade-off. Run this chart inside the intended CVM
-trust boundary; the supported chart path no longer has external
-Assam/cert-issuer URL values.
+The chart wires workload injection to chart-managed CDS. CDS generates its
+mesh CA key in process memory and persists only the public CA bundle. The
+persisted bundle lets already-issued leaves keep verifying across CDS
+restarts; it does not preserve issuance — a restart generates a new CA key,
+and workloads must re-bootstrap to trust new leaves. See docs/operator.md
+for the singleton-vs-handoff trade-off. Run this chart inside the intended
+CVM trust boundary; the supported chart path no longer has external CDS
+URL values.
 
 The chart's RA-TLS handshakes accept any TEE-attested peer unless the
-operator pins `assam.measurements`, `certIssuer.measurements`, and
-`ratls-mesh.assam.measurements` to the expected launch digests. Leave these
-empty only on a trusted Pod network; see docs/THREAT_MODEL.md for the
-threat surface.
+operator pins `cds.measurements` and `ratls-mesh.measurements` to the
+expected launch digests. Leave these empty only on a trusted Pod network;
+see docs/THREAT_MODEL.md for the threat surface.
 
 ## Workload opt-in
 

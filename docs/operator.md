@@ -3,7 +3,8 @@
 The c8s operator installs the Kubernetes-facing c8s components. It hosts
 status-mirror controllers, serves the pod-injection admission webhook, and
 ships an embedded Helm chart for installing the operator, CRDs, RBAC, webhook
-resources, attestation-service DaemonSet, Assam, and cert-issuer.
+resources, attestation-service DaemonSet, and CDS (the Certificate
+Distribution Service trust root).
 
 ## Overview
 
@@ -15,10 +16,9 @@ The operator tree is built around these pieces:
 - `cmd/c8s install` extracts the embedded chart from `internal/helmchart`
   and shells out to `helm upgrade --install`.
 - `internal/helmchart/c8s` installs the operator Deployment and Service, the
-  CRDs, RBAC, webhook configuration, attestation-service DaemonSet, Assam, and
-  cert-issuer.
+  CRDs, RBAC, webhook configuration, attestation-service DaemonSet, and CDS.
 - `internal/webhook` injects get-cert containers into opted-in pods so each
-  workload can fetch and renew a leaf certificate through Assam.
+  workload can fetch and renew a leaf certificate through CDS.
 
 The operator does not inject the RA-TLS mesh sidecar. Pod-to-pod mTLS remains
 the responsibility of the node-level `ratls-mesh` DaemonSet. The chart-managed
@@ -43,10 +43,10 @@ the operator Deployment, the webhook Service and configuration, and the
 attestation-service DaemonSet. Enabling injection also requires platform-owned
 prerequisites:
 
-- the chart-managed Assam Service reachable from workload pods;
-- whitelist storage and a measurement resource map for any workload allowed to
+- the chart-managed CDS Service reachable from workload pods;
+- whitelist storage and a measurement allowlist for any workload allowed to
   mutate the whitelist;
-- a cert-issuer public-bundle PVC for CA continuity;
+- a CDS public-bundle PVC for CA continuity;
 - nodes with the expected TEE device access for attestation-service;
 
 After the platform installs those pieces, workload opt-in is self-service:
@@ -68,27 +68,25 @@ The main source directories are:
 ## Default install behavior
 
 The supported chart shape is chart-managed and CVM-only. The chart does not
-support a non-CVM install shape or a bring-your-own Assam/cert-issuer endpoint
-shape.
+support a non-CVM install shape or a bring-your-own CDS endpoint shape.
 
-- The chart renders webhook, attestation-service, Assam, and cert-issuer
-  together.
-- The webhook is wired to the chart-managed Assam Service.
-- Assam is wired to the chart-managed cert-issuer Service.
-- cert-issuer validates EAR JWTs through chart-managed Assam's JWKS endpoint.
-- whitelist admin is EAR-authorized through Assam; the chart does not render an
-  Assam whitelist password or attestation-service API key into Kubernetes
+- The chart renders webhook, attestation-service, and CDS together.
+- The webhook is wired to the chart-managed CDS Service.
+- CDS verifies evidence, issues EAR tokens, and signs workload CSRs in one
+  process; EAR validation and signing share that process, so there is no
+  internal Service hop or JWKS fetch between them.
+- whitelist admin is EAR-authorized through CDS; the chart does not render a
+  CDS whitelist password or attestation-service API key into Kubernetes
   Secrets.
 - `image.tag` or `image.digest`, `attestationService.image.tag` or
-  `attestationService.image.digest`, `assam.image.tag` or
-  `assam.image.digest`, and `certIssuer.image.tag` or
-  `certIssuer.image.digest` are required; the CLI passes its build version when
+  `attestationService.image.digest`, and `cds.image.tag` or
+  `cds.image.digest` are required; the CLI passes its build version when
   running `c8s install`. Unstamped local builds report version `dev`, and the
   install CLI maps that to the `latest` image tag because CI does not publish
   `dev`.
 
 This means a default platform install creates the operator, CRDs, RBAC,
-webhook, attestation-service, Assam, and cert-issuer. It does not mutate
+webhook, attestation-service, and CDS. It does not mutate
 application workloads until those workloads opt in with
 `confidential.ai/cw`.
 
@@ -127,82 +125,76 @@ See [`docs/kata.md`](kata.md) for the design (why it wraps upstream
 kata-deploy), the threat model, distro support, the one-shot bootstrap-window
 caveat, and the SEV-SNP-host / GPU constraints.
 
-## Chart-managed Assam
+## Chart-managed CDS
 
-The supported deployment is chart-managed Assam plus cert-issuer running inside
-the intended CVM trust boundary.
+The supported deployment is chart-managed CDS running inside the intended CVM
+trust boundary.
 
-The chart installs an Assam Deployment, Service, ServiceAccount, and either an
-`emptyDir` whitelist DB or a PVC when `assam.persistence.enabled=true`. The
-operator injects pods with the chart-managed Assam Service URL. Whitelist
-writes use `Authorization: Bearer <EAR>`. Assam accepts `POST /whitelist` and
-`DELETE /whitelist` only when the EAR was issued by Assam and the requester's
-normalized launch measurement is allowed for `assam/whitelist-write` in
-`assam.resourceMap`.
+The chart installs a CDS Deployment, Service, ServiceAccount, and either an
+`emptyDir` whitelist DB or a PVC when `cds.persistence.enabled=true`. The
+operator injects pods with the chart-managed CDS Service URL. Whitelist
+writes use `Authorization: Bearer <EAR>`. CDS accepts `POST /whitelist` and
+`DELETE /whitelist` only when the EAR was issued by CDS and the requester's
+normalized launch measurement is listed in `cds.whitelistWriteMeasurements`.
 
-Internal Assam, cert-issuer, and CA-bundle refresh traffic uses chart-managed
-cluster Services. Trust for those flows comes from EAR validation, measurement
-allowlists, and CA continuity checks rather than WebPKI on the Service hop.
+CA-bundle refresh traffic uses the chart-managed cluster Service. Trust for
+those flows comes from EAR validation, measurement allowlists, and CA
+continuity checks rather than WebPKI on the Service hop.
+
+CDS verifies EAR JWTs against its own in-process signer; there is no JWKS
+fetch to a separate component. The chart does not render a CA private key into
+a Kubernetes Secret. CDS generates its mesh CA key inside the process, keeps it
+in memory, and persists only the public CA bundle in the configured
+public-bundle PVC.
 
 Minimal whitelist-write values:
 
 ```yaml
-assam:
-  resourceMap:
-    "<sha384-launch-measurement>":
-      - assam/whitelist-write
+cds:
+  whitelistWriteMeasurements:
+    - "<sha384-launch-measurement>"
 ```
 
-## Chart-managed cert-issuer
+### Operational warning: CDS is a singleton until handoff is enabled
 
-Cert-issuer validates EAR JWTs through chart-managed Assam's JWKS endpoint.
-
-The chart does not render a CA private key into a Kubernetes Secret. Cert-issuer
-generates its mesh CA key inside the process, keeps it in memory, and persists
-only the public CA bundle in the configured public-bundle PVC.
-
-### Operational warning: cert-issuer is a singleton until handoff is enabled
-
-By default, cert-issuer runs as a single replica with the in-memory mesh CA
+By default, CDS runs as a single replica with the in-memory mesh CA
 key, and **any restart is a full re-bootstrap event**: the replacement pod
 generates a fresh CA whose public key is not signed by anything ratls-mesh
-already trusts. `pkg/ratls/assamclient`'s continuity check then refuses the
-new CA on the next `/ca` poll, cert-issuer keeps signing leaves with the
+already trusts. `pkg/ratls/cdsclient`'s continuity check then refuses the
+new CA on the next `/ca` poll, CDS keeps signing leaves with the
 new key, no workload trusts them, and the mesh degrades as old leaves
 expire. Recovery is to restart every workload so its get-cert init container
-re-runs the Assam provisioning flow.
+re-runs the CDS provisioning flow.
 
 Scheduled in-process CA rotation (`--ca-rotation-interval`) is **not** a
 re-bootstrap: the rotator signs the new CA with the still-live current
 CA's key, the continuity check accepts it, and workloads pick it up on
 their next `/ca` refresh. Only restart loses the signing key.
 
-To remove this restriction, enable in-process handoff bootstrap by setting
-`certIssuer.handoff.enabled=true` in values and pinning
-`certIssuer.measurements` to cert-issuer's launch digest. The chart
-auto-injects the `cert-issuer/handoff` entry into the rendered
-resourceMap from those measurements (so the value is set in one place,
-not two); enabling handoff without measurements fails chart render. With
-that flag set, cert-issuer generates an ECDSA handoff signer key in process
-at startup and exchanges it for an Assam-issued EAR via Assam's
-`/attest-key` endpoint (over the H1 RA-TLS channel). No operator key file
-or Kubernetes Secret is rendered — the alternative would put CA-adjacent
-material into etcd, which the chart-managed CVM design forbids.
+To remove this restriction, enable in-process handoff by setting
+`cds.handoff.enabled=true` in values and pinning `cds.measurements` to CDS's
+launch digest; the same flat allowlist authorises `/handoff`, and enabling
+handoff without measurements fails chart render. With that flag set, CDS
+generates an ECDSA handoff signer key in process at startup and
+self-provisions its handoff EAR via its own EAR issuer (no external service to
+dial). No operator key file or Kubernetes Secret is rendered — the alternative
+would put CA-adjacent material into etcd, which the chart-managed CVM design
+forbids.
 
 Until handoff is enabled:
 
-- run cert-issuer with `replicas: 1` and `strategy: Recreate` (default in
+- run CDS with `replicas: 1` and `strategy: Recreate` (default in
   this chart);
-- guard the cert-issuer Deployment with a PodDisruptionBudget that blocks
+- guard the CDS Deployment with a PodDisruptionBudget that blocks
   voluntary disruptions;
-- treat any cert-issuer restart as a planned maintenance event with workload
+- treat any CDS restart as a planned maintenance event with workload
   churn;
-- monitor the `cert_ca_fingerprint_info{fingerprint=…}` metric — a
-  fingerprint change without a planned rotation means a restart happened
-  and workload re-provisioning is needed.
+- watch CDS startup logs for the active CA fingerprint — a fingerprint
+  change without a planned rotation means a restart happened and workload
+  re-provisioning is needed.
 
 After enabling handoff, verify the bootstrap succeeded by checking
-cert-issuer logs for `attested CA handoff enabled` and
+CDS logs for `attested CA handoff enabled` and
 `handoff EAR refreshed` lines. Failures will be logged at warn-level
 without crashing the binary; the handoff handler stays unregistered and the
 restart-fragility window above applies until the operator fixes the
@@ -244,7 +236,7 @@ The init container runs:
 
 ```bash
 get-cert \
-  --assam-url=http://<release>-assam.<namespace>.svc:8080 \
+  --cds-url=https://<release>-cds.<namespace>.svc:8443 \
   --attestation-service-url=<release-attestation-service-url> \
   --san=<confidential.ai/cw> \
   --out=/etc/c8s/certs/tls.crt \
@@ -326,20 +318,18 @@ Run Helm lint:
 helm lint internal/helmchart/c8s \
   --set image.tag=latest \
   --set attestationService.image.tag=latest \
-  --set assam.image.tag=latest \
-  --set certIssuer.image.tag=latest
+  --set cds.image.tag=latest
 ```
 
-Render the chart defaults. The output should include the chart-managed Assam
-and cert-issuer Services wired through the operator and Assam args:
+Render the chart defaults. The output should include the chart-managed CDS
+Service wired through the operator's `--cds-url` arg:
 
 ```bash
 helm template c8s internal/helmchart/c8s \
   --namespace c8s-system \
   --set image.tag=latest \
   --set attestationService.image.tag=latest \
-  --set assam.image.tag=latest \
-  --set certIssuer.image.tag=latest
+  --set cds.image.tag=latest
 ```
 
 Render the supported shape with a whitelist-write allowlist:
@@ -349,15 +339,14 @@ helm template c8s internal/helmchart/c8s \
   --namespace c8s-system \
   --set image.tag=latest \
   --set attestationService.image.tag=latest \
-  --set assam.image.tag=latest \
-  --set certIssuer.image.tag=latest \
-  --set 'assam.resourceMap.<sha384-launch-measurement>[0]=assam/whitelist-write'
+  --set cds.image.tag=latest \
+  --set 'cds.whitelistWriteMeasurements[0]=<sha384-launch-measurement>'
 ```
 
 The rendered manifests should include:
 
-- an Assam Deployment, Service, ServiceAccount, and resource-map ConfigMap;
-- the operator arg `--assam-url=http://c8s-assam.c8s-system.svc:8080`;
-- no Assam admin-password Secret and no attestation-service API-key Secret;
-- `confidential.ai/trust-boundary-warning` annotations on the chart-managed
-  Assam resources.
+- a CDS Deployment, Service, and ServiceAccount;
+- the operator arg `--cds-url=https://c8s-cds.c8s-system.svc:8443`;
+- no CDS admin-password Secret and no attestation-service API-key Secret;
+- `confidential.ai/trust-root-mode: inMemory` annotations on the chart-managed
+  CDS resources.

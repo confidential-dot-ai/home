@@ -6,11 +6,10 @@ Confidential computing infrastructure for Kubernetes. Provides TEE attestation, 
 
 | Component | Description | Docs |
 |---|---|---|
-| [`cmd/assam`](cmd/assam/) | Key Broker Service - verifies TEE attestation evidence and issues signed X.509 certificates | [README](cmd/assam/README.md) |
+| [`cmd/cds`](cmd/cds/) | Certificate Distribution Service - verifies TEE attestation evidence, issues EAR tokens, and signs workload CSRs with an in-process mesh CA | [operator docs](docs/operator.md) |
 | [`cmd/c8s`](cmd/c8s/) | Operator and install CLI for CRDs, status mirroring, webhook injection, and the embedded Helm chart | [operator docs](docs/operator.md) |
 | [`cmd/get-cert`](cmd/get-cert/) | CLI tool and init-container for TEE-attested certificate provisioning | [README](cmd/get-cert/README.md) |
 | [`cmd/ratls-mesh`](cmd/ratls-mesh/) | Transparent L4 proxy wrapping inter-node K8s traffic in RA-TLS | [README](cmd/ratls-mesh/README.md) |
-| [`cmd/cert-issuer`](cmd/cert-issuer/) | Certificate issuer with in-process mesh CA rotation | [README](cmd/cert-issuer/README.md) |
 | [`cmd/nri-image-policy`](cmd/nri-image-policy/) | NRI plugin enforcing container image digest whitelists | - |
 
 ## Libraries
@@ -18,10 +17,10 @@ Confidential computing infrastructure for Kubernetes. Provides TEE attestation, 
 | Package | Description |
 |---|---|
 | [`pkg/ratls`](pkg/ratls/) | RA-TLS library for hardware-attested mTLS (AMD SEV-SNP, Intel TDX) |
-| [`pkg/ratls/assamclient`](pkg/ratls/assamclient/) | Assam attestation client for certificate provisioning |
-| [`pkg/attestclient`](pkg/attestclient/) | High-level client for the assam attestation flow |
+| [`pkg/ratls/cdsclient`](pkg/ratls/cdsclient/) | CDS attestation client for certificate provisioning |
+| [`pkg/attestclient`](pkg/attestclient/) | High-level client for the CDS attestation flow |
 | [`pkg/attestationclient`](pkg/attestationclient/) | Low-level HTTP client for the attestation service |
-| [`pkg/whitelistclient`](pkg/whitelistclient/) | CRUD client for the assam whitelist API |
+| [`pkg/whitelistclient`](pkg/whitelistclient/) | CRUD client for the CDS whitelist API |
 | [`pkg/whitelist`](pkg/whitelist/) | Whitelist types and JSON parsing |
 | [`pkg/types`](pkg/types/) | Shared request/response types |
 | [`pkg/issuerapi`](pkg/issuerapi/) | Certificate issuer API types |
@@ -32,17 +31,17 @@ Confidential computing infrastructure for Kubernetes. Provides TEE attestation, 
 
 ```
 cmd/
-  assam/                   KBS server binary
+  cds/                     Certificate Distribution Service binary (attestation, EAR, mesh CA)
   c8s/                     Operator and Helm install CLI
   get-cert/                TEE-attested cert provisioning CLI/init-container
   ratls-mesh/              Transparent L4 RA-TLS proxy (DaemonSet)
-  cert-issuer/             Certificate issuer with in-process mesh CA rotation
   nri-image-policy/        NRI container image policy plugin
 internal/
   attestation/             Attestation handlers and challenge store
-  certissuer/              HTTP client for cert-issuer
+  cmds/                    Subcommand entrypoints (cds, get-cert, ratls-mesh, ...)
   controller/              Operator manager and ConfidentialWorkload reconciler
   ear/                     EAR JWT token issuer (ES256)
+  issuer/                  Mesh CA signing, rotation, bundle, and handoff
   helmchart/               Embedded c8s Helm chart
   readiness/               Background health checker
   server/                  Chi router and middleware
@@ -53,7 +52,7 @@ internal/
   containerd/              Containerd tag-to-digest resolver
 pkg/
   ratls/                   RA-TLS library (AMD SEV-SNP, Intel TDX)
-    assamclient/           Assam attestation client
+    cdsclient/             CDS attestation client
   attestclient/            High-level attestation flow client
   attestationclient/       Attestation service HTTP client
   whitelistclient/         Whitelist CRUD + fetch client
@@ -75,7 +74,7 @@ Requires Go 1.26.3+.
 make build
 
 # Build individual binary
-make build-assam
+make build-c8s
 make build-ratls-mesh
 make build-nri-image-policy
 # ... etc
@@ -93,8 +92,7 @@ make clean
 ## Install and demos
 
 - [Quickstart](docs/QUICKSTART.md) is the supported install entry point.
-- [Demo](docs/DEMO.md) shows the self-contained chart-managed Assam +
-  cert-issuer path.
+- [Demo](docs/DEMO.md) shows the self-contained chart-managed CDS path.
 - [Kata runtime](docs/kata.md) covers `c8s install --kata[-enforce]`: Kata
   Containers installation and pod-as-kata-cvm enforcement.
 - [Threat model](docs/THREAT_MODEL.md) documents what is enforced today and
@@ -110,9 +108,8 @@ per-role image names remain stable, but each image copies the same multi-mode
 | Image | Base | Notes |
 |---|---|---|
 | `ghcr.io/lunal-dev/c8s-operator` | distroless | Multi-mode `c8s` binary for operator/install and non-node roles |
-| `ghcr.io/lunal-dev/assam` | distroless | |
+| `ghcr.io/lunal-dev/cds` | distroless | |
 | `ghcr.io/lunal-dev/get-cert` | distroless | |
-| `ghcr.io/lunal-dev/cert-issuer` | distroless | |
 | `ghcr.io/lunal-dev/ratls-mesh` | debian-slim | Needs iptables |
 | `ghcr.io/lunal-dev/nri-image-policy` | debian-slim | |
 

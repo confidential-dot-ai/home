@@ -83,13 +83,12 @@ destinations whose `Pod.Status.HostIP` matches this node's `NODE_IP`.
 | `--drain-timeout` | `30s` | Graceful shutdown drain timeout |
 | `--local-cidr-boot-timeout` | `1s` | Synchronous retry budget at startup for host pod-network CIDR discovery; past this we fall through to the async refresh loop and `ValidateLocalDest` uses Kubernetes `Pod.Status.HostIP` ownership until discovery recovers |
 | `--measurements` | `""` | Comma-separated hex SHA-384 launch measurements (empty = accept any TEE, warns) |
-| `--cert-mode` | `self-signed` | Certificate mode: `self-signed` or `assam` |
-| `--assam-url` | `""` | Assam service URL for attestation (required for `assam` cert mode) |
-| `--attestation-service-url` | (required) | Local attestation service URL (required for `assam` cert mode) |
-| `--cert-issuer-url` | `""` | Cert-issuer URL for CA bundle refresh after authenticated provisioning (required for `assam` cert mode) |
-| `--assam-measurements` | `""` | Comma-separated SHA-384 hex launch measurements that Assam's RA-TLS peer cert must match. Empty = accept any (UNSAFE outside development) |
+| `--cert-mode` | `self-signed` | Certificate mode: self-signed (default), cds (boots self-signed, upgrades to CDS-issued in background) |
+| `--cds-url` | `""` | CDS service URL for attestation and CA bundle retrieval (required for cds mode) |
+| `--attestation-service-url` | (required) | Local attestation service URL (required for cds mode) |
+| `--cds-measurements` | `""` | Comma-separated SHA-384 hex launch measurements that CDS's RA-TLS peer cert must match. Empty = accept any (UNSAFE outside development) |
 | `--ca-cert` | `""` | Path to CA certificate PEM for X.509 chain verification |
-| `--ca-url` | `""` | Cert-issuer `/v1/ca` URL for periodic CA bundle refresh |
+| `--ca-url` | `""` | CDS `/ca` URL for periodic CA bundle refresh (cds mode); empty derives from --cds-url |
 | `--ca-poll-interval` | `5m` | Interval for polling `--ca-url` |
 | `--cert-ttl` | `24h` | Certificate lifetime; rotates at 50% of TTL |
 | `--rotation-timeout` | `30s` | Max time for background certificate rotation |
@@ -121,24 +120,24 @@ The `--cert-mode` flag controls how ratls-mesh obtains TLS certificates:
 | Mode | Behavior |
 |------|----------|
 | `self-signed` | Default. RA-TLS self-signed certificates with attestation evidence embedded as X.509 extensions. Peers verify via hardware attestation chain. |
-| `assam` | Boots with self-signed RA-TLS, then a background goroutine contacts assam with exponential backoff (2s → 60s), obtains CA-signed certificates, and hot-swaps them. Once upgraded, stays on CA-signed certs. |
+| `cds` | Boots with self-signed RA-TLS, then a background goroutine contacts CDS with exponential backoff (2s → 60s), obtains CA-signed certificates, and hot-swaps them. Once upgraded, stays on CA-signed certs. |
 
-### Bootstrap flow (assam mode)
+### Bootstrap flow (cds mode)
 
-1. Proxy starts immediately with self-signed RA-TLS certificates (no assam dependency at startup)
-2. Background goroutine initiates assam attestation: authenticate → attest → obtain cert and authenticated CA bundle
+1. Proxy starts immediately with self-signed RA-TLS certificates (no CDS dependency at startup)
+2. Background goroutine contacts CDS (one service): authenticate → attest → obtain leaf cert and authenticated CA bundle; CDS signs the CSR in-process
 3. On success, `CertManager.SwapProvider()` hot-swaps to CA-signed certificates
 4. `/ca` polling starts only after that authenticated CA bundle has seeded trust, and accepts only continuity-signed updates
 5. Peer verification accepts BOTH RA-TLS attestation AND CA-chain during the transition (dual verification)
 6. Once all nodes upgrade, CA-chain verification is the fast path
 
-This design ensures zero-downtime upgrades — nodes can be upgraded from self-signed to assam-issued certificates without service interruption.
+This design ensures zero-downtime upgrades — nodes can be upgraded from self-signed to CDS-issued certificates without service interruption.
 
-**CA bundle wiring.** Assam mode needs a CA trust root from cert-issuer.
-Set either `assam.caUrl` (in the chart) / `--ca-url` (CLI) for dynamic
+**CA bundle wiring.** cds mode needs a CA trust root from CDS.
+Set either `cds.caUrl` (in the chart) / `--ca-url` (CLI) for dynamic
 periodic refresh, *or* mount a static CA configMap — the chart references
-`{release}-cert-issuer-mesh-ca` by default and mounts it at
-`/etc/mesh-ca` when `assam.caUrl` is empty. With neither set, the pod
+`{release}-cds-mesh-ca` by default and mounts it at
+`/etc/mesh-ca` when `cds.caUrl` is empty. With neither set, the pod
 fails to schedule with a "configmap not found" error at install time.
 
 ### Dual verification
@@ -147,7 +146,7 @@ When `--ca-cert` is provided, the mesh accepts peers verified via either:
 - A valid CA-signed certificate chain (fast path, standard X.509)
 - A valid RA-TLS attestation extension (fallback, hardware verification)
 
-This enables rolling upgrades where some nodes have assam-issued certificates and others still use self-signed RA-TLS.
+This enables rolling upgrades where some nodes have CDS-issued certificates and others still use self-signed RA-TLS.
 
 ## Deployment
 
@@ -175,8 +174,7 @@ Reviewer-relevant defaults:
 | `iptablesSync.resyncPeriod` | `30s` | Periodic reconciliation of pod ipsets and iptables rules. |
 | `iptablesSync.ipsetMaxElem` | `262144` | Maximum size for each managed ipset. |
 | `excludeUids` | `"0"` | Excludes root-owned host daemon traffic from `OUTPUT` redirect in addition to the mesh UID. |
-| `assam.caPollInterval` | `5m` | Interval for polling cert-issuer `/ca` for CA bundle refresh after authenticated provisioning. |
-| `assam.measurements` | `[]` | SHA-384 hex launch digests that Assam's RA-TLS peer cert must match; empty accepts any (UNSAFE outside dev). |
+| `ratls-mesh.measurements` | `[]` | SHA-384 hex launch digests that CDS's RA-TLS peer cert must match; empty accepts any (UNSAFE outside dev). |
 
 ## Observability
 

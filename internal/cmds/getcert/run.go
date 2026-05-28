@@ -100,7 +100,7 @@ func NewCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "get-cert",
 		Short: "Obtain a signed certificate via the CDS attestation flow",
-		Long: `get-cert requests a TLS certificate from the Confidential Data Service (CDS)
+		Long: `get-cert requests a TLS certificate from the Certificate Distribution Service (CDS)
 by proving it is running in a Trusted Execution Environment (TEE).
 
 It generates an ECDSA P-256 key pair (or loads the key passed with --key),

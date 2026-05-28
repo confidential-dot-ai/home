@@ -1,6 +1,6 @@
 # get-cert
 
-A CLI tool for obtaining TLS certificates through the assam TEE attestation flow. It generates (or loads) an ECDSA P-256 key pair, creates a CSR with a specified Subject Alternative Name (SAN), and runs the full attestation-verification-certification flow via assam.
+A CLI tool for obtaining TLS certificates through the CDS (Certificate Distribution Service) TEE attestation flow. It generates (or loads) an ECDSA P-256 key pair, creates a CSR with a specified Subject Alternative Name (SAN), and runs the full attestation-verification-certification flow via cds.
 
 Designed to run as a Kubernetes init container or renewal sidecar alongside a workload that uses the obtained certificate.
 
@@ -10,7 +10,7 @@ Obtain a certificate with a DNS SAN:
 
 ```bash
 get-cert \
-  --assam-url http://assam:8080 \
+  --cds-url http://cds:8443 \
   --attestation-service-url http://localhost:8400 \
   --san api.example.com \
   --out /tls/cert.pem \
@@ -21,7 +21,7 @@ Obtain a certificate with an IP SAN:
 
 ```bash
 get-cert \
-  --assam-url http://assam:8080 \
+  --cds-url http://cds:8443 \
   --attestation-service-url http://localhost:8400 \
   --san 10.0.0.1 \
   --out /tls/cert.pem \
@@ -32,7 +32,7 @@ Use an existing private key:
 
 ```bash
 get-cert \
-  --assam-url http://assam:8080 \
+  --cds-url http://cds:8443 \
   --attestation-service-url http://localhost:8400 \
   --san api.example.com \
   --key my-key.pem \
@@ -43,7 +43,8 @@ get-cert \
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--assam-url` | | *(required)* | URL of the running assam service |
+| `--cds-url` | | *(required)* | URL of the running cds service |
+| `--cds-measurements` | | *(empty)* | Comma-separated SHA-384 hex launch measurements for CDS RA-TLS verification; empty accepts any attested CDS |
 | `--attestation-service-url` | | *(required)* | URL of the local attestation service |
 | `--san` | | *(required)* | Subject Alternative Name — IP address or hostname |
 | `--out` | `-o` | *(stdout)* | Path to write the signed certificate chain PEM |
@@ -57,7 +58,7 @@ get-cert \
 
 ## Output path validation
 
-Before generating keys or contacting assam, get-cert verifies that the output directories for `--out` and `--key-out` exist and are writable. This prevents requesting certificates that can't be saved.
+Before generating keys or contacting cds, get-cert verifies that the output directories for `--out` and `--key-out` exist and are writable. This prevents requesting certificates that can't be saved.
 
 ## SAN detection
 
@@ -68,6 +69,6 @@ The `--san` flag accepts either an IP address or a hostname. get-cert automatica
 
 ## Certificate TTL
 
-Certificate lifetime is controlled server-side by assam's `--cert-ttl` flag (default 24h). get-cert does not set the TTL — configure it on the assam server.
+Certificate lifetime is controlled server-side by cds's `--cert-ttl` flag (default 24h). get-cert does not set the TTL — configure it on the cds server.
 
 For long-running pods, set `--renew-interval` shorter than the server-side TTL. When the workload is not nginx, pass `--reload-nginx=false` and have the workload reload the refreshed cert files using its own mechanism.

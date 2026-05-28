@@ -62,7 +62,7 @@ webhook:
     runAsGroup: 65532
     runAsNonRoot: true
 
-## Confidential Data Service (cds): the c8s trust root. One binary, one Service,
+## Certificate Distribution Service (cds): the c8s trust root. One binary, one Service,
 ## one ServiceAccount, and one measurement allowlist serve EAR issuance,
 ## whitelist, JWKS, mesh-CA leaf signing, and handoff.
 ##

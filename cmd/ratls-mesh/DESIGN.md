@@ -148,36 +148,35 @@ After reading the destination header with `bufio.Reader`, any bytes already buff
 | Dual-stack iptables | Both `iptables` (IPv4) and `ip6tables` (IPv6) rules are installed. Prevents IPv6 traffic from bypassing the mesh on dual-stack clusters. | Requires `ip6tables` binary in container image. |
 | Measurement pinning | `--measurements` flag accepts expected SHA-384 launch digests. Without it, any valid TEE is accepted (logged as warning). | Requires redeployment when binary changes. |
 
-## Assam Certificate Issuance
+## CDS Certificate Issuance
 
 ### Architecture
 
-When `--cert-mode assam` is used, the mesh obtains CA-signed certificates via assam attestation instead of self-signing:
+When `--cert-mode cds` is used, the mesh obtains CA-signed certificates via CDS attestation instead of self-signing:
 
 ```
-Bootstrap (ratls-mesh dials Assam over its own self-signed RA-TLS cert):
+Bootstrap (ratls-mesh dials CDS over its own self-signed RA-TLS cert):
 
   1. ratls-mesh                       boot with self-signed RA-TLS cert
                                       (provider = self-signed)
 
-  2. ratls-mesh -> assam              POST /authenticate
-                <- assam              challenge
+  2. ratls-mesh -> CDS                POST /authenticate
+                <- CDS                challenge
 
   3. ratls-mesh -> attestation-svc    POST /attest (challenge nonce, pubkey)
                 <- attestation-svc    SNP evidence
 
-  4. ratls-mesh -> assam              POST /attest (evidence + CSR)
-                   assam -> att-svc   verify(evidence)
-                          <- att-svc  ok
-                   assam -> ci        POST /sign-csr (CSR + EAR)
-                          <- ci       signed leaf cert
-                <- assam              leaf cert + CA bundle
+  4. ratls-mesh -> CDS                POST /attest (evidence + CSR)
+                   CDS -> att-svc     verify(evidence)
+                       <- att-svc     ok
+                   CDS                signs the CSR in-process with the mesh CA
+                <- CDS                leaf cert + CA bundle
 
   5. ratls-mesh                       SwapProvider() hot-swaps the TLS
                                       provider to the CA-signed cert
 
-  6. ratls-mesh -> cert-issuer        GET /ca (continuity-checked refresh)
-                <- cert-issuer        updated CA bundle
+  6. ratls-mesh -> CDS                GET /ca (continuity-checked refresh)
+                <- CDS                updated CA bundle
 ```
 
 ### CertProvider Abstraction
@@ -192,7 +191,7 @@ type CertProvider interface {
 
 Two implementations:
 - `SelfSignedProvider`: generates key, obtains hardware attestation, creates self-signed cert with attestation extension
-- `assamclient.Provider`: generates key, embeds a RA-TLS attestation extension in the CSR, performs assam attestation flow, obtains a CA-signed cert and authenticated CA bundle, then uses `/ca` only for later continuity-checked bundle refreshes
+- `cdsclient.Provider`: generates key, embeds a RA-TLS attestation extension in the CSR, performs CDS attestation flow, obtains a CA-signed cert and authenticated CA bundle, then uses `/ca` only for later continuity-checked bundle refreshes
 
 The abstraction enables runtime provider swapping via `CertManager.SwapProvider()` — the old cert continues serving while the new one provisions.
 
@@ -212,11 +211,11 @@ If both verification paths fail, the error includes both failure reasons for dia
 
 ### Bootstrap Design Decision
 
-The mesh boots with self-signed RA-TLS first, then upgrades to assam-issued certificates in the background. This design was chosen because:
+The mesh boots with self-signed RA-TLS first, then upgrades to CDS-issued certificates in the background. This design was chosen because:
 
-1. **Zero startup dependency on assam** — the mesh is immediately functional even if assam is down or not yet deployed
+1. **Zero startup dependency on CDS** — the mesh is immediately functional even if CDS is down or not yet deployed
 2. **Rolling upgrade safety** — mixed clusters (some self-signed, some CA-signed) work correctly via dual verification
-3. **Failure resilience** — if assam upgrade fails, the mesh continues operating with self-signed RA-TLS
+3. **Failure resilience** — if CDS upgrade fails, the mesh continues operating with self-signed RA-TLS
 4. **No coordination needed** — each node upgrades independently on its own schedule
 
 ## iptables Rules
@@ -543,30 +542,30 @@ Certificates are provisioned lazily on the first TLS handshake and cached in mem
 
 The `certState.mu` mutex serializes certificate provisioning — at most one attestation process runs at a time per cert type (server/client). After the first provisioning, the cached cert is returned for all subsequent handshakes until rotation.
 
-### Assam-Issued Certificates
+### CDS-Issued Certificates
 
-When using `--cert-mode assam`, the lifecycle changes:
+When using `--cert-mode cds`, the lifecycle changes:
 
 1. Initial boot: self-signed RA-TLS certificate (same flow as above)
-2. Background goroutine contacts assam: authenticate → attest → obtain cert and authenticated CA bundle
+2. Background goroutine contacts CDS: authenticate → attest → obtain cert and authenticated CA bundle
 3. `CertManager.SwapProvider()` atomically swaps the provider:
    - Acquires lock, replaces provider, clears cert cache and rotation timer
    - Releases lock, provisions new cert synchronously
    - On success: new CA-signed cert served to all subsequent handshakes
    - On failure: old self-signed cert continues serving (error logged)
 4. CA bundle polling starts only after the authenticated bundle has seeded trust, and accepts only continuity-signed updates from `/ca`
-5. Rotation continues at 50% of TTL, now using the assam provider
+5. Rotation continues at 50% of TTL, now using the CDS provider
 6. Peer verification uses `dualVerifyPeerCallback`: CA chain (fast) or RA-TLS (fallback)
 
 ## Comparison to Alternatives
 
-| | Istio ambient | ratls-mesh | **assam-mode ratls-mesh** |
+| | Istio ambient | ratls-mesh | **cds-mode ratls-mesh** |
 |--|--------------|------------|--------------------------|
 | **Trust root** | istiod CA (software) | AMD SEV-SNP (hardware) | Mesh CA (issued after hardware attestation) |
 | **Control plane compromise** | Full mTLS bypass | DoS only (can't forge attestation) | DoS only (CA is in-TEE sidecar) |
-| **Certificate issuance** | Centralized CA | Per-node self-signed with attestation | Per-node CA-signed after assam attestation |
+| **Certificate issuance** | Centralized CA | Per-node self-signed with attestation | Per-node CA-signed after CDS attestation |
 | **Protocol** | L4/L7 (ztunnel + waypoint) | L4 only | L4 only |
-| **Dependencies** | istiod, ztunnel, CNI plugin | Single binary + iptables/ipset | Single binary + iptables/ipset + assam + cert-issuer |
+| **Dependencies** | istiod, ztunnel, CNI plugin | Single binary + iptables/ipset | Single binary + iptables/ipset + CDS |
 | **Node-to-node encryption** | HBONE (HTTP/2 tunnel) | TLS 1.3 direct | TLS 1.3 direct |
 | **Per-pod identity** | SPIFFE identity per pod | Node-level TEE identity | Node-level TEE identity |
-| **Hardware requirement** | None | AMD SEV-SNP CVM | AMD SEV-SNP CVM + assam infrastructure |
+| **Hardware requirement** | None | AMD SEV-SNP CVM | AMD SEV-SNP CVM + CDS infrastructure |

@@ -6,8 +6,8 @@ final security model. Each bullet links to the tracking issue.
 
 ## Trust model
 
-- Chart-managed cert-issuer is singleton and keeps the active CA key in memory (tracked at [#18](https://github.com/lunal-dev/c8s/issues/18)).
-- Active/active cert-issuer replica handoff is not implemented (tracked at [#18](https://github.com/lunal-dev/c8s/issues/18)).
+- Chart-managed CDS runs as a singleton and keeps the active CA key in memory (tracked at [#18](https://github.com/lunal-dev/c8s/issues/18)).
+- Active/active CDS replica handoff is opt-in via `cds.handoff.enabled`; it is off by default (tracked at [#18](https://github.com/lunal-dev/c8s/issues/18)).
 - Application-secret release is not implemented (tracked at [#46](https://github.com/lunal-dev/c8s/issues/46)).
 - Per-workload measurement allowlists are not enforced at `/attest` (tracked at [#57](https://github.com/lunal-dev/c8s/issues/57)).
 - The c8s infrastructure images are not pinned into NRI policy by default (tracked at [#51](https://github.com/lunal-dev/c8s/issues/51)).
@@ -27,6 +27,6 @@ final security model. Each bullet links to the tracking issue.
 
 ## Operations
 
-- Chart-managed Assam/cert-issuer is not highly available by default (broker side tracked at [#75](https://github.com/lunal-dev/c8s/issues/75)).
+- Chart-managed CDS is not highly available by default (broker side tracked at [#75](https://github.com/lunal-dev/c8s/issues/75)).
 - Multi-tenancy isolation has no complete design (tracked at [#56](https://github.com/lunal-dev/c8s/issues/56)).
 - Federation and multi-cluster orchestration remain fleet-level concerns.
