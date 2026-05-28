@@ -14,7 +14,7 @@ import (
 	"github.com/lunal-dev/c8s/pkg/whitelist"
 )
 
-// Client is an HTTP client for the assam whitelist API.
+// Client is an HTTP client for the CDS whitelist API.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
@@ -58,7 +58,7 @@ func (c Client) List() (types.WhitelistListResponse, error) {
 }
 
 // Add adds an image digest to the whitelist. Requires an EAR bearer token
-// authorized for assam/whitelist-write.
+// authorized for cds/whitelist-write.
 func (c Client) Add(digest types.Digest, image string, earToken []byte) error {
 	reqBody := types.WhitelistAddRequest{
 		Digest: digest,
@@ -91,7 +91,7 @@ func (c Client) Add(digest types.Digest, image string, earToken []byte) error {
 }
 
 // Delete removes image digests from the whitelist. Requires an EAR bearer token
-// authorized for assam/whitelist-write.
+// authorized for cds/whitelist-write.
 // Returns an error with 404 status if any digest does not exist.
 func (c Client) Delete(digests []types.Digest, earToken []byte) error {
 	reqBody := types.WhitelistDeleteRequest{

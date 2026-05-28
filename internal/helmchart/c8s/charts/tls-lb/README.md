@@ -19,10 +19,10 @@ CDS-issued certificate for client preflight/discovery.
 1. The chart annotates the nginx pod template with `confidential.ai/cw=<san>`
    and the tls-lb cert provisioning settings.
 2. The c8s admission webhook injects `c8s-init-cert` and `c8s-renew-cert`.
-3. The init container contacts the Assam key broker configured on the c8s
+3. The init container contacts the CDS trust root configured on the c8s
    operator, proving the pod is running inside a genuine TEE via the local
    attestation service.
-4. Assam issues a CDS TLS certificate for the configured SAN (subject alternative name).
+4. CDS issues a TLS certificate for the configured SAN (subject alternative name).
 5. The CDS cert and key are written to the chart-owned in-memory `tls-certs` volume shared with nginx.
 6. The native get-cert sidecar reuses that key, renews the CDS cert, and SIGHUPs nginx after each successful renewal.
 7. If `publicTLS.secretName` is set, nginx presents that Secret's WebPKI cert
@@ -93,7 +93,7 @@ helm install my-lb charts/tls-lb \
 | `discovery.cdsCertPath` | `/.well-known/cds-cert.pem` | Endpoint serving the CDS-issued cert PEM |
 | `discovery.meshCAPath` | `/.well-known/mesh-ca.pem` | Endpoint serving the mesh CA PEM |
 | `meshCA.expose` | `true` | Serve and advertise the mesh CA PEM when discovery is enabled. |
-| `meshCA.configMapName` | `""` | Mesh CA ConfigMap name. Empty defaults to `<release>-cert-issuer-mesh-ca`. |
+| `meshCA.configMapName` | `""` | Mesh CA ConfigMap name. Empty defaults to `<release>-cds-mesh-ca`. |
 | `meshCA.optional` | `true` | Tolerate a missing mesh CA ConfigMap at pod start. Set to `false` when the ConfigMap is pre-created and missing data should fail fast. |
 | `nginx.replicas` | `1` | Number of nginx replicas |
 | `nginx.httpsPort` | `443` | HTTPS listen port |

@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	handoffProtocolLabel            = "c8s-cert-issuer-handoff-v1"
+	handoffProtocolLabel            = "c8s-cds-handoff-v1"
 	handoffRequestSignaturePurpose  = "request-signature"
 	handoffResponseSignaturePurpose = "response-signature"
 	handoffPayloadKeyPurpose        = "payload-key"
@@ -42,17 +42,17 @@ type HandoffResponse = issuerapi.HandoffResponse
 
 var (
 	tokenValidationFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "cert_issuer_token_validation_failures_total",
+		Name: "cds_token_validation_failures_total",
 		Help: "Token validation failures by reason.",
 	}, []string{"reason"})
 
 	measurementDeniedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "cert_issuer_measurement_denied_total",
+		Name: "cds_measurement_denied_total",
 		Help: "Requests denied due to measurement mismatch.",
 	}, []string{"endpoint"})
 
 	handoffEARExpirySeconds = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "cert_issuer_handoff_ear_expiry_seconds",
+		Name: "cds_handoff_ear_expiry_seconds",
 		Help: "Seconds until the handoff issuer EAR exp claim; negative when expired or unreadable.",
 	})
 )
@@ -77,7 +77,7 @@ func RecordMeasurementDenied(endpoint string) {
 
 // HandoffDeps carries the EAR verification context, active CA snapshot, and
 // public bundle the handoff handler needs. It decouples the handler from any
-// particular Issuer implementation so cds and cert-issuer can both drive it.
+// particular Issuer implementation.
 type HandoffDeps struct {
 	Logger              *slog.Logger
 	KeyProvider         KeyProvider

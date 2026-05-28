@@ -135,7 +135,7 @@ func run(cfg config) error {
 
 	// /attest-key issues a TEE-attested EAR for a caller-generated key (no CSR,
 	// no certificate). Shares the challenge store, attestation service, and EAR
-	// issuer with /attest. CertIssuer is unused by HandleAttestKey.
+	// issuer with /attest.
 	attestKeyHandler := attestation.Handler{
 		Challenges:        &challengeStore,
 		AttestationClient: asClient,
@@ -238,10 +238,10 @@ func run(cfg config) error {
 // CA to an attested peer replica. It is disabled (returns nil) unless
 // --handoff-measurements pins which peer launch digests may pull the CA.
 //
-// Unlike legacy cert-issuer, cds self-provisions its handoff signer EAR in
-// process via LocalHandoffBootstrap: cds is its own EAR issuer, so the
-// requester EAR is validated against cds's own rotator/issuer name, and the
-// signer EAR is minted by cds's earIssuer — no external Assam to dial.
+// cds self-provisions its handoff signer EAR in process via
+// LocalHandoffBootstrap: cds is its own EAR issuer, so the requester EAR is
+// validated against cds's own rotator/issuer name, and the signer EAR is minted
+// by cds's earIssuer — no external service to dial for it.
 func buildHandoffHandler(ctx context.Context, cfg config, mesh *issuer.CA, keyProvider issuer.KeyProvider, earIssuer ear.Issuer, asClient attestationclient.Client) (*issuer.HandoffHandler, error) {
 	handoffMeasurements := parseMeasurementAllowlist(cfg.handoffMeasurements)
 	if len(handoffMeasurements) == 0 {

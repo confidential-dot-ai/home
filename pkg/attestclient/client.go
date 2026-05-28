@@ -18,19 +18,19 @@ import (
 	"github.com/lunal-dev/c8s/pkg/types"
 )
 
-// Client is a high-level client for the assam attestation flow.
+// Client is a high-level client for the CDS attestation flow.
 // It handles the full challenge-attest-certify flow in a single call.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
 }
 
-// CertificateResult is the complete assam challenge/attest/certify result.
-// Certificate is the PEM chain issued by assam. Challenge, Platform, and
+// CertificateResult is the complete CDS challenge/attest/certify result.
+// Certificate is the PEM chain issued by CDS. Challenge, Platform, and
 // Evidence are the attestation material that authorized issuance.
 //
 // Authenticity of Certificate on the network path is provided by the RA-TLS
-// handshake the caller performed against Assam (see pkg/ratls.NewClientTLSConfig);
+// handshake the caller performed against CDS (see pkg/ratls.NewClientTLSConfig);
 // callers MUST construct this client over an RA-TLS-verified transport.
 type CertificateResult struct {
 	Certificate string
@@ -58,7 +58,7 @@ func NewClientWithHTTP(baseURL string, httpClient *http.Client) Client {
 // GenerateEvidence calls the local attestation service to generate TEE evidence
 // for the given report data. This is the same attestation service call used
 // internally by ObtainCertificate, exposed for callers that need evidence
-// without the full assam challenge-attest-certify flow.
+// without the full CDS challenge-attest-certify flow.
 func (c Client) GenerateEvidence(attestationServiceURL string, reportData []byte) (types.AttestResponse, error) {
 	return c.GenerateEvidenceContext(context.Background(), attestationServiceURL, reportData)
 }
@@ -77,10 +77,10 @@ func (c Client) GenerateEvidenceContext(ctx context.Context, attestationServiceU
 // certificate chain.
 //
 // It:
-//  1. Requests a challenge nonce from assam (POST /authenticate)
+//  1. Requests a challenge nonce from CDS (POST /authenticate)
 //  2. Passes SHA-384(CSR public key || challenge) as report_data to the
 //     local attestation service (POST /attest)
-//  3. Submits the evidence and caller-provided CSR to assam (POST /attest)
+//  3. Submits the evidence and caller-provided CSR to CDS (POST /attest)
 //     which verifies the evidence and returns a signed certificate chain
 func (c Client) ObtainCertificate(attestationServiceURL, csrPEM string) (string, error) {
 	return c.ObtainCertificateWithContext(context.Background(), attestationServiceURL, csrPEM)
@@ -103,12 +103,12 @@ func (c Client) ObtainCertificateWithEvidence(attestationServiceURL, csrPEM stri
 }
 
 // ObtainCertificateWithEvidenceContext is ObtainCertificateWithEvidence with
-// caller-controlled cancellation across authenticate, local attest, and assam
+// caller-controlled cancellation across authenticate, local attest, and CDS
 // attest requests.
 func (c Client) ObtainCertificateWithEvidenceContext(ctx context.Context, attestationServiceURL, csrPEM string) (CertificateResult, error) {
 	ctx = contextOrBackground(ctx)
 
-	// Step 1: get challenge from assam
+	// Step 1: get challenge from CDS
 	challengeResp, err := c.AuthenticateContext(ctx)
 	if err != nil {
 		return CertificateResult{}, fmt.Errorf("authenticate: %w", err)
@@ -130,9 +130,9 @@ func (c Client) ObtainCertificateWithEvidenceContext(ctx context.Context, attest
 		return CertificateResult{}, fmt.Errorf("attestation service: %w", err)
 	}
 
-	// Step 3: submit evidence + CSR to assam for verification and cert issuance.
+	// Step 3: submit evidence + CSR to CDS for verification and cert issuance.
 	// asResp.Evidence is the platform-specific evidence object as emitted by
-	// /attest; assam's /attest expects it wrapped in an AttestationEvidence
+	// /attest; CDS's /attest expects it wrapped in an AttestationEvidence
 	// envelope keyed by Platform.
 	attestReq := attestRequest{
 		Challenge: challengeResp.Challenge,
@@ -156,14 +156,14 @@ func (c Client) ObtainCertificateWithEvidenceContext(ctx context.Context, attest
 }
 
 // AttestKey performs the attestation flow for an in-process ECDSA key:
-//  1. Requests a challenge nonce from Assam (POST /authenticate)
+//  1. Requests a challenge nonce from CDS (POST /authenticate)
 //  2. Calls the local attestation service for evidence binding
 //     SHA-384(pubkey || challenge) into REPORTDATA
-//  3. Submits evidence + the PKIX-DER pubkey to Assam (POST /attest-key) and
+//  3. Submits evidence + the PKIX-DER pubkey to CDS (POST /attest-key) and
 //     returns the signed EAR JWT
 //
-// Used by in-cluster c8s components (cert-issuer for handoff signer key
-// bootstrap) that need an Assam-issued EAR bound to a key they hold in
+// Used by in-cluster c8s components (CDS for its handoff signer key
+// bootstrap) that need a CDS-issued EAR bound to a key they hold in
 // memory, without going through the cert-issuance flow.
 func (c Client) AttestKey(ctx context.Context, attestationServiceURL string, pubKeyDER []byte) (string, error) {
 	ctx = contextOrBackground(ctx)
@@ -310,7 +310,7 @@ func (c Client) AttestContext(ctx context.Context, req attestRequest) (string, e
 	return string(body), nil
 }
 
-// Healthz checks liveness of the assam service.
+// Healthz checks liveness of the CDS service.
 func (c Client) Healthz() (bool, error) {
 	url := c.baseURL + "/healthz"
 	resp, err := c.httpClient.Get(url)
@@ -322,7 +322,7 @@ func (c Client) Healthz() (bool, error) {
 	return resp.StatusCode >= 200 && resp.StatusCode < 300, nil
 }
 
-// Readyz checks readiness of the assam service.
+// Readyz checks readiness of the CDS service.
 func (c Client) Readyz() (bool, error) {
 	url := c.baseURL + "/readyz"
 	resp, err := c.httpClient.Get(url)

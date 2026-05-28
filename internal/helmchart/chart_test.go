@@ -1,7 +1,6 @@
 package helmchart
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -158,15 +157,13 @@ func TestChartDefaultRendersReplacementStack(t *testing.T) {
 		t.Fatalf("default chart missing MutatingWebhookConfiguration\n%s", out)
 	}
 	for _, want := range []string{
-		"app.kubernetes.io/component: assam",
-		"app.kubernetes.io/component: cert-issuer",
+		"app.kubernetes.io/component: cds",
 		"app.kubernetes.io/name: ratls-mesh",
 		"app.kubernetes.io/name: nri-image-policy",
 		"app.kubernetes.io/name: tee-proxy",
 		"port: 443\n      targetPort: 443\n      protocol: TCP\n      name: https",
 		"app.kubernetes.io/name: tls-lb",
 		"server_name \"c8s-tls-lb.c8s-system.svc\";",
-		"Route: /whitelist -> http://c8s-assam.c8s-system.svc:8080",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("default chart missing %q\n%s", want, out)
@@ -179,7 +176,7 @@ func TestChartDefaultRendersReplacementStack(t *testing.T) {
 	args := renderedOperatorArgs(t, out)
 	for _, want := range []string{
 		"--get-cert-image=ghcr.io/lunal-dev/c8s-operator:dev",
-		"--cds-url=https://c8s-assam.c8s-system.svc:8080",
+		"--cds-url=https://c8s-cds.c8s-system.svc:8443",
 		"--get-cert-renew-interval=6h",
 	} {
 		if !slices.Contains(args, want) {
@@ -798,108 +795,6 @@ func TestChartWebhookSelectsPlatformPodsWithoutBootstrappingAllPods(t *testing.T
 	assertRenderedDeploymentPodLabels(t, out, "c8s-tls-lb", wantPlatformLabels)
 }
 
-func TestChartManagedAssamSatisfiesWebhookAssamURL(t *testing.T) {
-	out, err := helmTemplate(t)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	assamDeployment := renderedDeployment(t, out, "c8s-assam")
-	if got := assamDeployment.Spec.Template.Annotations["confidential.ai/trust-boundary-warning"]; got == "" {
-		t.Fatalf("c8s-assam Deployment missing confidential.ai/trust-boundary-warning annotation\nannotations: %v", assamDeployment.Spec.Template.Annotations)
-	}
-	if got := assamDeployment.Labels["app.kubernetes.io/component"]; got != "assam" {
-		t.Fatalf("c8s-assam Deployment app.kubernetes.io/component label = %q, want %q", got, "assam")
-	}
-	assam := renderedDeploymentContainer(t, out, "c8s-assam", "assam")
-	if assam.Image != "ghcr.io/lunal-dev/assam:dev" {
-		t.Fatalf("assam container image = %q, want ghcr.io/lunal-dev/assam:dev", assam.Image)
-	}
-	operatorArgs := renderedOperatorArgs(t, out)
-	// In the legacy default (cds disabled), the operator points injected
-	// get-cert at the assam Service via the single --cds-url flag.
-	assertContainerHasArg(t, "operator", operatorArgs, "--cds-url=https://c8s-assam.c8s-system.svc:8080")
-	assertContainerHasArg(t, "assam", assam.Args, "--cert-issuer-url=https://c8s-cert-issuer.c8s-system.svc:8090")
-	assertContainerHasArg(t, "assam", assam.Args, "--log-level=info")
-	assertContainerNoArgPrefix(t, "assam", assam.Args, "--cert-issuer-url=http://")
-}
-
-func TestChartManagedAssamLogLevel(t *testing.T) {
-	out, err := helmTemplate(t,
-		"--set", "assam.logLevel=debug",
-	)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-
-	args := renderedDeploymentContainer(t, out, "c8s-assam", "assam").Args
-	assertContainerHasArg(t, "assam", args, "--log-level=debug")
-}
-
-func TestChartManagedAssamRendersResourceMap(t *testing.T) {
-	out, err := helmTemplate(t,
-		"--set", "assam.resourceMap.allowed[0]=assam/whitelist-write",
-	)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	for _, want := range []string{
-		"name: c8s-assam-resource-map",
-		"resource-map.json:",
-		"\"allowed\": [",
-		"\"assam/whitelist-write\"",
-		"--resource-map=/etc/assam/resource-map.json",
-		"mountPath: /etc/assam",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("render missing %q\n%s", want, out)
-		}
-	}
-}
-
-func TestChartManagedAssamAndCertIssuerWireTogether(t *testing.T) {
-	out, err := helmTemplate(t)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	certIssuer := renderedDeployment(t, out, "c8s-cert-issuer")
-	if got := certIssuer.Labels["app.kubernetes.io/component"]; got != "cert-issuer" {
-		t.Fatalf("c8s-cert-issuer Deployment app.kubernetes.io/component label = %q, want %q", got, "cert-issuer")
-	}
-	if got := certIssuer.Spec.Template.Annotations["confidential.ai/trust-root-mode"]; got != "inMemory" {
-		t.Fatalf("c8s-cert-issuer pod confidential.ai/trust-root-mode = %q, want %q", got, "inMemory")
-	}
-	if !renderedManifestHasNamedKind(t, out, "PersistentVolumeClaim", "c8s-cert-issuer-public-bundle") {
-		t.Fatalf("missing PersistentVolumeClaim/c8s-cert-issuer-public-bundle\n%s", out)
-	}
-	container := renderedDeploymentContainer(t, out, "c8s-cert-issuer", "cert-issuer")
-	if container.Image != "ghcr.io/lunal-dev/cert-issuer:dev" {
-		t.Fatalf("cert-issuer container image = %q, want ghcr.io/lunal-dev/cert-issuer:dev", container.Image)
-	}
-	assertContainerHasArg(t, "cert-issuer", container.Args, "--ca-rotation-interval=720h")
-	assertContainerHasArg(t, "cert-issuer", container.Args, "--ca-repo-dir=/var/lib/cert-issuer/public-bundle")
-	assertContainerHasArg(t, "cert-issuer", container.Args, "--jwks-url=https://c8s-assam.c8s-system.svc:8080/.well-known/jwks.json")
-	assam := renderedDeploymentContainer(t, out, "c8s-assam", "assam")
-	assertContainerHasArg(t, "assam", assam.Args, "--cert-issuer-url=https://c8s-cert-issuer.c8s-system.svc:8090")
-	assertContainerNoArgPrefix(t, "assam", assam.Args, "--cert-issuer-url=http://")
-	meshArgs := renderedDaemonSetContainer(t, out, "c8s-ratls-mesh", "ratls-mesh").Args
-	// In the legacy default (global.cdsEnabled=false) the unified CDS Service
-	// does not exist and the single --cds-url cannot serve both attest and CA,
-	// so ratls-mesh stays self-signed: no --cert-mode cds, no --cds-url, no
-	// legacy --cert-issuer-url/--ca-url either.
-	if got, ok := containerArgValue(meshArgs, "--cert-mode"); ok && got != "self-signed" {
-		t.Fatalf("ratls-mesh --cert-mode = %q in legacy default, want self-signed (or absent)\nargs: %v", got, meshArgs)
-	}
-	for _, prefix := range []string{"--cds-url", "--cert-issuer-url", "--ca-url"} {
-		assertContainerNoArgPrefix(t, "ratls-mesh", meshArgs, prefix)
-	}
-	for _, prefix := range []string{"--ca-key=", "--ca-cert="} {
-		assertContainerNoArgPrefix(t, "cert-issuer", container.Args, prefix)
-	}
-	if renderedManifestHasKind(t, out, "Secret") {
-		t.Fatalf("chart-managed cert-issuer should not render any Secret (mesh CA key stays in process memory)")
-	}
-}
-
 func TestChartManagedRATLSServiceTargetPortsMatchContainerPorts(t *testing.T) {
 	out, err := helmTemplate(t)
 	if err != nil {
@@ -912,8 +807,7 @@ func TestChartManagedRATLSServiceTargetPortsMatchContainerPorts(t *testing.T) {
 		container  string
 		want       string
 	}{
-		{service: "c8s-assam", deployment: "c8s-assam", container: "assam", want: "https"},
-		{service: "c8s-cert-issuer", deployment: "c8s-cert-issuer", container: "cert-issuer", want: "https"},
+		{service: "c8s-cds", deployment: "c8s-cds", container: "cds", want: "https"},
 	} {
 		svc := renderedService(t, out, tc.service)
 		if len(svc.Spec.Ports) != 1 {
@@ -930,36 +824,15 @@ func TestChartManagedRATLSServiceTargetPortsMatchContainerPorts(t *testing.T) {
 	}
 }
 
-// TestChartAssamServesRATLS proves the Assam container is wired to serve
-// RA-TLS — without --ratls-platform set, /attest is plain HTTP and
-// ratls-mesh's bootstrap-channel MITM defence (H1) is bypassed.
-func TestChartAssamServesRATLS(t *testing.T) {
-	out, err := helmTemplate(t)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	assamArgs := renderedDeploymentContainer(t, out, "c8s-assam", "assam").Args
-	if !slices.Contains(assamArgs, "--ratls-platform=snp") {
-		t.Fatalf("assam container missing --ratls-platform=snp\nargs: %v", assamArgs)
-	}
-	for _, arg := range assamArgs {
-		if strings.HasPrefix(arg, "--ratls-platform=") && arg != "--ratls-platform=snp" {
-			t.Fatalf("assam --ratls-platform = %q, want snp (empty would disable RA-TLS)", arg)
-		}
-	}
-}
-
 // TestChartOperatorDialsTrustRootOverHTTPS proves the operator injects get-cert
-// with --cds-url over https://, not http://. In the legacy default it resolves
-// to the assam Service; a regression to http:// would silently turn off the H1
-// defence. (ratls-mesh stays self-signed in the legacy default — see
-// TestChartManagedAssamAndCertIssuerWireTogether.)
+// with --cds-url over https://, not http://. A regression to http:// would
+// silently turn off the bootstrap-channel MITM defence (H1).
 func TestChartOperatorDialsTrustRootOverHTTPS(t *testing.T) {
 	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	const wantURL = "https://c8s-assam.c8s-system.svc:8080"
+	const wantURL = "https://c8s-cds.c8s-system.svc:8443"
 
 	operatorArgs := renderedOperatorArgs(t, out)
 	assertContainerHasArg(t, "operator", operatorArgs, "--cds-url="+wantURL)
@@ -973,7 +846,7 @@ func TestChartOperatorDialsTrustRootOverHTTPS(t *testing.T) {
 // directly, so there is no parent/subchart mirror to drift.
 func TestChartRatlsMeshCDSMeasurementsFlagsThrough(t *testing.T) {
 	const measurement = "abc1230000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff"
-	out, err := helmTemplateCDS(t,
+	out, err := helmTemplate(t,
 		"--set", "global.cdsMeasurements[0]="+measurement,
 	)
 	if err != nil {
@@ -1027,83 +900,6 @@ func TestChartNRIImagePolicyUsesCDSPushAndPullModes(t *testing.T) {
 	}
 }
 
-// TestChartCertIssuerHandoffEnabledWiresAssamFlags confirms that turning on
-// certIssuer.handoff.enabled in values plumbs the bootstrap flags into the
-// cert-issuer container — without them, the in-process handoff bootstrap
-// silently doesn't run and /handoff stays disabled.
-func TestChartCertIssuerHandoffEnabledWiresAssamFlags(t *testing.T) {
-	const measurement = "0011223344556677889900112233445566778899001122334455667788990011223344556677889900112233445566ff"
-	out, err := helmTemplate(t,
-		"--set", "certIssuer.handoff.enabled=true",
-		"--set", "assam.measurements[0]="+measurement,
-		// certIssuer.measurements is what enables handoff now — the chart
-		// auto-injects the cert-issuer/handoff resourceMap entry from it
-		// (see TestChartHandoffMeasurementsAutoInjectResourceMap).
-		"--set", "certIssuer.measurements[0]="+measurement,
-	)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	args := renderedDeploymentContainer(t, out, "c8s-cert-issuer", "cert-issuer").Args
-
-	assertContainerHasArg(t, "cert-issuer", args, "--handoff-assam-url=https://c8s-assam.c8s-system.svc:8080")
-	assertContainerHasArg(t, "cert-issuer", args, "--handoff-attestation-service-url=http://c8s-attestation-service.c8s-system.svc:8400")
-	// The single --assam-measurements flag is shared between JWKS fetch and
-	// handoff bootstrap (both pin Assam's identity).
-	assertContainerHasArg(t, "cert-issuer", args, "--assam-measurements="+measurement)
-}
-
-// TestChartCertIssuerHandoffDisabledOmitsAssamFlags is the negative: when
-// handoff is off (the default), the cert-issuer args MUST NOT include the
-// bootstrap flags. A regression here would silently start dialling Assam on
-// every restart even when handoff isn't supposed to be enabled.
-func TestChartCertIssuerHandoffDisabledOmitsAssamFlags(t *testing.T) {
-	out, err := helmTemplate(t)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	args := renderedDeploymentContainer(t, out, "c8s-cert-issuer", "cert-issuer").Args
-	for _, prefix := range []string{
-		"--handoff-assam-url=",
-		"--handoff-attestation-service-url=",
-	} {
-		assertContainerNoArgPrefix(t, "cert-issuer", args, prefix)
-	}
-}
-
-// TestChartHandoffEnabledFailsWithoutCertIssuerMeasurements locks the
-// chart-time validation after the resourceMap-from-measurements
-// consolidation: enabling certIssuer.handoff.enabled without setting
-// certIssuer.measurements would leave the auto-injected entry empty, the
-// bootstrap would still run, /handoff would register, and every handoff
-// request would 403 — only discovered when scaling up. Fail at helm template.
-func TestChartHandoffEnabledFailsWithoutCertIssuerMeasurements(t *testing.T) {
-	out, err := helmTemplate(t,
-		"--set", "certIssuer.handoff.enabled=true",
-	)
-	if err == nil {
-		t.Fatalf("helm template succeeded with handoff enabled but no certIssuer.measurements; output=%s", out)
-	}
-	if got := parseValidationErrorKind(out); got != "handoff_measurements" {
-		t.Fatalf("validation kind = %q, want handoff_measurements; output=%s", got, out)
-	}
-}
-
-// TestChartAssamWhitelistMaxBodyBytesPlumbsValue confirms that overriding
-// assam.whitelistMaxBodyBytes flows into the assam container's
-// --whitelist-max-body-bytes flag (typed-decoded from the rendered
-// Deployment, no string matching).
-func TestChartAssamWhitelistMaxBodyBytesPlumbsValue(t *testing.T) {
-	out, err := helmTemplate(t,
-		"--set", "assam.whitelistMaxBodyBytes=131072",
-	)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	args := renderedDeploymentContainer(t, out, "c8s-assam", "assam").Args
-	assertContainerHasArg(t, "assam", args, "--whitelist-max-body-bytes=131072")
-}
-
 // parseValidationErrorKind extracts kind=<id> from helm's stderr when the
 // chart's `fail` message starts with `VALIDATION_ERROR kind=<id>:`. Returns
 // empty string if the marker is absent.
@@ -1114,102 +910,6 @@ func parseValidationErrorKind(helmOutput string) string {
 		return ""
 	}
 	return m[1]
-}
-
-// TestChartHandoffMeasurementsAutoInjectResourceMap proves the consolidation:
-// setting certIssuer.measurements is enough — the chart auto-injects the
-// cert-issuer/handoff entry into the rendered resource-map.json so the
-// active cert-issuer authorises the joining replica without the operator
-// repeating the measurement value in two places.
-func TestChartHandoffMeasurementsAutoInjectResourceMap(t *testing.T) {
-	const measurement = "0011223344556677889900112233445566778899001122334455667788990011223344556677889900112233445566ff"
-	out, err := helmTemplate(t,
-		"--set", "certIssuer.handoff.enabled=true",
-		"--set", "assam.measurements[0]="+measurement,
-		"--set", "certIssuer.measurements[0]="+measurement,
-	)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	rm := decodeCertIssuerResourceMap(t, out)
-	got, ok := rm[measurement]
-	if !ok {
-		t.Fatalf("resource-map.json missing entry for measurement %q; got %#v", measurement, rm)
-	}
-	if !slices.Contains(got, "cert-issuer/handoff") {
-		t.Fatalf("auto-injected resource list = %v, want to contain cert-issuer/handoff", got)
-	}
-}
-
-// TestChartHandoffOperatorSuppliedHandoffResourceWins proves that an
-// operator-supplied resource list including cert-issuer/* (the glob form
-// that covers handoff) is preserved as-is — the chart doesn't double-add
-// the literal cert-issuer/handoff entry.
-func TestChartHandoffOperatorSuppliedHandoffResourceWins(t *testing.T) {
-	const measurement = "0011223344556677889900112233445566778899001122334455667788990011223344556677889900112233445566ff"
-	out, err := helmTemplate(t,
-		"--set", "certIssuer.handoff.enabled=true",
-		"--set", "assam.measurements[0]="+measurement,
-		"--set", "certIssuer.measurements[0]="+measurement,
-		"--set-string", "certIssuer.resourceMap."+measurement+"[0]=cert-issuer/*",
-	)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	rm := decodeCertIssuerResourceMap(t, out)
-	got := rm[measurement]
-	if slices.Contains(got, "cert-issuer/handoff") {
-		t.Fatalf("auto-injected duplicate cert-issuer/handoff alongside cert-issuer/*; got %v", got)
-	}
-	if !slices.Contains(got, "cert-issuer/*") {
-		t.Fatalf("operator-supplied cert-issuer/* dropped; got %v", got)
-	}
-}
-
-// decodeCertIssuerResourceMap decodes the resource-map.json embedded in
-// the rendered cert-issuer ConfigMap into a typed map. Avoids substring
-// matching on the rendered YAML.
-func decodeCertIssuerResourceMap(t *testing.T, manifest string) map[string][]string {
-	t.Helper()
-	for _, doc := range splitManifestDocs(manifest) {
-		var meta docMeta
-		if err := sigsyaml.Unmarshal([]byte(doc), &meta); err != nil || meta.Kind != "ConfigMap" {
-			continue
-		}
-		var cm corev1.ConfigMap
-		if err := sigsyaml.Unmarshal([]byte(doc), &cm); err != nil {
-			t.Fatalf("decode ConfigMap: %v\n%s", err, doc)
-		}
-		raw, ok := cm.Data["resource-map.json"]
-		if !ok {
-			continue
-		}
-		var rm map[string][]string
-		if err := json.Unmarshal([]byte(raw), &rm); err != nil {
-			t.Fatalf("parse resource-map.json: %v\n%s", err, raw)
-		}
-		return rm
-	}
-	t.Fatalf("no ConfigMap with resource-map.json found")
-	return nil
-}
-
-// TestChartCertIssuerJWKSURLIsHTTPSAndPinnedToAssamMeasurement proves cert-issuer's
-// JWKS fetch from Assam is RA-TLS, not plaintext HTTP. A regression here
-// would let an on-path attacker swap the EAR signing keys cert-issuer trusts,
-// which in turn would let them forge EARs and get arbitrary CSRs signed.
-func TestChartCertIssuerJWKSURLIsHTTPSAndPinnedToAssamMeasurement(t *testing.T) {
-	const measurement = "9988776655443322110099887766554433221100998877665544332211009988776655443322110099887766554433ee"
-	out, err := helmTemplate(t,
-		"--set", "assam.measurements[0]="+measurement,
-	)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	args := renderedDeploymentContainer(t, out, "c8s-cert-issuer", "cert-issuer").Args
-	assertContainerHasArg(t, "cert-issuer", args, "--jwks-url=https://c8s-assam.c8s-system.svc:8080/.well-known/jwks.json")
-	assertContainerHasArg(t, "cert-issuer", args, "--assam-measurements="+measurement)
-	assertContainerNoArgPrefix(t, "cert-issuer", args, "--jwks-url=http://")
 }
 
 func assertContainerHasArg(t *testing.T, container string, args []string, want string) {
@@ -1249,7 +949,7 @@ func TestChartWebhookRendersSecurityKnobs(t *testing.T) {
 	}
 	args := renderedOperatorArgs(t, out)
 	for _, want := range []string{
-		"--cds-url=https://c8s-assam.c8s-system.svc:8080",
+		"--cds-url=https://c8s-cds.c8s-system.svc:8443",
 		"--cert-fs-group=4242",
 		"--cert-key-mode=0440",
 		"--get-cert-renew-interval=3h",
@@ -1288,7 +988,7 @@ func TestChartRendersTLSLBPublicTLSAndDiscovery(t *testing.T) {
 		"--set-string", "tls-lb.publicTLS.certKey=public.crt",
 		"--set-string", "tls-lb.publicTLS.keyKey=public.key",
 		"--set", "tls-lb.discovery.enabled=true",
-		"--set-string", "tls-lb.meshCA.configMapName=c8s-cert-issuer-mesh-ca",
+		"--set-string", "tls-lb.meshCA.configMapName=c8s-cds-mesh-ca",
 		"--set-string", "tls-lb.upstream.address=c8s-tee-proxy:443",
 		"--set", "tls-lb.upstream.protocol=https",
 		"--set", "tls-lb.upstream.tls.verify=true",
@@ -1323,7 +1023,7 @@ func TestChartRendersTLSLBPublicTLSAndDiscovery(t *testing.T) {
 		"path: public.key",
 		"name: discovery",
 		"name: mesh-ca",
-		"name: c8s-cert-issuer-mesh-ca",
+		"name: c8s-cds-mesh-ca",
 		"optional: true",
 	} {
 		if !strings.Contains(out, want) {
@@ -1454,7 +1154,7 @@ func TestTLSLBAdditionalRoutesConfigureNginxLocations(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "routes[0].path=/whitelist",
 		"--set-string", "routes[0].match=exact",
-		"--set-string", "routes[0].backend.address=assam.c8s-system.svc:8080",
+		"--set-string", "routes[0].backend.address=cds.c8s-system.svc:8080",
 		"--set-string", "routes[1].path=/tenant/",
 		"--set-string", "routes[1].backend.address=tenant-router.c8s-system.svc:8080",
 	)
@@ -1491,7 +1191,7 @@ func TestTLSLBAdditionalRoutesConfigureNginxLocations(t *testing.T) {
 	defaultRoute := cfg.location(t, "prefix", "/")
 	defaultRoute.assertDirective(t, "proxy_pass", "http://backend")
 	cfg.upstream(t, "backend").assertServer(t, "vllm:8000")
-	cfg.upstream(t, "route_0").assertServer(t, "assam.c8s-system.svc:8080")
+	cfg.upstream(t, "route_0").assertServer(t, "cds.c8s-system.svc:8080")
 	cfg.upstream(t, "route_1").assertServer(t, "tenant-router.c8s-system.svc:8080")
 }
 
@@ -1518,32 +1218,32 @@ func TestTLSLBTypedHTTPSRouteConfiguresProxyTLS(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "routes[0].path=/whitelist",
 		"--set-string", "routes[0].match=exact",
-		"--set-string", "routes[0].backend.address=assam.c8s-system.svc.cluster.local:8080",
+		"--set-string", "routes[0].backend.address=cds.c8s-system.svc.cluster.local:8080",
 		"--set-string", "routes[0].backend.protocol=https",
 		"--set", "routes[0].backend.tls.verify=true",
-		"--set-string", "routes[0].backend.tls.serverName=assam.c8s-system.svc.cluster.local",
+		"--set-string", "routes[0].backend.tls.serverName=cds.c8s-system.svc.cluster.local",
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
 	cfg := renderedTLSLBNginxConfig(t, out)
-	cfg.upstream(t, "route_0").assertServer(t, "assam.c8s-system.svc.cluster.local:8080")
+	cfg.upstream(t, "route_0").assertServer(t, "cds.c8s-system.svc.cluster.local:8080")
 	route := cfg.location(t, "exact", "/whitelist")
 	route.assertDirective(t, "proxy_ssl_server_name", "on")
-	route.assertDirective(t, "proxy_ssl_name", "assam.c8s-system.svc.cluster.local")
+	route.assertDirective(t, "proxy_ssl_name", "cds.c8s-system.svc.cluster.local")
 	route.assertDirective(t, "proxy_ssl_verify", "on")
 	route.assertDirective(t, "proxy_ssl_verify_depth", "2")
 	route.assertDirective(t, "proxy_ssl_trusted_certificate", "/mesh-ca/ca.pem")
 	route.assertDirective(t, "proxy_pass", "https://route_0")
 	route.assertNoDirective(t, "proxy_ssl_certificate")
 	route.assertNoDirective(t, "proxy_ssl_certificate_key")
-	assertTLSLBMeshCAVolume(t, out, "tls-lb-cert-issuer-mesh-ca", true)
+	assertTLSLBMeshCAVolume(t, out, "tls-lb-cds-mesh-ca", true)
 }
 
 func TestTLSLBTypedHTTPSRouteCanUseCDSClientCert(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "routes[0].path=/whitelist",
-		"--set-string", "routes[0].backend.address=assam.c8s-system.svc.cluster.local:8080",
+		"--set-string", "routes[0].backend.address=cds.c8s-system.svc.cluster.local:8080",
 		"--set-string", "routes[0].backend.protocol=https",
 		"--set", "routes[0].backend.tls.useCDSClientCert=true",
 	)
@@ -1554,14 +1254,14 @@ func TestTLSLBTypedHTTPSRouteCanUseCDSClientCert(t *testing.T) {
 	route := cfg.location(t, "prefix", "/whitelist")
 	route.assertDirective(t, "proxy_ssl_certificate", "/tls/cert.pem")
 	route.assertDirective(t, "proxy_ssl_certificate_key", "/tls/key.pem")
-	route.assertDirective(t, "proxy_ssl_name", "assam.c8s-system.svc.cluster.local")
+	route.assertDirective(t, "proxy_ssl_name", "cds.c8s-system.svc.cluster.local")
 	route.assertDirective(t, "proxy_pass", "https://route_0")
 }
 
 func TestTLSLBTypedHTTPSRouteCustomTrustedCAPathDoesNotMountMeshCA(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "routes[0].path=/whitelist",
-		"--set-string", "routes[0].backend.address=assam.c8s-system.svc.cluster.local:8080",
+		"--set-string", "routes[0].backend.address=cds.c8s-system.svc.cluster.local:8080",
 		"--set-string", "routes[0].backend.protocol=https",
 		"--set", "routes[0].backend.tls.verify=true",
 		"--set-string", "routes[0].backend.tls.trustedCAPath=/etc/ssl/certs/ca-certificates.crt",
@@ -1849,14 +1549,14 @@ func TestTLSLBMultiRouteMountsMeshCAForVerifiedRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	assertTLSLBMeshCAVolume(t, out, "tls-lb-cert-issuer-mesh-ca", true)
+	assertTLSLBMeshCAVolume(t, out, "tls-lb-cds-mesh-ca", true)
 }
 
 func TestTLSLBRejectsInvalidRouteMatch(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "routes[0].path=/whitelist",
 		"--set-string", "routes[0].match=regex",
-		"--set-string", "routes[0].backend.address=assam.c8s-system.svc:8080",
+		"--set-string", "routes[0].backend.address=cds.c8s-system.svc:8080",
 	)
 	if err == nil {
 		t.Fatalf("helm template succeeded, want invalid route match failure\n%s", out)
@@ -1873,7 +1573,7 @@ func TestTLSLBRejectsMissingRouteFields(t *testing.T) {
 		{
 			name: "path",
 			args: []string{
-				"--set-string", "routes[0].backend.address=assam.c8s-system.svc:8080",
+				"--set-string", "routes[0].backend.address=cds.c8s-system.svc:8080",
 			},
 			want: "tls-lb.routes[0].path is required",
 		},
@@ -1906,7 +1606,7 @@ func TestTLSLBRejectsMissingRouteFields(t *testing.T) {
 func TestTLSLBRejectsRouteUpstream(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "routes[0].path=/whitelist",
-		"--set-string", "routes[0].upstream=http://assam.c8s-system.svc:8080",
+		"--set-string", "routes[0].upstream=http://cds.c8s-system.svc:8080",
 	)
 	if err == nil {
 		t.Fatalf("helm template succeeded, want unsupported route upstream failure\n%s", out)
@@ -1917,7 +1617,7 @@ func TestTLSLBRejectsRouteUpstream(t *testing.T) {
 func TestTLSLBRejectsInvalidTypedRouteProtocol(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "routes[0].path=/whitelist",
-		"--set-string", "routes[0].backend.address=assam.c8s-system.svc:8080",
+		"--set-string", "routes[0].backend.address=cds.c8s-system.svc:8080",
 		"--set-string", "routes[0].backend.protocol=grpc",
 	)
 	if err == nil {
@@ -1929,7 +1629,7 @@ func TestTLSLBRejectsInvalidTypedRouteProtocol(t *testing.T) {
 func TestTLSLBRejectsUnsafeRoutePath(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "routes[0].path=/bad;return",
-		"--set-string", "routes[0].backend.address=assam.c8s-system.svc:8080",
+		"--set-string", "routes[0].backend.address=cds.c8s-system.svc:8080",
 	)
 	if err == nil {
 		t.Fatalf("helm template succeeded, want unsafe route path failure\n%s", out)
@@ -1964,7 +1664,7 @@ func TestTLSLBDefaultTrustedCAPathStillMountsMeshCAWhenExplicit(t *testing.T) {
 	cfg := renderedTLSLBNginxConfig(t, out)
 	defaultRoute := cfg.location(t, "prefix", "/")
 	defaultRoute.assertDirective(t, "proxy_ssl_trusted_certificate", "/mesh-ca/ca.pem")
-	assertTLSLBMeshCAVolume(t, out, "tls-lb-cert-issuer-mesh-ca", true)
+	assertTLSLBMeshCAVolume(t, out, "tls-lb-cds-mesh-ca", true)
 }
 
 func TestTLSLBMeshCAOptionalCanBeRequired(t *testing.T) {
@@ -1975,7 +1675,7 @@ func TestTLSLBMeshCAOptionalCanBeRequired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	assertTLSLBMeshCAVolume(t, out, "tls-lb-cert-issuer-mesh-ca", false)
+	assertTLSLBMeshCAVolume(t, out, "tls-lb-cds-mesh-ca", false)
 }
 
 func TestTLSLBDiscoveryRequiresAdvertisedMeshCA(t *testing.T) {
@@ -1988,7 +1688,7 @@ func TestTLSLBDiscoveryRequiresAdvertisedMeshCA(t *testing.T) {
 	cfg := renderedTLSLBNginxConfig(t, out)
 	meshCA := cfg.location(t, "exact", "/.well-known/mesh-ca.pem")
 	meshCA.assertDirective(t, "alias", "/mesh-ca/ca.pem")
-	assertTLSLBMeshCAVolume(t, out, "tls-lb-cert-issuer-mesh-ca", true)
+	assertTLSLBMeshCAVolume(t, out, "tls-lb-cds-mesh-ca", true)
 	assertRenderedDeploymentPodAnnotations(t, out, "tls-lb", map[string]string{
 		webhook.AnnotationDiscoveryMeshCAURL: "/.well-known/mesh-ca.pem",
 	})
@@ -2391,8 +2091,7 @@ func helmTemplate(t *testing.T, args ...string) (string, error) {
 		"--namespace", "c8s-system",
 		"--set", "image.tag=dev",
 		"--set", "attestationService.image.tag=dev",
-		"--set", "assam.image.tag=dev",
-		"--set", "certIssuer.image.tag=dev",
+		"--set", "cds.image.tag=dev",
 		"--set", "ratls-mesh.image.tag=dev",
 		"--set", "nri-image-policy.image.tag=dev",
 		"--set", "nri-image-policy.image.digest=sha256:aaaa000000000000000000000000000000000000000000000000000000000000",
@@ -2426,28 +2125,6 @@ type docMeta struct {
 	Metadata struct {
 		Name string `json:"name"`
 	} `json:"metadata"`
-}
-
-// renderedComponents decodes every manifest's metadata and returns the set of
-// distinct app.kubernetes.io/component label values. Typed decode (not a
-// substring scan) so a label that only appears in a comment or unrelated
-// string can't be mistaken for a rendered resource.
-func renderedComponents(t *testing.T, manifest string) map[string]bool {
-	t.Helper()
-	const componentKey = "app.kubernetes.io/component"
-	components := map[string]bool{}
-	for _, doc := range splitManifestDocs(manifest) {
-		var obj struct {
-			Metadata metav1.ObjectMeta `json:"metadata"`
-		}
-		if err := sigsyaml.Unmarshal([]byte(doc), &obj); err != nil {
-			continue
-		}
-		if c := obj.Metadata.Labels[componentKey]; c != "" {
-			components[c] = true
-		}
-	}
-	return components
 }
 
 // splitManifestDocs returns each non-empty doc in a multi-doc YAML stream as
@@ -2563,53 +2240,15 @@ func renderedOperatorArgs(t *testing.T, manifest string) []string {
 	return nil
 }
 
-// helmTemplateCDS renders the chart with the unified cds trust root enabled via
-// the single global.cdsEnabled switch, which silences the legacy assam +
-// cert-issuer templates (parent) and points the ratls-mesh subchart's --cds-url
-// at the cds Service. Extra args are appended.
-func helmTemplateCDS(t *testing.T, args ...string) (string, error) {
-	t.Helper()
-	return helmTemplate(t, append([]string{
-		"--set", "global.cdsEnabled=true",
-		"--set", "cds.image.tag=dev",
-	}, args...)...)
-}
-
-// TestChartCDSDisabledByDefaultRendersLegacyStack locks the migration default:
-// until the legacy-removal PR flips cds.enabled, the default render must carry
-// the assam + cert-issuer trust root and no cds resources.
-func TestChartCDSDisabledByDefaultRendersLegacyStack(t *testing.T) {
+// TestChartCDSIsInMemorySingleton locks the two invariants the in-memory mesh
+// CA depends on: the Deployment is a single replica (a second would mint a
+// divergent trust root) and is annotated inMemory (the CA key never lands in a
+// Secret/PVC). The cds component's presence is covered by
+// TestChartDefaultRendersReplacementStack.
+func TestChartCDSIsInMemorySingleton(t *testing.T) {
 	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	components := renderedComponents(t, out)
-	for _, want := range []string{"assam", "cert-issuer"} {
-		if !components[want] {
-			t.Fatalf("default render missing %q component; got %v", want, components)
-		}
-	}
-	if components["cds"] {
-		t.Fatalf("default render must not include cds (cds.enabled=false); got %v", components)
-	}
-}
-
-// TestChartCDSEnabledReplacesLegacyStack proves the either/or: enabling cds
-// renders exactly one trust root (cds) and silences assam + cert-issuer, so
-// two mesh CAs and a NodePort collision are impossible.
-func TestChartCDSEnabledReplacesLegacyStack(t *testing.T) {
-	out, err := helmTemplateCDS(t)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	components := renderedComponents(t, out)
-	if !components["cds"] {
-		t.Fatalf("cds.enabled render missing cds component; got %v", components)
-	}
-	for _, banned := range []string{"assam", "cert-issuer"} {
-		if components[banned] {
-			t.Fatalf("cds.enabled render must not include legacy %q component; got %v", banned, components)
-		}
 	}
 	dep := renderedDeployment(t, out, "c8s-cds")
 	if got := dep.Spec.Template.Annotations["confidential.ai/trust-root-mode"]; got != "inMemory" {
@@ -2618,19 +2257,13 @@ func TestChartCDSEnabledReplacesLegacyStack(t *testing.T) {
 	if got := *dep.Spec.Replicas; got != 1 {
 		t.Fatalf("cds replicas = %d, want 1 (in-memory CA singleton)", got)
 	}
-	container := renderedDeploymentContainer(t, out, "c8s-cds", "cds")
-	if container.Image != "ghcr.io/lunal-dev/cds:dev" {
-		t.Fatalf("cds image = %q, want ghcr.io/lunal-dev/cds:dev", container.Image)
-	}
 }
 
-// TestChartCDSEnabledPointsClientsAtCDS proves the migration's payoff: with the
-// unified cds enabled, the operator-injected get-cert and the ratls-mesh
-// daemonset both resolve their single --cds-url to the cds Service (not the
-// legacy assam Service). The ratls-mesh subchart can't read cds.enabled, so it
-// keys off the global.cdsEnabled mirror — this locks that wiring.
-func TestChartCDSEnabledPointsClientsAtCDS(t *testing.T) {
-	out, err := helmTemplateCDS(t)
+// TestChartPointsClientsAtCDS proves the operator-injected get-cert and the
+// ratls-mesh daemonset both resolve their single --cds-url to the cds Service,
+// and the mesh runs in cds cert-mode — this locks that wiring.
+func TestChartPointsClientsAtCDS(t *testing.T) {
+	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
@@ -2648,11 +2281,11 @@ func TestChartCDSEnabledPointsClientsAtCDS(t *testing.T) {
 	}
 }
 
-// TestChartCDSWiresInProcessTrustRoot confirms the merged flag set: the
-// in-memory CA (no Secret/ca-cert flag), the whitelist DB, and the in-process
-// JWKS (no --jwks-url, no --cert-issuer-url hop to a separate binary).
+// TestChartCDSWiresInProcessTrustRoot confirms the flag set: the in-memory CA
+// (no Secret/ca-cert flag), the whitelist DB, and the in-process JWKS (no
+// --jwks-url, since signing happens in the same binary).
 func TestChartCDSWiresInProcessTrustRoot(t *testing.T) {
-	out, err := helmTemplateCDS(t)
+	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
@@ -2665,19 +2298,28 @@ func TestChartCDSWiresInProcessTrustRoot(t *testing.T) {
 	} {
 		assertContainerHasArg(t, "cds", args, want)
 	}
-	// The merge eliminates the split-binary plumbing: no CA Secret, no JWKS
-	// fetch, no cert-issuer round-trip.
-	for _, banned := range []string{"--ca-cert=", "--ca-key=", "--jwks-url=", "--cert-issuer-url="} {
-		assertContainerNoArgPrefix(t, "cds", args, banned)
-	}
 }
 
-// TestChartCDSMeasurementsPlumbFlatAllowlist proves the consolidation of the
-// split assam.measurements + certIssuer.resourceMap into one flat
-// cds.measurements list driving --measurements.
+// TestChartCDSServesRATLS confirms the cds container renders with a non-empty
+// --ratls-platform by default, i.e. RA-TLS serving is ON. An empty platform
+// makes cds serve /attest, /sign-csr, and /attest-key over plaintext HTTP,
+// collapsing the H1 bootstrap-channel MITM defence — a regression this guards.
+func TestChartCDSServesRATLS(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	args := renderedDeploymentContainer(t, out, "c8s-cds", "cds").Args
+	// Default cds.ratlsPlatform is snp; an empty value would render
+	// "--ratls-platform=" and serve plaintext. Assert the exact default token.
+	assertContainerHasArg(t, "cds", args, "--ratls-platform=snp")
+}
+
+// TestChartCDSMeasurementsPlumbFlatAllowlist proves the flat cds.measurements
+// list drives --measurements.
 func TestChartCDSMeasurementsPlumbFlatAllowlist(t *testing.T) {
 	const measurement = "0011223344556677889900112233445566778899001122334455667788990011223344556677889900112233445566ff"
-	out, err := helmTemplateCDS(t, "--set", "cds.measurements[0]="+measurement)
+	out, err := helmTemplate(t, "--set", "cds.measurements[0]="+measurement)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
@@ -2685,12 +2327,12 @@ func TestChartCDSMeasurementsPlumbFlatAllowlist(t *testing.T) {
 	assertContainerHasArg(t, "cds", args, "--measurements="+measurement)
 }
 
-// TestChartCDSHandoffEnabledWiresMeasurements confirms handoff plumbs the
-// flat allowlist into --handoff-measurements (cds is its own EAR issuer, so
-// there is no external Assam URL to wire, unlike legacy cert-issuer).
+// TestChartCDSHandoffEnabledWiresMeasurements confirms handoff plumbs the flat
+// allowlist into --handoff-measurements (cds is its own EAR issuer, so there is
+// no external URL to wire).
 func TestChartCDSHandoffEnabledWiresMeasurements(t *testing.T) {
 	const measurement = "0011223344556677889900112233445566778899001122334455667788990011223344556677889900112233445566ff"
-	out, err := helmTemplateCDS(t,
+	out, err := helmTemplate(t,
 		"--set", "cds.handoff.enabled=true",
 		"--set", "cds.measurements[0]="+measurement,
 	)
@@ -2705,7 +2347,7 @@ func TestChartCDSHandoffEnabledWiresMeasurements(t *testing.T) {
 // (default) the bootstrap flag MUST be absent, or cds would register /handoff
 // when it shouldn't.
 func TestChartCDSHandoffDisabledOmitsFlag(t *testing.T) {
-	out, err := helmTemplateCDS(t)
+	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
@@ -2717,7 +2359,7 @@ func TestChartCDSHandoffDisabledOmitsFlag(t *testing.T) {
 // guard: handoff with an empty allowlist would register /handoff and 403 every
 // caller — caught at template time, not at scale-up.
 func TestChartCDSHandoffEnabledFailsWithoutMeasurements(t *testing.T) {
-	out, err := helmTemplateCDS(t, "--set", "cds.handoff.enabled=true")
+	out, err := helmTemplate(t, "--set", "cds.handoff.enabled=true")
 	if err == nil {
 		t.Fatalf("helm template succeeded with cds handoff enabled but no cds.measurements; output=%s", out)
 	}
@@ -2877,7 +2519,7 @@ func Example_tlsLBConfig() {
 	//         server vllm:8000;
 	//     }
 	//     upstream route_0 {
-	//         server c8s-assam.c8s-system.svc:8080;
+	//         server c8s-cds.c8s-system.svc:8443;
 	//     }
 	//     upstream route_1 {
 	//         server tenant-router.c8s-system.svc:8080;
@@ -2898,7 +2540,7 @@ func Example_tlsLBConfig() {
 	//         # Large buffers for upstream responses that include TEE attestation headers (~8KB).
 	//         proxy_buffer_size 16k;
 	//         proxy_buffers 4 16k;
-	//         # Route: /whitelist -> http://c8s-assam.c8s-system.svc:8080
+	//         # Route: /whitelist -> http://c8s-cds.c8s-system.svc:8443
 	//         location = /whitelist {
 	//             proxy_pass http://route_0;
 	//             proxy_set_header Host $host;
@@ -2949,7 +2591,7 @@ func renderExampleTLSLBNginxConf() string {
 		"--set", "nginx.image.tag=dev",
 		"--set-string", "routes[0].path=/whitelist",
 		"--set-string", "routes[0].match=exact",
-		"--set-string", "routes[0].backend.address=c8s-assam.c8s-system.svc:8080",
+		"--set-string", "routes[0].backend.address=c8s-cds.c8s-system.svc:8443",
 		"--set-string", "routes[1].path=/tenant/",
 		"--set-string", "routes[1].backend.address=tenant-router.c8s-system.svc:8080",
 		"--set-string", "routes[1].backend.protocol=https",

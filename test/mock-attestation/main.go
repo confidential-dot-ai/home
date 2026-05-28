@@ -40,7 +40,7 @@ func handleAttest(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("mock attest called", "platform", req.Platform)
 
-	// Return synthetic evidence that assam's mock/test mode can accept.
+	// Return synthetic evidence that the CDS mock/test mode can accept.
 	resp := map[string]any{
 		"platform": "mock",
 		"evidence": map[string]any{

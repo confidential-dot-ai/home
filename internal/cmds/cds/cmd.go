@@ -1,5 +1,6 @@
-// Package cds implements the unified Confidential Data Service subcommand
-// (merge of assam and cert-issuer per lunal-dev/c8s#76).
+// Package cds implements the unified Confidential Data Service subcommand:
+// the c8s trust root (attestation, EAR issuance, mesh CA, leaf signing,
+// handoff) — see lunal-dev/c8s#76.
 package cds
 
 import (
@@ -23,7 +24,7 @@ func NewCmd() *cobra.Command {
 	var cfg config
 	cmd := &cobra.Command{
 		Use:   "cds",
-		Short: "Run the unified Confidential Data Service (assam + cert-issuer)",
+		Short: "Run the unified Confidential Data Service (CDS)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return run(cfg)
 		},

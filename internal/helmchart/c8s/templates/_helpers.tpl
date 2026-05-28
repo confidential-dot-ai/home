@@ -15,18 +15,6 @@
 {{- printf "%s-attestation-service" .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "c8s.assamName" -}}
-{{- printf "%s-assam" .Release.Name | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
-{{- define "c8s.assamResourceMapName" -}}
-{{- printf "%s-resource-map" (include "c8s.assamName" .) | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
-{{- define "c8s.certIssuerName" -}}
-{{- printf "%s-cert-issuer" .Release.Name | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
 {{- define "c8s.cdsName" -}}
 {{- printf "%s-cds" .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
@@ -59,26 +47,6 @@
 {{ .Values.attestationService.image.repository }}:{{ .Values.attestationService.image.tag }}
 {{- else -}}
 {{ fail "attestationService.image.tag or attestationService.image.digest must be set" }}
-{{- end -}}
-{{- end -}}
-
-{{- define "c8s.assamImage" -}}
-{{- if .Values.assam.image.digest -}}
-{{ .Values.assam.image.repository }}@{{ .Values.assam.image.digest }}
-{{- else if .Values.assam.image.tag -}}
-{{ .Values.assam.image.repository }}:{{ .Values.assam.image.tag }}
-{{- else -}}
-{{ fail "assam.image.tag or assam.image.digest must be set" }}
-{{- end -}}
-{{- end -}}
-
-{{- define "c8s.certIssuerImage" -}}
-{{- if .Values.certIssuer.image.digest -}}
-{{ .Values.certIssuer.image.repository }}@{{ .Values.certIssuer.image.digest }}
-{{- else if .Values.certIssuer.image.tag -}}
-{{ .Values.certIssuer.image.repository }}:{{ .Values.certIssuer.image.tag }}
-{{- else -}}
-{{ fail "certIssuer.image.tag or certIssuer.image.digest must be set" }}
 {{- end -}}
 {{- end -}}
 
@@ -146,42 +114,16 @@
 http://{{ include "c8s.attestationServiceName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.attestationService.port }}
 {{- end -}}
 
-{{- define "c8s.assamURL" -}}
-https://{{ include "c8s.assamName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.assam.port }}
-{{- end -}}
-
-{{- define "c8s.certIssuerURL" -}}
-https://{{ include "c8s.certIssuerName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.certIssuer.port }}
-{{- end -}}
-
 {{- define "c8s.cdsURL" -}}
 https://{{ include "c8s.cdsName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.cds.port }}
 {{- end -}}
 
 {{/*
   c8s.trustRootURL is the URL clients (get-cert, ratls-mesh) point their single
-  --cds-url at. It resolves to the unified cds when enabled, otherwise the legacy
-  assam Service — so the same client flag works in both chart modes during the
-  migration. The legacy branch is dropped when assam.yaml is removed.
+  --cds-url at — the unified cds Service.
 */}}
 {{- define "c8s.trustRootURL" -}}
-{{- if .Values.global.cdsEnabled -}}
 {{ include "c8s.cdsURL" . }}
-{{- else -}}
-{{ include "c8s.assamURL" . }}
-{{- end -}}
-{{- end -}}
-
-{{- define "c8s.certIssuerJWKSURL" -}}
-https://{{ include "c8s.assamName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.assam.port }}/.well-known/jwks.json
-{{- end -}}
-
-{{- define "c8s.certIssuerResourceMapName" -}}
-{{- printf "%s-resource-map" (include "c8s.certIssuerName" .) | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
-{{- define "c8s.certIssuerPublicBundleClaimName" -}}
-{{- default (printf "%s-public-bundle" (include "c8s.certIssuerName" .)) .Values.certIssuer.ca.publicBundlePersistence.claimName | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{- define "c8s.attestationServiceConfig" -}}

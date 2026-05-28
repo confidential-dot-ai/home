@@ -1,4 +1,4 @@
-package assamclient
+package cdsclient
 
 import (
 	"net/http"

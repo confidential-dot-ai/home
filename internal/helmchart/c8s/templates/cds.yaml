@@ -1,4 +1,3 @@
-{{- if .Values.global.cdsEnabled }}
 {{/*
   Validate handoff wiring. With handoff.enabled=true the cds pod self-provisions
   its handoff signer EAR in process and registers /handoff, but every request is
@@ -186,4 +185,3 @@ spec:
       {{- if and (eq .Values.cds.service.type "NodePort") .Values.cds.service.nodePort }}
       nodePort: {{ .Values.cds.service.nodePort }}
       {{- end }}
-{{- end }}

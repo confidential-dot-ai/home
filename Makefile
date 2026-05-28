@@ -1,4 +1,4 @@
-.PHONY: build build-c8s build-c8s-node build-assam build-get-cert build-ratls-mesh build-cert-issuer \
+.PHONY: build build-c8s build-c8s-node build-get-cert build-ratls-mesh \
        build-nri-image-policy \
        test test-integration vet fmt lint clean \
        manifests generate check-crd-chart install-controller-gen require-controller-gen
@@ -38,15 +38,6 @@ build-c8s-node:
 		-o $(BUILD_DIR)/c8s-node ./cmd/c8s
 	@echo "Built $(BUILD_DIR)/c8s-node"
 
-# --- Assam ---
-
-build-assam:
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
-		-o $(BUILD_DIR)/assam ./cmd/assam
-	@echo "Built $(BUILD_DIR)/assam"
-
 # --- Get-Cert ---
 
 build-get-cert:
@@ -64,15 +55,6 @@ build-ratls-mesh:
 		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
 		-o $(BUILD_DIR)/ratls-mesh ./cmd/ratls-mesh
 	@echo "Built $(BUILD_DIR)/ratls-mesh"
-
-# --- Cert Issuer ---
-
-build-cert-issuer:
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
-		-o $(BUILD_DIR)/cert-issuer ./cmd/cert-issuer
-	@echo "Built $(BUILD_DIR)/cert-issuer"
 
 # --- NRI Image Policy ---
 

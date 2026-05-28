@@ -30,13 +30,13 @@ routes: []
   # - path: /whitelist
   #   match: exact  # exact | prefix (default)
   #   backend:
-  #     address: assam.default.svc.cluster.local:8080
+  #     address: cds.default.svc.cluster.local:8080
   #     protocol: http
   #     tls:
   #       useCDSClientCert: false
   #       verify: false
   #       verifyDepth: 2
-  #       serverName: assam.default.svc.cluster.local
+  #       serverName: cds.default.svc.cluster.local
   #       trustedCAPath: ""
 
 # -- Public TLS certificate presented to internet clients. When secretName is
@@ -59,18 +59,17 @@ discovery:
   meshCAPath: "/.well-known/mesh-ca.pem"
 
 # -- Mesh CA bundle exposed for demo preflight clients. Defaults match the
-# chart-managed c8s cert-issuer ConfigMap name.
+# chart-managed c8s CDS ConfigMap name.
 meshCA:
   # -- Serve and advertise the mesh CA PEM when discovery is enabled. The
   # ConfigMap must exist for nginx to serve the bundle; setting optional=true
   # below lets the pod start without it (the discovery URL will then return
   # 404 until the ConfigMap is created).
   expose: true
-  # -- Name of an existing ConfigMap holding the mesh CA bundle. cert-issuer
-  # does not render this ConfigMap itself (the bundle lives in the in-memory
-  # CA + PVC-backed public bundle on the cert-issuer pod), so the operator
-  # must provide one when discovery is enabled. Empty defaults to
-  # "<release>-cert-issuer-mesh-ca".
+  # -- Name of an existing ConfigMap holding the mesh CA bundle. CDS does not
+  # render this ConfigMap itself (the bundle lives in the in-memory CA + public
+  # bundle on the CDS pod), so the operator must provide one when discovery is
+  # enabled. Empty defaults to "<release>-cds-mesh-ca".
   configMapName: ""
   key: ca.pem
   mountPath: "/mesh-ca"
@@ -85,8 +84,7 @@ certProvisioning:
   # -- Enable verbose (debug) logging for webhook-injected cert provisioning.
   verbose: false
   # -- How often the webhook-injected get-cert sidecar renews the TLS
-  #    certificate and SIGHUPs nginx. Must be shorter than the cert TTL issued
-  #    by Assam.
+  #    certificate and SIGHUPs nginx. Must be shorter than the cert TTL issued by CDS.
   renewInterval: "1h"
 
 nginx:

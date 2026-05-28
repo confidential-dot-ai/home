@@ -34,13 +34,13 @@ func (p *CertKeyProvider) PublicKey(_ string) (*ecdsa.PublicKey, error) {
 }
 
 var jwksRefreshesTotal = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "cert_issuer_jwks_refreshes_total",
+	Name: "cds_jwks_refreshes_total",
 	Help: "Total JWKS endpoint refreshes.",
 })
 
 // JWKSKeyProvider resolves EAR signing keys from a JWKS endpoint via
 // jwx's background-refreshing cache. On a kid miss we force-refresh once
-// per second to pick up an Assam key rotation between scheduled refreshes.
+// per second to pick up a CDS key rotation between scheduled refreshes.
 type JWKSKeyProvider struct {
 	url    string
 	cache  *jwk.Cache

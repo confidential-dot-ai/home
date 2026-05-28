@@ -1,5 +1,5 @@
-// Package issuerapi defines the wire types for the cert-issuer HTTP API.
-// Both cert-issuer (server) and its clients import this package to
+// Package issuerapi defines the wire types for the CDS signing/handoff HTTP
+// API. Both CDS (server) and its clients import this package to
 // ensure the JSON contract stays in sync.
 package issuerapi
 
@@ -194,7 +194,7 @@ type SignCSRResponse struct {
 	CACertificate PEMData `json:"ca_certificate"`
 }
 
-// HandoffRequest asks an active cert-issuer replica to wrap its in-memory CA
+// HandoffRequest asks an active CDS replica to wrap its in-memory CA
 // signing material to a recipient-bound X25519 public key.
 type HandoffRequest struct {
 	// EAR is the requester's Entity Attestation Result JWT token.

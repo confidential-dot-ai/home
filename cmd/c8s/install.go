@@ -51,7 +51,7 @@ var installCmd = &cobra.Command{
   - the ConfidentialWorkload CRD
   - the mutating admission webhook configuration
   - the attestation-service DaemonSet (per-node /attest + /verify)
-  - chart-managed Assam and cert-issuer
+  - the CDS trust root (attestation, EAR issuance, mesh CA, leaf signing)
   - vendored component charts from lunal-dev/c8s-charts
 
 On RKE2 (--distro rke2) the kata-deploy and nri-image-policy DaemonSets carry
@@ -84,8 +84,7 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH.`,
 			// bootstrap path because CI does not publish a dev tag.
 			"--set", "image.tag=" + imageTag,
 			"--set", "attestationService.image.tag=" + imageTag,
-			"--set", "assam.image.tag=" + imageTag,
-			"--set", "certIssuer.image.tag=" + imageTag,
+			"--set", "cds.image.tag=" + imageTag,
 			"--set", "ratls-mesh.image.tag=" + imageTag,
 			"--set", "nri-image-policy.image.tag=" + imageTag,
 			"--set", "tee-proxy.image.tag=" + imageTag,
@@ -248,7 +247,7 @@ func appendKataInstallArgs(helmArgs []string, kata, enforce bool) []string {
 const installNextSteps = `Next steps:
 
   1. Deploy this chart inside the intended CVM trust boundary. The supported
-     install shape wires chart-managed Assam, cert-issuer, and
+     install shape wires the chart-managed CDS trust root and
      attestation-service together.
 
   2. (Optional) Mirror status with a ConfidentialWorkload CR:

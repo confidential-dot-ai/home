@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/lunal-dev/c8s/internal/certissuerclient"
 	"github.com/lunal-dev/c8s/internal/ear"
 	"github.com/lunal-dev/c8s/pkg/attestationclient"
 	"github.com/lunal-dev/c8s/pkg/ratls"
@@ -23,8 +22,6 @@ import (
 type Handler struct {
 	Challenges        *ChallengeStore
 	AttestationClient attestationclient.Client
-	CertIssuer        certissuerclient.Client
-	CertTTL           string
 	EarIssuer         ear.Issuer
 }
 
@@ -39,106 +36,10 @@ func HandleAuthenticate(challenges *ChallengeStore) http.HandlerFunc {
 	}
 }
 
-// HandleAttest handles POST /attest - verifies evidence and returns a signed
-// certificate chain.
-func (h Handler) HandleAttest(w http.ResponseWriter, r *http.Request) {
-	var req types.AttestRequestBody
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		WriteError(w, http.StatusUnprocessableEntity, "invalid_request", err.Error())
-		return
-	}
-
-	// Decode and consume the challenge (single use)
-	challengeBytes, err := base64.StdEncoding.DecodeString(req.Challenge)
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid_challenge", "invalid or expired challenge")
-		return
-	}
-
-	if !h.Challenges.Consume(challengeBytes) {
-		WriteError(w, http.StatusBadRequest, "invalid_challenge", "invalid or expired challenge")
-		return
-	}
-
-	csr, err := ParseAndVerifyCSR(req.CSR)
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid_csr", err.Error())
-		return
-	}
-	csrPubKey, err := ECDSAPublicKeyFromCSR(csr)
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid_csr", err.Error())
-		return
-	}
-	expectedReportData, err := ratls.ReportDataForKey(csrPubKey, challengeBytes)
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid_csr", err.Error())
-		return
-	}
-
-	// Serialise evidence for embedding in the EAR token
-	evidenceJSON, err := json.Marshal(req.Evidence)
-	if err != nil {
-		evidenceJSON = []byte("null")
-	}
-
-	// Verify the evidence with the attestation service
-	reportData := types.NewBase64Bytes(expectedReportData[:sha512.Size384])
-	verifyReq := types.VerifyReportData(req.Evidence, reportData)
-
-	verifyResp, err := h.AttestationClient.Verify(r.Context(), verifyReq)
-	if err != nil {
-		h.handleAttestationError(w, err)
-		return
-	}
-
-	if !verifyResp.Result.SignatureValid {
-		slog.Warn("attestation signature invalid")
-		WriteError(w, http.StatusUnauthorized, "verification_failed", "attestation signature invalid")
-		return
-	}
-
-	if verifyResp.Result.ReportDataMatch == nil || !*verifyResp.Result.ReportDataMatch {
-		slog.Warn("challenge did not match attestation evidence",
-			"report_data_match", verifyResp.Result.ReportDataMatch)
-		WriteError(w, http.StatusUnauthorized, "verification_failed", "challenge mismatch in attestation evidence")
-		return
-	}
-
-	// Issue an EAR token for the cert-issuer
-	earToken, err := h.EarIssuer.IssueWithLaunchDigestAndPubKey(json.RawMessage(evidenceJSON), verifyResp.Result.Claims.LaunchDigest, csrPubKey)
-	if err != nil {
-		slog.Error("failed to issue EAR token", "error", err)
-		WriteError(w, http.StatusInternalServerError, "ear_issuance_failed",
-			fmt.Sprintf("failed to issue EAR token: %s", err))
-		return
-	}
-
-	// Forward the caller's CSR to the cert-issuer with the EAR token. The
-	// response is a PEM chain: issued leaf followed by the CA bundle.
-	// Authenticity of this response on the network path is provided by the
-	// RA-TLS handshake the workload performed against this Assam — without
-	// that handshake, an on-path attacker could swap the bundle for an
-	// attacker-controlled CA.
-	certPEM, err := h.CertIssuer.SignCSR(r.Context(), earToken, req.CSR, h.CertTTL)
-	if err != nil {
-		h.handleCertIssuerError(w, err)
-		return
-	}
-
-	slog.Info("certificate issued successfully")
-
-	w.Header().Set("Content-Type", "application/x-pem-file")
-	w.Write([]byte(certPEM))
-}
-
-// HandleAttestKey handles POST /attest-key. The flow mirrors HandleAttest
-// but issues just an EAR (no certificate) and takes a raw ECDSA pubkey
-// instead of a CSR — used by in-cluster c8s components that need a
-// TEE-attested EAR for a key they generate in-process (today: cert-issuer's
-// handoff signer key).
+// HandleAttestKey handles POST /attest-key: it issues an EAR (no certificate)
+// for a caller-generated ECDSA pubkey — used by in-cluster c8s components that
+// need a TEE-attested EAR for a key they generate in-process (CDS's handoff
+// signer key).
 func (h Handler) HandleAttestKey(w http.ResponseWriter, r *http.Request) {
 	var req types.AttestKeyRequestBody
 	dec := json.NewDecoder(r.Body)
@@ -270,21 +171,6 @@ func (h Handler) handleAttestationError(w http.ResponseWriter, err error) {
 		WriteError(w, http.StatusBadGateway, "attestation_service_unreachable",
 			fmt.Sprintf("failed to reach attestation service: %s", err))
 	}
-}
-
-func (h Handler) handleCertIssuerError(w http.ResponseWriter, err error) {
-	var apiErr *certissuerclient.APIError
-	if errors.As(err, &apiErr) {
-		slog.Warn("cert-issuer returned error",
-			"status", apiErr.Status, "body", apiErr.Body)
-		WriteError(w, http.StatusBadGateway, "cert_issuer_error",
-			fmt.Sprintf("cert-issuer returned %d: %s", apiErr.Status, apiErr.Body))
-		return
-	}
-
-	slog.Warn("cert-issuer unreachable", "error", err)
-	WriteError(w, http.StatusBadGateway, "cert_issuer_unreachable",
-		fmt.Sprintf("failed to reach cert-issuer: %s", err))
 }
 
 // WriteError writes a JSON error response in the c8s error-envelope shape.

@@ -16,13 +16,12 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jws"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 
-	"github.com/lunal-dev/c8s/pkg/attestclient"
 	"github.com/lunal-dev/c8s/pkg/ratls"
 	"github.com/lunal-dev/c8s/pkg/types"
 )
 
-// HandoffEARSource produces the cert-issuer's own EAR token that handoff
-// responses sign over. Implementations must be safe for concurrent reads.
+// HandoffEARSource produces CDS's own EAR token that handoff responses sign
+// over. Implementations must be safe for concurrent reads.
 type HandoffEARSource interface {
 	Current() (string, error)
 }
@@ -44,108 +43,20 @@ func (a *AtomicHandoffEAR) Set(token string) {
 	a.v.Store(token)
 }
 
-// HandoffBootstrap generates the cert-issuer's handoff signer key in process,
-// gets a TEE attestation report binding it via the local attestation service,
-// and exchanges that for an EAR with Assam's /attest-key endpoint over RA-TLS.
-//
-// The result is what the handoff handler needs: an in-memory signer key plus
-// a refreshing EAR source. There are no operator-supplied key files; the
-// alternative would be mounting a Secret-backed PEM into the cert-issuer pod,
-// which contradicts the chart-managed CVM design ("CA private material never
-// passes through Kubernetes Secrets" — see docs/THREAT_MODEL.md).
+// HandoffBootstrap provisions the handoff signer key + a refreshing EAR source
+// that the handoff handler needs. CDS implements it in process via
+// NewLocalHandoffBootstrap (it is its own EAR issuer); the signer key lives in
+// process memory only, never an operator-supplied file or Kubernetes Secret.
 type HandoffBootstrap interface {
 	Signer() *ecdsa.PrivateKey
 	EARSource() HandoffEARSource
 	RunRefresh(ctx context.Context, logger *slog.Logger)
 }
 
-type handoffBootstrap struct {
-	signer    *ecdsa.PrivateKey
-	earSource *AtomicHandoffEAR
-
-	assamClient           attestclient.Client
-	attestationServiceURL string
-}
-
-var _ HandoffBootstrap = (*handoffBootstrap)(nil)
-
-// NewHandoffBootstrap generates the handoff signer key and prepares the
-// RA-TLS client to Assam. It does NOT call /attest-key — that happens in the
-// RunRefresh loop, so cert-issuer can start independently of Assam's
-// reachability. The /handoff endpoint stays registered but returns 503
-// (via the EAR source's not-yet-ready error) until the first refresh
-// succeeds.
-func NewHandoffBootstrap(assamURL, attestationServiceURL string, assamMeasurements [][]byte) (HandoffBootstrap, error) {
-	signer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generate handoff signer key: %w", err)
-	}
-	httpClient, err := ratls.NewVerifyingHTTPClient(assamMeasurements, attestationServiceURL)
-	if err != nil {
-		return nil, err
-	}
-	return &handoffBootstrap{
-		signer:                signer,
-		earSource:             &AtomicHandoffEAR{},
-		assamClient:           attestclient.NewClientWithHTTP(assamURL, httpClient),
-		attestationServiceURL: attestationServiceURL,
-	}, nil
-}
-
-func (h *handoffBootstrap) Signer() *ecdsa.PrivateKey {
-	return h.signer
-}
-
-func (h *handoffBootstrap) EARSource() HandoffEARSource {
-	return h.earSource
-}
-
-// RunRefresh runs the initial /attest-key call and then re-attests the
-// handoff signer key on a schedule keyed off the current EAR's expiry.
-// Refreshes happen at half the remaining validity so a single failed attempt
-// has another chance before workloads see expired tokens.
-//
-// The first iteration is the initial bootstrap. Until it succeeds the EAR
-// source returns "not yet bootstrapped" and HandleHandoff returns 503.
-// Failures during refresh keep the previous EAR (if any) serving — the
-// handler keeps working until that EAR's exp passes.
-func (h *handoffBootstrap) RunRefresh(ctx context.Context, logger *slog.Logger) {
-	pubDER, err := x509.MarshalPKIXPublicKey(&h.signer.PublicKey)
-	if err != nil {
-		logger.Error("handoff refresher: marshal pubkey", "error", err)
-		return
-	}
-
-	for {
-		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		token, err := h.assamClient.AttestKey(refreshCtx, h.attestationServiceURL, pubDER)
-		cancel()
-		if err != nil {
-			if _, curErr := h.earSource.Current(); curErr != nil {
-				logger.Warn("handoff bootstrap: attest-key failed; will retry", "error", err)
-			} else {
-				logger.Warn("handoff refresh: attest-key failed; keeping previous EAR", "error", err)
-			}
-		} else {
-			h.earSource.Set(token)
-			if _, curErr := h.earSource.Current(); curErr == nil {
-				logger.Info("handoff EAR refreshed")
-			}
-		}
-
-		current, _ := h.earSource.Current()
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(nextRefreshAfter(current)):
-		}
-	}
-}
-
 // LocalEARMinter mints an EAR over a TEE-attested ECDSA public key. It is the
-// EAR-issuance half of the attestation /attest-key flow, used by the unified
-// CDS to self-provision its handoff signer EAR in process — CDS is its own EAR
-// issuer, so there is no external Assam to dial (contrast NewHandoffBootstrap).
+// EAR-issuance half of the attestation /attest-key flow, used by CDS to
+// self-provision its handoff signer EAR in process — CDS is its own EAR issuer,
+// so there is no external service to dial for it.
 type LocalEARMinter interface {
 	IssueWithLaunchDigestAndPubKey(submodsEvidence json.RawMessage, launchDigest string, teePubKey *ecdsa.PublicKey) (string, error)
 }
@@ -170,11 +81,10 @@ type localHandoffBootstrap struct {
 var _ HandoffBootstrap = (*localHandoffBootstrap)(nil)
 
 // NewLocalHandoffBootstrap generates the handoff signer key and prepares an
-// in-process attest-key flow against the local attestation service. Unlike
-// NewHandoffBootstrap it issues the EAR with the supplied minter (CDS's own EAR
-// issuer) rather than dialing a remote Assam — there is no RA-TLS hop and no
-// remote measurement to pin, because the evidence is verified and the EAR
-// signed inside the CDS trust boundary.
+// in-process attest-key flow against the local attestation service. It issues
+// the EAR with the supplied minter (CDS's own EAR issuer) in process — there is
+// no RA-TLS hop and no remote measurement to pin, because the evidence is
+// verified and the EAR signed inside the CDS trust boundary.
 func NewLocalHandoffBootstrap(attestation AttestationService, minter LocalEARMinter) (HandoffBootstrap, error) {
 	if attestation == nil || minter == nil {
 		return nil, fmt.Errorf("local handoff bootstrap requires an attestation service and EAR minter")
@@ -195,9 +105,9 @@ func (h *localHandoffBootstrap) Signer() *ecdsa.PrivateKey { return h.signer }
 
 func (h *localHandoffBootstrap) EARSource() HandoffEARSource { return h.earSource }
 
-// RunRefresh mirrors handoffBootstrap.RunRefresh: an initial bootstrap attempt
-// followed by re-attestation keyed off the current EAR's expiry. The /handoff
-// endpoint returns 503 until the first attestKey succeeds.
+// RunRefresh runs an initial bootstrap attempt followed by re-attestation keyed
+// off the current EAR's expiry. The /handoff endpoint returns 503 until the
+// first attestKey succeeds.
 func (h *localHandoffBootstrap) RunRefresh(ctx context.Context, logger *slog.Logger) {
 	pubDER, err := x509.MarshalPKIXPublicKey(&h.signer.PublicKey)
 	if err != nil {
@@ -309,7 +219,7 @@ func HandoffEARExpiry(token string) (time.Time, error) {
 
 // nextRefreshAfter returns the duration until the next refresh attempt for
 // the supplied token. Half the remaining validity, clamped to a sane band so
-// we don't hammer Assam on every tick when the token is brand new and don't
+// we don't re-attest on every tick when the token is brand new and don't
 // sleep forever on a malformed token.
 func nextRefreshAfter(token string) time.Duration {
 	const (

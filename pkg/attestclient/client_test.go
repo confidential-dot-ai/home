@@ -85,7 +85,7 @@ func TestObtainCertificateWithEvidenceReturnsAttestationMaterial(t *testing.T) {
 	mux.HandleFunc("/attest", func(w http.ResponseWriter, r *http.Request) {
 		var req attestRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode assam attest request: %v", err)
+			t.Fatalf("decode cds attest request: %v", err)
 		}
 		if req.Challenge != challenge {
 			t.Fatalf("challenge = %q, want %q", req.Challenge, challenge)
@@ -98,10 +98,10 @@ func TestObtainCertificateWithEvidenceReturnsAttestationMaterial(t *testing.T) {
 		}
 		_, _ = io.WriteString(w, certPEM)
 	})
-	assam := httptest.NewServer(mux)
-	defer assam.Close()
+	cds := httptest.NewServer(mux)
+	defer cds.Close()
 
-	client := NewClientWithHTTP(assam.URL, assam.Client())
+	client := NewClientWithHTTP(cds.URL, cds.Client())
 	result, err := client.ObtainCertificateWithEvidence(attestationService.URL, csrPEM)
 	if err != nil {
 		t.Fatalf("ObtainCertificateWithEvidence: %v", err)
@@ -144,10 +144,10 @@ func TestObtainCertificateWithEvidenceContextCanceled(t *testing.T) {
 	mux.HandleFunc("/authenticate", func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("authenticate handler should not be called after context cancellation")
 	})
-	assam := httptest.NewServer(mux)
-	defer assam.Close()
+	cds := httptest.NewServer(mux)
+	defer cds.Close()
 
-	client := NewClientWithHTTP(assam.URL, assam.Client())
+	client := NewClientWithHTTP(cds.URL, cds.Client())
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 

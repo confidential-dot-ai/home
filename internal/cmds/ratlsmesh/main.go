@@ -28,7 +28,7 @@ import (
 	"github.com/lunal-dev/c8s/pkg/attestclient"
 	"github.com/lunal-dev/c8s/pkg/certutil"
 	"github.com/lunal-dev/c8s/pkg/ratls"
-	"github.com/lunal-dev/c8s/pkg/ratls/assamclient"
+	"github.com/lunal-dev/c8s/pkg/ratls/cdsclient"
 )
 
 // Run dispatches ratls-mesh CLI args via cobra. Signal handling is wired
@@ -129,7 +129,7 @@ func bindProxyFlags(fs *pflag.FlagSet, c *proxyConfig) {
 	fs.StringVar(&c.cdsMeasurements, "cds-measurements", "", "comma-separated SHA-384 hex launch measurements that CDS's RA-TLS peer cert must match. Empty = accept any (UNSAFE outside development).")
 	fs.IntVar(&c.sessionCacheSize, "session-cache-size", 64, "TLS session cache size per node (0 disables session resumption)")
 	fs.BoolVar(&c.accessLog, "access-log", true, "emit per-connection structured access log")
-	fs.StringVar(&c.certPipelineProbeURL, "cert-pipeline-probe-url", "", "cert-issuer /ready URL for pipeline health probing (empty = disabled)")
+	fs.StringVar(&c.certPipelineProbeURL, "cert-pipeline-probe-url", "", "CDS /ready URL for pipeline health probing (empty = disabled)")
 	fs.DurationVar(&c.cdsRetryBackoff, "cds-retry-backoff", 2*time.Second, "initial backoff duration for CDS certificate upgrade retries")
 	fs.DurationVar(&c.cdsRetryMaxBackoff, "cds-retry-max-backoff", 60*time.Second, "maximum backoff duration for CDS certificate upgrade retries")
 	fs.IntVar(&c.maxDestHeaderSize, "max-dest-header-size", 256, "maximum destination header size in bytes")
@@ -401,20 +401,20 @@ func runProxy(ctx context.Context, c *proxyConfig) error {
 	// goroutine contacts CDS, gets CA-signed certs, and hot-swaps them via
 	// CertManager.SwapProvider. The cdsCfg is shared with the CA bundle
 	// refresh goroutine below. cds serves both attestation and CA bundle on
-	// one URL, so AssamURL and CertIssuerURL both take --cds-url.
-	var cdsCfg *assamclient.Config
+	// one URL, so CDSURL and CDSCAURL both take --cds-url.
+	var cdsCfg *cdsclient.Config
 	if c.certMode == "cds" {
-		cdsCfg = &assamclient.Config{
-			AssamURL:              c.cdsURL,
+		cdsCfg = &cdsclient.Config{
+			CDSURL:                c.cdsURL,
 			AttestationServiceURL: c.attestationServiceURL,
-			CertIssuerURL:         c.cdsURL,
+			CDSCAURL:              c.cdsURL,
 			CACertURL:             effectiveCAURL,
 			NodeIP:                c.nodeIP,
 			TEEType:               teeType,
-			AssamMeasurements:     cdsMeasurements,
+			CDSMeasurements:       cdsMeasurements,
 		}
 		go func() {
-			cdsProvider, err := assamclient.NewProvider(cdsCfg, logger)
+			cdsProvider, err := cdsclient.NewProvider(cdsCfg, logger)
 			if err != nil {
 				logger.Error("cds provider creation failed", "error", err)
 				return
@@ -463,7 +463,7 @@ func runProxy(ctx context.Context, c *proxyConfig) error {
 	// CA bundle refresh: periodically poll CDS /ca for updated CA bundle.
 	if effectiveCAURL != "" && c.certMode == "cds" {
 		go func() {
-			cdsClient := assamclient.NewClient(cdsCfg)
+			cdsClient := cdsclient.NewClient(cdsCfg)
 
 			ticker := time.NewTicker(c.caPollInterval)
 			defer ticker.Stop()
@@ -484,14 +484,14 @@ func runProxy(ctx context.Context, c *proxyConfig) error {
 					if clientCertMgr != nil {
 						clientCertMgr.UpdateCACerts(newCerts)
 					}
-					logger.Debug("CA bundle refreshed from cert-issuer", "count", len(newCerts))
+					logger.Debug("CA bundle refreshed from CDS", "count", len(newCerts))
 				}
 			}
 		}()
 		logger.Info("CA bundle refresh enabled", "url", effectiveCAURL, "interval", c.caPollInterval)
 	}
 
-	// Cert pipeline health probe: periodically check cert-issuer /ready.
+	// Cert pipeline health probe: periodically check CDS /ready.
 	if c.certPipelineProbeURL != "" {
 		m.certPipelineHealthy.Set(0) // Start as unhealthy until first probe succeeds.
 		go func() {

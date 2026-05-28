@@ -1,4 +1,4 @@
-package assamclient
+package cdsclient
 
 import (
 	"context"
@@ -23,9 +23,9 @@ import (
 	"github.com/lunal-dev/c8s/pkg/types"
 )
 
-// mockServers creates test HTTP servers simulating assam, the attestation
-// service, and the cert-issuer.
-func mockServers(t *testing.T, caKey *ecdsa.PrivateKey, caCert *x509.Certificate, caBundle ...*x509.Certificate) (assam, attestSvc, issuer *httptest.Server) {
+// mockServers creates test HTTP servers simulating CDS, the attestation
+// service, and the in-process signer.
+func mockServers(t *testing.T, caKey *ecdsa.PrivateKey, caCert *x509.Certificate, caBundle ...*x509.Certificate) (cdsSrv, attestSvc, issuer *httptest.Server) {
 	t.Helper()
 	if len(caBundle) == 0 {
 		caBundle = []*x509.Certificate{caCert}
@@ -43,12 +43,12 @@ func mockServers(t *testing.T, caKey *ecdsa.PrivateKey, caCert *x509.Certificate
 		})
 	}))
 
-	// Assam: authenticate returns challenge, attest verifies and returns cert.
-	// These tests cover the assamclient HTTP plumbing in isolation; the
-	// production RA-TLS handshake against Assam is exercised by
+	// CDS: authenticate returns challenge, attest verifies and returns cert.
+	// These tests cover the cdsclient HTTP plumbing in isolation; the
+	// production RA-TLS handshake against CDS is exercised by
 	// TestProviderRATLSHandshakeRejectsWrongMeasurement etc. via a real
 	// httptest.NewTLSServer wired with attested certs.
-	assam = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	cdsSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/authenticate":
 			challenge := make([]byte, 32)
@@ -109,7 +109,7 @@ func mockServers(t *testing.T, caKey *ecdsa.PrivateKey, caCert *x509.Certificate
 		}
 	}))
 
-	// Cert-issuer: serves the CA certificate bundle.
+	// CA bundle endpoint: serves the CA certificate bundle.
 	issuer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/ca" {
 			http.NotFound(w, r)
@@ -121,7 +121,7 @@ func mockServers(t *testing.T, caKey *ecdsa.PrivateKey, caCert *x509.Certificate
 		}
 	}))
 
-	return assam, attestSvc, issuer
+	return cdsSrv, attestSvc, issuer
 }
 
 func testSNPEvidence(t *testing.T) json.RawMessage {
@@ -255,15 +255,15 @@ func caBundleServer(t *testing.T, certs ...*x509.Certificate) *httptest.Server {
 
 func TestProviderProvision(t *testing.T) {
 	caKey, caCert := testCA(t)
-	assam, attestSvc, issuer := mockServers(t, caKey, caCert)
-	defer assam.Close()
+	cdsSrv, attestSvc, issuer := mockServers(t, caKey, caCert)
+	defer cdsSrv.Close()
 	defer attestSvc.Close()
 	defer issuer.Close()
 
 	p, err := NewProvider(&Config{
-		AssamURL:              assam.URL,
+		CDSURL:                cdsSrv.URL,
 		AttestationServiceURL: attestSvc.URL,
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -325,9 +325,9 @@ func TestRefreshCABundle(t *testing.T) {
 	defer issuer.Close()
 
 	client := NewClient(&Config{
-		AssamURL:              "http://unused",
+		CDSURL:                "http://unused",
 		AttestationServiceURL: "http://unused",
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -362,9 +362,9 @@ func TestRefreshCABundleUsesExplicitCACertURL(t *testing.T) {
 	defer issuer.Close()
 
 	client := NewClient(&Config{
-		AssamURL:              "http://unused",
+		CDSURL:                "http://unused",
 		AttestationServiceURL: "http://unused",
-		CertIssuerURL:         "http://unused.invalid",
+		CDSCAURL:              "http://unused.invalid",
 		CACertURL:             issuer.URL + "/custom/ca.pem",
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
@@ -394,9 +394,9 @@ func TestRefreshCABundleRejectsUntrustedInitialBundle(t *testing.T) {
 	defer issuer.Close()
 
 	client := NewClient(&Config{
-		AssamURL:              "http://unused",
+		CDSURL:                "http://unused",
 		AttestationServiceURL: "http://unused",
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -419,9 +419,9 @@ func TestRefreshCABundleDoesNotAddUnverifiedRotationRoot(t *testing.T) {
 	defer issuer.Close()
 
 	client := NewClient(&Config{
-		AssamURL:              "http://unused",
+		CDSURL:                "http://unused",
 		AttestationServiceURL: "http://unused",
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -451,9 +451,9 @@ func TestRefreshCABundleDoesNotTrustPublicKeyCloneChain(t *testing.T) {
 	defer issuer.Close()
 
 	client := NewClient(&Config{
-		AssamURL:              "http://unused",
+		CDSURL:                "http://unused",
 		AttestationServiceURL: "http://unused",
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -482,9 +482,9 @@ func TestRefreshCABundleRejectsTrustedSignerPublicKeyClone(t *testing.T) {
 	defer issuer.Close()
 
 	client := NewClient(&Config{
-		AssamURL:              "http://unused",
+		CDSURL:                "http://unused",
 		AttestationServiceURL: "http://unused",
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -508,15 +508,15 @@ func TestRefreshCABundleRejectsTrustedSignerPublicKeyClone(t *testing.T) {
 func TestProviderProvisionRetainsRotationParentCA(t *testing.T) {
 	oldKey, oldCert := testCA(t)
 	newKey, newCert := testCAWithParent(t, oldKey, oldCert, "Rotated Mesh CA")
-	assam, attestSvc, issuer := mockServers(t, newKey, newCert, newCert, oldCert)
-	defer assam.Close()
+	cdsSrv, attestSvc, issuer := mockServers(t, newKey, newCert, newCert, oldCert)
+	defer cdsSrv.Close()
 	defer attestSvc.Close()
 	defer issuer.Close()
 
 	p, err := NewProvider(&Config{
-		AssamURL:              assam.URL,
+		CDSURL:                cdsSrv.URL,
 		AttestationServiceURL: attestSvc.URL,
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -539,15 +539,15 @@ func TestProviderProvisionRetainsRotationParentCA(t *testing.T) {
 func TestProviderProvisionRetainsPreviouslyTrustedPublishedCA(t *testing.T) {
 	_, oldCert := testCA(t)
 	newKey, newCert := testCA(t)
-	assam, attestSvc, issuer := mockServers(t, newKey, newCert, newCert, oldCert)
-	defer assam.Close()
+	cdsSrv, attestSvc, issuer := mockServers(t, newKey, newCert, newCert, oldCert)
+	defer cdsSrv.Close()
 	defer attestSvc.Close()
 	defer issuer.Close()
 
 	client := NewClient(&Config{
-		AssamURL:              assam.URL,
+		CDSURL:                cdsSrv.URL,
 		AttestationServiceURL: attestSvc.URL,
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -572,15 +572,15 @@ func TestProviderProvisionRetainsPreviouslyTrustedPublishedCA(t *testing.T) {
 func TestProviderProvisionDoesNotRetainUntrustedPublishedCA(t *testing.T) {
 	_, oldCert := testCA(t)
 	newKey, newCert := testCA(t)
-	assam, attestSvc, issuer := mockServers(t, newKey, newCert, newCert, oldCert)
-	defer assam.Close()
+	cdsSrv, attestSvc, issuer := mockServers(t, newKey, newCert, newCert, oldCert)
+	defer cdsSrv.Close()
 	defer attestSvc.Close()
 	defer issuer.Close()
 
 	p, err := NewProvider(&Config{
-		AssamURL:              assam.URL,
+		CDSURL:                cdsSrv.URL,
 		AttestationServiceURL: attestSvc.URL,
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -604,15 +604,15 @@ func TestProviderProvisionRetainsMultiGenerationRotationParents(t *testing.T) {
 	rootKey, rootCert := testCA(t)
 	intermediateKey, intermediateCert := testCAWithParent(t, rootKey, rootCert, "First Rotated Mesh CA")
 	currentKey, currentCert := testCAWithParent(t, intermediateKey, intermediateCert, "Second Rotated Mesh CA")
-	assam, attestSvc, issuer := mockServers(t, currentKey, currentCert, currentCert, intermediateCert, rootCert)
-	defer assam.Close()
+	cdsSrv, attestSvc, issuer := mockServers(t, currentKey, currentCert, currentCert, intermediateCert, rootCert)
+	defer cdsSrv.Close()
 	defer attestSvc.Close()
 	defer issuer.Close()
 
 	p, err := NewProvider(&Config{
-		AssamURL:              assam.URL,
+		CDSURL:                cdsSrv.URL,
 		AttestationServiceURL: attestSvc.URL,
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -638,15 +638,15 @@ func TestProviderProvisionRetainsMultiGenerationRotationParents(t *testing.T) {
 func TestProviderProvisionRejectsBundleWhoseFirstCADoesNotSignLeaf(t *testing.T) {
 	realKey, realCert := testCA(t)
 	_, attackerRoot := testCA(t)
-	assam, attestSvc, issuer := mockServers(t, realKey, realCert, attackerRoot, realCert)
-	defer assam.Close()
+	cdsSrv, attestSvc, issuer := mockServers(t, realKey, realCert, attackerRoot, realCert)
+	defer cdsSrv.Close()
 	defer attestSvc.Close()
 	defer issuer.Close()
 
 	p, err := NewProvider(&Config{
-		AssamURL:              assam.URL,
+		CDSURL:                cdsSrv.URL,
 		AttestationServiceURL: attestSvc.URL,
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -676,7 +676,7 @@ func TestProviderProvisionRejectsLeafForDifferentKey(t *testing.T) {
 	}))
 	defer attestSvc.Close()
 
-	assam := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	cdsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/authenticate":
 			challenge := make([]byte, 32)
@@ -707,15 +707,15 @@ func TestProviderProvisionRejectsLeafForDifferentKey(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer assam.Close()
+	defer cdsSrv.Close()
 
 	issuer := caBundleServer(t, caCert)
 	defer issuer.Close()
 
 	p, err := NewProvider(&Config{
-		AssamURL:              assam.URL,
+		CDSURL:                cdsSrv.URL,
 		AttestationServiceURL: attestSvc.URL,
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -734,15 +734,15 @@ func TestProviderProvisionDoesNotTrustAppendedPublicKeyCloneChain(t *testing.T) 
 	realKey, realCert := testCA(t)
 	attackerKey, attackerRoot := testCA(t)
 	alternateRealCA := testCAForPublicKey(t, attackerKey, attackerRoot, realCert.PublicKey, realCert.Subject)
-	assam, attestSvc, issuer := mockServers(t, realKey, realCert, realCert, alternateRealCA, attackerRoot)
-	defer assam.Close()
+	cdsSrv, attestSvc, issuer := mockServers(t, realKey, realCert, realCert, alternateRealCA, attackerRoot)
+	defer cdsSrv.Close()
 	defer attestSvc.Close()
 	defer issuer.Close()
 
 	p, err := NewProvider(&Config{
-		AssamURL:              assam.URL,
+		CDSURL:                cdsSrv.URL,
 		AttestationServiceURL: attestSvc.URL,
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -768,8 +768,8 @@ func TestProviderProvisionDoesNotTrustUnauthenticatedAlternateCA(t *testing.T) {
 	alternateRealCA := testCAForPublicKey(t, attackerKey, attackerRoot, realCert.PublicKey, realCert.Subject)
 	var publicCAHit atomic.Bool
 
-	assam, attestSvc, issuer := mockServers(t, realKey, realCert, realCert)
-	defer assam.Close()
+	cdsSrv, attestSvc, issuer := mockServers(t, realKey, realCert, realCert)
+	defer cdsSrv.Close()
 	defer attestSvc.Close()
 	defer issuer.Close()
 	publicIssuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -781,9 +781,9 @@ func TestProviderProvisionDoesNotTrustUnauthenticatedAlternateCA(t *testing.T) {
 	defer publicIssuer.Close()
 
 	p, err := NewProvider(&Config{
-		AssamURL:              assam.URL,
+		CDSURL:                cdsSrv.URL,
 		AttestationServiceURL: attestSvc.URL,
-		CertIssuerURL:         publicIssuer.URL,
+		CDSCAURL:              publicIssuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -807,15 +807,15 @@ func TestProviderProvisionDoesNotTrustUnauthenticatedAlternateCA(t *testing.T) {
 
 func TestProviderProvisionHonorsCanceledContext(t *testing.T) {
 	realKey, realCert := testCA(t)
-	assam, attestSvc, issuer := mockServers(t, realKey, realCert, realCert)
-	defer assam.Close()
+	cdsSrv, attestSvc, issuer := mockServers(t, realKey, realCert, realCert)
+	defer cdsSrv.Close()
 	defer attestSvc.Close()
 	defer issuer.Close()
 
 	p, err := NewProvider(&Config{
-		AssamURL:              assam.URL,
+		CDSURL:                cdsSrv.URL,
 		AttestationServiceURL: attestSvc.URL,
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -842,9 +842,9 @@ func TestRefreshCABundleAcceptsContinuitySignedRotationCA(t *testing.T) {
 	defer issuer.Close()
 
 	client := NewClient(&Config{
-		AssamURL:              "http://unused",
+		CDSURL:                "http://unused",
 		AttestationServiceURL: "http://unused",
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -874,9 +874,9 @@ func TestRefreshCABundleAcceptsContinuitySignedRotationChainInBundleOrder(t *tes
 	defer issuer.Close()
 
 	client := NewClient(&Config{
-		AssamURL:              "http://unused",
+		CDSURL:                "http://unused",
 		AttestationServiceURL: "http://unused",
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -900,9 +900,9 @@ func TestRefreshCABundleRejectsReplacementWithoutOverlap(t *testing.T) {
 	defer issuer.Close()
 
 	client := NewClient(&Config{
-		AssamURL:              "http://unused",
+		CDSURL:                "http://unused",
 		AttestationServiceURL: "http://unused",
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -926,9 +926,9 @@ func TestRefreshCABundleRejectsExpiredTrustedOnlyBundle(t *testing.T) {
 	defer issuer.Close()
 
 	client := NewClient(&Config{
-		AssamURL:              "http://unused",
+		CDSURL:                "http://unused",
 		AttestationServiceURL: "http://unused",
-		CertIssuerURL:         issuer.URL,
+		CDSCAURL:              issuer.URL,
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -951,9 +951,9 @@ func TestRefreshCABundleRejectsExpiredTrustedOnlyBundle(t *testing.T) {
 
 func TestNewProviderValidation(t *testing.T) {
 	base := Config{
-		AssamURL:              "http://assam",
+		CDSURL:                "http://cds",
 		AttestationServiceURL: "http://attest",
-		CertIssuerURL:         "http://issuer",
+		CDSCAURL:              "http://issuer",
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
 		HTTPClient:            plainHTTPClient(),
@@ -963,9 +963,9 @@ func TestNewProviderValidation(t *testing.T) {
 		name   string
 		modify func(*Config)
 	}{
-		{"missing AssamURL", func(c *Config) { c.AssamURL = "" }},
+		{"missing CDSURL", func(c *Config) { c.CDSURL = "" }},
 		{"missing AttestationServiceURL", func(c *Config) { c.AttestationServiceURL = "" }},
-		{"missing CertIssuerURL", func(c *Config) { c.CertIssuerURL = "" }},
+		{"missing CDSCAURL", func(c *Config) { c.CDSCAURL = "" }},
 		{"missing NodeIP", func(c *Config) { c.NodeIP = "" }},
 		{"invalid NodeIP", func(c *Config) { c.NodeIP = "not-an-ip" }},
 		{"missing TEEType", func(c *Config) { c.TEEType = 0 }},

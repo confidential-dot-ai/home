@@ -15,12 +15,12 @@ import (
 
 var (
 	rateLimitRejectionsTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "cert_issuer_rate_limit_rejections_total",
+		Name: "cds_rate_limit_rejections_total",
 		Help: "Total requests rejected by rate limiter.",
 	})
 
 	rateLimiterEntries = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "cert_issuer_rate_limiter_entries",
+		Name: "cds_rate_limiter_entries",
 		Help: "Current number of entries in the per-IP rate limiter.",
 	})
 )

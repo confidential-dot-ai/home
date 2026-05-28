@@ -19,9 +19,8 @@ import (
 // for bare-metal-only deployments; the verifier will reject embedded
 // evidence at handshake time.
 //
-// Connection-pool and timeout knobs match the values both Assam and
-// cert-issuer were using before this helper existed (5s dial, 10s
-// response-header, 30s overall, MaxIdleConns=5, MaxConnsPerHost=2).
+// Connection-pool and timeout knobs: 5s dial, 10s response-header, 30s
+// overall, MaxIdleConns=5, MaxConnsPerHost=2.
 func NewVerifyingHTTPClient(measurements [][]byte, attestationServiceURL string) (*http.Client, error) {
 	tlsCfg, _, err := NewClientTLSConfig(&ClientConfig{
 		Policy: &VerifyPolicy{Measurements: measurements, AttestationServiceURL: attestationServiceURL},

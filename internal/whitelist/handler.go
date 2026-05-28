@@ -140,9 +140,9 @@ func (h Handler) authorize(w http.ResponseWriter, r *http.Request) ([]byte, bool
 	return body, true
 }
 
-// EARWriteAuthorizer authorizes whitelist mutation requests with an Assam EAR.
+// EARWriteAuthorizer authorizes whitelist mutation requests with a CDS EAR.
 // A valid EAR is not enough by itself: the token's launch measurement must be
-// explicitly allowed for resources.AssamWhitelistWrite.
+// explicitly allowed for resources.WhitelistWrite.
 type EARWriteAuthorizer struct {
 	PublicKey           func() *ecdsa.PublicKey
 	ExpectedIssuer      string
@@ -152,7 +152,7 @@ type EARWriteAuthorizer struct {
 
 func (a EARWriteAuthorizer) Authorize(r *http.Request, body []byte) error {
 	if len(a.AllowedMeasurements) == 0 {
-		return fmt.Errorf("no measurements allowed for %s", resources.AssamWhitelistWrite)
+		return fmt.Errorf("no measurements allowed for %s", resources.WhitelistWrite)
 	}
 	auth := r.Header.Get("Authorization")
 	tokenStr, ok := strings.CutPrefix(auth, "Bearer ")
@@ -210,7 +210,7 @@ func (a EARWriteAuthorizer) Authorize(r *http.Request, body []byte) error {
 		return err
 	}
 	if !a.AllowedMeasurements[measurement] {
-		return fmt.Errorf("measurement not allowed for %s", resources.AssamWhitelistWrite)
+		return fmt.Errorf("measurement not allowed for %s", resources.WhitelistWrite)
 	}
 
 	// Body binding: the EAR's pbh claim must match SHA-256 of the request

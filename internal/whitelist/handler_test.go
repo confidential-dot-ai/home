@@ -15,7 +15,6 @@ import (
 	"github.com/lunal-dev/c8s/internal/ear"
 	"github.com/lunal-dev/c8s/internal/earclaims"
 	"github.com/lunal-dev/c8s/internal/readiness"
-	"github.com/lunal-dev/c8s/internal/server"
 	"github.com/lunal-dev/c8s/internal/whitelist"
 	"github.com/lunal-dev/c8s/pkg/attestationclient"
 	"github.com/lunal-dev/c8s/pkg/certutil"
@@ -26,7 +25,7 @@ import (
 const (
 	digestA       = "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 	digestMissing = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-	testIssuer    = "assam"
+	testIssuer    = "cds"
 	measurementA  = "allowed-launch-digest"
 )
 
@@ -74,25 +73,29 @@ func testWhitelistApp(t *testing.T) (http.Handler, *readiness.Checker, ear.Issue
 	asClient := attestationclient.NewClient("http://localhost:0")
 	checker := readiness.NewChecker(asClient, 10*time.Second)
 
-	challengeStore := attestation.NewChallengeStore(60 * time.Second)
-
-	deps := server.Dependencies{
-		AttestationHandler: attestation.Handler{
-			Challenges: &challengeStore,
-		},
-		WhitelistHandler: whitelist.Handler{
-			Store: &store,
-			WriteAuthorizer: whitelist.EARWriteAuthorizer{
-				PublicKey:           issuer.PublicKey,
-				ExpectedIssuer:      testIssuer,
-				AllowedMeasurements: map[string]bool{measurementA: true},
-				ClockSkew:           30 * time.Second,
-			}.Authorize,
-		},
-		ReadyFn: checker.Ready,
+	wh := whitelist.Handler{
+		Store: &store,
+		WriteAuthorizer: whitelist.EARWriteAuthorizer{
+			PublicKey:           issuer.PublicKey,
+			ExpectedIssuer:      testIssuer,
+			AllowedMeasurements: map[string]bool{measurementA: true},
+			ClockSkew:           30 * time.Second,
+		}.Authorize,
 	}
 
-	return server.NewRouter(deps), &checker, issuer
+	return whitelistTestRouter(wh, checker.Ready), &checker, issuer
+}
+
+// whitelistTestRouter mounts only the routes the whitelist tests exercise, so
+// these unit tests don't depend on the full server router.
+func whitelistTestRouter(wh whitelist.Handler, ready attestation.ReadinessFunc) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("GET /readyz", attestation.HandleReadyz(ready))
+	mux.HandleFunc("GET /whitelist", wh.HandleList)
+	mux.HandleFunc("POST /whitelist", wh.HandleAdd)
+	mux.HandleFunc("DELETE /whitelist", wh.HandleDelete)
+	return mux
 }
 
 func TestHealthzReturnsOK(t *testing.T) {
@@ -532,22 +535,17 @@ func TestWhitelistAddRejectsBodyOverConfiguredCap(t *testing.T) {
 	}
 	asClient := attestationclient.NewClient("http://localhost:0")
 	checker := readiness.NewChecker(asClient, 10*time.Second)
-	challengeStore := attestation.NewChallengeStore(60 * time.Second)
-	deps := server.Dependencies{
-		AttestationHandler: attestation.Handler{Challenges: &challengeStore},
-		WhitelistHandler: whitelist.Handler{
-			Store: &store,
-			WriteAuthorizer: whitelist.EARWriteAuthorizer{
-				PublicKey:           issuer.PublicKey,
-				ExpectedIssuer:      testIssuer,
-				AllowedMeasurements: map[string]bool{measurementA: true},
-				ClockSkew:           30 * time.Second,
-			}.Authorize,
-			MaxWriteBodyBytes: 64,
-		},
-		ReadyFn: checker.Ready,
+	wh := whitelist.Handler{
+		Store: &store,
+		WriteAuthorizer: whitelist.EARWriteAuthorizer{
+			PublicKey:           issuer.PublicKey,
+			ExpectedIssuer:      testIssuer,
+			AllowedMeasurements: map[string]bool{measurementA: true},
+			ClockSkew:           30 * time.Second,
+		}.Authorize,
+		MaxWriteBodyBytes: 64,
 	}
-	srv := httptest.NewServer(server.NewRouter(deps))
+	srv := httptest.NewServer(whitelistTestRouter(wh, checker.Ready))
 	defer srv.Close()
 
 	body := strings.Repeat("x", 1024)

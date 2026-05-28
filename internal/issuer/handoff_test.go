@@ -609,7 +609,7 @@ func TestNewHandoffHandlerValidatesInputs(t *testing.T) {
 
 	// An EAR source that hasn't bootstrapped yet is accepted at construction
 	// time — the handler returns 503 at request time. This decouples
-	// cert-issuer startup from Assam reachability.
+	// CDS startup from handoff EAR readiness.
 	notReady := baseDeps(map[string]bool{"m": true})
 	notReady.EARSource = erroringHandoffEARSource{}
 	hh, err := NewHandoffHandler(notReady)
@@ -637,8 +637,7 @@ func (erroringHandoffEARSource) Current() (string, error) {
 
 // TestHandoffReturns503BeforeBootstrap proves that a handoff handler whose
 // EAR source has not bootstrapped yet returns 503 (rather than crashing,
-// returning 401, or blocking the request). This is the "Assam unreachable
-// at startup" case after the non-blocking bootstrap fix.
+// returning 401, or blocking the request).
 func TestHandoffReturns503BeforeBootstrap(t *testing.T) {
 	tokenKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

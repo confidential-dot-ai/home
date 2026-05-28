@@ -1,4 +1,4 @@
-package assamclient
+package cdsclient
 
 import (
 	"context"
@@ -24,7 +24,7 @@ import (
 // fakeASEvidence stands up a minimal attestation-service stub that returns
 // canned SNP evidence for any /attest call. Required because RequestCert
 // dials the AS to embed an attestation report into the CSR before talking
-// to Assam — we want the test to fail at the Assam TLS handshake, not at
+// to CDS — we want the test to fail at the CDS TLS handshake, not at
 // CSR construction.
 func fakeASEvidence(t *testing.T) *httptest.Server {
 	t.Helper()
@@ -43,29 +43,29 @@ func fakeASEvidence(t *testing.T) *httptest.Server {
 	}))
 }
 
-// TestProviderRATLSRejectsUnattestedAssam proves the assamclient's default
-// (no HTTPClient override) http.Client refuses to talk to an Assam server
+// TestProviderRATLSRejectsUnattestedCDS proves the cdsclient's default
+// (no HTTPClient override) http.Client refuses to talk to an CDS server
 // whose serving cert lacks an RA-TLS attestation extension. This is the
 // safety net that closes the bootstrap-channel MITM gap: an on-path attacker
 // cannot present a TEE-attested cert with an allowed measurement, so the TLS
 // handshake fails before any cert-issuance bytes flow.
-func TestProviderRATLSRejectsUnattestedAssam(t *testing.T) {
+func TestProviderRATLSRejectsUnattestedCDS(t *testing.T) {
 	as := fakeASEvidence(t)
 	defer as.Close()
 
 	// Plain HTTPS server with a regular self-signed cert (no RA-TLS extension).
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("unexpected request to unattested Assam: %s", r.URL.Path)
+		t.Fatalf("unexpected request to unattested CDS: %s", r.URL.Path)
 	}))
 	defer srv.Close()
 
 	p, err := NewProvider(&Config{
-		AssamURL:              srv.URL,
+		CDSURL:                srv.URL,
 		AttestationServiceURL: as.URL,
-		CertIssuerURL:         "http://unused.invalid",
+		CDSCAURL:              "http://unused.invalid",
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
-		AssamMeasurements:     [][]byte{make([]byte, ratls.SNPMeasurementSize)},
+		CDSMeasurements:       [][]byte{make([]byte, ratls.SNPMeasurementSize)},
 		// HTTPClient deliberately nil so NewClient builds the RA-TLS transport.
 	}, nil)
 	if err != nil {
@@ -74,7 +74,7 @@ func TestProviderRATLSRejectsUnattestedAssam(t *testing.T) {
 
 	_, _, err = p.Provision(context.Background())
 	if err == nil {
-		t.Fatal("Provision succeeded against unattested Assam")
+		t.Fatal("Provision succeeded against unattested CDS")
 	}
 	// The exact error wording depends on which side of the handshake fails
 	// first, but it must be a TLS-layer failure (not e.g. a parse error from
@@ -87,7 +87,7 @@ func TestProviderRATLSRejectsUnattestedAssam(t *testing.T) {
 // TestProviderRATLSRejectsCertWithoutAttestationExtension is a tighter test
 // than the previous one: it stands up an HTTPS server whose cert is issued by
 // a well-known x509 path (not self-signed by httptest), and confirms the
-// assamclient still rejects it because the cert lacks the RA-TLS extension.
+// cdsclient still rejects it because the cert lacks the RA-TLS extension.
 func TestProviderRATLSRejectsCertWithoutAttestationExtension(t *testing.T) {
 	as := fakeASEvidence(t)
 	defer as.Close()
@@ -98,7 +98,7 @@ func TestProviderRATLSRejectsCertWithoutAttestationExtension(t *testing.T) {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "rogue-assam"},
+		Subject:               pkix.Name{CommonName: "rogue-cds"},
 		NotBefore:             time.Now().Add(-time.Minute),
 		NotAfter:              time.Now().Add(time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
@@ -126,17 +126,17 @@ func TestProviderRATLSRejectsCertWithoutAttestationExtension(t *testing.T) {
 	defer srv.Close()
 
 	p, err := NewProvider(&Config{
-		AssamURL:              srv.URL,
+		CDSURL:                srv.URL,
 		AttestationServiceURL: as.URL,
-		CertIssuerURL:         "http://unused.invalid",
+		CDSCAURL:              "http://unused.invalid",
 		NodeIP:                "10.0.0.1",
 		TEEType:               ratls.TEETypeSEVSNP,
-		AssamMeasurements:     [][]byte{make([]byte, ratls.SNPMeasurementSize)},
+		CDSMeasurements:       [][]byte{make([]byte, ratls.SNPMeasurementSize)},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := p.Provision(context.Background()); err == nil {
-		t.Fatal("Provision accepted Assam cert without an RA-TLS attestation extension")
+		t.Fatal("Provision accepted CDS cert without an RA-TLS attestation extension")
 	}
 }

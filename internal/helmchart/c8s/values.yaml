@@ -1,10 +1,9 @@
-## Single source for the unified CDS, under `global` so the vendored ratls-mesh
-## subchart reads the same values the parent does (no per-subchart mirror to
-## drift). cdsEnabled toggles cds vs the legacy assam/cert-issuer trust root;
-## cdsMeasurements is the SHA-384 hex launch-digest allowlist clients pin CDS's
-## RA-TLS cert against (empty = accept any, UNSAFE outside dev).
+## Single source for the unified CDS, under `global` so the vendored subcharts
+## (ratls-mesh, nri-image-policy) read the same values the parent does (no
+## per-subchart mirror to drift). cdsMeasurements is the SHA-384 hex
+## launch-digest allowlist clients pin CDS's RA-TLS cert against (empty = accept
+## any, UNSAFE outside dev).
 global:
-  cdsEnabled: false
   cdsMeasurements: []
 
 ## Operator container image. The same image runs every c8s mode that
@@ -33,7 +32,7 @@ operator:
   extraArgs: []
 
 ## Common ServiceAccount settings for the chart-managed top-level c8s
-## workloads: operator, attestation-service, Assam, and cert-issuer.
+## workloads: operator, attestation-service, and CDS.
 serviceAccount:
   imagePullSecrets: []
 
@@ -54,7 +53,7 @@ webhook:
     fsGroup: 65532
     keyMode: "0640"
   getCert:
-    ## Must be shorter than Assam's certTTL. The default renews at 25% of
+    ## Must be shorter than CDS's certTTL. The default renews at 25% of
     ## the chart's 24h certificate TTL.
     renewInterval: 6h
     ## Defaults match distroless nonroot. Kata deployments that need UID 0
@@ -63,145 +62,13 @@ webhook:
     runAsGroup: 65532
     runAsNonRoot: true
 
-## Assam is the key broker / certificate broker that injected get-cert
-## containers talk to.
-##
-## For the whitepaper production security model, Assam/CDS must run inside the
-## attested trust boundary and its state/secrets must not rely only on
-## Kubernetes control-plane secrecy.
-assam:
-  image:
-    repository: ghcr.io/lunal-dev/assam
-    tag: ""
-    digest: ""
-    pullPolicy: IfNotPresent
-  port: 8080
-  service:
-    type: NodePort
-    nodePort: 30808
-  whitelistDB: /data/whitelist.db
-  ## Optional Assam resource map:
-  ##   <measurement>: ["assam/whitelist-write"]
-  ## Empty means whitelist mutation endpoints reject writes.
-  resourceMap: {}
-  earIssuer: assam
-  certTTL: 24h
-  challengeTTL: 60s
-  readinessInterval: 10s
-  tokenSignerRotationInterval: 720h
-  tokenSignerOverlap: 25h
-  tokenSignerRotationJitter: 0.1
-  logLevel: info
-  ## RA-TLS settings for the Assam serving cert (closes the bootstrap-channel
-  ## MITM gap: ratls-mesh validates Assam's peer cert via the embedded SEV-SNP
-  ## attestation report instead of trusting the cluster network).
-  ## Empty platform disables TLS — UNSAFE outside tests.
-  ratlsPlatform: snp
-  ratlsCertTTL: 24h
-  ## Cap on whitelist mutation request bodies (bytes). Whitelist payloads
-  ## are tiny; the cap stops a malicious client from forcing the handler
-  ## to buffer megabytes during the auth body-binding check.
-  whitelistMaxBodyBytes: 65536
-  ## Expected launch digests (SHA-384 hex) of the attested Assam binary.
-  ## ratls-mesh and other RA-TLS-aware clients pass this list to the TLS
-  ## handshake's measurement allowlist. Empty means the client accepts ANY
-  ## measurement — suitable for dev only; chart-managed CVM-only deployments
-  ## MUST populate this with the operator-pinned Assam launch digest.
-  measurements: []
-  persistence:
-    enabled: false
-    size: 1Gi
-    storageClassName: ""
-  resources:
-    requests:
-      cpu: 50m
-      memory: 64Mi
-    limits:
-      cpu: 500m
-      memory: 256Mi
-
-## Chart-managed cert-issuer. This completes the certificate path when paired
-## with chart-managed Assam. The mesh CA key is generated inside the
-## cert-issuer process and remains in memory only.
-certIssuer:
-  image:
-    repository: ghcr.io/lunal-dev/cert-issuer
-    tag: ""
-    digest: ""
-    pullPolicy: IfNotPresent
-  port: 8090
-  jwksCacheTTL: 5m
-  expectedIssuer: assam
-  rateLimit: 10
-  rateBurst: 20
-  logLevel: info
-  ## Assam forwards CSRs from its own pod, so cert-issuer cannot compare the
-  ## CSR node IP SAN to the TCP source IP in the chart-managed path. DNS SAN
-  ## and CN validation still run; set dnsSanPattern/cnPattern for those names.
-  sanValidation: false
-  dnsSanPattern: ""
-  cnPattern: ""
-  ## Optional cert-issuer resource map:
-  ##   <measurement>: ["cert-issuer/sign-csr", "cert-issuer/handoff"]
-  ## Empty means sign-csr accepts any valid EAR signed by Assam.
-  resourceMap: {}
-  ## RA-TLS settings for cert-issuer's serving cert. Without this Assam
-  ## (and any other in-cluster client) talks to cert-issuer over plaintext
-  ## HTTP and an on-path attacker can forge sign-csr responses.
-  ratlsPlatform: snp
-  ratlsCertTTL: 24h
-  ## Expected SHA-384 hex launch measurements of the cert-issuer binary
-  ## itself. Distributed to peers (Assam, future replicas) so their
-  ## RA-TLS handshake against cert-issuer pins this identity.
-  ## Empty = peers accept any measurement (UNSAFE outside dev).
-  measurements: []
-  ca:
-    ## The mesh CA key is generated inside cert-issuer memory and is not
-    ## rendered into a Kubernetes Secret or persistent volume.
-    commonName: c8s Mesh CA
-    maxTTL: 24h
-    minValidity: 1h
-    certValidity: 8760h
-    ## Rotate the in-memory mesh CA inside cert-issuer on this interval.
-    rotationInterval: 720h
-    ## Persist only the public CA bundle across cert-issuer pod restarts.
-    ## Private CA keys remain in process memory and are never written here.
-    publicBundlePersistence:
-      existingClaim: ""
-      claimName: ""
-      storageClassName: ""
-      size: 16Mi
-      mountPath: /var/lib/cert-issuer/public-bundle
-  ## Attested CA handoff between cert-issuer replicas. When enabled,
-  ## cert-issuer generates an ECDSA handoff signer key in process at startup
-  ## and exchanges it for an Assam-issued EAR via /attest-key — no operator
-  ## key file or Kubernetes Secret is involved. Required for any active/active
-  ## cert-issuer deployment; without it, a cert-issuer pod restart triggers a
-  ## full mesh re-bootstrap (see docs/THREAT_MODEL.md).
-  ##
-  ## handoff.enabled also requires a `cert-issuer/handoff` measurement entry
-  ## in certIssuer.resourceMap (or the bootstrap will succeed but the handoff
-  ## handler will reject every caller). The Assam launch-digest pin is
-  ## inherited from the parent assam.measurements value.
-  handoff:
-    enabled: false
-  resources:
-    requests:
-      cpu: 50m
-      memory: 64Mi
-    limits:
-      cpu: 500m
-      memory: 256Mi
-
-## Unified Confidential Data Service (cds): the in-process merge of Assam and
-## cert-issuer into one binary, one Service, one ServiceAccount, and one
-## measurement allowlist (see lunal-dev/c8s#76). Toggled by global.cdsEnabled
-## (off by default); the legacy assam/cert-issuer templates render in the other
-## state — run one trust root or the other, not both.
+## Confidential Data Service (cds): the c8s trust root. One binary, one Service,
+## one ServiceAccount, and one measurement allowlist serve EAR issuance,
+## whitelist, JWKS, mesh-CA leaf signing, and handoff.
 ##
 ## The mesh CA key is generated inside the cds process and stays in memory
 ## only — it is never rendered into a Kubernetes Secret or volume. EAR signing
-## and JWKS are in-process too, so there is no internal RA-TLS hop to Assam.
+## and JWKS are in-process too, so there is no internal RA-TLS hop.
 cds:
   image:
     repository: ghcr.io/lunal-dev/cds
@@ -223,16 +90,16 @@ cds:
   requestTimeout: 5s
   maxRequestSize: 65536
   readinessInterval: 10s
-  ## Assam forwards CSRs from its own pod under the split design; the unified
-  ## cds receives /attest directly, but /sign-csr CSRs still arrive without a
-  ## matching TCP source IP under chart routing. Leave sanValidation off and
-  ## pin DNS SAN / CN patterns instead.
+  ## /sign-csr CSRs arrive without a matching TCP source IP under chart routing,
+  ## so leave sanValidation off and pin DNS SAN / CN patterns instead.
   sanValidation: false
   dnsSanPattern: ""
   cnPattern: ""
-  ## One flat allowlist of SHA-384 hex launch digests permitted to call /attest
-  ## and (when handoff is enabled) /handoff. Empty = no pinning (UNSAFE outside
-  ## dev). This replaces the split assam.measurements + certIssuer.resourceMap.
+  ## One flat allowlist of SHA-384 hex launch digests permitted to call /attest,
+  ## /sign-csr, and (when handoff is enabled) /handoff. NOTE: /handoff hands over
+  ## the mesh CA private key, so every digest listed here can pull the CA — there
+  ## is no separate, narrower handoff allowlist in the chart. Empty = no pinning
+  ## (UNSAFE outside dev).
   measurements: []
   ## SHA-384 hex launch digests whose bearer EAR may mutate the whitelist via
   ## POST/DELETE /whitelist. Empty = whitelist writes are rejected.
@@ -257,8 +124,8 @@ cds:
     certValidity: 8760h
     minValidity: 1h
   ## Attested CA handoff to a joining cds replica. When enabled, cds
-  ## self-provisions its handoff signer EAR in process (no external Assam dial)
-  ## and registers /handoff, authorising peers whose launch digest is in
+  ## self-provisions its handoff signer EAR in process (no external dial) and
+  ## registers /handoff, authorising peers whose launch digest is in
   ## cds.measurements. Required for any active/active cds deployment; without
   ## it, a cds pod restart triggers a full mesh re-bootstrap.
   handoff:
@@ -423,7 +290,6 @@ nri-image-policy:
   ## Selects the containerd config layout it targets — see the subchart's
   ## values.yaml. `c8s install --distro` sets this.
   distro: k8s
-
   image:
     repository: ghcr.io/lunal-dev/nri-image-policy
     tag: ""
@@ -455,10 +321,11 @@ tee-proxy:
     pullPolicy: IfNotPresent
   imagePullSecrets: []
   attestationURL: ""
+  tpm:
+    enabled: false
   router:
-    routes:
-      - path: /whitelist
-        upstream: "http://{{ .Release.Name }}-assam.{{ .Release.Namespace }}.svc:8080"
+    ## No extra host routes by default; CDS serves /whitelist directly.
+    routes: []
     image:
       repository: docker.io/library/nginx
       digest: "sha256:1eff5a5f3fcf8431a0abb7eddf5471fec24e5e1905a2581aeacdb07a4479b92b"

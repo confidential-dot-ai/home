@@ -20,9 +20,9 @@ import (
 	"github.com/lunal-dev/c8s/pkg/types"
 )
 
-// AttestHandler serves POST /attest by verifying TEE evidence and signing
-// the requester's CSR in-process — no EAR JWT round-trip, since cds is both
-// the former assam and former cert-issuer in one binary.
+// AttestHandler serves POST /attest by verifying TEE evidence and signing the
+// requester's CSR in-process — attestation and mesh-CA signing live in the same
+// binary, so there is no EAR JWT round-trip to a separate signer.
 //
 // THREAT MODEL: the measurement check is the only thing standing between an
 // attacker who controls a TEE workload and a CA-signed leaf for any subject

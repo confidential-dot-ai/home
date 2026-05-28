@@ -1,9 +1,9 @@
-// Package assamclient implements certificate provisioning via the assam
+// Package cdsclient implements certificate provisioning via the CDS
 // attestation service. It performs the attestation flow:
 // authenticate -> attest -> obtain certificate and authenticated CA bundle.
-// Later CA refreshes fetch /ca from cert-issuer and require trust
+// Later CA refreshes fetch /ca from CDS and require trust
 // continuity.
-package assamclient
+package cdsclient
 
 import (
 	"bytes"
@@ -28,24 +28,24 @@ import (
 	"github.com/lunal-dev/c8s/pkg/ratls"
 )
 
-// Config for the assam attestation client.
+// Config for the CDS attestation client.
 type Config struct {
-	// AssamURL is the base URL of the assam service
-	// (e.g., "http://assam.tee-attestation.svc:8080").
-	AssamURL string
+	// CDSURL is the base URL of the CDS service
+	// (e.g., "https://cds.c8s-system.svc:8443").
+	CDSURL string
 
 	// AttestationServiceURL is the URL of the local attestation service
-	// used by assam to generate TEE evidence
+	// used by CDS to generate TEE evidence
 	// (e.g., "http://localhost:8400").
 	AttestationServiceURL string
 
-	// CertIssuerURL is the base URL of the cert-issuer sidecar for CA
+	// CDSCAURL is the base URL of the CDS CA endpoint for CA
 	// bundle refreshes after authenticated provisioning
-	// (e.g., "http://assam.tee-attestation.svc:8090").
-	CertIssuerURL string
+	// (e.g., "https://cds.c8s-system.svc:8443").
+	CDSCAURL string
 
 	// CACertURL, when set, is the exact URL used for CA bundle refreshes.
-	// Empty defaults to CertIssuerURL + "/ca".
+	// Empty defaults to CDSCAURL + "/ca".
 	CACertURL string
 
 	// NodeIP is this node's IP for the certificate subject/SAN.
@@ -56,42 +56,42 @@ type Config struct {
 
 	// TEEType is the TEE platform to stamp into the RA-TLS attestation
 	// extension. It must be specified explicitly. Only SEV-SNP is currently
-	// supported by the Assam client evidence extraction path.
+	// supported by the CDS client evidence extraction path.
 	TEEType ratls.TEEType
 
-	// AssamMeasurements, when non-empty, restricts the Assam server's
+	// CDSMeasurements, when non-empty, restricts the CDS server's
 	// accepted launch digests during the RA-TLS handshake to this set.
 	// Each entry is a 48-byte SEV-SNP measurement. Empty means "any
 	// measurement" — UNSAFE outside development; the chart should always
-	// populate this from `assam.measurements` in values.yaml.
-	AssamMeasurements [][]byte
+	// populate this from `global.cdsMeasurements` in values.yaml.
+	CDSMeasurements [][]byte
 
 	// HTTPClient is an optional HTTP client. If nil, a default RA-TLS
-	// transport is built using the AssamMeasurements policy. Tests that
+	// transport is built using the CDSMeasurements policy. Tests that
 	// need to bypass RA-TLS (e.g. against a plain HTTP fake) can supply a
 	// custom client; production code MUST leave this nil so the client is
 	// constructed with attestation-bound peer verification.
 	HTTPClient *http.Client
 }
 
-// Client handles certificate provisioning via assam.
+// Client handles certificate provisioning via CDS.
 type Client struct {
 	cfg             *Config
 	httpClient      *http.Client
-	assamClient     attestclient.Client
+	cdsAttestClient attestclient.Client
 	mu              sync.RWMutex
 	trustedCABundle []*x509.Certificate
 }
 
-// NewClient creates an assam attestation client. When cfg.HTTPClient is nil,
-// the returned client dials Assam over RA-TLS with a peer-verification policy
-// built from cfg.AssamMeasurements; this is what closes the bootstrap-channel
+// NewClient creates an CDS attestation client. When cfg.HTTPClient is nil,
+// the returned client dials CDS over RA-TLS with a peer-verification policy
+// built from cfg.CDSMeasurements; this is what closes the bootstrap-channel
 // MITM gap (an on-path attacker cannot present a TEE-attested cert with an
 // allowed measurement, so the TLS handshake fails before any cert is issued).
 func NewClient(cfg *Config) *Client {
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		policy := &ratls.VerifyPolicy{Measurements: cfg.AssamMeasurements, AttestationServiceURL: cfg.AttestationServiceURL}
+		policy := &ratls.VerifyPolicy{Measurements: cfg.CDSMeasurements, AttestationServiceURL: cfg.AttestationServiceURL}
 		tlsCfg, _, err := ratls.NewClientTLSConfig(&ratls.ClientConfig{Policy: policy})
 		if err != nil {
 			// NewClientTLSConfig only errors on misconfigured Platform/AttestFunc
@@ -112,17 +112,17 @@ func NewClient(cfg *Config) *Client {
 		}
 	}
 	return &Client{
-		cfg:         cfg,
-		httpClient:  httpClient,
-		assamClient: attestclient.NewClientWithHTTP(cfg.AssamURL, httpClient),
+		cfg:             cfg,
+		httpClient:      httpClient,
+		cdsAttestClient: attestclient.NewClientWithHTTP(cfg.CDSURL, httpClient),
 	}
 }
 
-// RequestCert performs the full assam attestation + certificate issuance flow:
+// RequestCert performs the full CDS attestation + certificate issuance flow:
 //  1. Generate ECDSA keypair + CSR
-//  2. Call assam (authenticate -> attest) over RA-TLS to get a signed certificate
+//  2. Call CDS (authenticate -> attest) over RA-TLS to get a signed certificate
 //     chain. Authenticity of the response is provided by the RA-TLS handshake
-//     (the underlying http.Client's TLSClientConfig verifies Assam's peer cert
+//     (the underlying http.Client's TLSClientConfig verifies CDS's peer cert
 //     against the configured measurement allowlist).
 //  3. Return key + leaf cert + authenticated CA bundle from the signed response
 func (c *Client) RequestCert(ctx context.Context) (*ecdsa.PrivateKey, []byte, []byte, error) {
@@ -136,23 +136,23 @@ func (c *Client) RequestCert(ctx context.Context) (*ecdsa.PrivateKey, []byte, []
 		return nil, nil, nil, fmt.Errorf("create CSR: %w", err)
 	}
 
-	certPEM, err := c.assamClient.ObtainCertificateWithContext(ctx, c.cfg.AttestationServiceURL, csrPEM)
+	certPEM, err := c.cdsAttestClient.ObtainCertificateWithContext(ctx, c.cfg.AttestationServiceURL, csrPEM)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("assam attestation: %w", err)
+		return nil, nil, nil, fmt.Errorf("CDS attestation: %w", err)
 	}
 
 	certs, err := certutil.ParsePEMCertificates([]byte(certPEM))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("parse assam certificate response: %w", err)
+		return nil, nil, nil, fmt.Errorf("parse CDS certificate response: %w", err)
 	}
 	if len(certs) < 2 {
-		return nil, nil, nil, fmt.Errorf("assam certificate response missing CA bundle")
+		return nil, nil, nil, fmt.Errorf("CDS certificate response missing CA bundle")
 	}
 
 	return key, certutil.EncodeCertPEM(certs[0].Raw), encodeCABundlePEM(certs[1:]), nil
 }
 
-// RefreshCABundle fetches the CA certificate bundle from the cert-issuer's
+// RefreshCABundle fetches the CA certificate bundle from CDS's
 // /ca endpoint. A candidate is accepted only when it is already trusted or
 // when it is a CA certificate signed by an already trusted CA. This keeps
 // unauthenticated CA bundle refreshes from expanding trust without signature
@@ -194,7 +194,7 @@ func (c *Client) rememberVerifiedCABundle(verified, published []*x509.Certificat
 		if containsCert(accepted, cert) {
 			continue
 		}
-		// Preserve overlap across in-memory cert-issuer restarts without
+		// Preserve overlap across in-memory CDS restarts without
 		// expanding trust to CAs this client has never accepted before.
 		if containsCert(c.trustedCABundle, cert) && isUsableCA(cert, now) {
 			accepted = append(accepted, cert)
@@ -211,7 +211,7 @@ func (c *Client) acceptCABundle(candidates []*x509.Certificate) ([]*x509.Certifi
 	defer c.mu.Unlock()
 
 	if len(c.trustedCABundle) == 0 {
-		return nil, fmt.Errorf("CA bundle refresh requires a trusted CA from assam certificate provisioning")
+		return nil, fmt.Errorf("CA bundle refresh requires a trusted CA from CDS certificate provisioning")
 	}
 
 	accepted := continuityCABundle(dedupeCerts(candidates), c.trustedCABundle, time.Now())
@@ -255,13 +255,13 @@ func (c *Client) attestationExtension(ctx context.Context, key *ecdsa.PrivateKey
 		return pkix.Extension{}, err
 	}
 
-	// This no-nonce report is embedded for peer RA-TLS fallback. Assam still
+	// This no-nonce report is embedded for peer RA-TLS fallback. CDS still
 	// performs a separate challenge-bound attestation before issuing the cert.
 	reportData, err := ratls.ReportDataForKey(&key.PublicKey, nil)
 	if err != nil {
 		return pkix.Extension{}, err
 	}
-	resp, err := c.assamClient.GenerateEvidenceContext(ctx, c.cfg.AttestationServiceURL, reportData[:sha512.Size384])
+	resp, err := c.cdsAttestClient.GenerateEvidenceContext(ctx, c.cfg.AttestationServiceURL, reportData[:sha512.Size384])
 	if err != nil {
 		return pkix.Extension{}, fmt.Errorf("attestation service: %w", err)
 	}
@@ -278,10 +278,10 @@ func (c *Client) attestationExtension(ctx context.Context, key *ecdsa.PrivateKey
 
 func (cfg *Config) teeType() (ratls.TEEType, error) {
 	if cfg == nil || cfg.TEEType == 0 {
-		return 0, fmt.Errorf("assamclient: TEEType is required")
+		return 0, fmt.Errorf("cdsclient: TEEType is required")
 	}
 	if cfg.TEEType != ratls.TEETypeSEVSNP {
-		return 0, fmt.Errorf("assamclient: TEEType %s is not supported", cfg.TEEType)
+		return 0, fmt.Errorf("cdsclient: TEEType %s is not supported", cfg.TEEType)
 	}
 	return cfg.TEEType, nil
 }
@@ -311,7 +311,7 @@ func (c *Client) caCertURL() string {
 	if c.cfg.CACertURL != "" {
 		return c.cfg.CACertURL
 	}
-	return strings.TrimRight(c.cfg.CertIssuerURL, "/") + "/ca"
+	return strings.TrimRight(c.cfg.CDSCAURL, "/") + "/ca"
 }
 
 func encodeCABundlePEM(certs []*x509.Certificate) []byte {

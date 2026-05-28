@@ -4,9 +4,7 @@ build/
 # Stray root-level binaries from `go build ./cmd/<name>` without -o build/
 # (Makefile targets land artifacts in build/; anything matching a cmd/
 # subdir at repo root is an accidental compile output).
-/assam
 /c8s
-/cert-issuer
 /get-cert
 /node-container-whitelist
 /nri-image-policy

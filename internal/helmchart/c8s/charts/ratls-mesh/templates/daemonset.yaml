@@ -1,15 +1,10 @@
 {{- $attestationServiceURL := printf "http://%s-attestation-service.%s.svc:8400" .Release.Name .Release.Namespace -}}
 {{/*
-  cds mode (single --cds-url to the unified CDS, which serves /attest and /ca)
-  only applies once global.cdsEnabled is set. Until then the CDS Service does
-  not exist, so force self-signed — the legacy split trust root has no single
-  URL serving both attest and CA, and the old two-flag form is gone.
+  cds mode points a single --cds-url at the unified CDS, which serves both
+  /attest and /ca.
 */}}
 {{- $cdsURL := printf "https://%s-cds.%s.svc:8443" .Release.Name .Release.Namespace -}}
 {{- $certMode := .Values.certMode -}}
-{{- if not .Values.global.cdsEnabled -}}
-{{- $certMode = "self-signed" -}}
-{{- end -}}
 {{- $excludeSourceNamespaces := append .Values.iptablesSync.excludeSourceNamespaces .Release.Namespace | uniq | join "," -}}
 {{- /*
 The iptables-cleanup preStop sleep fires last in the native-sidecar
@@ -65,6 +60,9 @@ spec:
       automountServiceAccountToken: true
       terminationGracePeriodSeconds: {{ $tgp }}
       securityContext:
+        {{- if .Values.tpm.enabled }}
+        supplementalGroups: {{ .Values.tpm.supplementalGroups | toJson }}
+        {{- end }}
         seccompProfile:
           type: RuntimeDefault
       {{- with .Values.imagePullSecrets }}
@@ -277,6 +275,9 @@ spec:
               {{- toYaml .Values.resources.requests | nindent 14 }}
             limits:
               {{- toYaml .Values.resources.limits | nindent 14 }}
+              {{- if .Values.tpm.enabled }}
+              {{ .Values.tpm.resource }}: 1
+              {{- end }}
           startupProbe:
             httpGet:
               path: /ready

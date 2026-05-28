@@ -11,12 +11,12 @@ import (
 
 var (
 	activeNodes = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "cert_issuer_active_nodes",
+		Name: "cds_active_nodes",
 		Help: "Number of distinct node IPs that received certificates within the TTL window.",
 	})
 
 	oldestActiveCertExpiry = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "cert_issuer_oldest_active_cert_expiry_seconds",
+		Name: "cds_oldest_active_cert_expiry_seconds",
 		Help: "Seconds until the oldest active node certificate expires.",
 	})
 )

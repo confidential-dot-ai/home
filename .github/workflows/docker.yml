@@ -69,29 +69,26 @@ jobs:
               - '!**/testdata/**'
             shared-root:
               - '{go.mod,go.sum,go.work,go.work.sum,Makefile,.github/workflows/docker.yml}'
-            assam:
-              - '{cmd/assam/**,internal/cmds/assam/**}'
             c8s:
               # cmd/c8s is the multi-mode binary used by the operator image;
               # it imports every internal/cmds subcommand, including get-cert.
               - '{cmd/c8s/**,internal/cmds/**}'
+            cds:
+              - '{cmd/cds/**,internal/cmds/cds/**}'
             get-cert:
               - '{cmd/get-cert/**,internal/cmds/getcert/**}'
             ratls-mesh:
               - '{cmd/ratls-mesh/**,internal/cmds/ratlsmesh/**}'
-            cert-issuer:
-              - '{cmd/cert-issuer/**,internal/cmds/certissuer/**}'
             nri-image-policy:
               - '{cmd/nri-image-policy/**,internal/cmds/nriimagepolicy/**}'
       - name: Build Docker matrix
         id: docker-matrix
         env:
           SHARED: ${{ steps.filter.outputs['shared-core'] == 'true' || steps.filter.outputs['shared-cmdsutil'] == 'true' || steps.filter.outputs['shared-root'] == 'true' }}
-          ASSAM: ${{ steps.filter.outputs.assam }}
           C8S: ${{ steps.filter.outputs.c8s }}
+          CDS: ${{ steps.filter.outputs.cds }}
           GET_CERT: ${{ steps.filter.outputs['get-cert'] }}
           RATLS_MESH: ${{ steps.filter.outputs['ratls-mesh'] }}
-          CERT_ISSUER: ${{ steps.filter.outputs['cert-issuer'] }}
           NRI_IMAGE_POLICY: ${{ steps.filter.outputs['nri-image-policy'] }}
         run: |
           set -euo pipefail
@@ -108,11 +105,10 @@ jobs:
             fi
           }
 
-          add_if_changed "$ASSAM" assam ghcr.io/lunal-dev/assam cmd/assam/Dockerfile
           add_if_changed "$C8S" c8s ghcr.io/lunal-dev/c8s-operator cmd/c8s/Dockerfile
+          add_if_changed "$CDS" cds ghcr.io/lunal-dev/cds cmd/cds/Dockerfile
           add_if_changed "$GET_CERT" get-cert ghcr.io/lunal-dev/get-cert cmd/get-cert/Dockerfile
           add_if_changed "$RATLS_MESH" ratls-mesh ghcr.io/lunal-dev/ratls-mesh cmd/ratls-mesh/Dockerfile
-          add_if_changed "$CERT_ISSUER" cert-issuer ghcr.io/lunal-dev/cert-issuer cmd/cert-issuer/Dockerfile
           add_if_changed "$NRI_IMAGE_POLICY" nri-image-policy ghcr.io/lunal-dev/nri-image-policy cmd/nri-image-policy/Dockerfile
 
           if [[ ${#include[@]} -eq 0 ]]; then

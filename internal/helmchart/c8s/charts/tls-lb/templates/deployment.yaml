@@ -1,4 +1,4 @@
-{{- $meshCAConfigMapName := default (printf "%s-cert-issuer-mesh-ca" .Release.Name) .Values.meshCA.configMapName -}}
+{{- $meshCAConfigMapName := default (printf "%s-cds-mesh-ca" .Release.Name) .Values.meshCA.configMapName -}}
 {{- $defaultMeshCAPath := printf "%s/%s" .Values.meshCA.mountPath .Values.meshCA.key -}}
 {{- $configuredTrustedCAPath := .Values.upstream.tls.trustedCAPath -}}
 {{- $upstreamTLSVerify := and (eq .Values.upstream.protocol "https") .Values.upstream.tls.verify -}}

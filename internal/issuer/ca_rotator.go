@@ -16,10 +16,10 @@ import (
 // the issuer has loaded a CA bundle.
 var ErrNoCertificateBundle = errors.New("no certificates loaded")
 
-// CARotatorDeps carries the cert-issuer-side wiring that CARotator needs
-// to mint a new CA and publish it. The fields/callbacks let CARotator stay
-// free of certissuer's metrics, atomic-pointer bundle, and process-local
-// token-signer plumbing.
+// CARotatorDeps carries the caller-side wiring that CARotator needs to mint a
+// new CA and publish it. The fields/callbacks let CARotator stay free of the
+// caller's metrics, atomic-pointer bundle, and process-local token-signer
+// plumbing.
 type CARotatorDeps struct {
 	Logger         *slog.Logger
 	Bundle         *BundleManager // public bundle; nil disables /ca write-back

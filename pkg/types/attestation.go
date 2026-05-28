@@ -22,9 +22,9 @@ type AttestRequestBody struct {
 }
 
 // AttestKeyRequestBody is the request body for POST /attest-key. Used by
-// in-cluster c8s components (currently cert-issuer for its handoff signer
-// key) that need an Assam-issued EAR bound to a TEE-attested ECDSA public
-// key, without going through the full cert-issuance flow that /attest does.
+// in-cluster c8s components (CDS for its own handoff signer key) that need a
+// CDS-issued EAR bound to a TEE-attested ECDSA public key, without going
+// through the full cert-issuance flow that /attest does.
 type AttestKeyRequestBody struct {
 	Challenge string              `json:"challenge"`
 	Evidence  AttestationEvidence `json:"evidence"`
@@ -38,7 +38,7 @@ type AttestKeyRequestBody struct {
 // AttestKeyResponseBody is the response body for POST /attest-key.
 type AttestKeyResponseBody struct {
 	// EAR is a signed JWT whose tee_public_key claim equals PublicKey from
-	// the request. Verifiers re-check the JWT signature against Assam's
+	// the request. Verifiers re-check the JWT signature against CDS's
 	// JWKS and re-derive the binding before trusting it for any action.
 	EAR string `json:"ear"`
 }
@@ -196,14 +196,14 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
-// SignCsrRequest is sent to the cert-issuer POST /sign-csr.
+// SignCsrRequest is sent to CDS POST /sign-csr.
 type SignCsrRequest struct {
 	Ear string `json:"ear"`
 	Csr string `json:"csr"`
 	Ttl string `json:"ttl"`
 }
 
-// SignCsrResponse is the response from the cert-issuer POST /sign-csr.
+// SignCsrResponse is the response from CDS POST /sign-csr.
 type SignCsrResponse struct {
 	Certificate   string `json:"certificate"`
 	CACertificate string `json:"ca_certificate"`

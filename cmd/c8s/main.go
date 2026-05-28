@@ -46,8 +46,6 @@ func main() {
 func normalizeArgvAlias() {
 	base := filepath.Base(os.Args[0])
 	for _, alias := range []string{
-		"assam",
-		"cert-issuer",
 		"get-cert",
 		"nri-image-policy",
 		"ratls-mesh",

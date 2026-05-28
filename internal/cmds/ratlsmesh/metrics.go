@@ -23,8 +23,8 @@ type metrics struct {
 	registry  *prometheus.Registry
 	startTime time.Time
 
-	certMode                  atomic.Int64 // 0 = self-signed, 1 = assam (active)
-	certModeConfigured        atomic.Int64 // 0 = self-signed, 1 = assam (configured)
+	certMode                  atomic.Int64 // 0 = self-signed, 1 = cds (active)
+	certModeConfigured        atomic.Int64 // 0 = self-signed, 1 = cds (configured)
 	acceptConsecutiveInbound  atomic.Int64
 	acceptConsecutiveOutbound atomic.Int64
 
@@ -171,7 +171,7 @@ func newMetrics() *metrics {
 	})
 	m.certPipelineHealthy = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "ratls_mesh_cert_pipeline_healthy",
-		Help: "1 when cert-issuer /ready is reachable (0=unreachable). Stays at -1 when cert-issuer probing is not configured.",
+		Help: "1 when CDS /ready is reachable (0=unreachable). Stays at -1 when CDS probing is not configured.",
 	})
 	m.certPipelineHealthy.Set(-1)
 	m.certExpiry = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -231,7 +231,7 @@ func newMetrics() *metrics {
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name:        "ratls_mesh_cert_mode",
 			Help:        "Active certificate mode (1=active).",
-			ConstLabels: prometheus.Labels{"mode": "assam"},
+			ConstLabels: prometheus.Labels{"mode": "cds"},
 		}, func() float64 { return boolFloat(m.certMode.Load() == 1) }),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name:        "ratls_mesh_cert_mode",
@@ -241,7 +241,7 @@ func newMetrics() *metrics {
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name:        "ratls_mesh_cert_mode_configured",
 			Help:        "Configured certificate mode (1=active).",
-			ConstLabels: prometheus.Labels{"mode": "assam"},
+			ConstLabels: prometheus.Labels{"mode": "cds"},
 		}, func() float64 { return boolFloat(m.certModeConfigured.Load() == 1) }),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name:        "ratls_mesh_cert_mode_configured",
@@ -271,7 +271,7 @@ func newMetrics() *metrics {
 // zero get a stable shape to compare against.
 func (m *metrics) populateVecZeros() {
 	directions := []string{"inbound", "outbound", "outbound_same_node"}
-	certModes := []string{"self-signed", "assam"}
+	certModes := []string{"self-signed", "cds"}
 	for _, dir := range []string{"inbound", "outbound"} {
 		m.activeConnections.WithLabelValues(dir)
 	}

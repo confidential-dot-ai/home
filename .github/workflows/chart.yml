@@ -47,8 +47,7 @@ jobs:
           helm lint "$CHART_DIR" \
             --set image.tag=ci \
             --set attestationService.image.tag=ci \
-            --set assam.image.tag=ci \
-            --set certIssuer.image.tag=ci \
+            --set cds.image.tag=ci \
             --set ratls-mesh.image.tag=ci \
             --set nri-image-policy.image.tag=ci \
             --set nri-image-policy.image.digest=sha256:aaaa000000000000000000000000000000000000000000000000000000000000 \
@@ -63,8 +62,7 @@ jobs:
             --namespace c8s-system \
             --set image.tag=ci \
             --set attestationService.image.tag=ci \
-            --set assam.image.tag=ci \
-            --set certIssuer.image.tag=ci \
+            --set cds.image.tag=ci \
             --set ratls-mesh.image.tag=ci \
             --set nri-image-policy.image.tag=ci \
             --set nri-image-policy.image.digest=sha256:aaaa000000000000000000000000000000000000000000000000000000000000 \
@@ -74,14 +72,13 @@ jobs:
             --set tee-proxy.image.tag=ci \
             > /dev/null
 
-      - name: Helm template with chart-managed Assam
+      - name: Helm template with webhook
         run: |
           helm template c8s "$CHART_DIR" \
             --namespace c8s-system \
             --set image.tag=ci \
             --set attestationService.image.tag=ci \
-            --set assam.image.tag=ci \
-            --set certIssuer.image.tag=ci \
+            --set cds.image.tag=ci \
             --set ratls-mesh.image.tag=ci \
             --set nri-image-policy.image.tag=ci \
             --set nri-image-policy.image.digest=sha256:aaaa000000000000000000000000000000000000000000000000000000000000 \
@@ -90,8 +87,6 @@ jobs:
             --set nri-image-policy.cds.node.selector.role=cds-node \
             --set tee-proxy.image.tag=ci \
             --set webhook.enabled=true \
-            --set assam.enabled=true \
-            --set certIssuer.enabled=true \
             > /dev/null
 
       - name: Helm package
