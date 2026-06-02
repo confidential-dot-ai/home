@@ -54,8 +54,13 @@ operator:
   podAnnotations: {}
   extraArgs: []
 
+## Chart-wide image pull secrets, used by every component unless that component
+## sets its own .imagePullSecrets. One entry here covers all c8s images.
+imagePullSecrets: []
+
 ## Common ServiceAccount settings for the chart-managed top-level c8s
-## workloads: operator, attestation-service, and CDS.
+## workloads: operator, attestation-service, and CDS. Leave empty to inherit
+## the chart-wide imagePullSecrets above; set to override for these workloads.
 serviceAccount:
   imagePullSecrets: []
 

@@ -63,10 +63,7 @@ spec:
       securityContext:
         seccompProfile:
           type: RuntimeDefault
-      {{- with .Values.ratlsMesh.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "c8s.imagePullSecrets" (dict "root" $ "local" .Values.ratlsMesh.imagePullSecrets) | nindent 6 }}
       tolerations:
         - operator: "Exists"
           effect: "NoExecute"

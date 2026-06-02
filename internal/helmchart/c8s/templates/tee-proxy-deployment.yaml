@@ -40,10 +40,7 @@ spec:
                   {{- include "tee-proxy.selectorLabels" . | nindent 18 }}
               topologyKey: kubernetes.io/hostname
       {{- end }}
-      {{- with .Values.teeProxy.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "c8s.imagePullSecrets" (dict "root" $ "local" .Values.teeProxy.imagePullSecrets) | nindent 6 }}
       containers:
         - name: proxy
           image: {{ include "tee-proxy.image" . }}

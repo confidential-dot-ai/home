@@ -238,11 +238,18 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: Helm
 {{- end -}}
 
-{{- define "c8s.serviceAccountImagePullSecrets" -}}
-{{- with .Values.serviceAccount.imagePullSecrets }}
+{{/* Emits an imagePullSecrets: block from .local, falling back to chart-wide
+  .Values.imagePullSecrets. Callers place it with nindent. Call with
+  (dict "root" $ "local" <list>). */}}
+{{- define "c8s.imagePullSecrets" -}}
+{{- with (.local | default .root.Values.imagePullSecrets) }}
 imagePullSecrets:
 {{ toYaml . }}
 {{- end -}}
+{{- end -}}
+
+{{- define "c8s.serviceAccountImagePullSecrets" -}}
+{{- include "c8s.imagePullSecrets" (dict "root" . "local" .Values.serviceAccount.imagePullSecrets) -}}
 {{- end -}}
 
 {{/*

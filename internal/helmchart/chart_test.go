@@ -1084,6 +1084,37 @@ func TestChartRendersManagedClusterKnobs(t *testing.T) {
 	}
 }
 
+// TestChartGlobalImagePullSecrets proves the chart-wide imagePullSecrets feeds
+// every component, and a per-component value overrides it for that component.
+func TestChartGlobalImagePullSecrets(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set", "imagePullSecrets[0].name=ghcr-pull",
+		"--set", "teeProxy.imagePullSecrets[0].name=tee-special",
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	// The global reaches a non-overriding component (ratls-mesh).
+	rm := renderedDaemonSet(t, out, "c8s-ratls-mesh")
+	if !hasPullSecret(rm.Spec.Template.Spec.ImagePullSecrets, "ghcr-pull") {
+		t.Errorf("ratls-mesh missing global pull secret: %v", rm.Spec.Template.Spec.ImagePullSecrets)
+	}
+	// teeProxy's own value overrides the global.
+	tp := renderedDeployment(t, out, "c8s-tee-proxy")
+	if hasPullSecret(tp.Spec.Template.Spec.ImagePullSecrets, "ghcr-pull") || !hasPullSecret(tp.Spec.Template.Spec.ImagePullSecrets, "tee-special") {
+		t.Errorf("tee-proxy should use its override, not the global: %v", tp.Spec.Template.Spec.ImagePullSecrets)
+	}
+}
+
+func hasPullSecret(refs []corev1.LocalObjectReference, name string) bool {
+	for _, r := range refs {
+		if r.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func TestChartRendersTLSLBPublicTLSAndDiscovery(t *testing.T) {
 	out, err := helmTemplate(t,
 		"--set-string", "tlsLb.publicTLS.secretName=tls-lb-public-tls",

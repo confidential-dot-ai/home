@@ -28,10 +28,7 @@ spec:
       {{- with .Values.nriImagePolicy.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
-      {{- with .Values.nriImagePolicy.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "c8s.imagePullSecrets" (dict "root" $ "local" .Values.nriImagePolicy.imagePullSecrets) | nindent 6 }}
       tolerations:
         - operator: "Exists"
           effect: "NoExecute"
