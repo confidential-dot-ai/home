@@ -2810,7 +2810,7 @@ func Example_tlsLBConfig() {
 	//         server tenant-router.c8s-system.svc:8080;
 	//     }
 	//     server {
-	//         listen 443 ssl;
+	//         listen 8443 ssl;
 	//         server_name "c8s-tls-lb.c8s-system.svc";
 	//
 	//         ssl_certificate     /tls/cert.pem;

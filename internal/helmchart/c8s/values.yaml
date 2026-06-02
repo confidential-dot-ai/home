@@ -830,8 +830,12 @@ tlsLb:
       pullPolicy: IfNotPresent
     # -- Number of nginx replicas.
     replicas: 1
-    # -- HTTPS port nginx listens on.
-    httpsPort: 443
+    # -- HTTPS port nginx listens on. Unprivileged (>=1024) because nginx runs
+    #    non-root with a dropped-capability securityContext and cannot bind a
+    #    privileged port. The Service presents 443 and forwards to this port
+    #    (targetPort references the named `https` port), so public 443 is
+    #    unaffected; front it with a LoadBalancer for external ingress.
+    httpsPort: 8443
     # -- UID/GID used by nginx and the webhook-injected get-cert containers so
     #    both can access the in-memory CDS key material.
     runAsUser: 101
