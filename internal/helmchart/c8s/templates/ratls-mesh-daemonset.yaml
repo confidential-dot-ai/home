@@ -90,7 +90,12 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               add:
+                # NET_ADMIN for iptables/ipset; NET_RAW for the xt_set match's
+                # socket to the ip_set subsystem (the nf_tables-compat path
+                # needs it, else `iptables -m set` fails with "Can't open socket
+                # to ipset" even though NET_ADMIN alone can run ipset commands).
                 - NET_ADMIN
+                - NET_RAW
               drop:
                 - ALL
             seccompProfile:
@@ -122,7 +127,12 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               add:
+                # NET_ADMIN for iptables/ipset; NET_RAW for the xt_set match's
+                # socket to the ip_set subsystem (the nf_tables-compat path
+                # needs it, else `iptables -m set` fails with "Can't open socket
+                # to ipset" even though NET_ADMIN alone can run ipset commands).
                 - NET_ADMIN
+                - NET_RAW
               drop:
                 - ALL
             seccompProfile:

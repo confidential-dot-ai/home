@@ -381,6 +381,12 @@ func TestChartRATLSNativeSidecarShape(t *testing.T) {
 		if !hasCapability(c, "NET_ADMIN") {
 			t.Errorf("init container %q must hold NET_ADMIN to manage iptables/ipset; caps=%+v", name, c.SecurityContext)
 		}
+		// NET_RAW is required for the xt_set match's socket to ip_set on the
+		// nf_tables-compat path; without it `iptables -m set` fails with
+		// "Can't open socket to ipset" despite NET_ADMIN.
+		if !hasCapability(c, "NET_RAW") {
+			t.Errorf("init container %q must hold NET_RAW for the iptables xt_set match; caps=%+v", name, c.SecurityContext)
+		}
 		// The sidecars run as root for iptables/ipset but are bounded by
 		// allowPrivilegeEscalation: false and the runtime-default seccomp
 		// profile. Both are easy to omit silently in a refactor and turn the
