@@ -50,8 +50,6 @@ spec:
             - {{ .Values.teeProxy.domain | quote }}
             - --upstream
             - "http://{{ .Values.teeProxy.upstream }}"
-            - --platform
-            - {{ .Values.teeProxy.platform | quote }}
             - --header-name
             - {{ .Values.teeProxy.headerName | quote }}
             {{- if $attestationURL }}

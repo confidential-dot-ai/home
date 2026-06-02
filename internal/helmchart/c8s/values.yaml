@@ -350,9 +350,6 @@ ratlsMesh:
 
   imagePullSecrets: []
 
-  # TEE platform. The supported c8s chart shape is SEV-SNP.
-  platform: sev-snp
-
   # Host path for iptables lock (k3s: /run/k3s/agent/xtables.lock)
   xtablesLockPath: /run/xtables.lock
 
@@ -660,8 +657,6 @@ teeProxy:
     pullPolicy: IfNotPresent
   imagePullSecrets: []
   replicas: 1
-  # TEE platform. The supported c8s chart shape is SEV-SNP.
-  platform: sev-snp
   # Domain for autocert TLS
   domain: ""
   # Static TLS certificate Secret. When enabled, tee-proxy starts HTTPS using
