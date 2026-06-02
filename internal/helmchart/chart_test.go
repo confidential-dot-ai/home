@@ -1085,10 +1085,68 @@ func TestChartWebhookRendersSecurityKnobs(t *testing.T) {
 	}
 }
 
+// TestChartAttestationServiceBaremetalLeastPrivilege proves the default
+// (cvmMode=baremetal) renders the least-privilege securityContext — not
+// privileged — so a plain install does not over-privilege a host-device
+// DaemonSet. This is the over-privilege regression guard.
+func TestChartAttestationServiceBaremetalLeastPrivilege(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	c := renderedDaemonSetContainer(t, out, "c8s-attestation-service", "attestation-service")
+	sc := c.SecurityContext
+	if sc == nil {
+		t.Fatal("attestation-service missing securityContext")
+	}
+	if sc.Privileged != nil && *sc.Privileged {
+		t.Errorf("default (baremetal) must not be privileged; got privileged=true")
+	}
+	if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+		t.Errorf("baremetal must set allowPrivilegeEscalation=false; got %+v", sc.AllowPrivilegeEscalation)
+	}
+	if !hasCapability(c, "SYS_RAWIO") {
+		t.Errorf("baremetal must add SYS_RAWIO; got %+v", sc.Capabilities)
+	}
+	if !slices.Contains(sc.Capabilities.Drop, "ALL") {
+		t.Errorf("baremetal must drop ALL; got %+v", sc.Capabilities)
+	}
+}
+
+// TestChartAttestationServiceManagedPrivileged proves cvmMode=managed renders a
+// privileged container (managed CVM gates vTPM access below the capability
+// layer, so /dev/tpm0 needs full privilege) and drops the least-privilege
+// capabilities map — the two modes are strictly either/or, not merged.
+func TestChartAttestationServiceManagedPrivileged(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "attestationService.cvmMode=managed")
+	if err != nil {
+		t.Fatalf("helm template (cvmMode=managed): %v\n%s", err, out)
+	}
+	c := renderedDaemonSetContainer(t, out, "c8s-attestation-service", "attestation-service")
+	sc := c.SecurityContext
+	if sc == nil || sc.Privileged == nil || !*sc.Privileged {
+		t.Errorf("managed must be privileged for vTPM access; got %+v", sc)
+	}
+	if sc != nil && sc.Capabilities != nil {
+		t.Errorf("managed must not carry the least-privilege capabilities map; got %+v", sc.Capabilities)
+	}
+}
+
+// TestChartAttestationServiceInvalidCvmMode proves an unrecognized cvmMode fails
+// the render loudly rather than silently falling through to least-privilege
+// (which would fail closed at runtime on a managed CVM).
+func TestChartAttestationServiceInvalidCvmMode(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "attestationService.cvmMode=bogus")
+	if err == nil {
+		t.Fatalf("expected render to fail on invalid cvmMode; got success\n%s", out)
+	}
+	assertHelmFailMessage(t, out, `attestationService.cvmMode must be "baremetal" or "managed" (got "bogus")`)
+}
+
 func TestChartRendersManagedClusterKnobs(t *testing.T) {
 	out, err := helmTemplate(t,
 		"--set", "serviceAccount.imagePullSecrets[0].name=ghcr-secret",
-		"--set", "attestationService.privileged=true",
+		"--set", "attestationService.cvmMode=managed",
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)

@@ -86,11 +86,13 @@ spec:
             - name: http
               containerPort: {{ .Values.attestationService.port }}
           securityContext:
-            {{- if .Values.attestationService.privileged }}
+            {{- if eq .Values.attestationService.cvmMode "managed" }}
             privileged: true
             readOnlyRootFilesystem: true
-            {{- else }}
+            {{- else if eq .Values.attestationService.cvmMode "baremetal" }}
 {{ toYaml .Values.attestationService.securityContext | indent 12 }}
+            {{- else }}
+{{ fail (printf "attestationService.cvmMode must be \"baremetal\" or \"managed\" (got %q)" .Values.attestationService.cvmMode) }}
             {{- end }}
           volumeMounts:
             - name: config

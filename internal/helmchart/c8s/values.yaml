@@ -222,11 +222,16 @@ attestationService:
     - az-tdx
     - gcp-snp
     - gcp-tdx
-  privileged: false
-  ## Default is least-privilege device access for bare-metal TEE devices.
-  ## Some managed-cloud CVM environments gate vTPM access below the LSM/device
-  ## capability layer and need `privileged: true`; set privileged=true for that
-  ## path instead of overriding this map.
+  ## CVM platform shape.
+  ##
+  ## baremetal (default): direct TEE device node. The least-privilege
+  ##   securityContext below (device mount + SYS_RAWIO) suffices.
+  ## managed: managed-cloud CVM (AKS/GKE), where vTPM access for SEV-SNP
+  ##   attestation is gated below the LSM/device-capability layer, so /dev/tpm0
+  ##   returns "Operation not permitted" without full privilege even with the
+  ##   device mounted and SYS_RAWIO granted. Renders privileged: true.
+  cvmMode: baremetal
+  ## Least-privilege device access, used only when cvmMode=baremetal.
   securityContext:
     readOnlyRootFilesystem: true
     allowPrivilegeEscalation: false
