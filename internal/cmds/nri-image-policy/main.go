@@ -48,6 +48,7 @@ var (
 	errInitialWhitelistNotModified = errors.New("initial whitelist fetch returned not modified without a cached CDS whitelist")
 	errInitialWhitelistNil         = errors.New("initial whitelist fetch returned nil whitelist")
 	errPushHandlerRequiresUnixAddr = errors.New("push mode requires plugin.health_addr to use unix://")
+	errPluginDied                  = errors.New("NRI plugin died during whitelist init")
 )
 
 // pushBodyLimit caps PUT /whitelist payloads. Push mode carries a
@@ -199,14 +200,21 @@ func Run(args []string) error {
 			logger:      logger,
 		})
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			switch {
+			case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
 				logger.Info("shutdown before plugin became ready")
 				if perr := <-pluginErrCh; perr != nil {
 					logger.Error("plugin error during shutdown", "error", perr)
 				}
 				return nil
+			case errors.Is(err, errPluginDied):
+				return err
+			default:
+				// The cache already holds the bootstrap floor (always_allow), so
+				// stay up serving it rather than crash-loop the plugin and block
+				// container creation node-wide. runPullLoop keeps retrying.
+				logger.Warn("initial whitelist pull failed; serving bootstrap floor and retrying in background", "error", err)
 			}
-			return err
 		}
 	}
 
@@ -351,7 +359,7 @@ func pullInitial(ctx context.Context, args pullArgs) (string, error) {
 	for attempt := 1; attempt <= whitelistApiMaxRetries; attempt++ {
 		select {
 		case err := <-args.pluginErrCh:
-			return "", fmt.Errorf("NRI plugin died during whitelist init: %w", err)
+			return "", fmt.Errorf("%w: %w", errPluginDied, err)
 		case <-ctx.Done():
 			args.logger.Info("shutdown requested during whitelist init")
 			return "", ctx.Err()

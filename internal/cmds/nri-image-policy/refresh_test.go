@@ -663,6 +663,29 @@ func TestPullInitialFailsAfterMaxRetries(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error after max retries against a 5xx server")
 	}
+	// A fetch failure must NOT look like a dead plugin: run() degrades to the
+	// bootstrap floor on a fetch failure but stays fatal on errPluginDied.
+	if errors.Is(err, errPluginDied) {
+		t.Fatalf("fetch failure misclassified as errPluginDied: %v", err)
+	}
+}
+
+// A plugin-half death during init wraps errPluginDied so run() can treat it as
+// fatal, unlike a recoverable fetch failure.
+func TestPullInitialPluginDeathWrapsErrPluginDied(t *testing.T) {
+	pluginErrCh := make(chan error, 1)
+	pluginErrCh <- errors.New("nri socket closed")
+	_, err := pullInitial(context.Background(), pullArgs{
+		client:      whitelistclient.NewClientWithHTTP("https://unused", &http.Client{}),
+		cache:       cache.NewPolicyCache(),
+		bootstrap:   &whitelist.Whitelist{Digests: map[string]string{}},
+		timeout:     time.Second,
+		pluginErrCh: pluginErrCh,
+		logger:      discardLogger(),
+	})
+	if !errors.Is(err, errPluginDied) {
+		t.Fatalf("plugin death not classified as errPluginDied: %v", err)
+	}
 }
 
 func TestPullInitialNotModifiedDoesNotDereferenceNilWhitelist(t *testing.T) {
