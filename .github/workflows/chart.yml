@@ -38,7 +38,11 @@ jobs:
             v="${GITHUB_REF#refs/tags/v}"
           else
             base=$(grep -E '^version:' "$CHART_DIR/Chart.yaml" | awk '{print $2}' | tr -d '"')
-            v="${base}-$(git rev-parse --short HEAD)"
+            # Prefix the sha with "g" (git-describe convention) so the SemVer
+            # pre-release segment is never a pure-numeric identifier, which
+            # forbids leading zeros: an all-digit sha like 0091982 would make
+            # helm reject "0.1.0-0091982" with "Version segment starts with 0".
+            v="${base}-g$(git rev-parse --short HEAD)"
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
@@ -52,8 +56,7 @@ jobs:
             --set teeProxy.image.tag=ci \
             --set nriImagePolicy.image.tag=ci \
             --set nriImagePolicy.image.digest=sha256:aaaa000000000000000000000000000000000000000000000000000000000000 \
-            --set nriImagePolicy.cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001 \
-            --set nriImagePolicy.cds.image.reference=ghcr.io/lunal-dev/cds:ci \
+            --set cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001 \
             --set nriImagePolicy.cds.node.selector.role=cds-node
 
       - name: Helm template
@@ -67,8 +70,7 @@ jobs:
             --set teeProxy.image.tag=ci \
             --set nriImagePolicy.image.tag=ci \
             --set nriImagePolicy.image.digest=sha256:aaaa000000000000000000000000000000000000000000000000000000000000 \
-            --set nriImagePolicy.cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001 \
-            --set nriImagePolicy.cds.image.reference=ghcr.io/lunal-dev/cds:ci \
+            --set cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001 \
             --set nriImagePolicy.cds.node.selector.role=cds-node \
             > /dev/null
 
@@ -83,8 +85,7 @@ jobs:
             --set teeProxy.image.tag=ci \
             --set nriImagePolicy.image.tag=ci \
             --set nriImagePolicy.image.digest=sha256:aaaa000000000000000000000000000000000000000000000000000000000000 \
-            --set nriImagePolicy.cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001 \
-            --set nriImagePolicy.cds.image.reference=ghcr.io/lunal-dev/cds:ci \
+            --set cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001 \
             --set nriImagePolicy.cds.node.selector.role=cds-node \
             --set webhook.enabled=true \
             > /dev/null

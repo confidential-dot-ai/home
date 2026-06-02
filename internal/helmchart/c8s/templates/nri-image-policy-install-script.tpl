@@ -177,10 +177,17 @@ whitelist:
       []
 {{- end }}
 {{- end }}
+{{- /* Self-allow the installer image first (load-bearing when
+       bootstrapWhitelist.deriveComponents=false, where the floor omits it), then
+       add the floor — skipping the installer digest so the map has no
+       duplicate key (the plugin loads this with yaml.v3, which rejects dups). */ -}}
+{{- $selfDigest := required "image.digest is required (chart self-allow for installer rollouts)" $root.Values.nriImagePolicy.image.digest }}
   always_allow:
-    {{ required "image.digest is required (chart self-allow for installer rollouts)" $root.Values.nriImagePolicy.image.digest | quote }}: {{ printf "%s@%s" $root.Values.nriImagePolicy.image.repository $root.Values.nriImagePolicy.image.digest | quote }}
-{{- range $digest, $image := $root.Values.nriImagePolicy.bootstrapWhitelist.digests }}
+    {{ $selfDigest | quote }}: {{ printf "%s@%s" $root.Values.nriImagePolicy.image.repository $selfDigest | quote }}
+{{- range $digest, $image := (include "c8s.imageWhitelist" $root | fromJson) }}
+{{- if ne $digest $selfDigest }}
     {{ $digest | quote }}: {{ $image | quote }}
+{{- end }}
 {{- end }}
 containerd:
   socket: {{ include "nri-image-policy.containerdSocket" $root | quote }}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -45,32 +46,132 @@ var (
 )
 
 // c8sComponent maps a chart image to the helm value keys --resolve-digests
-// pins. valuePrefix is the values path whose image the chart renders; repository
-// is that path's values.yaml default, against which the tag is resolved. The
-// resolved digest and (for the cds self-entry) the full repo@digest reference
-// are pinned under valuePrefix. resolveDigests pins both the repository and the
-// digest it resolved against, so an operator's -f override of a repository
-// cannot leave the chart deploying repoA@<digest-of-repoB>.
+// pins. valuePrefix is the values path whose image the chart renders;
+// repository is that path's values.yaml default, against which the tag is
+// resolved. resolveDigests pins both the repository and the digest it resolved
+// against, so an operator's -f override of a repository cannot leave the chart
+// deploying repoA@<digest-of-repoB>.
 type c8sComponent struct {
 	valuePrefix string // values path, e.g. "cds.image" (renders {repository}@{digest})
 	repository  string // values.yaml default repository resolved against
-	refKey      string // value key for the full repo@digest reference ("" if none)
 }
 
-// c8sComponents are the chart images c8s install pins to digests under
-// --resolve-digests. Each repository must match the repository: field at the
-// same values path in internal/helmchart/c8s/values.yaml. cds appears twice:
-// once for the cds Deployment image (cds.image) and once for the nri push-hook
-// / whitelist-seed self-entry (nriImagePolicy.cds.image), which the render
-// guard requires.
-var c8sComponents = []c8sComponent{
-	{"image", "ghcr.io/lunal-dev/c8s-operator", ""},
-	{"attestationService.image", "ghcr.io/lunal-dev/attestation-service", ""},
-	{"cds.image", "ghcr.io/lunal-dev/cds", ""},
-	{"ratlsMesh.image", "ghcr.io/lunal-dev/ratls-mesh", ""},
-	{"nriImagePolicy.image", "ghcr.io/lunal-dev/nri-image-policy", ""},
-	{"teeProxy.image", "ghcr.io/lunal-dev/tee-proxy", ""},
-	{"nriImagePolicy.cds.image", "ghcr.io/lunal-dev/cds", "nriImagePolicy.cds.image.reference"},
+// chartComponents reads the component set from the chart at chartPath via
+// `helm show values` (which dumps values.yaml without rendering templates, so
+// no render guard fires). The valuePath list and each component's repository
+// both live in that one values tree, so a single decode serves both. This is
+// the single source shared with the chart's c8s.components helper; the Go side
+// does not duplicate the list.
+func chartComponents(ctx context.Context, chartPath string) ([]c8sComponent, error) {
+	out, err := exec.CommandContext(ctx, "helm", "show", "values", chartPath).Output()
+	if err != nil {
+		return nil, fmt.Errorf("helm show values %q: %w", chartPath, err)
+	}
+
+	var tree map[string]any
+	if err := yaml.Unmarshal(out, &tree); err != nil {
+		return nil, fmt.Errorf("parse chart values: %w", err)
+	}
+
+	list, ok := tree["c8sComponents"].([]any)
+	if !ok || len(list) == 0 {
+		return nil, fmt.Errorf("chart declares no c8sComponents")
+	}
+
+	comps := make([]c8sComponent, 0, len(list))
+	for _, entry := range list {
+		m, ok := entry.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("c8sComponents entry is not a mapping: %T", entry)
+		}
+		valuePath, ok := m["valuePath"].(string)
+		if !ok {
+			return nil, fmt.Errorf("c8sComponents entry missing string valuePath: %v", m)
+		}
+		repo, err := stringAtPath(tree, valuePath+".repository")
+		if err != nil {
+			return nil, fmt.Errorf("component %q: %w", valuePath, err)
+		}
+		comps = append(comps, c8sComponent{valuePrefix: valuePath, repository: repo})
+	}
+	return comps, nil
+}
+
+// preflightCDSNode fails fast (before the helm install) when no node carries
+// the CDS node-selector label. The chart pins the singleton CDS pod to that
+// label, so without a matching node CDS stays Pending and `helm --wait` would
+// block for the full timeout before failing with an opaque message. The label
+// requirement is exact (read straight from the chart's cds.node.selector), not
+// a heuristic.
+//
+// It reads the chart's default values, so it only guards the default path; an
+// operator who customizes via -f is trusted to manage node labels themselves
+// (the caller skips this when -f is supplied).
+func preflightCDSNode(ctx context.Context, chartPath string) error {
+	out, err := exec.CommandContext(ctx, "helm", "show", "values", chartPath).Output()
+	if err != nil {
+		return fmt.Errorf("helm show values %q: %w", chartPath, err)
+	}
+	var tree map[string]any
+	if err := yaml.Unmarshal(out, &tree); err != nil {
+		return fmt.Errorf("parse chart values: %w", err)
+	}
+
+	sel, ok := nestedMap(tree, "cds", "node", "selector")
+	if !ok || len(sel) != 1 {
+		// The chart's own one-pair guard will report a malformed selector; the
+		// preflight only owns the "no matching node" case.
+		return nil
+	}
+	var key, val string
+	for k, v := range sel {
+		key = k
+		val, _ = v.(string)
+	}
+
+	labeled, err := exec.CommandContext(ctx, "kubectl", "get", "nodes",
+		"-l", key+"="+val, "-o", "name").Output()
+	if err != nil {
+		return fmt.Errorf("kubectl get nodes -l %s=%s: %w", key, val, err)
+	}
+	if strings.TrimSpace(string(labeled)) == "" {
+		return fmt.Errorf("no node is labelled %s=%s, so the CDS pod cannot schedule (image policy pins it there). Label one: kubectl label node <node> %s=%s", key, val, key, val)
+	}
+	return nil
+}
+
+// nestedMap walks map keys and returns the map[string]any at the path.
+func nestedMap(tree map[string]any, keys ...string) (map[string]any, bool) {
+	cur := tree
+	for _, k := range keys {
+		next, ok := cur[k].(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		cur = next
+	}
+	return cur, true
+}
+
+// stringAtPath walks a dotted path through a decoded YAML tree and returns the
+// string at it, erroring if a segment is missing or the leaf is not a string.
+func stringAtPath(tree map[string]any, path string) (string, error) {
+	var cur any = tree
+	for _, seg := range strings.Split(path, ".") {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return "", fmt.Errorf("path %q: %q is not a mapping", path, seg)
+		}
+		cur, ok = m[seg]
+		if !ok {
+			return "", fmt.Errorf("path %q: missing segment %q", path, seg)
+		}
+	}
+	s, ok := cur.(string)
+	if !ok {
+		return "", fmt.Errorf("path %q: not a string (%T)", path, cur)
+	}
+	return s, nil
 }
 
 var installCmd = &cobra.Command{
@@ -91,12 +192,16 @@ On RKE2 (--distro rke2) the kata-deploy and nri-image-policy DaemonSets carry
 a containerd-prep initContainer that wires up the drop-in import; no node
 preparation is required beyond a running cluster.
 
-With --resolve-digests, each component image tag is resolved to its registry
-digest (via the 'crane' CLI) and pinned, including the CDS digest the
-image-policy floor and render guard require.
+By default each component image tag is resolved to its registry digest (via the
+'crane' CLI) and pinned, including the CDS digest the image-policy floor and
+render guard require, and nriImagePolicy.bootstrapWhitelist.deriveComponents is
+enabled so the resolved images are added to the NRI allowlist. This makes a
+plain install satisfy the floor with no hand-written values. Pass
+--resolve-digests=false when you supply the digests yourself via -f; the
+render guards then require those values.
 
-Requires the 'helm' and 'kubectl' CLIs to be on PATH ('crane' too when
---resolve-digests is set).`,
+Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
+--resolve-digests=false.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if _, err := exec.LookPath("helm"); err != nil {
 			return fmt.Errorf("helm CLI not found on PATH: %w", err)
@@ -112,6 +217,10 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH ('crane' too when
 		defer os.RemoveAll(dir)
 
 		chartPath := filepath.Join(dir, helmchart.ChartRoot)
+		components, err := chartComponents(cmd.Context(), chartPath)
+		if err != nil {
+			return fmt.Errorf("read chart components: %w", err)
+		}
 		imageTag := defaultInstallImageTag(version.Version)
 		helmArgs := []string{
 			"upgrade", "--install", installRelease, chartPath,
@@ -119,13 +228,9 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH ('crane' too when
 		}
 		// Chart has no default image tags; chart images are released in lockstep
 		// with the CLI, so pass the CLI's build version for every component.
-		// Unstamped local builds report "dev"; fall back to the main branch tag
-		// for that bootstrap path because CI does not publish a dev tag. The cds
-		// self-entry (refKey set) shares cds.image's tag and has none of its own.
-		for _, c := range c8sComponents {
-			if c.refKey != "" {
-				continue
-			}
+		// A non-release build has no published image tag and falls back to the
+		// main branch tag (see defaultInstallImageTag).
+		for _, c := range components {
 			helmArgs = append(helmArgs, "--set", c.valuePrefix+".tag="+imageTag)
 		}
 		helmArgs = appendInstallCRDArgs(helmArgs, installCRDs)
@@ -135,7 +240,7 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH ('crane' too when
 		}
 		helmArgs = appendKataInstallArgs(helmArgs, installKata, installKataEnforce)
 		if installResolveDigests {
-			helmArgs, err = appendResolvedDigestArgs(cmd.Context(), helmArgs, imageTag)
+			helmArgs, err = appendResolvedDigestArgs(cmd.Context(), helmArgs, imageTag, components)
 			if err != nil {
 				return err
 			}
@@ -163,6 +268,16 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH ('crane' too when
 		}
 		if installWait {
 			helmArgs = append(helmArgs, "--wait", "--timeout=5m")
+		}
+
+		// Fail fast on the default path if the CDS node is unlabelled, before
+		// mutating the cluster. Skipped when -f is supplied: a custom values
+		// file may disable image policy or change the selector, and the operator
+		// owns node labels in that case.
+		if len(installValues) == 0 {
+			if err := preflightCDSNode(cmd.Context(), chartPath); err != nil {
+				return err
+			}
 		}
 
 		// Only the kata stack ships privileged pods (kata-deploy DaemonSet);
@@ -327,11 +442,11 @@ func craneDigest(ctx context.Context, ref string) (string, error) {
 
 // appendResolvedDigestArgs resolves each chart component's repo:tag to its
 // registry digest (via crane) and appends the helm --set flags that pin it.
-func appendResolvedDigestArgs(ctx context.Context, helmArgs []string, tag string) ([]string, error) {
+func appendResolvedDigestArgs(ctx context.Context, helmArgs []string, tag string, components []c8sComponent) ([]string, error) {
 	if _, err := exec.LookPath("crane"); err != nil {
-		return nil, fmt.Errorf("--resolve-digests needs the 'crane' CLI on PATH: %w", err)
+		return nil, fmt.Errorf("digest resolution needs the 'crane' CLI on PATH; install it or pass --resolve-digests=false and supply digests via -f: %w", err)
 	}
-	return buildDigestArgs(helmArgs, tag, func(ref string) (string, error) {
+	return buildDigestArgs(helmArgs, tag, components, func(ref string) (string, error) {
 		digest, err := craneDigest(ctx, ref)
 		if err != nil {
 			return "", err
@@ -345,34 +460,28 @@ func appendResolvedDigestArgs(ctx context.Context, helmArgs []string, tag string
 // its repository and the digest resolved against that repository. Pinning the
 // repository too means an operator's -f override of a repository cannot leave
 // the chart deploying repoA@<digest-of-repoB>: helm gives --set strict
-// precedence over -f, so the repository and digest move together. The cds
-// repository is resolved once and reused for cds.image and nriImagePolicy.cds.image
-// so the two targets cannot diverge. Any resolution failure aborts: a
+// precedence over -f, so the repository and digest move together. cds.image
+// covers both the CDS Deployment and the NRI push-hook / whitelist-seed
+// self-entry, which all read it. Any resolution failure aborts: a
 // partially-pinned floor would let the render guard pass while the served
 // whitelist pointed at the wrong digest. The resolver is injected so the arg
 // assembly is testable without a registry.
-func buildDigestArgs(helmArgs []string, tag string, resolve func(ref string) (string, error)) ([]string, error) {
-	cache := map[string]string{}
-	for _, c := range c8sComponents {
+func buildDigestArgs(helmArgs []string, tag string, components []c8sComponent, resolve func(ref string) (string, error)) ([]string, error) {
+	for _, c := range components {
 		repo := c.repository
-		ref := repo + ":" + tag
-		digest, ok := cache[ref]
-		if !ok {
-			var err error
-			digest, err = resolve(ref)
-			if err != nil {
-				return nil, err
-			}
-			cache[ref] = digest
+		digest, err := resolve(repo + ":" + tag)
+		if err != nil {
+			return nil, err
 		}
 		helmArgs = append(helmArgs,
 			"--set-string", c.valuePrefix+".repository="+repo,
 			"--set-string", c.valuePrefix+".digest="+digest,
 		)
-		if c.refKey != "" {
-			helmArgs = append(helmArgs, "--set-string", c.refKey+"="+repo+"@"+digest)
-		}
 	}
+	// Resolving the component digests is exactly when you want them in the NRI
+	// allowlist, so turn on derivation (off by default in the chart; the
+	// resolve path enables it).
+	helmArgs = append(helmArgs, "--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true")
 	return helmArgs, nil
 }
 
@@ -409,6 +518,6 @@ func init() {
 	installCmd.Flags().StringVar(&installDistro, "distro", "k8s", "host Kubernetes distro: k8s (vanilla/kubeadm) or rke2 — selects containerd config paths for kata and nri-image-policy")
 	installCmd.Flags().BoolVar(&installKata, "kata", false, "install the Kata Containers runtime stack (kata-deploy DaemonSet + RuntimeClasses)")
 	installCmd.Flags().BoolVar(&installKataEnforce, "kata-enforce", false, "enable kata enforcement: inject runtimeClasses into workload pods and reject non-kata RuntimeClasses (implies --kata)")
-	installCmd.Flags().BoolVar(&installResolveDigests, "resolve-digests", false, "resolve each c8s component image tag to its registry digest (via crane) and pin it, including the CDS digest the image-policy floor and render guard require")
+	installCmd.Flags().BoolVar(&installResolveDigests, "resolve-digests", true, "resolve each c8s component image tag to its registry digest (via crane), pin it, and add the resolved images to the NRI allowlist (enables deriveComponents). On by default; pass --resolve-digests=false when supplying digests via -f")
 	rootCmd.AddCommand(installCmd)
 }

@@ -45,15 +45,15 @@ one label key/value pair so both CDS-installer affinity (matching) and
 worker-installer anti-affinity (NotIn) can be derived mechanically.
 */}}
 {{- define "nri-image-policy.cdsNodeKey" -}}
-{{- $sel := .Values.nriImagePolicy.cds.node.selector -}}
+{{- $sel := .Values.cds.node.selector -}}
 {{- if ne (len $sel) 1 -}}
-{{- fail "cds.node.selector must be exactly one key/value pair (e.g. {role: cds-node})" -}}
+{{- fail "cds.node.selector must be exactly one key/value pair (e.g. {role: cds})" -}}
 {{- end -}}
 {{- range $k, $_ := $sel }}{{ $k }}{{ end -}}
 {{- end }}
 
 {{- define "nri-image-policy.cdsNodeValue" -}}
-{{- $sel := .Values.nriImagePolicy.cds.node.selector -}}
+{{- $sel := .Values.cds.node.selector -}}
 {{- range $_, $v := $sel }}{{ $v }}{{ end -}}
 {{- end }}
 

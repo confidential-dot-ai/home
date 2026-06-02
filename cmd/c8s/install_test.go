@@ -3,11 +3,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/lunal-dev/c8s/internal/helmchart"
 )
 
 var errTestResolve = errors.New("simulated resolve failure")
@@ -153,6 +160,18 @@ func TestAppendDistroInstallArgsRejectsUnknownDistro(t *testing.T) {
 	}
 }
 
+// testComponents mirrors the chart's c8sComponents for the resolver tests,
+// which exercise buildDigestArgs without reading a real chart. The chart-read
+// path (chartComponents) is covered separately by TestChartComponentsFromValues.
+var testComponents = []c8sComponent{
+	{"image", "ghcr.io/lunal-dev/c8s-operator"},
+	{"attestationService.image", "ghcr.io/lunal-dev/attestation-service"},
+	{"cds.image", "ghcr.io/lunal-dev/cds"},
+	{"ratlsMesh.image", "ghcr.io/lunal-dev/ratls-mesh"},
+	{"nriImagePolicy.image", "ghcr.io/lunal-dev/nri-image-policy"},
+	{"teeProxy.image", "ghcr.io/lunal-dev/tee-proxy"},
+}
+
 func TestBuildDigestArgsPinsEveryComponent(t *testing.T) {
 	// Deterministic fake resolver: digest derived from the ref so each
 	// component gets a distinct, predictable value.
@@ -175,7 +194,7 @@ func TestBuildDigestArgsPinsEveryComponent(t *testing.T) {
 		return "", nil
 	}
 
-	got, err := buildDigestArgs([]string{"upgrade"}, "v1", resolve)
+	got, err := buildDigestArgs([]string{"upgrade"}, "v1", testComponents, resolve)
 	if err != nil {
 		t.Fatalf("buildDigestArgs: %v", err)
 	}
@@ -195,28 +214,26 @@ func TestBuildDigestArgsPinsEveryComponent(t *testing.T) {
 		"--set-string", "nriImagePolicy.image.digest=sha256:00000000000000000000000000000000000000000000000000000000000000ee",
 		"--set-string", "teeProxy.image.repository=ghcr.io/lunal-dev/tee-proxy",
 		"--set-string", "teeProxy.image.digest=sha256:00000000000000000000000000000000000000000000000000000000000000ff",
-		// cds resolved once; reused for the nri push-hook/seed self-entry, with
-		// repository, digest, and the full repo@digest reference.
-		"--set-string", "nriImagePolicy.cds.image.repository=ghcr.io/lunal-dev/cds",
-		"--set-string", "nriImagePolicy.cds.image.digest=sha256:00000000000000000000000000000000000000000000000000000000000000cc",
-		"--set-string", "nriImagePolicy.cds.image.reference=ghcr.io/lunal-dev/cds@sha256:00000000000000000000000000000000000000000000000000000000000000cc",
+		// Resolving component digests enables their derivation into the NRI allowlist.
+		"--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true",
 	})
 }
 
-// The cds repository is resolved for two value targets; it must be looked up
-// exactly once so the cds Deployment image and the nri self-entry can never
-// diverge.
-func TestBuildDigestArgsResolvesCDSOnce(t *testing.T) {
+// Each component repository is resolved at most once per install (no wasted
+// registry round-trips).
+func TestBuildDigestArgsResolvesEachComponentOnce(t *testing.T) {
 	calls := map[string]int{}
 	resolve := func(ref string) (string, error) {
 		calls[ref]++
 		return "sha256:1111111111111111111111111111111111111111111111111111111111111111", nil
 	}
-	if _, err := buildDigestArgs(nil, "v1", resolve); err != nil {
+	if _, err := buildDigestArgs(nil, "v1", testComponents, resolve); err != nil {
 		t.Fatalf("buildDigestArgs: %v", err)
 	}
-	if got := calls["ghcr.io/lunal-dev/cds:v1"]; got != 1 {
-		t.Fatalf("cds resolved %d times, want 1", got)
+	for ref, n := range calls {
+		if n != 1 {
+			t.Errorf("ref %q resolved %d times, want 1", ref, n)
+		}
 	}
 }
 
@@ -230,8 +247,43 @@ func TestBuildDigestArgsFailsClosedOnResolveError(t *testing.T) {
 		}
 		return "sha256:2222222222222222222222222222222222222222222222222222222222222222", nil
 	}
-	if _, err := buildDigestArgs(nil, "v1", resolve); err == nil {
+	if _, err := buildDigestArgs(nil, "v1", testComponents, resolve); err == nil {
 		t.Fatal("buildDigestArgs ignored a resolver error, want fail-closed")
+	}
+}
+
+// chartComponents reads the component set from the chart's values.yaml; this
+// asserts the parse against the embedded chart so the install-time list cannot
+// silently diverge from what the chart declares.
+func TestChartComponentsFromValues(t *testing.T) {
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skip("helm not on PATH")
+	}
+	dir, err := extractChart()
+	if err != nil {
+		t.Fatalf("extractChart: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	comps, err := chartComponents(context.Background(), filepath.Join(dir, helmchart.ChartRoot))
+	if err != nil {
+		t.Fatalf("chartComponents: %v", err)
+	}
+
+	got := map[string]string{}
+	for _, c := range comps {
+		got[c.valuePrefix] = c.repository
+	}
+	want := map[string]string{
+		"image":                    "ghcr.io/lunal-dev/c8s-operator",
+		"attestationService.image": "ghcr.io/lunal-dev/attestation-service",
+		"cds.image":                "ghcr.io/lunal-dev/cds",
+		"ratlsMesh.image":          "ghcr.io/lunal-dev/ratls-mesh",
+		"nriImagePolicy.image":     "ghcr.io/lunal-dev/nri-image-policy",
+		"teeProxy.image":           "ghcr.io/lunal-dev/tee-proxy",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("chart components = %v, want %v", got, want)
 	}
 }
 

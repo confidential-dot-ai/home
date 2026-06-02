@@ -1,3 +1,34 @@
+## The c8s component image set: the single source the chart and `c8s install`
+## both enumerate from, so adding a component is one edit here.
+##   - valuePath:   dotted path to the component's image object (repository/
+##                  tag/digest live there).
+##   - enabledPath: dotted path to its deploy toggle ("" = always deployed); a
+##                  disabled component is neither derived into the NRI whitelist
+##                  nor coverage-checked.
+##   - cdsExempt:   cds is always seeded via its self-entry (independent of
+##                  deriveComponents), so the fail-closed coverage guard skips it.
+## Consumed by the c8s.components helper (NRI whitelist derivation + render
+## guard) and by `c8s install` (digest resolution, via `helm show values`).
+c8sComponents:
+  - valuePath: image
+    enabledPath: ""
+    cdsExempt: false
+  - valuePath: cds.image
+    enabledPath: ""
+    cdsExempt: true
+  - valuePath: attestationService.image
+    enabledPath: ""
+    cdsExempt: false
+  - valuePath: ratlsMesh.image
+    enabledPath: ratlsMesh.enabled
+    cdsExempt: false
+  - valuePath: nriImagePolicy.image
+    enabledPath: ""
+    cdsExempt: false
+  - valuePath: teeProxy.image
+    enabledPath: teeProxy.enabled
+    cdsExempt: false
+
 ## Operator container image. The same image runs every c8s mode that
 ## doesn't need extra OS bins: controller manager and injected get-cert.
 ## `tag` and `digest` are consumer-supplied — the chart fails to render if
@@ -71,6 +102,16 @@ cds:
   service:
     type: NodePort
     nodePort: 30808
+  ## CDS is a singleton, in-memory trust root reached over a node-local
+  ## NodePort and (with persistence) an RWO volume, so it must land on a
+  ## known node. node.selector pins it; it must be exactly one label key/value
+  ## pair. The default expects that node labelled `role=cds`; override to match
+  ## your cluster. When image policy is enabled, the same selector also drives
+  ## the cds-installer affinity, worker anti-affinity, and push-hook placement.
+  node:
+    selector:
+      role: cds
+    tolerations: []
   logLevel: info
   whitelistDB: /data/whitelist.db
   earIssuer: cds
@@ -461,20 +502,16 @@ nriImagePolicy:
   # relative to other NRI plugins.
   pluginFilename: 10-nri-image-policy
 
-  # CDS coordinates. The chart uses cds.node.selector three ways:
-  # cds-installer affinity (In), worker-installer anti-affinity (NotIn),
-  # push hook nodeSelector. Set to whatever label the CDS chart uses to
-  # pin its Pod.
+  # CDS coordinates. The node selector that pins CDS lives at top-level
+  # cds.node.selector; the image policy reuses it for cds-installer affinity
+  # (In), worker-installer anti-affinity (NotIn), and the push-hook nodeSelector.
+  # The CDS image admitted by the push-hook and the seed self-entry comes from
+  # the top-level cds.image (digest required when image policy is on), so there
+  # is no separate CDS image to pin here.
   cds:
-    image:
-      digest: ""
-      reference: ""
     ## Host-process NRI pulls through the chart-managed CDS NodePort and
     ## verifies CDS RA-TLS instead of trusting cluster DNS or ClusterIP routing.
     url: "https://127.0.0.1:30808"
-    node:
-      selector: {}
-      tolerations: []
   policy:
     mode: audit  # audit | fail-closed
     enforceExisting: true
@@ -540,16 +577,24 @@ nriImagePolicy:
   #      before CDS is reachable.
   #   2. Rendered into CDS's --whitelist-seed (templates/cds.yaml), so CDS's
   #      served /whitelist is non-empty on the first worker pull.
-  # Must allow everything needed to reach a Ready CDS on the CDS node and a
-  # working kubelet on every node: attestation-service, kube-proxy, coredns,
-  # pause/sandbox, CNI, the plugin/installer image. The CDS image self-entry is
-  # added to the served seed automatically from nriImagePolicy.cds.image
-  # (digest + reference), so it need not be listed here.
-  #
-  # Operator-supplied via values or `-f` (resolve digests with crane/skopeo).
+  # `digests` is the floor: everything needed to reach a Ready CDS on the CDS
+  # node and a working kubelet on every node — the c8s component images plus
+  # kube-proxy, coredns, pause/sandbox, CNI — supplied via values or `-f`
+  # (resolve digests with crane/skopeo). In production you pin the full set
+  # here; deriveComponents below is a demo convenience for the c8s images only.
   #
   # Format: map of "sha256:<hex>" -> "<image reference>"
   bootstrapWhitelist:
+    # deriveComponents: a demo convenience (off by default, like
+    # `c8s install --resolve-digests`, which turns it on). When true, the c8s
+    # component images this chart installs (operator, cds, attestation-service,
+    # ratls-mesh, nri-image-policy, tee-proxy) are auto-added to the floor
+    # whenever their image.digest is set, so a digest-pinned install self-allows
+    # the c8s images without listing them in `digests`. It never covers the
+    # non-c8s system images, so production installs pin the full floor in
+    # `digests` instead. Entries in `digests` override a derived entry for the
+    # same sha256.
+    deriveComponents: false
     digests: {}
     # sha256:abc123...: "ghcr.io/lunal-dev/cds:v0.1.0"
 

@@ -23,11 +23,11 @@ spec:
         sidecar.istio.io/inject: "false"
     spec:
       restartPolicy: OnFailure
-      {{- with .Values.nriImagePolicy.cds.node.selector }}
+      {{- with .Values.cds.node.selector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.nriImagePolicy.cds.node.tolerations }}
+      {{- with .Values.cds.node.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -44,7 +44,7 @@ spec:
               value: {{ printf "%s/%s" .Values.nriImagePolicy.hostPaths.runtimeDir .Values.nriImagePolicy.healthSocketName | quote }}
             - name: PAYLOAD
               value: |-
-                {"version":"1","digests":{ {{ required "cds.image.digest is required" .Values.nriImagePolicy.cds.image.digest | quote }}: {{ required "cds.image.reference is required" .Values.nriImagePolicy.cds.image.reference | quote }} }}
+                {"version":"1","digests":{ {{ $d := required "cds.image.digest is required" .Values.cds.image.digest }}{{ $d | quote }}: {{ printf "%s@%s" .Values.cds.image.repository $d | quote }} }}
             - name: MAX_TIME
               value: {{ .Values.nriImagePolicy.push.curlMaxTime | quote }}
             - name: RETRIES

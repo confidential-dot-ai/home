@@ -826,6 +826,32 @@ func TestChartManagedRATLSServiceTargetPortsMatchContainerPorts(t *testing.T) {
 	}
 }
 
+// TestChartCDSPinnedToCDSNode proves the CDS Deployment is pinned to the
+// cds.node.selector node. CDS is a singleton trust root reached over a
+// node-local NodePort and (with persistence) an RWO volume, so it must land on
+// a known node — independent of image policy. When policy is on, that node is
+// also where the push-mode plugin and push-hook seed the CDS digest.
+func TestChartCDSPinnedToCDSNode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"image policy on (default)", nil},
+		{"image policy off", []string{"--set", "nriImagePolicy.enabled=false"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := helmTemplate(t, tc.args...)
+			if err != nil {
+				t.Fatalf("helm template: %v\n%s", err, out)
+			}
+			sel := renderedDeployment(t, out, "c8s-cds").Spec.Template.Spec.NodeSelector
+			if got := sel["role"]; got != "cds" {
+				t.Errorf("CDS nodeSelector[role] = %q, want %q (CDS must pin to a known node)", got, "cds")
+			}
+		})
+	}
+}
+
 // TestChartOperatorDialsTrustRootOverHTTPS proves the operator injects get-cert
 // with --cds-url over https://, not http://. A regression to http:// would
 // silently turn off the bootstrap-channel MITM defence (H1).
@@ -2173,9 +2199,7 @@ func helmTemplate(t *testing.T, args ...string) (string, error) {
 		"--set", "teeProxy.image.tag=dev",
 		"--set", "nriImagePolicy.image.tag=dev",
 		"--set", "nriImagePolicy.image.digest=sha256:aaaa000000000000000000000000000000000000000000000000000000000000",
-		"--set", "nriImagePolicy.cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001",
-		"--set", "nriImagePolicy.cds.image.reference=ghcr.io/lunal-dev/cds:dev",
-		"--set", "nriImagePolicy.cds.node.selector.role=cds-node",
+		"--set", "cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001",
 	}
 	cmd := exec.Command("helm", append(base, args...)...)
 	cmd.Dir = "."
@@ -2782,11 +2806,200 @@ func TestChartSeedsCDSWhitelistFromFloor(t *testing.T) {
 	if got := seed.Digests[floorDigest]; got != "ghcr.io/x/coredns:v1" {
 		t.Errorf("seed floor digest = %q, want ghcr.io/x/coredns:v1\nseed: %v", got, seed.Digests)
 	}
-	// The CDS self-entry, taken from nriImagePolicy.cds.image (set by the test
-	// harness to digest ...0001 / reference ghcr.io/lunal-dev/cds:dev).
+	// The CDS self-entry, derived from cds.image (set by the test harness to
+	// digest ...0001); the reference is repository@digest.
 	const cdsDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000001"
-	if got := seed.Digests[cdsDigest]; got != "ghcr.io/lunal-dev/cds:dev" {
-		t.Errorf("seed CDS self-entry = %q, want ghcr.io/lunal-dev/cds:dev\nseed: %v", got, seed.Digests)
+	const cdsRef = "ghcr.io/lunal-dev/cds@" + cdsDigest
+	if got := seed.Digests[cdsDigest]; got != cdsRef {
+		t.Errorf("seed CDS self-entry = %q, want %q\nseed: %v", got, cdsRef, seed.Digests)
+	}
+}
+
+// TestChartDerivesComponentDigestsIntoWhitelist proves that when the c8s
+// component images are digest-pinned, each is auto-derived into the NRI
+// whitelist seed with a repo@digest reference matching the rendered pod image —
+// so a digest-pinned install self-allows the c8s components it deploys (#51).
+func TestChartDerivesComponentDigestsIntoWhitelist(t *testing.T) {
+	const (
+		opD  = "sha256:00000000000000000000000000000000000000000000000000000000000000a1"
+		asD  = "sha256:00000000000000000000000000000000000000000000000000000000000000a2"
+		cdsD = "sha256:00000000000000000000000000000000000000000000000000000000000000a3"
+		rmD  = "sha256:00000000000000000000000000000000000000000000000000000000000000a4"
+		nriD = "sha256:00000000000000000000000000000000000000000000000000000000000000a5"
+		tpD  = "sha256:00000000000000000000000000000000000000000000000000000000000000a6"
+	)
+	out, err := helmTemplate(t,
+		"--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true",
+		"--set-string", "image.digest="+opD,
+		"--set-string", "attestationService.image.digest="+asD,
+		"--set-string", "cds.image.digest="+cdsD,
+		"--set-string", "ratlsMesh.image.digest="+rmD,
+		"--set-string", "nriImagePolicy.image.digest="+nriD,
+		"--set-string", "teeProxy.image.digest="+tpD,
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+
+	cm := renderedConfigMap(t, out, "c8s-cds-whitelist-seed")
+	seed, err := pkgwhitelist.ParseJSON([]byte(cm.Data["whitelist-seed.json"]))
+	if err != nil {
+		t.Fatalf("seed JSON does not parse: %v\n%s", err, cm.Data["whitelist-seed.json"])
+	}
+
+	// Each derived entry's reference must be repo@digest for the image the chart
+	// actually deploys (#51: refs match the rendered pod images).
+	want := map[string]string{
+		opD:  "ghcr.io/lunal-dev/c8s-operator@" + opD,
+		asD:  "ghcr.io/lunal-dev/attestation-service@" + asD,
+		cdsD: "ghcr.io/lunal-dev/cds@" + cdsD,
+		rmD:  "ghcr.io/lunal-dev/ratls-mesh@" + rmD,
+		nriD: "ghcr.io/lunal-dev/nri-image-policy@" + nriD,
+		tpD:  "ghcr.io/lunal-dev/tee-proxy@" + tpD,
+	}
+	for digest, ref := range want {
+		if got := seed.Digests[digest]; got != ref {
+			t.Errorf("derived entry %s = %q, want %q\nseed: %v", digest, got, ref, seed.Digests)
+		}
+	}
+
+	// The same derived floor must reach the worker plugin's always_allow,
+	// decoded as typed config (not substring-matched).
+	worker := bootConfigFromInstaller(t, out, "c8s-nri-image-policy-worker")
+	for digest, ref := range want {
+		if got := worker.Whitelist.AlwaysAllow[digest]; got != ref {
+			t.Errorf("worker always_allow[%s] = %q, want %q\nalways_allow: %v", digest, got, ref, worker.Whitelist.AlwaysAllow)
+		}
+	}
+}
+
+// installerBootConfig is a typed view of the image-policy.yaml the installer
+// writes. It mirrors the fields of the plugin's own config
+// (internal/cmds/nri-image-policy/config.go, which is unexported) needed by the
+// chart tests, so assertions are against typed fields rather than substrings.
+type installerBootConfig struct {
+	Whitelist struct {
+		AlwaysAllow map[string]string `yaml:"always_allow"`
+		Pull        struct {
+			URL string `yaml:"url"`
+		} `yaml:"pull"`
+		Push struct {
+			PersistPath string `yaml:"persist_path"`
+		} `yaml:"push"`
+	} `yaml:"whitelist"`
+	Policy struct {
+		Mode string `yaml:"mode"`
+	} `yaml:"policy"`
+}
+
+// bootConfigHeredocRE captures the image-policy.yaml body the installer writes
+// via a `write_file ... <<'IMAGE_POLICY_EOF' ... IMAGE_POLICY_EOF` heredoc.
+var bootConfigHeredocRE = regexp.MustCompile(`(?s)<<'IMAGE_POLICY_EOF'\n(.*?)\nIMAGE_POLICY_EOF`)
+
+// bootConfigFromInstaller decodes the image-policy.yaml an installer DaemonSet
+// writes into a typed installerBootConfig. It uses gopkg.in/yaml.v3 — the same
+// library the plugin's loadConfig uses — which (unlike sigs.k8s.io/yaml's JSON
+// path) rejects the duplicate mapping keys that would crash the plugin at
+// startup. (KnownFields is intentionally NOT set: the goal is duplicate-key
+// detection plus typed field access, not mirroring the plugin's full schema.)
+func bootConfigFromInstaller(t *testing.T, manifest, dsName string) installerBootConfig {
+	t.Helper()
+	ds := renderedDaemonSet(t, manifest, dsName)
+	script := strings.Join(containerArgs(t, &ds, "install"), "\n")
+	m := bootConfigHeredocRE.FindStringSubmatch(script)
+	if m == nil {
+		t.Fatalf("install script for %s has no IMAGE_POLICY_EOF heredoc\n%s", dsName, script)
+	}
+	var cfg installerBootConfig
+	if err := yaml.Unmarshal([]byte(m[1]), &cfg); err != nil {
+		t.Fatalf("plugin would reject its boot config for %s (yaml.v3): %v\n%s", dsName, err, m[1])
+	}
+	return cfg
+}
+
+// TestChartBootConfigParsesAsPluginYAML guards the regression where the
+// installer self-image was emitted both explicitly and via the derived floor,
+// producing a duplicate always_allow key. yaml.v3 (the plugin's loader) rejects
+// duplicate keys, so the plugin would crash-loop. Decode each archetype's boot
+// config exactly as the plugin does, and assert the archetype-specific mode.
+func TestChartBootConfigParsesAsPluginYAML(t *testing.T) {
+	out, err := helmTemplate(t,
+		// deriveComponents on (and a second component digest) so the installer
+		// image appears in always_allow both explicitly and via derivation —
+		// the exact shape of the duplicate-key regression this guards.
+		"--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true",
+		"--set-string", "cds.image.digest=sha256:00000000000000000000000000000000000000000000000000000000000000c5",
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	// Worker pulls from CDS; the CDS-node accepts pushes. Asserting the
+	// mutually-exclusive field per archetype confirms the typed decode landed
+	// on the right document, not just that some YAML parsed.
+	if wl := bootConfigFromInstaller(t, out, "c8s-nri-image-policy-worker").Whitelist; wl.Pull.URL == "" || wl.Push.PersistPath != "" {
+		t.Errorf("worker boot config should configure pull, not push: pull.url=%q push.persist_path=%q", wl.Pull.URL, wl.Push.PersistPath)
+	}
+	if wl := bootConfigFromInstaller(t, out, "c8s-nri-image-policy-cds").Whitelist; wl.Push.PersistPath == "" || wl.Pull.URL != "" {
+		t.Errorf("cds boot config should configure push, not pull: pull.url=%q push.persist_path=%q", wl.Pull.URL, wl.Push.PersistPath)
+	}
+}
+
+// A fleet-supplied bootstrapWhitelist.digests entry must override a derived
+// entry for the same sha256 (fleet values win).
+func TestChartFleetWhitelistOverridesDerived(t *testing.T) {
+	const cdsD = "sha256:00000000000000000000000000000000000000000000000000000000000000a3"
+	out, err := helmTemplate(t,
+		// deriveComponents on so cds.image.digest produces a derived entry for
+		// the fleet `digests` value to override.
+		"--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true",
+		"--set-string", "cds.image.digest="+cdsD,
+		"--set-string", "nriImagePolicy.bootstrapWhitelist.digests."+cdsD+"=mirror.local/cds@"+cdsD,
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	cm := renderedConfigMap(t, out, "c8s-cds-whitelist-seed")
+	seed, err := pkgwhitelist.ParseJSON([]byte(cm.Data["whitelist-seed.json"]))
+	if err != nil {
+		t.Fatalf("seed JSON does not parse: %v", err)
+	}
+	if got := seed.Digests[cdsD]; got != "mirror.local/cds@"+cdsD {
+		t.Errorf("fleet override lost: %s = %q, want mirror.local/cds@%s\nseed: %v", cdsD, got, cdsD, seed.Digests)
+	}
+}
+
+// deriveComponents is OFF by default (a demo convenience, like
+// --resolve-digests): the seed carries only the CDS push-hook self-entry and
+// operator-supplied digests, not the auto-derived component images. Covers both
+// the default (unset) and an explicit =false.
+func TestChartDeriveComponentsDefaultsOff(t *testing.T) {
+	const opD = "sha256:00000000000000000000000000000000000000000000000000000000000000a1"
+	const cdsDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"default unset", []string{"--set-string", "image.digest=" + opD}},
+		{"explicit false", []string{"--set-string", "image.digest=" + opD, "--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=false"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := helmTemplate(t, tc.args...)
+			if err != nil {
+				t.Fatalf("helm template: %v\n%s", err, out)
+			}
+			cm := renderedConfigMap(t, out, "c8s-cds-whitelist-seed")
+			seed, err := pkgwhitelist.ParseJSON([]byte(cm.Data["whitelist-seed.json"]))
+			if err != nil {
+				t.Fatalf("seed JSON does not parse: %v", err)
+			}
+			if _, ok := seed.Digests[opD]; ok {
+				t.Errorf("operator digest derived without deriveComponents: %v", seed.Digests)
+			}
+			// The CDS self-entry (push-hook) is always present, independent of derivation.
+			if _, ok := seed.Digests[cdsDigest]; !ok {
+				t.Errorf("CDS push-hook self-entry missing: %v", seed.Digests)
+			}
+		})
 	}
 }
 
@@ -2838,16 +3051,48 @@ func TestChartOmitsCDSSeedWhenImagePolicyDisabled(t *testing.T) {
 }
 
 // The CDS image must be admittable by digest in the floor/seed; without
-// nriImagePolicy.cds.image.digest the image policy would deny CDS on its own
-// node. The chart fails the render with a structured marker rather than shipping
-// that deadlock.
+// cds.image.digest the image policy would deny CDS on its own node. The chart
+// fails the render with a structured marker rather than shipping that deadlock.
 func TestChartRejectsImagePolicyWithoutCDSDigest(t *testing.T) {
-	out, err := helmTemplate(t, "--set-string", "nriImagePolicy.cds.image.digest=")
+	out, err := helmTemplate(t, "--set-string", "cds.image.digest=")
 	if err == nil {
 		t.Fatalf("helm template succeeded without cds image digest, want guard failure\n%s", out)
 	}
 	if kind := parseValidationErrorKind(out); kind != "cds_image_digest" {
 		t.Fatalf("validation error kind = %q, want cds_image_digest\n%s", kind, out)
+	}
+}
+
+// In fail-closed mode with deriveComponents off, a digest-pinned component
+// whose digest is absent from bootstrapWhitelist.digests would be denied on its
+// own node, so the chart fails the render. cds.image is exempt (always seeded).
+func TestChartRejectsUncoveredComponentInFailClosed(t *testing.T) {
+	const nriD = "sha256:aaaa000000000000000000000000000000000000000000000000000000000000"
+
+	// Uncovered: nriImagePolicy.image is digest-pinned (by the harness) but not
+	// in digests, deriveComponents off, fail-closed -> guard fires.
+	out, err := helmTemplate(t, "--set", "nriImagePolicy.policy.mode=fail-closed")
+	if err == nil {
+		t.Fatalf("helm template succeeded with an uncovered component in fail-closed, want guard failure\n%s", out)
+	}
+	if kind := parseValidationErrorKind(out); kind != "uncovered_component_digest" {
+		t.Fatalf("validation error kind = %q, want uncovered_component_digest\n%s", kind, out)
+	}
+
+	// Covered three ways: each must render.
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"audit mode is non-blocking", []string{"--set", "nriImagePolicy.policy.mode=audit"}},
+		{"deriveComponents covers it", []string{"--set", "nriImagePolicy.policy.mode=fail-closed", "--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true"}},
+		{"digest listed in floor", []string{"--set", "nriImagePolicy.policy.mode=fail-closed", "--set-string", "nriImagePolicy.bootstrapWhitelist.digests." + nriD + "=ghcr.io/lunal-dev/nri-image-policy@" + nriD}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if out, err := helmTemplate(t, tc.args...); err != nil {
+				t.Fatalf("helm template should render: %v\n%s", err, out)
+			}
+		})
 	}
 }
 
