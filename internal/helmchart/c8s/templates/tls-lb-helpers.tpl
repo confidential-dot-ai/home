@@ -179,14 +179,21 @@ shared knobs live on tlsLb.cors. Args: dict { "cors": route.cors, "label": ... }
 {{- end -}}
 
 {{/*
-Render the http-level `map $http_origin $cors_origin {...}` block driven by
-tlsLb.cors.allowOrigins. Emitted only when CORS is enabled. Caller nindents
-into the nginx `http {}` context.
+Render the http-level CORS maps. `$cors_origin` echoes a matching request
+Origin from tlsLb.cors.allowOrigins. The remaining maps implement
+upstream-pass-through: when the upstream emits Access-Control-Allow-Origin
+we adopt its full CORS header set verbatim (so browsers never see duplicate
+headers); otherwise we fall back to tls-lb's configured values. Emitted only
+when CORS is enabled. Caller nindents into the nginx `http {}` context.
 */}}
 {{- define "tls-lb.corsMap" -}}
 {{- $cors := default dict .Values.tlsLb.cors -}}
 {{- if default false $cors.enabled -}}
-{{- $origins := default (list) $cors.allowOrigins }}
+{{- $origins := default (list) $cors.allowOrigins -}}
+{{- $methods := join ", " (default (list "GET" "POST" "OPTIONS") $cors.allowMethods) -}}
+{{- $headers := join ", " (default (list "Authorization" "Content-Type") $cors.allowHeaders) -}}
+{{- $exposeHeaders := default (list) $cors.exposeHeaders -}}
+{{- $credentials := ternary "true" "" (default false $cors.allowCredentials) }}
 map $http_origin $cors_origin {
 {{- if has "*" $origins }}
     default "*";
@@ -197,20 +204,58 @@ map $http_origin $cors_origin {
 {{- end }}
 {{- end }}
 }
+
+map $upstream_http_access_control_allow_origin $cors_passthrough {
+    default "0";
+    "~.+"   "1";
+}
+
+map $cors_passthrough $cors_out_origin {
+    "0" $cors_origin;
+    "1" $upstream_http_access_control_allow_origin;
+}
+
+map $cors_passthrough $cors_out_methods {
+    "0" "{{ $methods }}";
+    "1" $upstream_http_access_control_allow_methods;
+}
+
+map $cors_passthrough $cors_out_headers {
+    "0" "{{ $headers }}";
+    "1" $upstream_http_access_control_allow_headers;
+}
+
+map $cors_passthrough $cors_out_credentials {
+    "0" "{{ $credentials }}";
+    "1" $upstream_http_access_control_allow_credentials;
+}
+
+map $cors_passthrough $cors_out_expose {
+    "0" "{{ if $exposeHeaders }}{{ join ", " $exposeHeaders }}{{ end }}";
+    "1" $upstream_http_access_control_expose_headers;
+}
 {{- end -}}
 {{- end -}}
 
 {{/*
-Render per-location CORS directives, including a 204 short-circuit for
-preflight OPTIONS requests. Caller passes the effective CORS dict and
-guarantees CORS is enabled. Caller nindents into a `location {}` block.
+Render per-location CORS directives. Non-preflight responses go through
+$cors_out_* — either the upstream's CORS headers (passed through unchanged)
+or tls-lb's configured ones, never both. proxy_hide_header drops the
+upstream copies so the maps' re-emitted version is the only one on the
+wire. Preflight OPTIONS short-circuits at nginx with tls-lb's configured
+policy. Caller passes the effective CORS dict and guarantees CORS is
+enabled. Caller nindents into a `location {}` block.
 */}}
 {{- define "tls-lb.corsLocationDirectives" -}}
 {{- $cors := default dict . -}}
 {{- $methods := join ", " (default (list "GET" "POST" "OPTIONS") $cors.allowMethods) -}}
 {{- $headers := join ", " (default (list "Authorization" "Content-Type") $cors.allowHeaders) -}}
-{{- $exposeHeaders := default (list) $cors.exposeHeaders -}}
 {{- $maxAge := default 600 $cors.maxAge }}
+proxy_hide_header Access-Control-Allow-Origin;
+proxy_hide_header Access-Control-Allow-Methods;
+proxy_hide_header Access-Control-Allow-Headers;
+proxy_hide_header Access-Control-Allow-Credentials;
+proxy_hide_header Access-Control-Expose-Headers;
 if ($request_method = 'OPTIONS') {
     add_header Access-Control-Allow-Origin  $cors_origin always;
     add_header Access-Control-Allow-Methods "{{ $methods }}" always;
@@ -222,15 +267,11 @@ if ($request_method = 'OPTIONS') {
     add_header Content-Length 0;
     return 204;
 }
-add_header Access-Control-Allow-Origin  $cors_origin always;
-add_header Access-Control-Allow-Methods "{{ $methods }}" always;
-add_header Access-Control-Allow-Headers "{{ $headers }}" always;
-{{- if default false $cors.allowCredentials }}
-add_header Access-Control-Allow-Credentials "true" always;
-{{- end }}
-{{- if $exposeHeaders }}
-add_header Access-Control-Expose-Headers "{{ join ", " $exposeHeaders }}" always;
-{{- end }}
+add_header Access-Control-Allow-Origin      $cors_out_origin always;
+add_header Access-Control-Allow-Methods     $cors_out_methods always;
+add_header Access-Control-Allow-Headers     $cors_out_headers always;
+add_header Access-Control-Allow-Credentials $cors_out_credentials always;
+add_header Access-Control-Expose-Headers    $cors_out_expose always;
 {{- end -}}
 
 {{/*

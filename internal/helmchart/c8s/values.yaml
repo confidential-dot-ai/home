@@ -765,10 +765,16 @@ tlsLb:
   # each entry in `routes`) and to the discovery endpoints (`discovery.path`,
   # `discovery.cdsCertPath`, `discovery.meshCAPath`) so browser clients can
   # bootstrap the attested TLS handshake. The internal /healthz endpoint is
-  # never affected. Preflight `OPTIONS` requests are short-circuited at nginx
-  # with a 204 response. Per-route opt-out: set `routes[i].cors.enabled: false`
-  # to disable CORS on that route while leaving the global block enabled. Only
-  # the `enabled` key is honored on a per-route cors block.
+  # never affected. Upstream pass-through: if the upstream emits
+  # Access-Control-Allow-Origin on a non-preflight response, tls-lb forwards
+  # the upstream's CORS header set verbatim and suppresses its own — browsers
+  # never see duplicate headers. If the upstream emits no CORS headers,
+  # tls-lb injects the configured ones below. Preflight `OPTIONS` requests
+  # are short-circuited at nginx with a 204 response using tls-lb's policy
+  # (they never reach the upstream). Per-route opt-out: set
+  # `routes[i].cors.enabled: false` to disable CORS on that route while
+  # leaving the global block enabled. Only the `enabled` key is honored on a
+  # per-route cors block.
   cors:
     enabled: false
     # -- Allowed Origin values. Use ["*"] to allow any origin (cannot be
