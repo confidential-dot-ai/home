@@ -119,6 +119,106 @@ https://{{ include "c8s.cdsName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.cd
 {{- end -}}
 
 {{/*
+c8s.getCertContainers renders the c8s-init-cert (run-once) + c8s-renew-cert
+(restartPolicy: Always sidecar) get-cert containers a chart-owned component
+uses to self-provision a CDS-issued cert, instead of depending on webhook
+injection. Both run the same c8s image and talk to CDS over RA-TLS.
+
+Caller passes a dict:
+  root          - the root context (for c8s.image / c8s.cdsURL / c8s.attestationApiURL)
+  san           - --san for the cert (the workload identity / Service DNS name)
+  certOut       - --out path (also --out for the renew container)
+  keyOut        - --key-out path for init; --key for renew
+  volume        - name of the writable cert volume to mount
+  mountPath     - where to mount it (the cert dir)
+  renewInterval - --renew-interval for the sidecar
+  keyMode       - --key-mode (octal)
+  runAsUser/runAsGroup/runAsNonRoot - securityContext (match the consumer so the
+                  shared cert volume is readable by it)
+  reloadNginx   - "true"/"false": SIGHUP nginx on renewal (tls-lb only)
+  extraArgs     - optional list of additional get-cert args (e.g. discovery),
+                  applied to both containers
+  renewExtraArgs- optional list applied to the renew container only (e.g. tls-lb
+                  --reload-watch)
+  extraMounts   - optional rendered volumeMount YAML, applied to both
+  renewExtraMounts - optional rendered volumeMount YAML, renew container only
+*/}}
+{{- define "c8s.getCertContainers" -}}
+{{- $root := .root -}}
+- name: c8s-init-cert
+  image: {{ include "c8s.image" $root }}
+  imagePullPolicy: IfNotPresent
+  args:
+    - get-cert
+    - --cds-url={{ include "c8s.cdsURL" $root }}
+    - --attestation-api-url={{ include "c8s.attestationApiURL" $root }}
+    - --san={{ .san }}
+    - --out={{ .certOut }}
+    - --key-out={{ .keyOut }}
+    - --key-mode={{ default "0640" .keyMode }}
+    {{- range .extraArgs }}
+    - {{ . }}
+    {{- end }}
+  volumeMounts:
+    - name: {{ .volume }}
+      mountPath: {{ .mountPath }}
+    {{- with .extraMounts }}
+    {{- . | nindent 4 }}
+    {{- end }}
+  securityContext:
+    {{- include "c8s.getCertSecurityContext" . | nindent 4 }}
+- name: c8s-renew-cert
+  image: {{ include "c8s.image" $root }}
+  imagePullPolicy: IfNotPresent
+  restartPolicy: Always
+  args:
+    - get-cert
+    - --cds-url={{ include "c8s.cdsURL" $root }}
+    - --attestation-api-url={{ include "c8s.attestationApiURL" $root }}
+    - --san={{ .san }}
+    - --key={{ .keyOut }}
+    - --out={{ .certOut }}
+    - --renew-interval={{ .renewInterval }}
+    - --reload-nginx={{ default "false" .reloadNginx }}
+    - --continue-on-initial-error
+    {{- range .renewExtraArgs }}
+    - {{ . }}
+    {{- end }}
+    {{- range .extraArgs }}
+    - {{ . }}
+    {{- end }}
+  volumeMounts:
+    - name: {{ .volume }}
+      mountPath: {{ .mountPath }}
+    {{- with .extraMounts }}
+    {{- . | nindent 4 }}
+    {{- end }}
+    {{- with .renewExtraMounts }}
+    {{- . | nindent 4 }}
+    {{- end }}
+  securityContext:
+    {{- include "c8s.getCertSecurityContext" . | nindent 4 }}
+{{- end -}}
+
+{{/*
+SecurityContext for the get-cert containers: runs as the consumer's UID/GID so
+the shared cert volume is writable, locked down otherwise. dict keys:
+runAsUser, runAsGroup, runAsNonRoot.
+*/}}
+{{- define "c8s.getCertSecurityContext" -}}
+allowPrivilegeEscalation: false
+readOnlyRootFilesystem: true
+runAsNonRoot: {{ .runAsNonRoot }}
+runAsUser: {{ .runAsUser }}
+runAsGroup: {{ .runAsGroup }}
+capabilities:
+  drop:
+    - ALL
+seccompProfile:
+  type: RuntimeDefault
+{{- end -}}
+
+{{/*
   c8s.cdsDnsSanPattern is the default --dns-san-pattern CDS enforces when
   cds.dnsSanPattern is unset: a regex matching any in-cluster Service DNS
   name (<name>.<namespace>.svc). CDS full-matches it, so workloads in any

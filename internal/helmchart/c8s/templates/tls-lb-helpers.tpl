@@ -67,6 +67,20 @@ Derive an SNI/verification name from a host:port upstream address.
 {{- end -}}
 
 {{/*
+Default SNI/verification name for the upstream. Normally the address host, but
+for the chart-managed tee-proxy (whose CDS cert SAN is its Service FQDN) it
+returns <tee-proxy.fullname>.<namespace>.svc so verify=true matches the SAN.
+*/}}
+{{- define "tls-lb.upstreamServerName" -}}
+{{- $host := include "tls-lb.serverNameFromAddress" .Values.tlsLb.upstream.address -}}
+{{- if eq $host (include "tee-proxy.fullname" .) -}}
+{{- printf "%s.%s.svc" $host .Release.Namespace -}}
+{{- else -}}
+{{- $host -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Validate the proxy TLS settings for an HTTPS backend (the default upstream or a
 route backend). Fails the render on values that would be silently ignored or
 break out of the generated nginx directives. Args: protocol, tls (dict),
@@ -308,10 +322,9 @@ cert under tlsMountPath.
 {{- end -}}
 
 {{/*
-Discovery + verbose args shared by both get-cert containers. tls-lb owns its
-own cert provisioning: the chart renders the same get-cert containers the
-admission webhook would inject, driven directly by chart values instead of
-round-tripping through pod annotations.
+tls-lb's discovery + verbose get-cert args, as a YAML list (one arg per line)
+for c8s.getCertContainers' extraArgs. tls-lb owns its own cert provisioning,
+so it adds discovery output and verbose logging to the shared get-cert flow.
 */}}
 {{- define "tls-lb.getCertCommonArgs" -}}
 {{- if .Values.tlsLb.discovery.enabled }}
@@ -328,89 +341,38 @@ round-tripping through pod annotations.
 {{- end }}
 
 {{/*
-SecurityContext shared by the get-cert containers. Runs as nginx's UID/GID so
-the shared tls-certs emptyDir is writable by both, with a locked-down posture
-otherwise (no privilege escalation, read-only root, all caps dropped).
-*/}}
-{{- define "tls-lb.getCertSecurityContext" -}}
-allowPrivilegeEscalation: false
-readOnlyRootFilesystem: true
-runAsNonRoot: {{ .Values.tlsLb.nginx.runAsNonRoot }}
-runAsUser: {{ .Values.tlsLb.nginx.runAsUser }}
-runAsGroup: {{ .Values.tlsLb.nginx.runAsGroup }}
-capabilities:
-  drop:
-    - ALL
-seccompProfile:
-  type: RuntimeDefault
-{{- end }}
-
-{{/*
 get-cert init + renew containers. c8s-init-cert obtains the leaf once and
 exits; c8s-renew-cert runs as a native sidecar (restartPolicy: Always) that
 reuses the key and SIGHUPs nginx on renewal. Caller nindents into the Pod
 spec's initContainers list.
 */}}
 {{- define "tls-lb.getCertContainers" -}}
-{{- $certPem := printf "%s/cert.pem" .Values.tlsLb.tlsMountPath -}}
-{{- $keyPem := printf "%s/key.pem" .Values.tlsLb.tlsMountPath -}}
-- name: c8s-init-cert
-  image: {{ include "c8s.image" . }}
-  imagePullPolicy: IfNotPresent
-  args:
-    - get-cert
-    - --cds-url={{ include "c8s.cdsURL" . }}
-    - --attestation-api-url={{ include "c8s.attestationApiURL" . }}
-    - --san={{ include "tls-lb.san" . }}
-    - --out={{ $certPem }}
-    - --key-out={{ $keyPem }}
-    - --key-mode=0640
-    {{- include "tls-lb.getCertCommonArgs" . | nindent 4 }}
-  volumeMounts:
-    {{- include "tls-lb.getCertVolumeMounts" (dict "ctx" . "reloadWatch" false) | nindent 4 }}
-  securityContext:
-    {{- include "tls-lb.getCertSecurityContext" . | nindent 4 }}
-- name: c8s-renew-cert
-  image: {{ include "c8s.image" . }}
-  imagePullPolicy: IfNotPresent
-  restartPolicy: Always
-  args:
-    - get-cert
-    - --cds-url={{ include "c8s.cdsURL" . }}
-    - --attestation-api-url={{ include "c8s.attestationApiURL" . }}
-    - --san={{ include "tls-lb.san" . }}
-    - --key={{ $keyPem }}
-    - --out={{ $certPem }}
-    - --renew-interval={{ .Values.tlsLb.certProvisioning.renewInterval }}
-    - --reload-nginx=true
-    - --continue-on-initial-error
-    {{- if .Values.tlsLb.publicTLS.secretName }}
-    - --reload-watch={{ include "tls-lb.publicCertPath" . }}
-    - --reload-watch={{ include "tls-lb.publicKeyPath" . }}
-    {{- end }}
-    {{- include "tls-lb.getCertCommonArgs" . | nindent 4 }}
-  volumeMounts:
-    {{- include "tls-lb.getCertVolumeMounts" (dict "ctx" . "reloadWatch" true) | nindent 4 }}
-  securityContext:
-    {{- include "tls-lb.getCertSecurityContext" . | nindent 4 }}
-{{- end }}
-
-{{/*
-Volume mounts for the get-cert containers: the shared tls-certs volume
-(writable), the discovery volume when enabled, and the public-TLS volume for
-the renew container's --reload-watch. dict args: ctx, reloadWatch (bool).
-*/}}
-{{- define "tls-lb.getCertVolumeMounts" -}}
-{{- $ctx := .ctx -}}
-- name: tls-certs
-  mountPath: {{ $ctx.Values.tlsLb.tlsMountPath }}
-{{- if $ctx.Values.tlsLb.discovery.enabled }}
-- name: discovery
-  mountPath: {{ $ctx.Values.tlsLb.discovery.mountPath }}
-{{- end }}
-{{- if and .reloadWatch $ctx.Values.tlsLb.publicTLS.secretName }}
-- name: public-tls
-  mountPath: {{ $ctx.Values.tlsLb.publicTLS.mountPath }}
-  readOnly: true
-{{- end }}
+{{- $discoveryMount := "" -}}
+{{- if .Values.tlsLb.discovery.enabled -}}
+{{- $discoveryMount = printf "- name: discovery\n  mountPath: %s" .Values.tlsLb.discovery.mountPath -}}
+{{- end -}}
+{{- $reloadWatchMount := "" -}}
+{{- $renewExtraArgs := list -}}
+{{- if .Values.tlsLb.publicTLS.secretName -}}
+{{- $reloadWatchMount = printf "- name: public-tls\n  mountPath: %s\n  readOnly: true" .Values.tlsLb.publicTLS.mountPath -}}
+{{- $renewExtraArgs = list (printf "--reload-watch=%s" (include "tls-lb.publicCertPath" .)) (printf "--reload-watch=%s" (include "tls-lb.publicKeyPath" .)) -}}
+{{- end -}}
+{{- include "c8s.getCertContainers" (dict
+  "root" .
+  "san" (include "tls-lb.san" .)
+  "certOut" (printf "%s/cert.pem" .Values.tlsLb.tlsMountPath)
+  "keyOut" (printf "%s/key.pem" .Values.tlsLb.tlsMountPath)
+  "volume" "tls-certs"
+  "mountPath" .Values.tlsLb.tlsMountPath
+  "renewInterval" .Values.tlsLb.certProvisioning.renewInterval
+  "keyMode" "0640"
+  "runAsUser" .Values.tlsLb.nginx.runAsUser
+  "runAsGroup" .Values.tlsLb.nginx.runAsGroup
+  "runAsNonRoot" .Values.tlsLb.nginx.runAsNonRoot
+  "reloadNginx" "true"
+  "extraArgs" (include "tls-lb.getCertCommonArgs" . | fromYamlArray)
+  "renewExtraArgs" $renewExtraArgs
+  "extraMounts" $discoveryMount
+  "renewExtraMounts" $reloadWatchMount
+) -}}
 {{- end }}

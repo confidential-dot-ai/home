@@ -3,8 +3,8 @@
 {{- $nri := .Values.nriImagePolicy -}}
 {{- $nriCDSURL := tpl (default "" $nri.cds.url) . -}}
 {{- $attestationNodePort := int .Values.attestationApi.service.nodePort -}}
-{{- if and $tlsLB.enabled $teeProxy.enabled (eq $tlsLB.upstream.protocol "https") (eq $tlsLB.upstream.address "c8s-tee-proxy:443") (not (or $teeProxy.tls.enabled $teeProxy.domain)) -}}
-{{- fail "tlsLb.upstream.protocol=https with the chart-managed tee-proxy requires teeProxy.tls.enabled=true or teeProxy.domain to enable the HTTPS listener" -}}
+{{- if and $tlsLB.enabled $teeProxy.enabled (eq $tlsLB.upstream.protocol "https") (eq $tlsLB.upstream.address "c8s-tee-proxy:443") (not (or $teeProxy.certProvisioning.enabled $teeProxy.tls.enabled $teeProxy.domain)) -}}
+{{- fail "tlsLb.upstream.protocol=https with the chart-managed tee-proxy requires teeProxy.certProvisioning.enabled (default), teeProxy.tls.enabled, or teeProxy.domain to enable the HTTPS listener" -}}
 {{- end -}}
 {{- if and .Values.kata.enforce.enabled (not .Values.kata.enabled) -}}
 {{- fail "kata.enforce.enabled=true requires kata.enabled=true: enforcement injects and validates the kata RuntimeClasses that kata.enabled installs" -}}

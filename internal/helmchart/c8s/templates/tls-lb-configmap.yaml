@@ -5,7 +5,7 @@
 {{- include "tls-lb.validateUpstreamAddress" .Values.tlsLb.upstream -}}
 {{- $defaultMeshCAPath := printf "%s/%s" .Values.tlsLb.meshCA.mountPath .Values.tlsLb.meshCA.key -}}
 {{- $upstreamTrustedCAPath := default $defaultMeshCAPath .Values.tlsLb.upstream.tls.trustedCAPath -}}
-{{- $upstreamServerName := default (include "tls-lb.serverNameFromAddress" .Values.tlsLb.upstream.address) .Values.tlsLb.upstream.tls.serverName -}}
+{{- $upstreamServerName := default (include "tls-lb.upstreamServerName" .) .Values.tlsLb.upstream.tls.serverName -}}
 {{- include "tls-lb.validateProxyTLS" (dict "protocol" .Values.tlsLb.upstream.protocol "tls" .Values.tlsLb.upstream.tls "serverName" $upstreamServerName "trustedCAPath" $upstreamTrustedCAPath "label" "tlsLb.upstream") -}}
 {{- include "tls-lb.validateCORS" .Values.tlsLb.cors -}}
 {{- range $i, $route := .Values.tlsLb.routes -}}

@@ -1,6 +1,9 @@
 {{- if .Values.teeProxy.enabled }}
 {{- $attestationURL := default (printf "http://%s-attestation-api.%s.svc:8400" .Release.Name .Release.Namespace) .Values.teeProxy.attestationURL -}}
-{{- $tlsMode := or .Values.teeProxy.tls.enabled (ne .Values.teeProxy.domain "") -}}
+{{- $certProvision := .Values.teeProxy.certProvisioning.enabled -}}
+{{- $tlsDir := .Values.teeProxy.tls.mountPath -}}
+{{- $useTLSDir := or .Values.teeProxy.tls.enabled $certProvision -}}
+{{- $tlsMode := or $useTLSDir (ne .Values.teeProxy.domain "") -}}
 {{- $probePort := ternary .Values.teeProxy.ports.https .Values.teeProxy.ports.http $tlsMode -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -41,6 +44,23 @@ spec:
               topologyKey: kubernetes.io/hostname
       {{- end }}
       {{- include "c8s.imagePullSecrets" (dict "root" $ "local" .Values.teeProxy.imagePullSecrets) | nindent 6 }}
+      {{- if $certProvision }}
+      initContainers:
+        {{- include "c8s.getCertContainers" (dict
+          "root" .
+          "san" (printf "%s.%s.svc" (include "tee-proxy.fullname" .) .Release.Namespace)
+          "certOut" (printf "%s/localhost+2.pem" $tlsDir)
+          "keyOut" (printf "%s/localhost+2-key.pem" $tlsDir)
+          "volume" "tls-certs"
+          "mountPath" $tlsDir
+          "renewInterval" .Values.teeProxy.certProvisioning.renewInterval
+          "keyMode" "0640"
+          "runAsUser" 65534
+          "runAsGroup" 65534
+          "runAsNonRoot" true
+          "reloadNginx" "false"
+        ) | nindent 8 }}
+      {{- end }}
       containers:
         - name: proxy
           image: {{ include "tee-proxy.image" . }}
@@ -56,9 +76,9 @@ spec:
             - --attestation-url
             - {{ $attestationURL | quote }}
             {{- end }}
-            {{- if .Values.teeProxy.tls.enabled }}
+            {{- if $useTLSDir }}
             - --tls-dir
-            - {{ .Values.teeProxy.tls.mountPath | quote }}
+            - {{ $tlsDir | quote }}
             {{- end }}
           ports:
             - name: https
@@ -84,7 +104,11 @@ spec:
           volumeMounts:
             - name: autocert-cache
               mountPath: /app/certs
-            {{- if .Values.teeProxy.tls.enabled }}
+            {{- if $certProvision }}
+            - name: tls-certs
+              mountPath: {{ $tlsDir }}
+              readOnly: true
+            {{- else if .Values.teeProxy.tls.enabled }}
             - name: static-tls
               mountPath: {{ .Values.teeProxy.tls.mountPath }}
               readOnly: true
@@ -108,7 +132,12 @@ spec:
         - name: autocert-cache
           persistentVolumeClaim:
             claimName: {{ include "tee-proxy.fullname" . }}-certs
-        {{- if .Values.teeProxy.tls.enabled }}
+        {{- if $certProvision }}
+        - name: tls-certs
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        {{- else if .Values.teeProxy.tls.enabled }}
         - name: static-tls
           secret:
             secretName: {{ required "teeProxy.tls.secretName must be set when teeProxy.tls.enabled=true" .Values.teeProxy.tls.secretName }}

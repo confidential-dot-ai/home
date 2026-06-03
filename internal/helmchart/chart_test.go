@@ -1360,6 +1360,9 @@ func TestChartTLSLBServiceTypeDerivesFromExposure(t *testing.T) {
 
 func TestChartRendersTeeProxyStaticTLSSecret(t *testing.T) {
 	out, err := helmTemplate(t,
+		// The static-secret TLS mode is the non-default alternative to
+		// certProvisioning (self-rendered CDS cert), so turn the latter off.
+		"--set", "teeProxy.certProvisioning.enabled=false",
 		"--set", "teeProxy.tls.enabled=true",
 		"--set-string", "teeProxy.tls.secretName=tee-proxy-internal-tls",
 		"--set-string", "tlsLb.upstream.address=c8s-tee-proxy:443",
@@ -1426,25 +1429,51 @@ func TestTLSLBCertProvisioningValuesDriveGetCertContainers(t *testing.T) {
 	}
 }
 
-func TestChartRejectsManagedTeeProxyHTTPSWithoutTLS(t *testing.T) {
+func TestChartRejectsManagedTeeProxyHTTPSWithoutListener(t *testing.T) {
+	// With every HTTPS-listener source off (certProvisioning, static tls,
+	// domain), https to the chart tee-proxy has nothing to talk to.
 	out, err := helmTemplate(t,
 		"--set-string", "tlsLb.upstream.address=c8s-tee-proxy:443",
 		"--set", "tlsLb.upstream.protocol=https",
+		"--set", "teeProxy.certProvisioning.enabled=false",
 	)
 	if err == nil {
-		t.Fatalf("helm template succeeded, want tee-proxy TLS failure\n%s", out)
+		t.Fatalf("helm template succeeded, want tee-proxy HTTPS-listener failure\n%s", out)
 	}
-	assertHelmFailMessage(t, out, "tlsLb.upstream.protocol=https with the chart-managed tee-proxy requires teeProxy.tls.enabled=true or teeProxy.domain to enable the HTTPS listener")
+	assertHelmFailMessage(t, out, "tlsLb.upstream.protocol=https with the chart-managed tee-proxy requires teeProxy.certProvisioning.enabled (default), teeProxy.tls.enabled, or teeProxy.domain to enable the HTTPS listener")
 }
 
-func TestChartRejectsTLSLBHTTPSWithDefaultTeeProxyHTTPPort(t *testing.T) {
+func TestChartRejectsTLSLBHTTPSWithTeeProxyHTTPPort(t *testing.T) {
 	out, err := helmTemplate(t,
+		"--set-string", "tlsLb.upstream.address=c8s-tee-proxy:80",
 		"--set", "tlsLb.upstream.protocol=https",
 	)
 	if err == nil {
 		t.Fatalf("helm template succeeded, want tls-lb upstream address failure\n%s", out)
 	}
 	assertHelmFailMessage(t, out, "tlsLb.upstream.protocol=https requires tlsLb.upstream.address to point at a TLS port; for the chart-managed tee-proxy use c8s-tee-proxy:443")
+}
+
+// TestChartDefaultTLSLBToTeeProxyIsMutualTLS pins the new default: tls-lb
+// reaches the chart tee-proxy over mutual attested TLS (both CDS-issued certs).
+func TestChartDefaultTLSLBToTeeProxyIsMutualTLS(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	cfg := renderedTLSLBNginxConf(t, out)
+	for _, want := range []string{
+		"server c8s-tee-proxy:443;",
+		"proxy_pass https://backend;",
+		"proxy_ssl_verify on;",
+		"proxy_ssl_name c8s-tee-proxy.c8s-system.svc;",
+		"proxy_ssl_certificate /tls/cert.pem;",
+		"proxy_ssl_trusted_certificate /mesh-ca/ca.pem;",
+	} {
+		if !strings.Contains(cfg, want) {
+			t.Fatalf("tls-lb nginx config missing %q\n%s", want, cfg)
+		}
+	}
 }
 
 func TestTLSLBVerifyDerivesProxySSLNameFromUpstream(t *testing.T) {
@@ -2865,6 +2894,10 @@ func helmTemplateTLSLB(t *testing.T, args ...string) (string, error) {
 		"--set", "nriImagePolicy.enabled=false",
 		"--set", "teeProxy.enabled=false",
 		"--set-string", "tlsLb.upstream.address=vllm:8000",
+		// Plain-HTTP upstream baseline for the tls-lb subchart tests; the
+		// chart default targets the tee-proxy over https, but this harness
+		// points at a bare vllm address. Tests that exercise https set it.
+		"--set", "tlsLb.upstream.protocol=http",
 		"--set", "tlsLb.nginx.image.tag=dev",
 		"--show-only", "templates/tls-lb-configmap.yaml",
 		"--show-only", "templates/tls-lb-deployment.yaml",
@@ -3338,6 +3371,7 @@ func renderExampleTLSLBNginxConf() string {
 		"--set", "nriImagePolicy.enabled=false",
 		"--set", "teeProxy.enabled=false",
 		"--set-string", "tlsLb.upstream.address=vllm:8000",
+		"--set", "tlsLb.upstream.protocol=http",
 		"--set", "tlsLb.nginx.image.tag=dev",
 		"--set-string", "tlsLb.routes[0].path=/whitelist",
 		"--set-string", "tlsLb.routes[0].match=exact",

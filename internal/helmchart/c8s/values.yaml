@@ -670,9 +670,20 @@ teeProxy:
   replicas: 1
   # Domain for autocert TLS
   domain: ""
+  # -- Self-provision a CDS-issued serving cert via get-cert (like tls-lb),
+  #    instead of a static secret. When enabled, chart-rendered c8s-init-cert /
+  #    c8s-renew-cert containers write localhost+2.pem/-key.pem into tls.mountPath
+  #    and tee-proxy serves HTTPS from there, hot-reloading on renewal. This is
+  #    how tls-lb reaches tee-proxy over mutual attested TLS rather than plain
+  #    HTTP. Mutually exclusive with tls.enabled (a static secret).
+  certProvisioning:
+    enabled: true
+    # -- Renewal interval for the get-cert sidecar. Must be shorter than the
+    #    CDS-issued cert TTL.
+    renewInterval: "1h"
   # Static TLS certificate Secret. When enabled, tee-proxy starts HTTPS using
   # --tls-dir and expects cert/key files named localhost+2.pem and
-  # localhost+2-key.pem inside mountPath.
+  # localhost+2-key.pem inside mountPath. Leave off when certProvisioning is on.
   tls:
     enabled: false
     secretName: ""
@@ -722,22 +733,28 @@ tlsLb:
   # chart-managed Service DNS name: <release>-tls-lb.<namespace>.svc.
   san: ""
 
-  # -- Upstream backend service to proxy traffic to.
+  # -- Upstream backend service to proxy traffic to. Defaults to the
+  # chart-managed tee-proxy over mutual attested TLS: tee-proxy serves a
+  # CDS-issued cert (teeProxy.certProvisioning) and tls-lb presents its own
+  # CDS-issued client cert and verifies tee-proxy's against the mesh CA. Point
+  # elsewhere (and set protocol/tls) for a different backend.
   upstream:
     # -- Host and port of the upstream service.
-    address: c8s-tee-proxy:80
+    address: c8s-tee-proxy:443
     # -- Protocol for the upstream connection (http or https).
-    protocol: http
+    protocol: https
     tls:
       # -- Present the CDS-issued certificate to HTTPS upstreams.
       useCDSClientCert: true
       # -- Verify HTTPS upstream certificates with the mounted mesh CA bundle.
-      verify: false
+      verify: true
       # -- Maximum upstream server certificate chain depth nginx will verify when
       # upstream.tls.verify=true. Increase for private PKI chains with more
       # intermediates between the upstream leaf and trusted CA bundle.
       verifyDepth: 2
-      # -- Optional SNI/verification name for the HTTPS upstream.
+      # -- SNI/verification name for the HTTPS upstream. Must match the upstream
+      # cert SAN. Empty defaults to the address host, except for the chart-managed
+      # tee-proxy where it defaults to its CDS cert SAN <release>-tee-proxy.<ns>.svc.
       serverName: ""
       # -- Optional CA file path. Empty defaults to <meshCA.mountPath>/<meshCA.key>.
       # Custom paths must be provided by the image or another mount.
