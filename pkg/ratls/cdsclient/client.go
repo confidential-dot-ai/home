@@ -48,11 +48,18 @@ type Config struct {
 	// Empty defaults to CDSCAURL + "/ca".
 	CACertURL string
 
-	// NodeIP is this node's IP for the certificate subject/SAN.
+	// NodeIP is this node's IP, used only in the certificate CommonName.
 	NodeIP string
 
 	// NodeName is this node's hostname for the certificate subject.
 	NodeName string
+
+	// DNSSAN, when set, is the sole DNS SAN placed on the CSR. The mesh
+	// authenticates peers by attestation, not by SAN, so this carries no
+	// security meaning for the mesh; it exists to satisfy the CDS CSR policy
+	// (CDS with --san-validation=false rejects IP SANs, so the leaf must
+	// present a DNS SAN matching --dns-san-pattern). Empty omits all SANs.
+	DNSSAN string
 
 	// TEEType is the TEE platform to stamp into the RA-TLS attestation
 	// extension. It must be specified explicitly. Only SEV-SNP is currently
@@ -229,10 +236,12 @@ func (c *Client) createCSR(ctx context.Context, key *ecdsa.PrivateKey) (string, 
 			CommonName:   cn,
 			Organization: []string{"Lunal"},
 		},
-		IPAddresses: []net.IP{net.ParseIP(c.cfg.NodeIP)},
 	}
-	if c.cfg.NodeName != "" {
-		tmpl.DNSNames = []string{c.cfg.NodeName}
+	// DNS SAN only — no IP SAN. CDS with --san-validation=false rejects IP
+	// SANs, and the mesh verifies peers by attestation, not SAN, so the node
+	// IP belongs in the CN, not a SAN.
+	if c.cfg.DNSSAN != "" {
+		tmpl.DNSNames = []string{c.cfg.DNSSAN}
 	}
 
 	ext, err := c.attestationExtension(ctx, key)

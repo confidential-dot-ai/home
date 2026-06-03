@@ -252,6 +252,8 @@ spec:
             - {{ $certMode | quote }}
             - --cds-url
             - {{ $cdsURL | quote }}
+            - --cert-dns-san
+            - {{ printf "ratls-mesh.%s.svc" .Release.Namespace | quote }}
             - --ca-poll-interval
             - {{ .Values.ratlsMesh.cds.caPollInterval | quote }}
             {{- with .Values.cds.measurements }}

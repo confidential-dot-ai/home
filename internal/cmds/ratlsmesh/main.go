@@ -65,6 +65,7 @@ type proxyConfig struct {
 	outboundPort              int
 	inboundPort               int
 	nodeIP                    string
+	certDNSSAN                string
 	logLevel                  string
 	dialTimeout               time.Duration
 	tlsDialTimeout            time.Duration
@@ -107,6 +108,7 @@ func bindProxyFlags(fs *pflag.FlagSet, c *proxyConfig) {
 	fs.IntVar(&c.outboundPort, "outbound-port", 15001, "outbound listener port (intercepted app traffic)")
 	fs.IntVar(&c.inboundPort, "inbound-port", 15006, "inbound listener port (RA-TLS from peer nodes)")
 	fs.StringVar(&c.nodeIP, "node-ip", "", "this node's IP (auto-detected from NODE_IP env if unset)")
+	fs.StringVar(&c.certDNSSAN, "cert-dns-san", "", "DNS SAN placed on the CDS-issued mesh cert (must match CDS --dns-san-pattern; empty omits SANs). Not used for peer verification, which is attestation-based.")
 	fs.StringVar(&c.logLevel, "log-level", "info", "log level: debug, info, warn, error")
 	fs.DurationVar(&c.dialTimeout, "dial-timeout", 5*time.Second, "plain TCP dial timeout")
 	fs.DurationVar(&c.tlsDialTimeout, "tls-dial-timeout", 10*time.Second, "RA-TLS dial timeout")
@@ -236,10 +238,13 @@ func runProxy(ctx context.Context, c *proxyConfig) error {
 		logger.Warn("--cds-measurements not set; the RA-TLS handshake will accept any CDS measurement. Set this to the chart-distributed launch digest of CDS to close bootstrap MITM.")
 	}
 
+	// The self-signed boot cert carries no SAN: mesh peers authenticate it by
+	// hardware attestation, not by SAN/hostname (NewServerTLSConfig sets
+	// InsecureSkipVerify and verifies the RA-TLS extension). The CDS-issued
+	// upgrade cert does carry a DNS SAN (see cdsclient.Config.DNSSAN).
 	serverTLS, serverCertMgr, err := ratls.NewServerTLSConfig(&ratls.ServerConfig{
 		Platform:        c.platform,
 		AttestFunc:      attestFunc,
-		DNSNames:        []string{c.nodeIP},
 		CertTTL:         c.certTTL,
 		ClientPolicy:    meshPolicy,
 		CACert:          caCerts,
@@ -408,6 +413,7 @@ func runProxy(ctx context.Context, c *proxyConfig) error {
 			CDSCAURL:          c.cdsURL,
 			CACertURL:         effectiveCAURL,
 			NodeIP:            c.nodeIP,
+			DNSSAN:            c.certDNSSAN,
 			TEEType:           teeType,
 			CDSMeasurements:   cdsMeasurements,
 		}
