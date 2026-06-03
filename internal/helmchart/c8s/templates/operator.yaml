@@ -51,6 +51,9 @@ spec:
             - --webhook-service-name={{ include "c8s.operatorName" . }}
             - --webhook-service-namespace={{ .Release.Namespace }}
             - --attestation-api-url={{ include "c8s.attestationApiURL" . }}
+            {{- range .Values.webhook.extraExcluded }}
+            - --exclude-namespaces={{ . }}
+            {{- end }}
             - --cert-fs-group={{ .Values.webhook.certVolume.fsGroup }}
             - --cert-key-mode={{ .Values.webhook.certVolume.keyMode }}
             - --get-cert-renew-interval={{ .Values.webhook.getCert.renewInterval }}

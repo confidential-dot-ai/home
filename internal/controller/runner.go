@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	v1alpha2 "github.com/lunal-dev/c8s/api/v1alpha2"
@@ -62,6 +63,11 @@ type Options struct {
 	GetCertRunAsUser    int64
 	GetCertRunAsGroup   int64
 	GetCertRunAsNonRoot bool
+
+	// ExcludeNamespaces are namespaces the startup reinject sweep skips, on
+	// top of the release namespace and the kube-system family. Mirrors
+	// webhook.extraExcluded so the sweep and the webhook config agree.
+	ExcludeNamespaces []string
 
 	// KataEnforce makes the pod webhook inject a kata runtimeClassName into
 	// in-scope workload pods that do not request one. Independent of
@@ -149,6 +155,27 @@ func Run(ctx context.Context, opts Options) error {
 			"image", opts.GetCertImage,
 			"cds_url", opts.CDSURL,
 			"kata_enforce", opts.KataEnforce)
+
+		// One-shot startup sweep: delete cw-annotated pods that were admitted
+		// while the webhook was down (so never injected) and let their owners
+		// recreate them through admission. Runs whenever the webhook does
+		// (get-cert or kata), since both stamp the injected marker and a missed
+		// kata runtimeClassName can only be fixed by re-admission. Leader-only
+		// runnable. failurePolicy=Fail means a recreated pod that races a
+		// not-yet-ready webhook is retried, not let through. Uses a direct
+		// client, not the manager cache: a single cluster-wide List + targeted
+		// Deletes at startup must not pin a cluster-wide pod informer for the
+		// operator's lifetime.
+		excluded := excludedNamespaceSet(opts.LeaderElectionNS, opts.ExcludeNamespaces)
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			c, err := client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme()})
+			if err != nil {
+				return fmt.Errorf("build sweep client: %w", err)
+			}
+			return reinjectSweep(ctx, c, excluded)
+		})); err != nil {
+			return fmt.Errorf("add reinject sweep: %w", err)
+		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

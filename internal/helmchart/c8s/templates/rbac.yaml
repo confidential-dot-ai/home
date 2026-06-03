@@ -22,7 +22,9 @@ rules:
     verbs: [get, update, patch]
   - apiGroups: [""]
     resources: [pods]
-    verbs: [get, list, watch]
+    # delete: the startup reinject sweep deletes un-injected cw pods so their
+    # controllers recreate them through the webhook.
+    verbs: [get, list, watch, delete]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch, delete]

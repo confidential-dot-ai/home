@@ -11,6 +11,12 @@ webhooks:
     failurePolicy: {{ .Values.webhook.failurePolicy }}
     timeoutSeconds: 5
     reinvocationPolicy: IfNeeded
+    # get-cert injection is opt-in (confidential.ai/cw), so an un-annotated pod
+    # is a no-op regardless of namespace. The exclusion matters for kata
+    # enforcement, which forces a runtimeClassName onto any in-scope pod with
+    # no annotation: without it, --kata-enforce would try to run c8s's own
+    # control plane (operator, cds, attestation-api, tee-proxy, tls-lb are not
+    # hostNetwork) as kata VMs. The reinject sweep excludes the same set.
     namespaceSelector:
       matchExpressions:
         - key: kubernetes.io/metadata.name
@@ -23,37 +29,6 @@ webhooks:
             {{- range .Values.webhook.extraExcluded }}
             - {{ . }}
             {{- end }}
-    rules:
-      - operations: [CREATE]
-        apiGroups: [""]
-        apiVersions: [v1]
-        resources: [pods]
-        scope: Namespaced
-    clientConfig:
-      service:
-        namespace: {{ .Release.Namespace }}
-        name: {{ include "c8s.operatorName" . }}
-        path: /mutate-pods
-        port: {{ .Values.webhook.service.port }}
-      {{- if .Values.webhook.caBundle }}
-      caBundle: {{ .Values.webhook.caBundle }}
-      {{- end }}
-  - name: platform-pods.c8s.confidential.ai
-    admissionReviewVersions: [v1]
-    sideEffects: None
-    failurePolicy: {{ .Values.webhook.failurePolicy }}
-    timeoutSeconds: 5
-    reinvocationPolicy: IfNeeded
-    objectSelector:
-      matchLabels:
-        app.kubernetes.io/name: tls-lb
-        app.kubernetes.io/instance: {{ .Release.Name }}
-    namespaceSelector:
-      matchExpressions:
-        - key: kubernetes.io/metadata.name
-          operator: In
-          values:
-            - {{ .Release.Namespace }}
     rules:
       - operations: [CREATE]
         apiGroups: [""]

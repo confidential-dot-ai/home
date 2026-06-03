@@ -819,37 +819,46 @@ func TestChartCanDisableStatusMirror(t *testing.T) {
 	}
 }
 
-func TestChartWebhookSelectsPlatformPodsWithoutBootstrappingAllPods(t *testing.T) {
+func TestChartWebhookInjectsWorkloadsAndExcludesSystemNamespaces(t *testing.T) {
 	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
+	// tls-lb now self-renders get-cert, so the platform-pods rule that only
+	// existed to inject it is gone: one workload webhook remains.
+	names := renderedMutatingWebhookNames(t, out)
+	if !slices.Equal(names, []string{"pods.c8s.confidential.ai"}) {
+		t.Fatalf("webhook names = %v, want only the workload rule", names)
+	}
+
 	generalWebhook := renderedMutatingWebhook(t, out, "pods.c8s.confidential.ai")
 	excludedNamespaces := selectorExpressionValues(generalWebhook.NamespaceSelector, "kubernetes.io/metadata.name", metav1.LabelSelectorOpNotIn)
-	if !slices.Contains(excludedNamespaces, "c8s-system") {
-		t.Fatalf("general webhook should exclude the release namespace: %v", excludedNamespaces)
-	}
-	for _, want := range []string{"kube-system", "kube-public", "kube-node-lease"} {
+	for _, want := range []string{"c8s-system", "kube-system", "kube-public", "kube-node-lease"} {
 		if !slices.Contains(excludedNamespaces, want) {
 			t.Fatalf("general webhook namespaceSelector missing excluded namespace %q: %v", want, excludedNamespaces)
 		}
 	}
+}
 
-	platformWebhook := renderedMutatingWebhook(t, out, "platform-pods.c8s.confidential.ai")
-	wantPlatformLabels := map[string]string{
-		"app.kubernetes.io/name":     "tls-lb",
-		"app.kubernetes.io/instance": "c8s",
+func TestChartWebhookExtraExcludedFlowsToWebhookAndSweep(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "webhook.extraExcluded={tenant-a,tenant-b}")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	for key, want := range wantPlatformLabels {
-		if got := platformWebhook.ObjectSelector.MatchLabels[key]; got != want {
-			t.Fatalf("platform webhook objectSelector label %s = %q, want %q", key, got, want)
+	// extraExcluded must reach both the webhook namespaceSelector (CREATE-time
+	// exclusion) and the operator's reinject sweep (--exclude-namespaces), or
+	// the two disagree on which namespaces are out of scope.
+	generalWebhook := renderedMutatingWebhook(t, out, "pods.c8s.confidential.ai")
+	excluded := selectorExpressionValues(generalWebhook.NamespaceSelector, "kubernetes.io/metadata.name", metav1.LabelSelectorOpNotIn)
+	args := renderedOperatorArgs(t, out)
+	for _, ns := range []string{"tenant-a", "tenant-b"} {
+		if !slices.Contains(excluded, ns) {
+			t.Fatalf("webhook namespaceSelector missing extraExcluded %q: %v", ns, excluded)
+		}
+		if !slices.Contains(args, "--exclude-namespaces="+ns) {
+			t.Fatalf("operator args missing --exclude-namespaces=%s\n%v", ns, args)
 		}
 	}
-	releaseNamespaces := selectorExpressionValues(platformWebhook.NamespaceSelector, "kubernetes.io/metadata.name", metav1.LabelSelectorOpIn)
-	if !slices.Contains(releaseNamespaces, "c8s-system") {
-		t.Fatalf("platform webhook should select the release namespace: %v", releaseNamespaces)
-	}
-	assertRenderedDeploymentPodLabels(t, out, "c8s-tls-lb", wantPlatformLabels)
 }
 
 func TestChartManagedRATLSServiceTargetPortsMatchContainerPorts(t *testing.T) {
@@ -2499,6 +2508,27 @@ func renderedMutatingWebhook(t *testing.T, manifest, name string) admissionregv1
 	return admissionregv1.MutatingWebhook{}
 }
 
+func renderedMutatingWebhookNames(t *testing.T, manifest string) []string {
+	t.Helper()
+	for _, doc := range splitManifestDocs(manifest) {
+		var meta docMeta
+		if err := sigsyaml.Unmarshal([]byte(doc), &meta); err != nil || meta.Kind != "MutatingWebhookConfiguration" {
+			continue
+		}
+		var cfg admissionregv1.MutatingWebhookConfiguration
+		if err := sigsyaml.Unmarshal([]byte(doc), &cfg); err != nil {
+			t.Fatalf("decode MutatingWebhookConfiguration: %v\n%s", err, doc)
+		}
+		names := make([]string, 0, len(cfg.Webhooks))
+		for _, hook := range cfg.Webhooks {
+			names = append(names, hook.Name)
+		}
+		return names
+	}
+	t.Fatalf("rendered manifest missing MutatingWebhookConfiguration\n%s", manifest)
+	return nil
+}
+
 func selectorExpressionValues(selector *metav1.LabelSelector, key string, op metav1.LabelSelectorOperator) []string {
 	if selector == nil {
 		return nil
@@ -2763,16 +2793,6 @@ func renderedDeploymentContainer(t *testing.T, manifest, deploymentName, contain
 	}
 	t.Fatalf("rendered Deployment %q missing container %q\n%s", deploymentName, containerName, manifest)
 	return corev1.Container{}
-}
-
-func assertRenderedDeploymentPodLabels(t *testing.T, manifest, name string, want map[string]string) {
-	t.Helper()
-	labels := renderedDeployment(t, manifest, name).Spec.Template.Labels
-	for key, wantValue := range want {
-		if got := labels[key]; got != wantValue {
-			t.Fatalf("Deployment %s label %s = %q, want %q\nlabels: %v", name, key, got, wantValue, labels)
-		}
-	}
 }
 
 // helmTemplateTLSLB renders the tls-lb component from the parent c8s chart in
