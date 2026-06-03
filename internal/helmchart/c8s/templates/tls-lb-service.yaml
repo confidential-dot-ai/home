@@ -1,21 +1,32 @@
 {{- if .Values.tlsLb.enabled }}
+{{- /*
+  Derive the Service type: setting a loadBalancerIP or cloud-LB annotations
+  only takes effect on a LoadBalancer Service, so promote the default ClusterIP
+  to LoadBalancer when either is set (avoids the "set the IP but forget the
+  type" footgun). An explicitly chosen type (LoadBalancer/NodePort) is honored.
+*/}}
+{{- $svc := .Values.tlsLb.service }}
+{{- $svcType := $svc.type }}
+{{- if and (eq $svcType "ClusterIP") (or $svc.loadBalancerIP $svc.annotations) }}
+{{- $svcType = "LoadBalancer" }}
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "tls-lb.fullname" . }}
   labels:
     {{- include "tls-lb.labels" . | nindent 4 }}
-  {{- with .Values.tlsLb.service.annotations }}
+  {{- with $svc.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  type: {{ .Values.tlsLb.service.type }}
-  {{- with .Values.tlsLb.service.loadBalancerIP }}
+  type: {{ $svcType }}
+  {{- with $svc.loadBalancerIP }}
   loadBalancerIP: {{ . | quote }}
   {{- end }}
   ports:
-    - port: {{ .Values.tlsLb.service.port }}
+    - port: {{ $svc.port }}
       targetPort: https
       protocol: TCP
       name: https

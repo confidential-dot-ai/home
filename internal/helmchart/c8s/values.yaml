@@ -848,11 +848,17 @@ tlsLb:
     resources: {}
 
   service:
+    # -- Service type. The default ClusterIP is auto-promoted to LoadBalancer
+    # when loadBalancerIP or annotations is set (both are inert on a ClusterIP),
+    # so setting an IP/annotation alone exposes the listener. Set explicitly to
+    # override (e.g. NodePort, or LoadBalancer with no pre-allocated IP).
     type: ClusterIP
     port: 443
     # -- Optional annotations on the Service (e.g. cloud LB / static IP hints).
+    # Setting these promotes the default ClusterIP to LoadBalancer.
     annotations: {}
     # -- Optional pre-allocated static load balancer IP. Cloud-provider specific.
+    # Setting this promotes the default ClusterIP to LoadBalancer.
     loadBalancerIP: ""
 
   # -- Volume mount path for the CDS-issued TLS certificate and key shared
