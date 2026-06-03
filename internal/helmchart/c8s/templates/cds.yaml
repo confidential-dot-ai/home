@@ -129,9 +129,7 @@ spec:
             - --max-request-size={{ .Values.cds.maxRequestSize }}
             - --readiness-interval={{ .Values.cds.readinessInterval }}
             - --san-validation={{ .Values.cds.sanValidation }}
-            {{- if .Values.cds.dnsSanPattern }}
-            - --dns-san-pattern={{ .Values.cds.dnsSanPattern }}
-            {{- end }}
+            - --dns-san-pattern={{ default (include "c8s.cdsDnsSanPattern" .) .Values.cds.dnsSanPattern }}
             {{- if .Values.cds.cnPattern }}
             - --allowed-cn-pattern={{ .Values.cds.cnPattern }}
             {{- end }}

@@ -139,6 +139,10 @@ cds:
   ## /sign-csr CSRs arrive without a matching TCP source IP under chart routing,
   ## so leave sanValidation off and pin DNS SAN / CN patterns instead.
   sanValidation: false
+  ## Regex a CSR's DNS SANs must match in full. Empty uses the chart default
+  ## (the in-cluster Service DNS, c8s.cdsDnsSanPattern), so CDS issues the cert
+  ## tls-lb requests for its Service name. Set to the public hostname (matching
+  ## tlsLb.san) when tls-lb fronts a routed domain.
   dnsSanPattern: ""
   cnPattern: ""
   ## The single flat allowlist of SHA-384 hex launch digests, used two ways:

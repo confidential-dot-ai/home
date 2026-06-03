@@ -119,6 +119,17 @@ https://{{ include "c8s.cdsName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.cd
 {{- end -}}
 
 {{/*
+  c8s.cdsDnsSanPattern is the default --dns-san-pattern CDS enforces when
+  cds.dnsSanPattern is unset: a regex matching the chart's in-cluster Service
+  DNS (<name>.<namespace>.svc), so CDS issues the leaf tls-lb's get-cert
+  requests for its Service name. Operators fronting a public domain override
+  cds.dnsSanPattern (matching tlsLb.san).
+*/}}
+{{- define "c8s.cdsDnsSanPattern" -}}
+^[a-z0-9-]+[.]{{ .Release.Namespace }}[.]svc$
+{{- end -}}
+
+{{/*
   c8s.trustRootURL is the URL clients (get-cert, ratls-mesh) point their single
   --cds-url at — the unified cds Service.
 */}}
