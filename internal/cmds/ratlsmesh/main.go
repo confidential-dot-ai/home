@@ -402,12 +402,17 @@ func runProxy(ctx context.Context, c *proxyConfig) error {
 
 	// CDS certificate upgrade: after self-signed RA-TLS boot, a background
 	// goroutine contacts CDS, gets CA-signed certs, and hot-swaps them via
-	// CertManager.SwapProvider. The cdsCfg is shared with the CA bundle
-	// refresh goroutine below. cds serves both attestation and CA bundle on
+	// CertManager.SwapProvider. cds serves both attestation and CA bundle on
 	// one URL, so CDSURL and CDSCAURL both take --cds-url.
-	var cdsCfg *cdsclient.Config
+	//
+	// cdsClient is shared between that upgrade goroutine (which seeds the trusted
+	// CA bundle during provisioning) and the CA bundle refresh goroutine below.
+	// /ca refreshes continuity-check against that seed, so they must use the same
+	// client — a fresh client would have an empty bundle and every refresh would
+	// fail with "requires a trusted CA from CDS".
+	var cdsClient *cdsclient.Client
 	if c.certMode == "cds" {
-		cdsCfg = &cdsclient.Config{
+		cdsCfg := &cdsclient.Config{
 			CDSURL:            c.cdsURL,
 			AttestationApiURL: c.attestationApiURL,
 			CDSCAURL:          c.cdsURL,
@@ -417,8 +422,9 @@ func runProxy(ctx context.Context, c *proxyConfig) error {
 			TEEType:           teeType,
 			CDSMeasurements:   cdsMeasurements,
 		}
+		cdsClient = cdsclient.NewClient(cdsCfg)
 		go func() {
-			cdsProvider, err := cdsclient.NewProvider(cdsCfg, logger)
+			cdsProvider, err := cdsclient.NewProviderWithClient(cdsClient, logger)
 			if err != nil {
 				logger.Error("cds provider creation failed", "error", err)
 				return
@@ -464,11 +470,13 @@ func runProxy(ctx context.Context, c *proxyConfig) error {
 		}()
 	}
 
-	// CA bundle refresh: periodically poll CDS /ca for updated CA bundle.
-	if effectiveCAURL != "" && c.certMode == "cds" {
+	// CA bundle refresh: periodically poll CDS /ca for updated CA bundle. Uses
+	// the same client the upgrade goroutine seeds — refresh continuity-checks
+	// against that trusted bundle, so a fresh client would never accept a
+	// refresh. Early ticks before the first successful provision are expected to
+	// warn until the seed is established.
+	if effectiveCAURL != "" && cdsClient != nil {
 		go func() {
-			cdsClient := cdsclient.NewClient(cdsCfg)
-
 			ticker := time.NewTicker(c.caPollInterval)
 			defer ticker.Stop()
 
