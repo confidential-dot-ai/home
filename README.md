@@ -70,14 +70,11 @@ test/
 Requires Go 1.26.3+.
 
 ```bash
-# Build all binaries
+# Build the c8s binary for the container images (linux/amd64)
 make build
 
-# Build individual binary
-make build-c8s
-make build-ratls-mesh
-make build-nri-image-policy
-# ... etc
+# Build and install the c8s CLI for your host platform, onto PATH
+make install
 
 # Run tests
 make test

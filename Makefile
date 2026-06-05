@@ -1,5 +1,4 @@
-.PHONY: build install build-c8s build-c8s-node build-get-cert build-ratls-mesh \
-       build-nri-image-policy \
+.PHONY: build install build-c8s \
        test test-integration vet fmt lint clean \
        manifests generate check-crd-chart install-controller-gen require-controller-gen
 
@@ -36,44 +35,6 @@ build-c8s:
 		go build -ldflags="$(LDFLAGS)" \
 		-o $(BUILD_DIR)/c8s ./cmd/c8s
 	@echo "Built $(BUILD_DIR)/c8s"
-
-# Slim variant for node-side images (nri-image-policy, ratls-mesh, get-cert):
-# omits 'operator' and 'install' subcommands so the
-# binary doesn't pull controller-runtime or the embedded helm chart.
-build-c8s-node:
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 \
-		go build -tags c8s_node \
-		-ldflags="$(LDFLAGS)" \
-		-o $(BUILD_DIR)/c8s-node ./cmd/c8s
-	@echo "Built $(BUILD_DIR)/c8s-node"
-
-# --- Get-Cert ---
-
-build-get-cert:
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 \
-		go build -ldflags="$(LDFLAGS)" \
-		-o $(BUILD_DIR)/get-cert ./cmd/get-cert
-	@echo "Built $(BUILD_DIR)/get-cert"
-
-# --- RA-TLS Mesh ---
-
-build-ratls-mesh:
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 \
-		go build -ldflags="$(LDFLAGS)" \
-		-o $(BUILD_DIR)/ratls-mesh ./cmd/ratls-mesh
-	@echo "Built $(BUILD_DIR)/ratls-mesh"
-
-# --- NRI Image Policy ---
-
-build-nri-image-policy:
-	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 \
-		go build -ldflags="$(LDFLAGS)" \
-		-o $(BUILD_DIR)/nri-image-policy ./cmd/nri-image-policy
-	@echo "Built $(BUILD_DIR)/nri-image-policy"
 
 # --- Tests ---
 
