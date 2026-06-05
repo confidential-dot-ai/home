@@ -1321,26 +1321,18 @@ func TestChartRendersTLSLBPublicTLSAndDiscovery(t *testing.T) {
 	}
 }
 
-// TestChartTLSLBServiceTypeDerivesFromExposure pins the footgun-avoiding
-// behavior: setting a loadBalancerIP or cloud-LB annotations only takes effect
-// on a LoadBalancer Service, so the chart promotes the default ClusterIP to
-// LoadBalancer when either is set. An explicitly chosen type is never
-// overridden.
-func TestChartTLSLBServiceTypeDerivesFromExposure(t *testing.T) {
+// TestChartTLSLBServiceType pins that the Service type is exactly what the
+// operator sets: default ClusterIP, explicit LoadBalancer/NodePort honored.
+// Public exposure is an explicit type=LoadBalancer, not inferred.
+func TestChartTLSLBServiceType(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		args []string
 		want corev1.ServiceType
 	}{
 		{"default is ClusterIP", nil, corev1.ServiceTypeClusterIP},
-		{"loadBalancerIP promotes to LoadBalancer",
-			[]string{"--set-string", "tlsLb.service.loadBalancerIP=1.2.3.4"}, corev1.ServiceTypeLoadBalancer},
-		{"annotations promote to LoadBalancer",
-			[]string{"--set-string", "tlsLb.service.annotations.foo=bar"}, corev1.ServiceTypeLoadBalancer},
-		{"explicit NodePort is honored despite loadBalancerIP",
-			[]string{"--set", "tlsLb.service.type=NodePort", "--set-string", "tlsLb.service.loadBalancerIP=1.2.3.4"}, corev1.ServiceTypeNodePort},
-		{"explicit LoadBalancer without an IP stays LoadBalancer",
-			[]string{"--set", "tlsLb.service.type=LoadBalancer"}, corev1.ServiceTypeLoadBalancer},
+		{"explicit LoadBalancer", []string{"--set", "tlsLb.service.type=LoadBalancer"}, corev1.ServiceTypeLoadBalancer},
+		{"explicit NodePort", []string{"--set", "tlsLb.service.type=NodePort"}, corev1.ServiceTypeNodePort},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, err := helmTemplate(t, tc.args...)
