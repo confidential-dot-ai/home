@@ -315,8 +315,6 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 			return fmt.Errorf("helm install failed: %w", err)
 		}
 
-		fmt.Fprintln(os.Stdout)
-		fmt.Fprint(os.Stdout, installNextSteps)
 		return nil
 	},
 }
@@ -522,24 +520,6 @@ func buildDigestArgs(helmArgs []string, tag string, components []c8sComponent, r
 	helmArgs = append(helmArgs, "--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true")
 	return helmArgs, nil
 }
-
-const installNextSteps = `Next steps:
-
-  1. Deploy this chart inside the intended CVM trust boundary. The supported
-     install shape wires the chart-managed CDS trust root and
-     attestation-api together.
-
-  2. (Optional) Mirror status with a ConfidentialWorkload CR:
-
-       kubectl apply -f samples/confidentialworkload.yaml
-
-     When injection is enabled, annotate your workload's pod template:
-       confidential.ai/cw: <workload-id>
-
-  3. Inspect mirrored workloads:
-
-       kubectl get cwl -A
-`
 
 func init() {
 	installCmd.Flags().StringVar(&installNamespace, "namespace", "c8s-system", "namespace to install into")
