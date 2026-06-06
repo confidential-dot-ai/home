@@ -25,6 +25,12 @@ rules:
     # delete: the startup reinject sweep deletes un-injected cw pods so their
     # controllers recreate them through the webhook.
     verbs: [get, list, watch, delete]
+  - apiGroups: [""]
+    resources: [events]
+    # The controller-runtime manager's event recorder (leader election,
+    # reconcile events) creates and patch-aggregates events across the
+    # namespaces it watches; without this it logs "events is forbidden".
+    verbs: [create, patch]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch, delete]

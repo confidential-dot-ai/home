@@ -17,6 +17,7 @@ import (
 	admissionregv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	sigsyaml "sigs.k8s.io/yaml"
 )
@@ -2045,18 +2046,40 @@ func TestChartOperatorRBACIsScoped(t *testing.T) {
 			t.Fatalf("render missing %q\n%s", want, out)
 		}
 	}
+	// The event recorder needs events, but only create/patch (recorder
+	// aggregation), never read or delete across the cluster. Decode the
+	// ClusterRole and assert the verbs exactly so a broadened grant fails.
+	var role rbacv1.ClusterRole
+	if !findDoc(t, out, "ClusterRole", "c8s-operator", &role) {
+		t.Fatalf("render missing ClusterRole c8s-operator\n%s", out)
+	}
+	if got := operatorVerbsFor(role, "", "events"); !slices.Equal(got, []string{"create", "patch"}) {
+		t.Fatalf("operator events verbs = %v, want [create patch]", got)
+	}
 	for _, unexpected := range []string{
 		"resources: [confidentialworkloads/finalizers]",
 		"resources: [deployments, statefulsets, daemonsets, replicasets]",
 		"resources: [secrets, configmaps]",
 		"resources: [nodes]",
-		"resources: [events]",
 		"resources: [rolebindings]",
 	} {
 		if strings.Contains(out, unexpected) {
 			t.Fatalf("render contained broad RBAC rule %q\n%s", unexpected, out)
 		}
 	}
+}
+
+// operatorVerbsFor returns the verbs the ClusterRole grants on (apiGroup,
+// resource), nil if no rule covers it. It does not expand wildcards: a "*"
+// resource or apiGroup matches only a literal "*" lookup, which is intentional
+// for least-privilege assertions.
+func operatorVerbsFor(role rbacv1.ClusterRole, apiGroup, resource string) []string {
+	for _, rule := range role.Rules {
+		if slices.Contains(rule.APIGroups, apiGroup) && slices.Contains(rule.Resources, resource) {
+			return rule.Verbs
+		}
+	}
+	return nil
 }
 
 func TestChartWebhookAddsCABundleRBAC(t *testing.T) {
