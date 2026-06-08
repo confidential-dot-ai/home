@@ -2,10 +2,17 @@
 Two installer DaemonSets share the same pod spec. The CDS-node DS pins
 to cds.node.selector (operator: In) and writes push-mode boot config;
 the worker DS NotIns the same label and writes pull-mode boot config.
+
+When cds.node.selector is empty (single-node / single-CVM: no dedicated CDS
+node), the split collapses — only the push-mode CDS DS renders and it targets
+every node, so the worker archetype is skipped to avoid two installers racing
+the same containerd config on the one node.
 */}}
 {{- if .Values.nriImagePolicy.enabled }}
+{{- $partitioned := eq (include "nri-image-policy.cdsPartitioned" .) "true" }}
 {{- range $archetype := list "cds" "worker" }}
 {{- $cds := eq $archetype "cds" }}
+{{- if or $cds $partitioned }}
 {{- $op := ternary "In" "NotIn" $cds }}
 ---
 apiVersion: apps/v1
@@ -58,10 +65,12 @@ spec:
                     operator: In
                     values:
                       - linux
+                  {{- if $partitioned }}
                   - key: {{ include "nri-image-policy.cdsNodeKey" $ | quote }}
                     operator: {{ $op }}
                     values:
                       - {{ include "nri-image-policy.cdsNodeValue" $ | quote }}
+                  {{- end }}
                   {{- range $.Values.nriImagePolicy.nodeAffinity.excludeLabels }}
                   - key: {{ .key }}
                     operator: NotIn
@@ -119,5 +128,6 @@ spec:
               memory: 32Mi
       volumes:
         {{- include "nri-image-policy.hostVolumes" $ | nindent 8 }}
+{{- end }}
 {{- end }}
 {{- end }}

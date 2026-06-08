@@ -118,6 +118,23 @@ func TestAppendKataInstallArgsEnforceImpliesEnabled(t *testing.T) {
 	})
 }
 
+func TestAppendSingleNodeInstallArgsDisabledIsNoOp(t *testing.T) {
+	got := appendSingleNodeInstallArgs([]string{"upgrade"}, false)
+	assertArgsEqual(t, got, []string{"upgrade"})
+}
+
+func TestAppendSingleNodeInstallArgsClearsCDSNodePinning(t *testing.T) {
+	// --single-node must null both the selector (drops the role=cds pin and
+	// collapses the installer split) and the tolerations (the dedicated-node
+	// taint is meaningless without a dedicated node).
+	got := appendSingleNodeInstallArgs([]string{"upgrade"}, true)
+	assertArgsEqual(t, got, []string{
+		"upgrade",
+		"--set", "cds.node.selector=null",
+		"--set", "cds.node.tolerations=null",
+	})
+}
+
 func TestAppendDistroInstallArgsSetsBothComponents(t *testing.T) {
 	// --distro feeds both the kata-deploy and nri-image-policy installers;
 	// nri-image-policy installs regardless of --kata, so distro always applies.

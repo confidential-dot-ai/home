@@ -40,21 +40,32 @@ Install image reference.
 {{- end }}
 
 {{/*
-Single nodeSelector entry from cds.node.selector. The chart requires exactly
-one label key/value pair so both CDS-installer affinity (matching) and
-worker-installer anti-affinity (NotIn) can be derived mechanically.
+cdsPartitioned is true when cds.node.selector pins CDS to a dedicated node, so
+the installer renders the CDS/worker split (CDS-installer affinity In the
+selector, worker-installer anti-affinity NotIn it). An empty selector means "no
+dedicated CDS node" (single-node / single-CVM): every node is CDS-eligible, the
+split collapses to a single push-mode installer everywhere, and the worker
+variant is not rendered. A nil selector (helm `--set cds.node.selector=null`)
+is a zero reflect.Value that panics len(), so test emptiness with `not` first.
+*/}}
+{{- define "nri-image-policy.cdsPartitioned" -}}
+{{- $sel := .Values.cds.node.selector -}}
+{{- if not $sel -}}false
+{{- else if eq (len $sel) 1 -}}true
+{{- else -}}{{- fail "cds.node.selector must be empty (no dedicated CDS node) or exactly one key/value pair (e.g. {role: cds})" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The single nodeSelector key/value of cds.node.selector. Only meaningful when
+cdsPartitioned is true; callers must gate on it.
 */}}
 {{- define "nri-image-policy.cdsNodeKey" -}}
-{{- $sel := .Values.cds.node.selector -}}
-{{- if ne (len $sel) 1 -}}
-{{- fail "cds.node.selector must be exactly one key/value pair (e.g. {role: cds})" -}}
-{{- end -}}
-{{- range $k, $_ := $sel }}{{ $k }}{{ end -}}
+{{- range $k, $_ := .Values.cds.node.selector }}{{ $k }}{{ end -}}
 {{- end }}
 
 {{- define "nri-image-policy.cdsNodeValue" -}}
-{{- $sel := .Values.cds.node.selector -}}
-{{- range $_, $v := $sel }}{{ $v }}{{ end -}}
+{{- range $_, $v := .Values.cds.node.selector }}{{ $v }}{{ end -}}
 {{- end }}
 
 {{/*

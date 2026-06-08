@@ -119,15 +119,21 @@ cds:
     nodePort: 30808
   ## CDS is a singleton, in-memory trust root reached over a node-local
   ## NodePort and (with persistence) an RWO volume, so it must land on a
-  ## known node. node.selector pins it; it must be exactly one label key/value
-  ## pair. The default expects that node labelled `role=cds`; override to match
-  ## your cluster. When image policy is enabled, the same selector also drives
-  ## the cds-installer affinity, worker anti-affinity, and push-hook placement.
+  ## known node. node.selector pins it to a dedicated node; it must be exactly
+  ## one label key/value pair. The default expects that node labelled
+  ## `role=cds`; override to match your cluster. When image policy is enabled,
+  ## the same selector also drives the cds-installer affinity, worker
+  ## anti-affinity, and push-hook placement.
+  ##
+  ## Set selector: {} for a single-node / single-CVM cluster with no dedicated
+  ## CDS node: CDS schedules on any node and the cds/worker installer split
+  ## collapses to a single push-mode installer on every node (`c8s install
+  ## --single-node` sets this for you).
   ##
   ## tolerations let CDS land on a node dedicated to it. The default tolerates
   ## `dedicated=cds:NoSchedule`, the conventional dedicated-CDS-node taint (the
   ## counterpart of the role=cds label); override for a different taint, or set
-  ## [] for an untainted node.
+  ## [] for an untainted node (e.g. a single-node cluster).
   node:
     selector:
       role: cds

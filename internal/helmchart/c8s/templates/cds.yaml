@@ -97,8 +97,10 @@ spec:
              When image policy is on, this is also the node whose push-mode
              plugin and push-hook seed the CDS digest, so co-location keeps the
              policy from denying CDS on a worker node. */}}
+      {{- with .Values.cds.node.selector }}
       nodeSelector:
-        {{- toYaml .Values.cds.node.selector | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.cds.node.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}

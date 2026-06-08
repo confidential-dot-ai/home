@@ -43,6 +43,7 @@ var (
 	installKataEnforce bool
 	installDistro      string
 	installCvmMode     string
+	installSingleNode  bool
 
 	installResolveDigests bool
 )
@@ -258,6 +259,7 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 			}
 		}
 		helmArgs = appendKataInstallArgs(helmArgs, installKata, installKataEnforce)
+		helmArgs = appendSingleNodeInstallArgs(helmArgs, installSingleNode)
 		if installResolveDigests {
 			helmArgs, err = appendResolvedDigestArgs(cmd.Context(), helmArgs, imageTag, components)
 			if err != nil {
@@ -292,8 +294,9 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 		// Fail fast on the default path if the CDS node is unlabelled, before
 		// mutating the cluster. Skipped when -f is supplied: a custom values
 		// file may disable image policy or change the selector, and the operator
-		// owns node labels in that case.
-		if len(installValues) == 0 {
+		// owns node labels in that case. Also skipped under --single-node, which
+		// clears the selector so no node needs the label.
+		if len(installValues) == 0 && !installSingleNode {
 			if err := preflightCDSNode(cmd.Context(), chartPath); err != nil {
 				return err
 			}
@@ -452,6 +455,22 @@ func appendKataInstallArgs(helmArgs []string, kata, enforce bool) []string {
 	return helmArgs
 }
 
+// appendSingleNodeInstallArgs collapses the dedicated-CDS-node partition for a
+// single-node / single-CVM cluster: an empty cds.node.selector makes every node
+// CDS-eligible (one push-mode installer everywhere, no worker split), and the
+// dedicated-node taint toleration is meaningless without it. helm renders =null
+// as an empty value the chart reads as "no partition". --set wins over -f, so
+// the flag is authoritative if both are supplied.
+func appendSingleNodeInstallArgs(helmArgs []string, singleNode bool) []string {
+	if !singleNode {
+		return helmArgs
+	}
+	return append(helmArgs,
+		"--set", "cds.node.selector=null",
+		"--set", "cds.node.tolerations=null",
+	)
+}
+
 // craneDigest resolves an image reference to its registry digest by shelling
 // out to `crane digest <ref>`. crane handles registry auth (docker config),
 // manifest lists, and the v2 protocol — reimplementing that in-process would
@@ -530,6 +549,7 @@ func init() {
 	installCmd.Flags().Int64Var(&installGetCertRunAsUser, "webhook-get-cert-run-as-user", 65532, "runAsUser for injected get-cert containers")
 	installCmd.Flags().Int64Var(&installGetCertRunAsGroup, "webhook-get-cert-run-as-group", 65532, "runAsGroup for injected get-cert containers")
 	installCmd.Flags().BoolVar(&installGetCertRunAsNonRoot, "webhook-get-cert-run-as-non-root", true, "set runAsNonRoot for injected get-cert containers")
+	installCmd.Flags().BoolVar(&installSingleNode, "single-node", false, "single-node / single-CVM cluster: clear the dedicated-CDS-node selector and taint toleration so every node is CDS-eligible (no role=cds label or dedicated node needed). Sets cds.node.selector={} and cds.node.tolerations=[]")
 	installCmd.Flags().StringVar(&installDistro, flagDistro, "k8s", "host Kubernetes distro: k8s (vanilla/kubeadm) or rke2 — selects containerd config paths for kata and nri-image-policy")
 	installCmd.Flags().StringVar(&installCvmMode, flagCvmMode, "baremetal", "CVM platform shape: baremetal (least-privilege device access) or managed (privileged attestation-service for managed-cloud CVMs that gate TEE device access)")
 	installCmd.Flags().BoolVar(&installKata, "kata", false, "install the Kata Containers runtime stack (kata-deploy DaemonSet + RuntimeClasses)")

@@ -478,6 +478,66 @@ func TestChartRATLSKubeVersionPinned(t *testing.T) {
 	}
 }
 
+// nodeAffinityHasKey reports whether any required nodeAffinity matchExpression
+// keys on the given label.
+func nodeAffinityHasKey(ds appsv1.DaemonSet, key string) bool {
+	aff := ds.Spec.Template.Spec.Affinity
+	if aff == nil || aff.NodeAffinity == nil ||
+		aff.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return false
+	}
+	for _, term := range aff.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		for _, expr := range term.MatchExpressions {
+			if expr.Key == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Default (dedicated-CDS-node) install renders BOTH installers, the CDS one
+// pinned to role=cds and the worker one excluding it. The single-node mode
+// must collapse this; this test guards the default against an accidental
+// collapse.
+func TestChartNriInstallerPartitionedByDefault(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	cds := renderedDaemonSet(t, out, "c8s-nri-image-policy-cds")
+	worker := renderedDaemonSet(t, out, "c8s-nri-image-policy-worker")
+	if !nodeAffinityHasKey(cds, "role") {
+		t.Error("default cds installer must pin to the role=cds selector")
+	}
+	if !nodeAffinityHasKey(worker, "role") {
+		t.Error("default worker installer must NotIn the role=cds selector")
+	}
+}
+
+// --single-node (empty cds.node.selector) collapses the partition: only the
+// push-mode CDS installer renders, it targets every node (no role term), the
+// worker installer is absent, and the CDS Deployment carries no nodeSelector.
+func TestChartNriInstallerCollapsesOnEmptySelector(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "cds.node.selector=null")
+	if err != nil {
+		t.Fatalf("helm template --set cds.node.selector=null: %v\n%s", err, out)
+	}
+	if findDoc(t, out, "DaemonSet", "c8s-nri-image-policy-worker", new(appsv1.DaemonSet)) {
+		t.Error("empty selector must not render the worker installer (would race the cds installer on the one node)")
+	}
+	cds := renderedDaemonSet(t, out, "c8s-nri-image-policy-cds")
+	if nodeAffinityHasKey(cds, "role") {
+		t.Error("with no partition the cds installer must not key on role; it should target every node")
+	}
+
+	// CDS Deployment must carry no nodeSelector so it lands on the lone node.
+	cdsDep := renderedDeployment(t, out, "c8s-cds")
+	if len(cdsDep.Spec.Template.Spec.NodeSelector) != 0 {
+		t.Errorf("cds Deployment must have no nodeSelector under single-node; got %v", cdsDep.Spec.Template.Spec.NodeSelector)
+	}
+}
+
 func findRATLSMeshDaemonSet(t *testing.T, helmOut string) *appsv1.DaemonSet {
 	t.Helper()
 	var ds *appsv1.DaemonSet
