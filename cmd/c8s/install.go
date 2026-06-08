@@ -190,7 +190,7 @@ var installCmd = &cobra.Command{
 	Long: `Extracts the bundled c8s Helm chart and runs
 'helm upgrade --install' against the current kubeconfig context. Deploys:
 
-  - the install namespace (labeled pod-security=privileged when --kata is set)
+  - the install namespace (labeled pod-security=privileged)
   - the c8s Deployment + Service (admission webhook + status-mirror controllers)
   - the ConfidentialWorkload CRD
   - the mutating admission webhook configuration
@@ -299,11 +299,14 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 			}
 		}
 
-		// Only the kata stack ships privileged pods (kata-deploy DaemonSet);
-		// without --kata, the c8s-system namespace can run under the default
-		// pod-security baseline.
-		privileged := installKata || installKataEnforce
-		if err := applyNamespace(cmd.Context(), installNamespace, privileged); err != nil {
+		// The install always ships pods that exceed the restricted pod-security
+		// profile: nri-image-policy runs privileged unconditionally, ratls-mesh's
+		// iptables init containers run as root with NET_ADMIN/NET_RAW, and
+		// attestation-api needs SYS_RAWIO (baremetal) or privileged (managed).
+		// --kata adds kata-deploy on top. No supported shape fits restricted, so
+		// the namespace is always labelled privileged (a CIS-hardened cluster, e.g.
+		// RKE2 with profile: cis, would otherwise reject those pods at admission).
+		if err := applyNamespace(cmd.Context(), installNamespace); err != nil {
 			return err
 		}
 
@@ -333,20 +336,15 @@ func extractChart() (string, error) {
 	return dir, nil
 }
 
-// applyNamespace creates the install namespace before helm. When privileged
-// is true the namespace is labeled to allow privileged pods (kata-deploy);
-// otherwise it is created without pod-security overrides. helm
+// applyNamespace creates the install namespace before helm, labelled to allow
+// privileged pods (the install's privileged components, see RunE). helm
 // --create-namespace cannot set labels, so we always pre-apply.
-func applyNamespace(ctx context.Context, namespace string, privileged bool) error {
-	manifest, err := namespaceManifest(namespace, privileged)
+func applyNamespace(ctx context.Context, namespace string) error {
+	manifest, err := namespaceManifest(namespace)
 	if err != nil {
 		return fmt.Errorf("render namespace manifest: %w", err)
 	}
-	psa := "baseline"
-	if privileged {
-		psa = "privileged"
-	}
-	fmt.Fprintf(os.Stdout, "+ kubectl apply -f - # Namespace/%s (pod-security=%s)\n", namespace, psa)
+	fmt.Fprintf(os.Stdout, "+ kubectl apply -f - # Namespace/%s (pod-security=privileged)\n", namespace)
 	kc := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
 	kc.Stdin = bytes.NewReader(manifest)
 	kc.Stdout = os.Stdout
@@ -358,21 +356,20 @@ func applyNamespace(ctx context.Context, namespace string, privileged bool) erro
 }
 
 // namespaceManifest renders the release Namespace as JSON (valid kubectl apply
-// input). When privileged is true it sets pod-security labels at the enforce,
-// warn, and audit modes; otherwise the namespace inherits the cluster default.
-func namespaceManifest(namespace string, privileged bool) ([]byte, error) {
+// input), labelled privileged at the enforce, warn, and audit modes so the
+// install's privileged pods admit on a cluster whose default profile is
+// stricter (e.g. CIS-hardened restricted).
+func namespaceManifest(namespace string) ([]byte, error) {
 	ns := corev1.Namespace{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Namespace"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: namespace,
+			Labels: map[string]string{
+				"pod-security.kubernetes.io/enforce": "privileged",
+				"pod-security.kubernetes.io/warn":    "privileged",
+				"pod-security.kubernetes.io/audit":   "privileged",
+			},
 		},
-	}
-	if privileged {
-		ns.Labels = map[string]string{
-			"pod-security.kubernetes.io/enforce": "privileged",
-			"pod-security.kubernetes.io/warn":    "privileged",
-			"pod-security.kubernetes.io/audit":   "privileged",
-		}
 	}
 	return json.Marshal(ns)
 }

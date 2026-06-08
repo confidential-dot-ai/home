@@ -45,7 +45,7 @@ func TestDefaultInstallImageTag(t *testing.T) {
 }
 
 func TestNamespaceManifestSetsPrivilegedPodSecurityLabels(t *testing.T) {
-	data, err := namespaceManifest("c8s-system", true)
+	data, err := namespaceManifest("c8s-system")
 	if err != nil {
 		t.Fatalf("namespaceManifest: %v", err)
 	}
@@ -61,31 +61,13 @@ func TestNamespaceManifestSetsPrivilegedPodSecurityLabels(t *testing.T) {
 	if ns.Name != "c8s-system" {
 		t.Fatalf("manifest name = %q, want c8s-system", ns.Name)
 	}
+	// The install always ships privileged pods, so the namespace must permit
+	// them regardless of flags; a CIS-hardened cluster default would otherwise
+	// reject them at admission.
 	for _, mode := range []string{"enforce", "warn", "audit"} {
 		key := "pod-security.kubernetes.io/" + mode
 		if got := ns.Labels[key]; got != "privileged" {
 			t.Fatalf("label %s = %q, want privileged", key, got)
-		}
-	}
-}
-
-func TestNamespaceManifestOmitsPodSecurityLabelsWhenNotPrivileged(t *testing.T) {
-	// Without --kata the install ships no privileged pods, so c8s-system
-	// should run under the cluster's default pod-security profile.
-	data, err := namespaceManifest("c8s-system", false)
-	if err != nil {
-		t.Fatalf("namespaceManifest: %v", err)
-	}
-
-	var ns corev1.Namespace
-	if err := json.Unmarshal(data, &ns); err != nil {
-		t.Fatalf("manifest is not valid JSON: %v\n%s", err, data)
-	}
-
-	for _, mode := range []string{"enforce", "warn", "audit"} {
-		key := "pod-security.kubernetes.io/" + mode
-		if got, ok := ns.Labels[key]; ok {
-			t.Fatalf("label %s = %q present, want unset", key, got)
 		}
 	}
 }
