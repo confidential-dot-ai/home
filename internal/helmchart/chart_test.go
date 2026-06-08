@@ -2292,7 +2292,7 @@ func TestChartNriImagePolicyDistroSelectsContainerdLayout(t *testing.T) {
 			distro:      "rke2",
 			wantDir:     "/var/lib/rancher/rke2/agent/etc/containerd",
 			wantMode:    "dropin",
-			wantRestart: "systemctl restart rke2-agent",
+			wantRestart: "if systemctl is-active --quiet rke2-server; then systemctl restart rke2-server; else systemctl restart rke2-agent; fi",
 		},
 	} {
 		t.Run(tc.distro, func(t *testing.T) {

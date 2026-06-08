@@ -603,7 +603,8 @@ nriImagePolicy:
     socket: ""
     namespace: k8s.io
     # Empty derives from distro (k8s -> "systemctl restart containerd",
-    # rke2 -> "systemctl restart rke2-agent").
+    # rke2 -> restart whichever of rke2-server/rke2-agent is active on the
+    # node, so server/control-plane and worker nodes are both handled).
     restartCommand: ""
 
   refresh:

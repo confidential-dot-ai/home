@@ -148,7 +148,10 @@ Host service restart that makes containerd re-read its config.
 {{- if .Values.nriImagePolicy.containerd.restartCommand -}}
 {{ .Values.nriImagePolicy.containerd.restartCommand }}
 {{- else if eq .Values.nriImagePolicy.distro "rke2" -}}
-systemctl restart rke2-agent
+{{- /* A server/control-plane node runs rke2-server (which owns containerd); a
+       worker node runs rke2-agent. Restart whichever unit is active so the
+       install works on a single-node/server cluster too, not just workers. */ -}}
+if systemctl is-active --quiet rke2-server; then systemctl restart rke2-server; else systemctl restart rke2-agent; fi
 {{- else -}}
 systemctl restart containerd
 {{- end -}}
