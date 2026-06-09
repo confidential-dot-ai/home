@@ -151,6 +151,71 @@ func preflightCDSNode(ctx context.Context, chartPath string) error {
 	return nil
 }
 
+// preflightDistro fails fast (before the helm install) when --distro disagrees
+// with the cluster's actual host distro. kata-deploy AND nri-image-policy both
+// bind containerd config paths derived from --distro (the latter installs
+// regardless of --kata), so a mismatch produces an opaque runtime failure
+// inside the on-host installer ("config doesn't have the right containerd
+// stanza") rather than anything actionable from helm.
+//
+// Detection: RKE2's bundled kubelet stamps a "+rke2" build suffix onto
+// status.nodeInfo.kubeletVersion (e.g. v1.29.5+rke2r1); vanilla upstream
+// kubelet has no suffix. The suffix is the only reliable distro signal
+// kubectl can see without going on-host.
+//
+// It reads node KubeletVersion straight from kubectl, so it only guards the
+// default path; an operator who overrides kata.containerdConfigDir or the
+// nriImagePolicy containerd-* fields via -f is trusted to manage the layout
+// themselves (the caller skips this when -f is supplied).
+func preflightDistro(ctx context.Context, distro string) error {
+	out, err := exec.CommandContext(ctx, "kubectl", "get", "nodes",
+		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.kubeletVersion}{"\n"}{end}`).Output()
+	if err != nil {
+		return fmt.Errorf("kubectl get nodes: %w", err)
+	}
+	rke2Nodes, otherNodes := classifyDistroNodes(strings.Split(strings.TrimSpace(string(out)), "\n"))
+	return checkDistroMatch(distro, rke2Nodes, otherNodes)
+}
+
+// classifyDistroNodes splits "name\tkubeletVersion" lines into RKE2-built vs
+// upstream-built buckets by the "+rke2" build-metadata suffix RKE2's kubelet
+// build carries. Lines without a tab (no kubeletVersion reported) are skipped
+// — a node Status with no kubeletVersion can't be classified either way, so
+// the preflight stays silent rather than guessing.
+func classifyDistroNodes(lines []string) (rke2, other []string) {
+	for _, l := range lines {
+		name, ver, ok := strings.Cut(l, "\t")
+		if !ok || name == "" {
+			continue
+		}
+		if strings.Contains(ver, "+rke2") {
+			rke2 = append(rke2, name)
+		} else {
+			other = append(other, name)
+		}
+	}
+	return
+}
+
+// checkDistroMatch reports a distro mismatch. It is strict on both sides: a
+// single mis-matched node still breaks the install on that node, since
+// kata-deploy + nri-image-policy run on every selected node and patch a
+// distro-specific containerd path. Mixed clusters (some RKE2, some not) get
+// caught on whichever side the operator didn't pick.
+func checkDistroMatch(distro string, rke2Nodes, otherNodes []string) error {
+	switch distro {
+	case "rke2":
+		if len(otherNodes) > 0 {
+			return fmt.Errorf("--distro rke2 was selected, but %d node(s) have a non-RKE2 kubeletVersion (no +rke2 build suffix): %s. kata-deploy and nri-image-policy will patch RKE2's containerd path (/var/lib/rancher/rke2/agent/etc/containerd) on every selected node and fail on these. Re-run with --distro k8s, or restrict the install with kata.nodeSelector / nriImagePolicy.nodeSelector via -f", len(otherNodes), strings.Join(otherNodes, ", "))
+		}
+	case "k8s":
+		if len(rke2Nodes) > 0 {
+			return fmt.Errorf("--distro k8s was selected (the default), but %d node(s) have an RKE2 kubeletVersion (+rke2 build suffix): %s. RKE2 keeps containerd config under /var/lib/rancher/rke2/agent/etc/containerd, not /etc/containerd; without --distro rke2 the kata and nri-image-policy installers patch the wrong directory and fail at runtime when the expected containerd stanza is missing. Re-run with --distro rke2", len(rke2Nodes), strings.Join(rke2Nodes, ", "))
+		}
+	}
+	return nil
+}
+
 // nestedMap walks map keys and returns the map[string]any at the path.
 func nestedMap(tree map[string]any, keys ...string) (map[string]any, bool) {
 	cur := tree
@@ -298,6 +363,17 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 		// clears the selector so no node needs the label.
 		if len(installValues) == 0 && !installSingleNode {
 			if err := preflightCDSNode(cmd.Context(), chartPath); err != nil {
+				return err
+			}
+		}
+
+		// Fail fast when --distro disagrees with the cluster — kata-deploy and
+		// nri-image-policy both bind containerd paths from --distro, and a
+		// mismatch surfaces as an opaque on-host installer error rather than
+		// anything helm can attribute. Skipped when -f is supplied: the
+		// containerd path is overrideable, and the operator owns it in that case.
+		if len(installValues) == 0 {
+			if err := preflightDistro(cmd.Context(), installDistro); err != nil {
 				return err
 			}
 		}

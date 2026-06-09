@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -156,6 +157,81 @@ func TestAppendDistroInstallArgsSetsBothComponents(t *testing.T) {
 func TestAppendDistroInstallArgsRejectsUnknownDistro(t *testing.T) {
 	if _, err := appendDistroInstallArgs([]string{"upgrade"}, "openshift"); err == nil {
 		t.Fatal("appendDistroInstallArgs accepted an unknown --distro, want error")
+	}
+}
+
+// classifyDistroNodes splits "name\tkubeletVersion" lines by the "+rke2"
+// build-metadata suffix RKE2's kubelet build carries. Anything else (vanilla
+// upstream, k3s, future distros) lands in the "other" bucket — the preflight
+// only owns the rke2 vs not-rke2 split.
+func TestClassifyDistroNodesByKubeletVersionSuffix(t *testing.T) {
+	lines := []string{
+		"node-a\tv1.29.5+rke2r1",
+		"node-b\tv1.29.5",        // vanilla upstream
+		"node-c\tv1.30.1+rke2r2", // newer RKE2 build
+		"node-d\tv1.30.0+k3s1",   // k3s lands in "other"
+		"",                       // a trailing blank line from kubectl is ignored
+		"malformed-no-tab",       // a line with no tab can't be classified, ignored
+	}
+	rke2, other := classifyDistroNodes(lines)
+	wantRke2 := []string{"node-a", "node-c"}
+	wantOther := []string{"node-b", "node-d"}
+	if !reflect.DeepEqual(rke2, wantRke2) {
+		t.Errorf("rke2 nodes = %v, want %v", rke2, wantRke2)
+	}
+	if !reflect.DeepEqual(other, wantOther) {
+		t.Errorf("other nodes = %v, want %v", other, wantOther)
+	}
+}
+
+func TestCheckDistroMatchAcceptsHomogeneousCluster(t *testing.T) {
+	// k8s + all-vanilla and rke2 + all-rke2 are the supported shapes; both
+	// must pass cleanly.
+	if err := checkDistroMatch("k8s", nil, []string{"node-a", "node-b"}); err != nil {
+		t.Errorf("k8s + vanilla nodes: unexpected error: %v", err)
+	}
+	if err := checkDistroMatch("rke2", []string{"node-a", "node-b"}, nil); err != nil {
+		t.Errorf("rke2 + rke2 nodes: unexpected error: %v", err)
+	}
+}
+
+// The bug the preflight exists to catch: --distro defaults to k8s, the user
+// forgets to pass --distro rke2 against an RKE2 cluster, and the kata installer
+// later fails with an opaque "containerd stanza missing" error. Catch it here.
+func TestCheckDistroMatchFlagsRKE2NodesUnderK8sDistro(t *testing.T) {
+	err := checkDistroMatch("k8s", []string{"node-a"}, nil)
+	if err == nil {
+		t.Fatal("--distro k8s on an RKE2 node: want error, got nil")
+	}
+	for _, want := range []string{"--distro rke2", "node-a", "+rke2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q (should name the fix, the node, and the signal)", err.Error(), want)
+		}
+	}
+}
+
+// Mirror case: --distro rke2 against a cluster whose nodes aren't actually
+// RKE2. Same containerd-path mismatch in the other direction.
+func TestCheckDistroMatchFlagsNonRKE2NodesUnderRKE2Distro(t *testing.T) {
+	err := checkDistroMatch("rke2", nil, []string{"node-a"})
+	if err == nil {
+		t.Fatal("--distro rke2 on a vanilla node: want error, got nil")
+	}
+	for _, want := range []string{"--distro k8s", "node-a"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+// Mixed clusters break too: kata-deploy + nri-image-policy run on every
+// selected node, so a single mismatched node fails the install on that node.
+func TestCheckDistroMatchRejectsMixedClusters(t *testing.T) {
+	if err := checkDistroMatch("k8s", []string{"rke2-node"}, []string{"vanilla-node"}); err == nil {
+		t.Error("--distro k8s with an rke2 node mixed in: want error, got nil")
+	}
+	if err := checkDistroMatch("rke2", []string{"rke2-node"}, []string{"vanilla-node"}); err == nil {
+		t.Error("--distro rke2 with a vanilla node mixed in: want error, got nil")
 	}
 }
 
