@@ -21,7 +21,8 @@ on:
   # ghcr.io/lunal-dev/{cds,get-cert}:<IMAGE_TAG>`) are the ones docker.yml
   # just published — not whatever stale digests were on `main` at the moment
   # of a concurrent push. The job-level `if:` below gates on a successful
-  # Docker push event (excludes Docker's own PR runs).
+  # Docker push to main or a release tag (excludes Docker's own PR runs and
+  # side-branch pushes — those never build or publish).
   #
   # No `pull_request:` trigger: the build is 45+ min and historically flaky
   # on upstream deps (snapshot.ubuntu.com 5xx, docker+apparmor on newer
@@ -61,13 +62,20 @@ jobs:
   build:
     name: Build kata-guest-base
     # workflow_run fires for every Docker completion — including its PR runs,
-    # which don't publish. Gate to "Docker succeeded on a push event" (push
-    # is the only event that does `docker push`). workflow_dispatch is the
-    # manual-rebuild escape hatch and always runs.
+    # which don't publish. Gate the AUTOMATIC path to "Docker succeeded on a
+    # push to main or a release tag (v*)": those are the only refs we publish
+    # a kata-guest-base image for, so a side-branch push never triggers the
+    # ~45-min build or pushes a branch-* tag (head_branch is the source ref of
+    # the triggering Docker event — "main", the tag name, or a branch name).
+    # workflow_dispatch stays the manual-rebuild escape hatch and always runs
+    # — it can still be invoked on a side branch on purpose, and that path
+    # does publish a branch-* tag (see Compute tags).
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push')
+       github.event.workflow_run.event == 'push' &&
+       (github.event.workflow_run.head_branch == 'main' ||
+        startsWith(github.event.workflow_run.head_branch, 'v')))
     # Self-hosted runner (the SEV-SNP build host) rather than a GitHub-hosted
     # ubuntu image. See the build-deps / glibc / AppArmor notes below for the
     # provisioning invariants this runner has to satisfy.
@@ -402,8 +410,9 @@ jobs:
       # --- Push to GHCR ------------------------------------------------
       #
       # The job-level `if:` already gates the whole job on a successful
-      # Docker push (or workflow_dispatch), so we publish unconditionally
-      # here. Tag derivation uses `head_branch`/`head_sha` from the
+      # Docker push to main / a release tag (or a manual workflow_dispatch),
+      # so we publish unconditionally here. Tag derivation uses
+      # `head_branch`/`head_sha` from the
       # workflow_run payload so the published tags match the commit Docker
       # just succeeded on (not this workflow's own ref, which is the default
       # branch under workflow_run). workflow_dispatch falls back to github.*.
