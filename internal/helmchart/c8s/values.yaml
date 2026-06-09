@@ -372,10 +372,32 @@ kata:
     ## Default true: under --kata the puller fetches the published artifact.
     enabled: true
     repository: ghcr.io/lunal-dev
-    tag: latest
+    ## Default tracks the same floating tag c8s itself falls back to for
+    ## non-release builds (see cmd/c8s/install.go fallbackImageTag). Release
+    ## installs SHOULD override this to a specific `<short-sha>` digest-stand-in
+    ## per docs/pitfalls.md "The bootstrap allowlist binds to floating :main
+    ## digests" — the puller has no `digest:` field yet (tracked there).
+    ## :latest is deliberately NOT the default: cds and the kata-guest-base
+    ## release pipeline do not publish a :latest tag, so a stock install would
+    ## 401/MANIFEST_UNKNOWN out of the box.
+    tag: main
     ## Pull the kata-guest-base oras artifact over plain HTTP (no TLS). For a
     ## local / in-cluster registry mirror only. Never set for a real registry.
     insecure: false
+    ## Optional Secret name (kubernetes.io/dockerconfigjson) in the release
+    ## namespace whose `.dockerconfigjson` is projected to /root/.docker/config.json
+    ## inside the puller pod so the host-side `oras pull` of kata-guest-base can
+    ## authenticate against a PRIVATE registry (e.g. ghcr.io/lunal-dev today).
+    ## Empty/unset = anonymous pull (correct once the artifacts go public — drop
+    ## this value and the Secret then). See docs/pitfalls.md "Private
+    ## kata-guest-base puller credentials".
+    ##
+    ## NOTE: this is a HOST-SIDE operator credential — NOT in the TCB / SNP
+    ## launch measurement, and unrelated to `registryAuth` below (which IS in
+    ## the measurement, baked into the guest rootfs, and authenticates in-guest
+    ## workload pulls). Rotating this Secret is a plain DS restart; rotating
+    ## `registryAuth` requires a kata-guest-base rebuild + re-pinned digest.
+    pullerAuthSecret: ""
     ## In-guest workload registry auth source. When set, the puller appends
     ## `agent.image_registry_auth=<this>` to the kata-qemu-snp guest kernel
     ## cmdline so the in-guest CDH can authenticate private guest-pulls.

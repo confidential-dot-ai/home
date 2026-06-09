@@ -107,6 +107,52 @@ floating-tag promotion**: a third workflow that rolls `:main` and `:latest` on
 all c8s artifacts only after BOTH `Docker` AND `kata-guest-base` succeed for
 the same commit. Out of scope here; tracked as a follow-up.
 
+## Private `kata-guest-base` puller credentials (`kata.guestImage.pullerAuthSecret`)
+
+`internal/helmchart/c8s/templates/kata-image-puller.yaml`, `internal/helmchart/c8s/values.yaml`
+
+The kata-image-puller fetches the `kata-guest-base` oras artifact by shelling
+out to `oras pull` **inside the puller pod** (see `files/scripts/pull-and-configure.sh`).
+This is **not** a kubelet image pull: `oras` only reads `~/.docker/config.json`
+and is oblivious to Kubernetes `imagePullSecrets`. So patching the puller
+ServiceAccount's `imagePullSecrets` only helps kubelet pull the puller's
+**own** image; the subsequent `kata-guest-base` pull stays anonymous and 401s
+against the private `ghcr.io/lunal-dev` artifact with:
+
+```
+Error response from registry: failed to resolve <tag>: GET …/manifests/<tag>: unauthorized
+```
+
+**Mitigation:** set `kata.guestImage.pullerAuthSecret` to the name of a
+`kubernetes.io/dockerconfigjson` Secret in the release namespace. The chart
+projects its `.dockerconfigjson` key to `/root/.docker/config.json` in the
+puller pod — exactly where `oras` looks (the container runs as root under
+`privileged: true`, so `$HOME=/root`).
+
+```sh
+kubectl create secret docker-registry ghcr-puller-creds \
+  -n c8s-system \
+  --docker-server=ghcr.io \
+  --docker-username=<user-or-x-access-token> \
+  --docker-password="$GITHUB_TOKEN"
+
+helm upgrade c8s … --set kata.guestImage.pullerAuthSecret=ghcr-puller-creds
+```
+
+**This is operator-side, not TCB-relevant.** The credential never enters the
+guest and is not part of the SNP launch measurement. Rotation is a Secret
+update + puller DaemonSet restart — no re-attestation, no kata-guest-base
+rebuild, no re-pinned digest. Contrast `kata.guestImage.registryAuth` and the
+baked `ghcr-auth.json` (see next section), both of which **do** move the
+measurement.
+
+**Remove this once the artifacts go public.** Same rationale as the baked
+`ghcr-auth.json` tradeoff below — `pullerAuthSecret` exists only because
+`kata-guest-base` is currently a private oras artifact. When the repos /
+artifacts flip public, drop the value from your values file and delete the
+Secret; the puller will pull anonymously and the host-side credential goes
+away entirely.
+
 ## `ghcr-auth.json` bakes a real GHCR PAT into the measured rootfs — by design, but know the tradeoff
 
 `kata-guest-base/extra/etc/c8s/ghcr-auth.json` is a docker auth.json baked into

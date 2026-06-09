@@ -134,6 +134,16 @@ spec:
               readOnly: true
             - name: host
               mountPath: /host
+            {{- if .Values.kata.guestImage.pullerAuthSecret }}
+            # oras reads ~/.docker/config.json; the container runs as root
+            # (privileged), so $HOME=/root. The projected volume below renames
+            # the standard dockerconfigjson key (.dockerconfigjson) to the
+            # filename oras expects (config.json). See docs/pitfalls.md
+            # "Private kata-guest-base puller credentials".
+            - name: dockercfg
+              mountPath: /root/.docker
+              readOnly: true
+            {{- end }}
           resources:
 {{ toYaml .Values.kata.guestImage.resources | indent 12 }}
       volumes:
@@ -144,4 +154,14 @@ spec:
         - name: host
           hostPath:
             path: /
+        {{- if .Values.kata.guestImage.pullerAuthSecret }}
+        - name: dockercfg
+          projected:
+            sources:
+              - secret:
+                  name: {{ .Values.kata.guestImage.pullerAuthSecret }}
+                  items:
+                    - key: .dockerconfigjson
+                      path: config.json
+        {{- end }}
 {{- end }}
