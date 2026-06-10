@@ -61,6 +61,12 @@ jobs:
     outputs:
       matrix: ${{ steps.docker-matrix.outputs.matrix }}
       has_images: ${{ steps.docker-matrix.outputs.has_images }}
+      # retag-unchanged gates on these. A step output that isn't mapped here
+      # reads as empty downstream — `has_retag == 'true'` was silently false on
+      # every push, so the retag job never ran and unchanged components got no
+      # `:<short-sha>` tag (kata-guest-base's fetch.sh then 404'd on them).
+      retag_matrix: ${{ steps.docker-matrix.outputs.retag_matrix }}
+      has_retag: ${{ steps.docker-matrix.outputs.has_retag }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
