@@ -239,7 +239,11 @@ func runInGuest(ctx context.Context, c *inGuestConfig) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", envMeshMeasurements, err)
 	}
-	meshPolicy := &ratls.VerifyPolicy{Measurements: meshPolicyMeasurements}
+
+	meshPolicy := &ratls.VerifyPolicy{
+		Measurements:      meshPolicyMeasurements,
+		AttestationApiURL: c.attestationServiceURL,
+	}
 	if len(meshPolicyMeasurements) == 0 {
 		logger.Warn("no mesh measurements pinned (C8S_MESH_MEASUREMENTS empty); accepting any TEE attestation (unsafe for production)")
 	}
