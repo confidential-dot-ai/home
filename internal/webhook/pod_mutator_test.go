@@ -1,12 +1,18 @@
 package webhook
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 func TestMutatePodInjectsCertBootstrapAndRenewal(t *testing.T) {
@@ -460,5 +466,156 @@ func TestKataRuntimeClassForDisabled(t *testing.T) {
 	}
 	if got := kataRuntimeClassFor(pod, Config{KataEnforce: false}.withDefaults()); got != "" {
 		t.Fatalf("kataRuntimeClassFor = %q, want \"\" when kata enforcement is off", got)
+	}
+}
+
+func TestWorkloadSAN(t *testing.T) {
+	cases := []struct {
+		name      string
+		cwID      string
+		namespace string
+		want      string
+	}{
+		{"bare id gets managed service dns name", "api", "default", "c8s-api.default.svc"},
+		{"dotted id passes through", "c8s-tls-lb.c8s-system.svc", "c8s-system", "c8s-tls-lb.c8s-system.svc"},
+		{"empty namespace falls back to id", "api", "", "api"},
+		{"id too long for a service name passes through", strings.Repeat("a", 60), "default", strings.Repeat("a", 60)},
+		{"empty id stays empty", "", "default", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := workloadSAN(tc.cwID, tc.namespace); got != tc.want {
+				t.Fatalf("workloadSAN(%q, %q) = %q, want %q", tc.cwID, tc.namespace, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleDerivesServiceSAN proves the request namespace, not the pod
+// object's (empty for template-created pods), feeds the injected --san.
+func TestHandleDerivesServiceSAN(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	m := &podMutator{
+		decoder: admission.NewDecoder(scheme),
+		cfg: Config{
+			GetCertImage:      "ghcr.io/lunal-dev/c8s-operator:test",
+			CDSURL:            "http://cds.c8s-system.svc:8443",
+			AttestationApiURL: "http://attestation-api.c8s-system.svc:8400",
+			CertDir:           "/etc/c8s/certs",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+	raw, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := m.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace: "default",
+			Object:    runtime.RawExtension{Raw: raw},
+		},
+	})
+	if !resp.Allowed {
+		t.Fatalf("Handle denied: %v", resp.Result)
+	}
+
+	initContainers := initContainersPatch(t, resp)
+	if len(initContainers) != 2 {
+		t.Fatalf("initContainers patch = %d containers, want bootstrap + renew", len(initContainers))
+	}
+	for _, c := range initContainers {
+		if !hasArg(c.Args, "--san=c8s-api.default.svc") {
+			t.Fatalf("%s args %v missing --san=c8s-api.default.svc", c.Name, c.Args)
+		}
+	}
+}
+
+// initContainersPatch decodes the /spec/initContainers patch op from an
+// admission response into typed containers.
+func initContainersPatch(t *testing.T, resp admission.Response) []corev1.Container {
+	t.Helper()
+	var initContainers []corev1.Container
+	for _, op := range resp.Patches {
+		if op.Path != "/spec/initContainers" {
+			continue
+		}
+		value, err := json.Marshal(op.Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(value, &initContainers); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return initContainers
+}
+
+func TestParseAnnotationsSANOverride(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		AnnotationWorkload: "api",
+		AnnotationSAN:      "api.default.svc",
+	}}}
+	inj, err := parseAnnotations(pod)
+	if err != nil {
+		t.Fatalf("parseAnnotations: %v", err)
+	}
+	if inj.SAN != "api.default.svc" {
+		t.Fatalf("SAN = %q, want api.default.svc", inj.SAN)
+	}
+
+	pod.Annotations[AnnotationSAN] = "https://api.default.svc"
+	if _, err := parseAnnotations(pod); !errors.Is(err, errInvalidInjectionAnnotation) {
+		t.Fatalf("parseAnnotations error = %v, want invalid annotation", err)
+	}
+}
+
+func TestHandleSANOverrideWinsOverDerivation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	m := &podMutator{
+		decoder: admission.NewDecoder(scheme),
+		cfg: Config{
+			GetCertImage:      "ghcr.io/lunal-dev/c8s-operator:test",
+			CDSURL:            "http://cds.c8s-system.svc:8443",
+			AttestationApiURL: "http://attestation-api.c8s-system.svc:8400",
+			CertDir:           "/etc/c8s/certs",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			AnnotationWorkload: "api",
+			AnnotationSAN:      "api.default.svc",
+		}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+	raw, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := m.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace: "default",
+			Object:    runtime.RawExtension{Raw: raw},
+		},
+	})
+	if !resp.Allowed {
+		t.Fatalf("Handle denied: %v", resp.Result)
+	}
+	initContainers := initContainersPatch(t, resp)
+	if len(initContainers) != 2 {
+		t.Fatalf("initContainers patch = %d containers, want bootstrap + renew", len(initContainers))
+	}
+	for _, c := range initContainers {
+		if !hasArg(c.Args, "--san=api.default.svc") {
+			t.Fatalf("%s args %v missing --san=api.default.svc", c.Name, c.Args)
+		}
 	}
 }

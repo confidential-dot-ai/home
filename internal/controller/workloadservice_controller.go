@@ -12,7 +12,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -31,11 +30,6 @@ const (
 	managedByLabel = "app.kubernetes.io/managed-by"
 	managedByValue = "c8s-operator"
 )
-
-// workloadServiceNamePrefix marks the managed Service as c8s-owned inside the
-// workload namespace and keeps it from colliding with the workload's own
-// Services.
-const workloadServiceNamePrefix = "c8s-"
 
 // collisionRequeue is how often the reconciler retries while a foreign
 // Service occupies the desired name. The foreign object emits no watch
@@ -120,7 +114,7 @@ func (r *WorkloadServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	cwID := template.Annotations[webhook.AnnotationWorkload]
 	desiredName := ""
 	if _, excluded := r.Excluded[req.Namespace]; !excluded {
-		desiredName = workloadServiceName(cwID)
+		desiredName = webhook.WorkloadServiceName(cwID)
 		if cwID != "" && desiredName == "" {
 			l.Info("cw id does not yield a valid Service name; skipping headless Service",
 				"cw", cwID)
@@ -196,19 +190,6 @@ func (r *WorkloadServiceReconciler) deleteStaleServices(ctx context.Context, obj
 		l.Info("deleted stale managed Service", "service", svc.Name, "namespace", svc.Namespace)
 	}
 	return nil
-}
-
-// workloadServiceName derives the managed Service name from the cw id, or ""
-// when the id is absent or cannot name a Service.
-func workloadServiceName(cwID string) string {
-	if cwID == "" {
-		return ""
-	}
-	name := workloadServiceNamePrefix + cwID
-	if len(validation.IsDNS1035Label(name)) > 0 {
-		return ""
-	}
-	return name
 }
 
 // servicePorts mirrors the pod template's containerPorts (regular and init

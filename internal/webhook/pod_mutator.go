@@ -48,6 +48,11 @@ const (
 	// select the workload's pods — Service selectors match labels only.
 	LabelWorkload = AnnotationWorkload
 
+	// AnnotationSAN overrides the DNS SAN get-cert requests. For workloads
+	// adopted into c8s whose clients already dial an existing Service name;
+	// without it the SAN is derived from the cw id (see workloadSAN).
+	AnnotationSAN = "confidential.ai/c8s-san"
+
 	AnnotationCertVolume             = "confidential.ai/c8s-cert-volume"
 	AnnotationCertDir                = "confidential.ai/c8s-cert-dir"
 	AnnotationCertFile               = "confidential.ai/c8s-cert-file"
@@ -152,11 +157,15 @@ type podMutator struct {
 // injection captures everything the mutator decides from pod annotations.
 type injection struct {
 	WorkloadID string
-	Cert       certSpec
-	Reload     reloadSpec
-	Discovery  discoverySpec
-	Security   getCertSecuritySpec
-	Verbose    bool
+	// SAN is the DNS SAN get-cert requests from CDS. The c8s-san annotation
+	// sets it directly; otherwise Handle derives it from the workload id and
+	// pod namespace (see workloadSAN), falling back to the id verbatim.
+	SAN       string
+	Cert      certSpec
+	Reload    reloadSpec
+	Discovery discoverySpec
+	Security  getCertSecuritySpec
+	Verbose   bool
 }
 
 type certSpec struct {
@@ -202,6 +211,7 @@ func parseAnnotations(pod *corev1.Pod) (*injection, error) {
 
 	inj := &injection{
 		WorkloadID: id,
+		SAN:        strings.TrimSpace(annotations[AnnotationSAN]),
 		Cert: certSpec{
 			Volume:   annotations[AnnotationCertVolume],
 			Dir:      annotations[AnnotationCertDir],
@@ -311,6 +321,7 @@ func listAnnotation(annotations map[string]string, name string) []string {
 
 func hasInjectionDetailAnnotations(annotations map[string]string) bool {
 	for _, name := range []string{
+		AnnotationSAN,
 		AnnotationCertVolume,
 		AnnotationCertDir,
 		AnnotationCertFile,
@@ -342,6 +353,12 @@ func (inj *injection) validate() error {
 	if errs := validation.IsValidLabelValue(inj.WorkloadID); len(errs) > 0 {
 		return fmt.Errorf("%w: %s must be a valid label value (mirrored as the %s pod label): %s",
 			errInvalidInjectionAnnotation, AnnotationWorkload, LabelWorkload, strings.Join(errs, "; "))
+	}
+	if inj.SAN != "" {
+		if errs := validation.IsDNS1123Subdomain(inj.SAN); len(errs) > 0 {
+			return fmt.Errorf("%w: %s must be a valid DNS name: %s",
+				errInvalidInjectionAnnotation, AnnotationSAN, strings.Join(errs, "; "))
+		}
 	}
 	if inj.Cert.RenewInterval < 0 {
 		return fmt.Errorf("%w: %s must not be negative", errInvalidInjectionAnnotation, AnnotationRenewInterval)
@@ -428,6 +445,11 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 	if err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
 	}
+	if inj != nil && inj.SAN == "" {
+		// req.Namespace, not pod.Namespace: template-created pods reach
+		// admission with an empty metadata.namespace.
+		inj.SAN = workloadSAN(inj.WorkloadID, req.Namespace)
+	}
 
 	// confidential.ai/cw drives both get-cert injection and kata-qemu-snp
 	// class selection: a pod that opts in to a c8s workload identity also
@@ -472,6 +494,38 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	return admission.PatchResponseFromRaw(req.Object.Raw, raw)
+}
+
+// workloadServiceNamePrefix marks the operator-managed headless Service inside
+// the workload namespace and keeps it from colliding with the workload's own
+// Services.
+const workloadServiceNamePrefix = "c8s-"
+
+// WorkloadServiceName derives the managed headless Service name from the cw
+// id, or "" when the id is absent or cannot name a Service. Shared with the
+// WorkloadServiceReconciler so the Service it provisions and the SAN get-cert
+// requests stay derived from one rule.
+func WorkloadServiceName(cwID string) string {
+	if cwID == "" {
+		return ""
+	}
+	name := workloadServiceNamePrefix + cwID
+	if len(validation.IsDNS1035Label(name)) > 0 {
+		return ""
+	}
+	return name
+}
+
+// workloadSAN is the DNS SAN get-cert requests for a workload. An id that
+// names a managed headless Service gets that Service's in-cluster DNS name,
+// which CDS's default --dns-san-pattern signs; any other id passes through
+// verbatim (e.g. the <name>.<ns>.svc ids the chart's own components use).
+func workloadSAN(cwID, namespace string) string {
+	svc := WorkloadServiceName(cwID)
+	if svc == "" || namespace == "" {
+		return cwID
+	}
+	return svc + "." + namespace + ".svc"
 }
 
 // validateWorkloadLabel rejects pods that set the confidential.ai/cw label
@@ -573,7 +627,7 @@ func initCertContainer(inj *injection, cfg Config) corev1.Container {
 		"get-cert",
 		"--cds-url=" + cfg.CDSURL,
 		"--attestation-api-url=" + cfg.AttestationApiURL,
-		"--san=" + inj.WorkloadID,
+		"--san=" + inj.SAN,
 		"--out=" + certPath(inj.Cert.Dir, inj.Cert.CertFile),
 		"--key-out=" + certPath(inj.Cert.Dir, inj.Cert.KeyFile),
 		"--key-mode=" + cfg.CertKeyMode,
@@ -603,7 +657,7 @@ func renewCertContainer(inj *injection, cfg Config) corev1.Container {
 		"get-cert",
 		"--cds-url=" + cfg.CDSURL,
 		"--attestation-api-url=" + cfg.AttestationApiURL,
-		"--san=" + inj.WorkloadID,
+		"--san=" + inj.SAN,
 		"--key=" + certPath(inj.Cert.Dir, inj.Cert.KeyFile),
 		"--out=" + certPath(inj.Cert.Dir, inj.Cert.CertFile),
 		"--renew-interval=" + inj.Cert.RenewInterval.String(),
@@ -688,6 +742,9 @@ func getCertEnv(inj *injection) []corev1.EnvVar {
 
 func (inj *injection) withDefaults(cfg Config) injection {
 	effective := *inj
+	if effective.SAN == "" {
+		effective.SAN = effective.WorkloadID
+	}
 	if effective.Cert.Volume == "" {
 		effective.Cert.Volume = "c8s-certs"
 	}

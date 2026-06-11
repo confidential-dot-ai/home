@@ -220,8 +220,15 @@ metadata:
     confidential.ai/cw: api
 ```
 
-`confidential.ai/cw` is required and becomes the certificate SAN. Injection
-does not require a CR lookup.
+`confidential.ai/cw` is required. The certificate SAN is derived from it: an
+id that names the operator-managed headless Service gets that Service's
+in-cluster DNS name (`c8s-<id>.<namespace>.svc`, which CDS's default
+`--dns-san-pattern` signs); an id that cannot name a Service (dots, length
+over 59) is used as the SAN verbatim and must match a CDS pattern itself.
+A workload adopted into c8s whose clients already dial an existing Service
+name can set `confidential.ai/c8s-san` to that name instead; the annotation
+value is used as the requested SAN verbatim and must match a CDS pattern.
+Injection does not require a CR lookup.
 
 For opted-in pods, the webhook:
 
@@ -240,7 +247,7 @@ The init container runs:
 get-cert \
   --cds-url=https://<release>-cds.<namespace>.svc:8443 \
   --attestation-api-url=<release-attestation-api-url> \
-  --san=<confidential.ai/cw> \
+  --san=<derived from confidential.ai/cw, e.g. c8s-api.default.svc> \
   --out=/etc/c8s/certs/tls.crt \
   --key-out=/etc/c8s/certs/tls.key \
   --key-mode=<webhook.certVolume.keyMode>
