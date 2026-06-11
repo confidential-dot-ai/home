@@ -51,6 +51,8 @@
 # Override knobs (env): KATA_VERSION, FS_TYPE, BUILD_VARIANT, KATA_SRC,
 #   STEEP_DIR, OUTPUT_DIR, DEBUG_OUTPUT_DIR, SKIP_KERNEL=1 (reuse an
 #   existing vmlinuz).
+#   ROOTFS_CACHE_TAR (restore the pre-overlay base rootfs from this .tar.zst
+#   when it exists, else pack the freshly built one there — the CI cache hook).
 #
 # NOTE (first-build validation): osbuilder's exact make-variable surface
 # (ROOTFS_BUILD_DEST / IMAGES_BUILD_DEST / AGENT_POLICY wiring) is pinned
@@ -270,18 +272,48 @@ else
 fi
 for gc in "${GUEST_COMPONENTS[@]}"; do log "  guest-component: ${gc} ($(stat -c%s "${GC_BIN_DIR}/${gc}") bytes)"; done
 
-log "Step 2/5: building ${DISTRO} rootfs with osbuilder (kata-agent included)"
-sudo make -C "${OSBUILDER}" \
-    DISTRO="${DISTRO}" \
-    OS_VERSION="${OS_VERSION}" \
-    GOPATH="${GO_PATH_DIR}" \
-    AGENT_INIT=no \
-    AGENT_POLICY=yes \
-    USE_DOCKER=1 \
-    EXTRA_PKGS="${KATA_EXTRA_PKGS}" \
-    ROOTFS_BUILD_DEST="${ROOTFS_BUILD_DEST}" \
-    rootfs
-[[ -d "${TARGET_ROOTFS}" ]] || die "osbuilder did not produce a rootfs at ${TARGET_ROOTFS}"
+# CI cache hook (kata-guest-base.yml "Restore base rootfs"): the Step 2 output
+# is fully determined by KATA_VERSION / DISTRO / OS_VERSION / AGENT_* /
+# EXTRA_PKGS — nothing commit-specific enters the rootfs until Step 3's
+# overlay — so it is reusable across builds. When ROOTFS_CACHE_TAR names an
+# existing tarball, unpack it instead of rebuilding (skipping the
+# rootfs-builder docker build, the debootstrap against snapshot.ubuntu.com,
+# and the in-container agent/libseccomp builds); when it names a missing path,
+# pack the freshly built rootfs there for the workflow to save. The pack runs
+# immediately after Step 2, before the later steps that historically fail, so
+# even a broken build leaves a reusable base rootfs.
+#
+# sudo tar with --numeric-owner / --xattrs: the tree is root-owned and carries
+# security.capability xattrs, all of which feed the measured verity root — a
+# tar that drops them would silently corrupt the guest. (This is also why the
+# workflow can't point actions/cache at the directory: its tar runs as the
+# runner user and loses ownership.)
+ROOTFS_TAR_FLAGS=(--zstd --numeric-owner --xattrs --xattrs-include='*')
+if [[ -n "${ROOTFS_CACHE_TAR:-}" && -f "${ROOTFS_CACHE_TAR}" ]]; then
+    log "Step 2/5: restoring base ${DISTRO} rootfs from ${ROOTFS_CACHE_TAR}"
+    sudo rm -rf "${TARGET_ROOTFS}"
+    sudo mkdir -p "${TARGET_ROOTFS}"
+    sudo tar "${ROOTFS_TAR_FLAGS[@]}" -xpf "${ROOTFS_CACHE_TAR}" -C "${TARGET_ROOTFS}"
+else
+    log "Step 2/5: building ${DISTRO} rootfs with osbuilder (kata-agent included)"
+    sudo make -C "${OSBUILDER}" \
+        DISTRO="${DISTRO}" \
+        OS_VERSION="${OS_VERSION}" \
+        GOPATH="${GO_PATH_DIR}" \
+        AGENT_INIT=no \
+        AGENT_POLICY=yes \
+        USE_DOCKER=1 \
+        EXTRA_PKGS="${KATA_EXTRA_PKGS}" \
+        ROOTFS_BUILD_DEST="${ROOTFS_BUILD_DEST}" \
+        rootfs
+    [[ -d "${TARGET_ROOTFS}" ]] || die "osbuilder did not produce a rootfs at ${TARGET_ROOTFS}"
+    if [[ -n "${ROOTFS_CACHE_TAR:-}" ]]; then
+        log "Packing base rootfs into ${ROOTFS_CACHE_TAR} (pre-overlay, for the CI cache)"
+        sudo tar "${ROOTFS_TAR_FLAGS[@]}" -cpf "${ROOTFS_CACHE_TAR}" -C "${TARGET_ROOTFS}" .
+        sudo chown "$(id -u):$(id -g)" "${ROOTFS_CACHE_TAR}"
+    fi
+fi
+[[ -d "${TARGET_ROOTFS}" ]] || die "base rootfs missing at ${TARGET_ROOTFS}"
 
 # --- Step 3/5: overlay the c8s layer -----------------------------------
 # Drop our binaries, systemd units, OPA policy (overwriting osbuilder's

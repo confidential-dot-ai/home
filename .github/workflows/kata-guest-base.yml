@@ -31,11 +31,13 @@ on:
   # Docker push to main or a release tag (excludes Docker's own PR runs and
   # side-branch pushes — those never build or publish).
   #
-  # No `pull_request:` trigger: the build is 45+ min and historically flaky
-  # on upstream deps (snapshot.ubuntu.com 5xx, docker+apparmor on newer
-  # runners). Cost of a post-merge break is "revert + open follow-up";
-  # paid PR feedback isn't worth the 45 min × every push. Use
-  # workflow_dispatch to rebuild on demand.
+  # No `pull_request:` trigger: the build is long (historically 45+ min;
+  # ~13 min with warm caches, ~4 min once the kernel + base-rootfs caches
+  # hit) and historically flaky on upstream deps (snapshot.ubuntu.com 5xx,
+  # docker+apparmor on newer runners — both off the hot path on cache hits).
+  # Cost of a post-merge break is "revert + open follow-up"; paid PR feedback
+  # isn't worth the build × every push. Use workflow_dispatch to rebuild on
+  # demand.
   workflow_run:
     workflows: ["Docker"]
     types: [completed]
@@ -338,25 +340,63 @@ jobs:
           path: ${{ runner.temp }}/kata-conf
           key: ${{ steps.kata-conf-cache.outputs.cache-primary-key }}
 
+      # Cache the pre-overlay base rootfs (build.sh Step 2/5: osbuilder's
+      # debootstrap + kata-agent, ~4 min + the snapshot.ubuntu.com flake
+      # surface). Nothing commit-specific enters the rootfs until Step 3's
+      # overlay, so it is reusable across builds. The cache unit is a
+      # build.sh-produced sudo-tar (ROOTFS_CACHE_TAR env on the build step),
+      # NOT the directory: actions/cache tars as the runner user and would
+      # drop the root ownership + security.capability xattrs that feed the
+      # measured verity root.
+      #
+      # Key: KATA_VERSION (osbuilder + agent + toolchain pins all derive from
+      # it) + build.sh itself, whose Step 2 block holds the remaining inputs
+      # (DISTRO/OS_VERSION/AGENT_*/EXTRA_PKGS). Hashing the whole script
+      # over-invalidates — any build.sh edit re-pays the ~4 min — which is the
+      # safe direction; a stale hit is impossible by construction. No
+      # restore-keys: a partial-input match could resurrect a rootfs built
+      # with different packages into the measured image.
+      - name: Restore base rootfs
+        id: rootfs-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/kata-base-rootfs.tar.zst
+          key: kata-base-rootfs-${{ env.KATA_VERSION }}-${{ hashFiles('c8s/kata-guest-base/scripts/build.sh') }}
+
       # Cache the guest kernel build output (steep/output/kernel) — the most
       # expensive INVARIANT in this job. build.sh Step 1/5 runs `steep kernel`,
-      # which short-circuits the ~10-min compile (and the kernel-source
-      # download under output/kernel/cache/) when its manifest.json fingerprint
-      # matches the inputs (steep src/commands/kernel.rs). Key on STEEP_REF (a
-      # different steep can yield a different kernel) + the c8s kernel config
-      # fragment; restore-keys falls back to the latest same-steep cache so even
-      # a fragment change reuses the cached kernel-source tarball. steep
-      # re-validates the fingerprint internally, so a stale restore can never
-      # yield the wrong kernel — it just rebuilds. Restore here (before build);
-      # the matching always()-save is after the build step below.
+      # which short-circuits the compile + the mkosi tools-tree build (and the
+      # kernel-source download under output/kernel/cache/) when its
+      # manifest.json fingerprint matches the inputs (steep
+      # src/commands/kernel.rs).
+      #
+      # The resolved-config snapshot (steep/kernel/config-x86_64.snapshot) MUST
+      # be cached alongside: steep rewrites it during the build (committed
+      # baseline + our container.config fragment merged in) and hashes it into
+      # the fingerprint. Without it a fresh steep checkout reverts the snapshot
+      # to the committed baseline, the fingerprint never matches, and the
+      # "cached" kernel rebuilds every run — tools tree (~200s) + compile
+      # (~150s) — which is exactly what happened before the -v2 key.
+      # (-v2 busts the old snapshot-less entries: cache keys are immutable, so
+      # an exact hit on an old entry would skip the save forever.)
+      #
+      # Key on STEEP_REF (a different steep can yield a different kernel) + the
+      # c8s kernel config fragment; restore-keys falls back to the latest
+      # same-steep cache so even a fragment change reuses the cached
+      # kernel-source tarball. steep re-validates the fingerprint internally,
+      # so a stale restore can never yield the wrong kernel — it just rebuilds.
+      # Restore here (before build); the matching always()-save is after the
+      # build step below.
       - name: Restore guest kernel build
         id: kernel-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: steep/output/kernel
-          key: ${{ runner.os }}-kata-kernel-${{ env.STEEP_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}
+          path: |
+            steep/output/kernel
+            steep/kernel/config-x86_64.snapshot
+          key: ${{ runner.os }}-kata-kernel-v2-${{ env.STEEP_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}
           restore-keys: |
-            ${{ runner.os }}-kata-kernel-${{ env.STEEP_REF }}-
+            ${{ runner.os }}-kata-kernel-v2-${{ env.STEEP_REF }}-
 
       # kata osbuilder's rootfs-builder Dockerfile fails its first RUN with
       # "apparmor failed to apply profile: ... /proc/thread-self/attr/apparmor/
@@ -386,6 +426,11 @@ jobs:
           # available on the self-hosted `the-machine` runner). gh needs a
           # token even for the public repo.
           GH_TOKEN: ${{ github.token }}
+          # Base-rootfs cache handshake (see "Restore base rootfs"): when the
+          # restore populated this tarball, build.sh unpacks it and skips
+          # Step 2; otherwise build.sh packs the freshly built rootfs here,
+          # right after Step 2, for the Save step below.
+          ROOTFS_CACHE_TAR: ${{ runner.temp }}/kata-base-rootfs.tar.zst
         run: ./scripts/build.sh
 
       # Restore the AppArmor posture torn down above. if: always() so it runs
@@ -411,8 +456,29 @@ jobs:
         if: always() && steps.kernel-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: steep/output/kernel
-          key: ${{ runner.os }}-kata-kernel-${{ env.STEEP_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}
+          # Keep in lockstep with the Restore step: the snapshot must travel
+          # with output/kernel or steep's fingerprint check misses every run.
+          path: |
+            steep/output/kernel
+            steep/kernel/config-x86_64.snapshot
+          key: ${{ runner.os }}-kata-kernel-v2-${{ env.STEEP_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}
+
+      # build.sh packs the tarball right after Step 2, before the later steps
+      # that historically fail, so an always()-save still banks the ~4-min
+      # rootfs on a late failure. But a failure DURING Step 2 leaves no
+      # tarball, and hashFiles() can't see RUNNER_TEMP — probe with a step so
+      # the save doesn't error on a missing path.
+      - name: Check base rootfs tarball
+        id: rootfs-tar
+        if: always()
+        run: echo "exists=$([[ -f "${RUNNER_TEMP}/kata-base-rootfs.tar.zst" ]] && echo true || echo false)" >> "${GITHUB_OUTPUT}"
+
+      - name: Save base rootfs
+        if: always() && steps.rootfs-cache.outputs.cache-hit != 'true' && steps.rootfs-tar.outputs.exists == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/kata-base-rootfs.tar.zst
+          key: ${{ steps.rootfs-cache.outputs.cache-primary-key }}
 
       # --- Push to GHCR ------------------------------------------------
       #
