@@ -161,7 +161,7 @@ variables (typically via systemd EnvironmentFile=/run/c8s/ratls-mesh.env,
 which c8s-cloudinit-env.service populates from cloud-init user-data).
 
 Required environment variables:
-  C8S_WORKLOAD_ID         workload identity (becomes the leaf cert SAN)
+  C8S_WORKLOAD_ID         workload identity (logged and reported to CDS)
   C8S_CDS_URL             https URL of CDS (attestation + leaf signing + CA)
 
 Optional environment variables:
@@ -254,13 +254,15 @@ func runInGuest(ctx context.Context, c *inGuestConfig) error {
 	asClient := attestclient.NewClientWithHTTP("", &http.Client{Timeout: c.rotationTimeout})
 	attestFunc := makeAttestFunc(asClient, c.attestationServiceURL)
 
-	dnsNames := []string{c.workloadID, podIP}
 	effectiveCAURL := strings.TrimRight(c.cdsURL, "/") + "/ca"
 
+	// The self-signed boot cert carries no SAN, same as host-mode: mesh peers
+	// authenticate it by hardware attestation, not by SAN/hostname. The
+	// CDS-issued upgrade cert carries no SAN either; its CN binds the pod IP
+	// (see cdsclient.Client.createCSR).
 	serverTLS, serverCertMgr, err := ratls.NewServerTLSConfig(&ratls.ServerConfig{
 		Platform:        c.platform,
 		AttestFunc:      attestFunc,
-		DNSNames:        dnsNames,
 		CertTTL:         c.certTTL,
 		ClientPolicy:    meshPolicy,
 		DynamicCACert:   true,
