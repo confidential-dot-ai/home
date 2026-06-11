@@ -111,10 +111,19 @@ spec:
             medium: Memory
             sizeLimit: 1Mi
         {{- end }}
+        # medium: Memory is load-bearing under kata-qemu-snp with
+        # shared_fs="none": a default (disk-backed) emptyDir gets provisioned
+        # through kata-agent's CDH secure-storage path inside the guest and
+        # fails CreateContainer ("[CDH] [ERROR]: Secure Mount failed").
+        # tmpfs-backed emptyDirs are mounted directly by the guest kernel.
         - name: nginx-cache
-          emptyDir: {}
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
         - name: nginx-tmp
-          emptyDir: {}
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
         - name: nginx-config
           configMap:
             name: {{ include "tls-lb.fullname" . }}-nginx
