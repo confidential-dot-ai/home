@@ -1498,6 +1498,84 @@ func TestTLSLBCertProvisioningValuesDriveGetCertContainers(t *testing.T) {
 	}
 }
 
+// TestChartTeeProxyHostPort covers the teeProxy.hostPort edge toggle. The
+// default publishes the node host ports (443/80). hostPort.enabled=false omits
+// them so the pod schedules where another controller already owns 80/443 (e.g.
+// RKE2's bundled ingress-nginx). Custom host ports bind independently of the
+// in-pod listener ports.
+func TestChartTeeProxyHostPort(t *testing.T) {
+	portHostPort := func(c corev1.Container, name string) (containerPort, hostPort int32, found bool) {
+		for _, p := range c.Ports {
+			if p.Name == name {
+				return p.ContainerPort, p.HostPort, true
+			}
+		}
+		return 0, 0, false
+	}
+
+	t.Run("default binds host 443/80", func(t *testing.T) {
+		out, err := helmTemplate(t)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		proxy, ok := findContainer(renderedDeployment(t, out, "c8s-tee-proxy").Spec.Template.Spec.Containers, "proxy")
+		if !ok {
+			t.Fatal("proxy container missing")
+		}
+		for name, want := range map[string]int32{"https": 443, "http": 80} {
+			if _, hp, found := portHostPort(proxy, name); !found || hp != want {
+				t.Fatalf("%s hostPort = %d (found=%v), want %d", name, hp, found, want)
+			}
+		}
+	})
+
+	t.Run("disabled omits host ports", func(t *testing.T) {
+		out, err := helmTemplate(t, "--set", "teeProxy.hostPort.enabled=false")
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		proxy, ok := findContainer(renderedDeployment(t, out, "c8s-tee-proxy").Spec.Template.Spec.Containers, "proxy")
+		if !ok {
+			t.Fatal("proxy container missing")
+		}
+		for _, name := range []string{"https", "http"} {
+			cp, hp, found := portHostPort(proxy, name)
+			if !found {
+				t.Fatalf("%s port missing entirely; container must still listen", name)
+			}
+			if hp != 0 {
+				t.Fatalf("%s hostPort = %d, want 0 (unbound)", name, hp)
+			}
+			if cp == 0 {
+				t.Fatalf("%s containerPort must stay set even with hostPort disabled", name)
+			}
+		}
+	})
+
+	t.Run("custom host ports decouple from listener ports", func(t *testing.T) {
+		out, err := helmTemplate(t,
+			"--set", "teeProxy.hostPort.https=8443",
+			"--set", "teeProxy.hostPort.http=8080",
+		)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		proxy, ok := findContainer(renderedDeployment(t, out, "c8s-tee-proxy").Spec.Template.Spec.Containers, "proxy")
+		if !ok {
+			t.Fatal("proxy container missing")
+		}
+		for name, want := range map[string]struct{ cp, hp int32 }{
+			"https": {443, 8443},
+			"http":  {80, 8080},
+		} {
+			cp, hp, found := portHostPort(proxy, name)
+			if !found || cp != want.cp || hp != want.hp {
+				t.Fatalf("%s = containerPort %d / hostPort %d (found=%v), want %d / %d", name, cp, hp, found, want.cp, want.hp)
+			}
+		}
+	})
+}
+
 func TestChartRejectsManagedTeeProxyHTTPSWithoutListener(t *testing.T) {
 	// With every HTTPS-listener source off (certProvisioning, static tls,
 	// domain), https to the chart tee-proxy has nothing to talk to.

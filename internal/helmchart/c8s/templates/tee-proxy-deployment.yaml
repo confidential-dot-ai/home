@@ -95,11 +95,15 @@ spec:
           ports:
             - name: https
               containerPort: {{ .Values.teeProxy.ports.https }}
-              hostPort: {{ .Values.teeProxy.ports.https }}
+              {{- if .Values.teeProxy.hostPort.enabled }}
+              hostPort: {{ .Values.teeProxy.hostPort.https | default .Values.teeProxy.ports.https }}
+              {{- end }}
               protocol: TCP
             - name: http
               containerPort: {{ .Values.teeProxy.ports.http }}
-              hostPort: {{ .Values.teeProxy.ports.http }}
+              {{- if .Values.teeProxy.hostPort.enabled }}
+              hostPort: {{ .Values.teeProxy.hostPort.http | default .Values.teeProxy.ports.http }}
+              {{- end }}
               protocol: TCP
           workingDir: /tmp
           env:

@@ -866,10 +866,23 @@ teeProxy:
   headerName: "Attestation-Report"
   # Remote attestation-api URL (required for new tee-proxy versions)
   attestationURL: ""
-  # Listening ports
+  # Listening ports (the ports tee-proxy itself listens on inside the pod).
   ports:
     https: 443
     http: 80
+  # Host-network edge binding. When enabled, tee-proxy publishes its listeners
+  # on the node's host ports so external clients reach attested TLS directly on
+  # the node IP. This grabs the node's 80/443: on clusters whose ingress already
+  # owns them — notably RKE2, which bundles rke2-ingress-nginx on hostPort
+  # 80/443 — the tee-proxy pod stays Pending ("didn't have free ports for the
+  # requested pod ports"). On such clusters set enabled: false (reach tee-proxy
+  # through its Service / your own ingress or NodePort) or point http/https at
+  # free host ports. http/https are the host ports to bind; empty derives them
+  # from ports.{http,https} above.
+  hostPort:
+    enabled: true
+    https: ""
+    http: ""
   # Node placement
   nodeSelector: {}
   tolerations: []
