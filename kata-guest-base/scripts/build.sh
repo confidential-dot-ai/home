@@ -89,11 +89,20 @@ KATA_SRC="${KATA_SRC:-${WORK_DIR}/kata-${KATA_VERSION}}"
 
 EXTRA_DIR="${IMAGE_DIR}/extra"
 # c8s's kernel config fragment, merged after steep's required + hardening
-# baseline by `steep kernel --kernel-config-fragment`. steep owns the
-# resolved-config snapshot internally now (fixed path in the steep tree,
-# auto-updated every build); the old --kernel-snapshot flag is gone, so
-# kernel/config-x86_64.snapshot in this repo is no longer a build input.
+# baseline by `steep kernel --kernel-config-fragment`. steep resolves the
+# merged .config and writes it to a fixed path in its own tree (the old
+# --kernel-snapshot flag is gone). That snapshot is NOT a build input —
+# steep regenerates it from scratch each resolve — but it is the only
+# place the effect of steep's baseline (kernel version / hardening) on OUR
+# guest kernel is visible. So after the kernel build Step 1 copies steep's
+# snapshot into this repo (KERNEL_SNAPSHOT), committed, so any drift is
+# reviewable in git. See README.md "Build" + container.config header.
 KERNEL_FRAGMENT="${IMAGE_DIR}/kernel/container.config"
+# Resolved-config lockfile: steep writes STEEP_SNAPSHOT during the kernel
+# build; Step 1 copies it to KERNEL_SNAPSHOT (tracked in git) for drift
+# detection. Not read by the build.
+KERNEL_SNAPSHOT="${IMAGE_DIR}/kernel/config-x86_64.snapshot"
+STEEP_SNAPSHOT="${STEEP_DIR}/kernel/config-x86_64.snapshot"
 
 log() { printf '\n=== %s ===\n' "$*"; }
 die() { echo "FATAL: $*" >&2; exit 1; }
@@ -185,6 +194,18 @@ else
     STEEP_VMLINUZ="${STEEP_DIR}/output/kernel/vmlinuz"
     [[ -f "${STEEP_VMLINUZ}" ]] || die "steep did not produce ${STEEP_VMLINUZ}"
     install -m 0644 "${STEEP_VMLINUZ}" "${VMLINUZ_OUT}"
+
+    # Capture the resolved-config snapshot steep just wrote (baseline +
+    # our container.config, merged). steep keeps it in its own tree where
+    # it gets overwritten/discarded; copy it next to the fragment in THIS
+    # repo so the merged config is committed and reviewable — this is how a
+    # change in steep's kernel base that affects our guest kernel becomes
+    # visible here. Not a build input. (SKIP_KERNEL reuses an existing
+    # vmlinuz without re-resolving, so it intentionally leaves the
+    # committed snapshot untouched.)
+    [[ -f "${STEEP_SNAPSHOT}" ]] || die "steep did not produce ${STEEP_SNAPSHOT} — cannot capture the resolved-config snapshot."
+    install -m 0644 "${STEEP_SNAPSHOT}" "${KERNEL_SNAPSHOT}"
+    echo "    snapshot: ${KERNEL_SNAPSHOT} (sha256 $(sha256sum "${KERNEL_SNAPSHOT}" | awk '{print $1}'))"
 fi
 echo "    kernel: ${VMLINUZ_OUT}"
 

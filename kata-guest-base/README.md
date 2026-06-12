@@ -134,10 +134,16 @@ IMAGE_TAG=<c8s-release-tag> ./scripts/fetch.sh
 
 The kernel is built from steep's required + hardening baseline plus this
 image's `kernel/container.config` fragment, passed as `steep kernel
---kernel-config-fragment`. steep keeps the resolved-config snapshot
-internally and rewrites it on every build, so there is no separate
-snapshot step here (and no `--kernel-snapshot` / `--update-snapshot`
-flag). For kernel version bumps see
+--kernel-config-fragment`. steep resolves the merged `.config` and writes
+it to a snapshot in its own tree (there is no `--kernel-snapshot` /
+`--update-snapshot` flag). `scripts/build.sh` then copies that snapshot to
+`kernel/config-x86_64.snapshot` in **this** repo: the committed, reviewable
+record of the resolved guest-kernel config (steep's baseline + this
+fragment, merged). It is a lockfile, not a build input — editing the
+fragment or re-pinning steep (`STEEP_REF` in the workflow) moves it, so
+commit the snapshot alongside that change and review its diff. It is the
+only place a change in steep's kernel base that affects our guest kernel
+shows up. For kernel version bumps see
 [base-images/rke2/README.md](https://github.com/lunal-dev/base-images/blob/master/rke2/README.md)
 "Bumping versions".
 
