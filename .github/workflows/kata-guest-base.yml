@@ -474,6 +474,14 @@ jobs:
           # Step 2; otherwise build.sh packs the freshly built rootfs here,
           # right after Step 2, for the Save step below.
           ROOTFS_CACHE_TAR: ${{ runner.temp }}/kata-base-rootfs.tar.zst
+          # Snapshot drift gate: on the master / release-tag publish path, make
+          # build.sh abort at Step 1 (before osbuilder + the GHCR push) if the
+          # resolved kernel config doesn't match the committed lockfile
+          # kata-guest-base/kernel/config-x86_64.snapshot. Off for
+          # workflow_dispatch (head_branch empty) so a side-branch test build of
+          # an in-flight kernel change can still publish a branch-* image before
+          # the snapshot is committed.
+          CHECK_SNAPSHOT: ${{ (github.event.workflow_run.head_branch == 'main' || startsWith(github.event.workflow_run.head_branch, 'v')) && '1' || '0' }}
         run: ./scripts/build.sh
 
       # Restore the AppArmor posture torn down above. if: always() so it runs

@@ -204,8 +204,30 @@ else
     # vmlinuz without re-resolving, so it intentionally leaves the
     # committed snapshot untouched.)
     [[ -f "${STEEP_SNAPSHOT}" ]] || die "steep did not produce ${STEEP_SNAPSHOT} — cannot capture the resolved-config snapshot."
+    # Drift gate: compare the freshly-resolved config against the committed
+    # lockfile BEFORE overwriting it. CHECK_SNAPSHOT=1 (set by CI on the
+    # publish path) makes a mismatch fatal HERE — at Step 1, before osbuilder
+    # (Steps 2-5) and the GHCR push — so a guest image whose kernel config
+    # drifted from what's committed/reviewed never gets built or published.
+    # Local builds leave CHECK_SNAPSHOT unset and just refresh the lockfile.
+    snapshot_drift=0
+    if [[ -f "${KERNEL_SNAPSHOT}" ]] && ! cmp -s "${STEEP_SNAPSHOT}" "${KERNEL_SNAPSHOT}"; then
+        snapshot_drift=1
+        committed_sha="$(sha256sum "${KERNEL_SNAPSHOT}" | awk '{print $1}')"
+    fi
+    # Copy regardless (so the uploaded artifact reflects what THIS build
+    # resolved, even on a gate failure) — then enforce.
     install -m 0644 "${STEEP_SNAPSHOT}" "${KERNEL_SNAPSHOT}"
     echo "    snapshot: ${KERNEL_SNAPSHOT} (sha256 $(sha256sum "${KERNEL_SNAPSHOT}" | awk '{print $1}'))"
+    if [[ "${CHECK_SNAPSHOT:-0}" == "1" && "${snapshot_drift}" == "1" ]]; then
+        die "resolved kernel config drifted from the committed snapshot.
+       committed ${KERNEL_SNAPSHOT}: ${committed_sha}
+       resolved  (this build):       $(sha256sum "${KERNEL_SNAPSHOT}" | awk '{print $1}')
+   steep's baseline (STEEP_REF) or kernel/container.config changed without
+   re-committing kata-guest-base/kernel/config-x86_64.snapshot. Re-resolve and
+   commit it (run the 'Kernel config snapshot' workflow, or a local build), or
+   revert the change that moved it. Failing before osbuilder + the GHCR push."
+    fi
 fi
 echo "    kernel: ${VMLINUZ_OUT}"
 
