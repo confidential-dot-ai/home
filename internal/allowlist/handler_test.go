@@ -1,4 +1,4 @@
-package whitelist_test
+package allowlist_test
 
 import (
 	"encoding/json"
@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/confidential-dot-ai/c8s/internal/allowlist"
 	"github.com/confidential-dot-ai/c8s/internal/attestation"
 	"github.com/confidential-dot-ai/c8s/internal/ear"
 	"github.com/confidential-dot-ai/c8s/internal/earclaims"
 	"github.com/confidential-dot-ai/c8s/internal/readiness"
-	"github.com/confidential-dot-ai/c8s/internal/whitelist"
 	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/earsigner"
@@ -54,9 +54,9 @@ func signedEAR(t *testing.T, keyPEM []byte, claims jwt.MapClaims) string {
 	return token
 }
 
-func testWhitelistApp(t *testing.T) (http.Handler, *readiness.Checker, ear.Issuer) {
+func testAllowlistApp(t *testing.T) (http.Handler, *readiness.Checker, ear.Issuer) {
 	t.Helper()
-	store, err := whitelist.OpenInMemory()
+	store, err := allowlist.OpenInMemory()
 	if err != nil {
 		t.Fatalf("open in-memory store: %v", err)
 	}
@@ -73,9 +73,9 @@ func testWhitelistApp(t *testing.T) (http.Handler, *readiness.Checker, ear.Issue
 	asClient := attestationclient.NewClient("http://localhost:0")
 	checker := readiness.NewChecker(asClient, 10*time.Second)
 
-	wh := whitelist.Handler{
+	wh := allowlist.Handler{
 		Store: &store,
-		WriteAuthorizer: whitelist.EARWriteAuthorizer{
+		WriteAuthorizer: allowlist.EARWriteAuthorizer{
 			PublicKey:           issuer.PublicKey,
 			ExpectedIssuer:      testIssuer,
 			AllowedMeasurements: map[string]bool{measurementA: true},
@@ -83,23 +83,23 @@ func testWhitelistApp(t *testing.T) (http.Handler, *readiness.Checker, ear.Issue
 		}.Authorize,
 	}
 
-	return whitelistTestRouter(wh, checker.Ready), &checker, issuer
+	return allowlistTestRouter(wh, checker.Ready), &checker, issuer
 }
 
-// whitelistTestRouter mounts only the routes the whitelist tests exercise, so
+// allowlistTestRouter mounts only the routes the allowlist tests exercise, so
 // these unit tests don't depend on the full server router.
-func whitelistTestRouter(wh whitelist.Handler, ready attestation.ReadinessFunc) http.Handler {
+func allowlistTestRouter(wh allowlist.Handler, ready attestation.ReadinessFunc) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", attestation.HandleReadyz(ready))
-	mux.HandleFunc("GET /whitelist", wh.HandleList)
-	mux.HandleFunc("POST /whitelist", wh.HandleAdd)
-	mux.HandleFunc("DELETE /whitelist", wh.HandleDelete)
+	mux.HandleFunc("GET /allowlist", wh.HandleList)
+	mux.HandleFunc("POST /allowlist", wh.HandleAdd)
+	mux.HandleFunc("DELETE /allowlist", wh.HandleDelete)
 	return mux
 }
 
 func TestHealthzReturnsOK(t *testing.T) {
-	app, _, _ := testWhitelistApp(t)
+	app, _, _ := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -115,7 +115,7 @@ func TestHealthzReturnsOK(t *testing.T) {
 }
 
 func TestReadyzReturnsUnavailableInitially(t *testing.T) {
-	app, _, _ := testWhitelistApp(t)
+	app, _, _ := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -130,12 +130,12 @@ func TestReadyzReturnsUnavailableInitially(t *testing.T) {
 	}
 }
 
-func TestWhitelistListEmpty(t *testing.T) {
-	app, _, _ := testWhitelistApp(t)
+func TestAllowlistListEmpty(t *testing.T) {
+	app, _, _ := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/whitelist")
+	resp, err := http.Get(srv.URL + "/allowlist")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -172,13 +172,13 @@ func TestWhitelistListEmpty(t *testing.T) {
 	}
 }
 
-func TestWhitelistAddRequiresAuth(t *testing.T) {
-	app, _, _ := testWhitelistApp(t)
+func TestAllowlistAddRequiresAuth(t *testing.T) {
+	app, _, _ := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
 	body := fmt.Sprintf(`{"digest":"%s","image":"test-image"}`, digestA)
-	resp, err := http.Post(srv.URL+"/whitelist", "application/json", strings.NewReader(body))
+	resp, err := http.Post(srv.URL+"/allowlist", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -189,13 +189,13 @@ func TestWhitelistAddRequiresAuth(t *testing.T) {
 	}
 }
 
-func TestWhitelistAddRejectsUnauthorizedMeasurement(t *testing.T) {
-	app, _, issuer := testWhitelistApp(t)
+func TestAllowlistAddRejectsUnauthorizedMeasurement(t *testing.T) {
+	app, _, issuer := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
 	body := fmt.Sprintf(`{"digest":"%s","image":"test-image"}`, digestA)
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/whitelist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestWhitelistAddRejectsUnauthorizedMeasurement(t *testing.T) {
 	}
 }
 
-func TestWhitelistWriteAuthorizerRejectsMissingExpiration(t *testing.T) {
+func TestAllowlistWriteAuthorizerRejectsMissingExpiration(t *testing.T) {
 	keyPEM, err := earsigner.Generate()
 	if err != nil {
 		t.Fatalf("generate EAR key: %v", err)
@@ -232,10 +232,10 @@ func TestWhitelistWriteAuthorizerRejectsMissingExpiration(t *testing.T) {
 			},
 		},
 	})
-	req := httptest.NewRequest(http.MethodPost, "/whitelist", nil)
+	req := httptest.NewRequest(http.MethodPost, "/allowlist", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	err = (whitelist.EARWriteAuthorizer{
+	err = (allowlist.EARWriteAuthorizer{
 		PublicKey:           issuer.PublicKey,
 		ExpectedIssuer:      testIssuer,
 		AllowedMeasurements: map[string]bool{measurementA: true},
@@ -246,7 +246,7 @@ func TestWhitelistWriteAuthorizerRejectsMissingExpiration(t *testing.T) {
 	}
 }
 
-func TestWhitelistWriteAuthorizerRejectsExpiredToken(t *testing.T) {
+func TestAllowlistWriteAuthorizerRejectsExpiredToken(t *testing.T) {
 	keyPEM, err := earsigner.Generate()
 	if err != nil {
 		t.Fatalf("generate EAR key: %v", err)
@@ -266,10 +266,10 @@ func TestWhitelistWriteAuthorizerRejectsExpiredToken(t *testing.T) {
 			},
 		},
 	})
-	req := httptest.NewRequest(http.MethodPost, "/whitelist", nil)
+	req := httptest.NewRequest(http.MethodPost, "/allowlist", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	err = (whitelist.EARWriteAuthorizer{
+	err = (allowlist.EARWriteAuthorizer{
 		PublicKey:           issuer.PublicKey,
 		ExpectedIssuer:      testIssuer,
 		AllowedMeasurements: map[string]bool{measurementA: true},
@@ -283,7 +283,7 @@ func TestWhitelistWriteAuthorizerRejectsExpiredToken(t *testing.T) {
 func addDigest(t *testing.T, srvURL string, issuer ear.Issuer, digest, image string) {
 	t.Helper()
 	body := fmt.Sprintf(`{"digest":"%s","image":"%s"}`, digest, image)
-	req, err := http.NewRequest(http.MethodPost, srvURL+"/whitelist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srvURL+"/allowlist", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
@@ -301,14 +301,14 @@ func addDigest(t *testing.T, srvURL string, issuer ear.Issuer, digest, image str
 	}
 }
 
-func TestWhitelistAddAndListRoundtrip(t *testing.T) {
-	app, _, issuer := testWhitelistApp(t)
+func TestAllowlistAddAndListRoundtrip(t *testing.T) {
+	app, _, issuer := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
 	addDigest(t, srv.URL, issuer, digestA, "test-image")
 
-	resp, err := http.Get(srv.URL + "/whitelist")
+	resp, err := http.Get(srv.URL + "/allowlist")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestWhitelistAddAndListRoundtrip(t *testing.T) {
 		t.Fatalf("got status %d, want 200", resp.StatusCode)
 	}
 
-	var result types.WhitelistListResponse
+	var result types.AllowlistListResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -326,7 +326,7 @@ func TestWhitelistAddAndListRoundtrip(t *testing.T) {
 	expectedDigest, _ := types.ParseDigest(digestA)
 	img, ok := result.Digests[expectedDigest]
 	if !ok {
-		t.Fatal("digest not found in whitelist")
+		t.Fatal("digest not found in allowlist")
 	}
 	if img != "test-image" {
 		t.Fatalf("image = %q, want test-image", img)
@@ -338,15 +338,15 @@ func TestWhitelistAddAndListRoundtrip(t *testing.T) {
 	}
 }
 
-func TestWhitelistDeleteExistingReturnsNoContent(t *testing.T) {
-	app, _, issuer := testWhitelistApp(t)
+func TestAllowlistDeleteExistingReturnsNoContent(t *testing.T) {
+	app, _, issuer := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
 	addDigest(t, srv.URL, issuer, digestA, "test-image")
 
 	body := fmt.Sprintf(`{"digests":["%s"]}`, digestA)
-	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/whitelist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/allowlist", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
@@ -364,13 +364,13 @@ func TestWhitelistDeleteExistingReturnsNoContent(t *testing.T) {
 	}
 
 	// verify empty
-	listResp, err := http.Get(srv.URL + "/whitelist")
+	listResp, err := http.Get(srv.URL + "/allowlist")
 	if err != nil {
 		t.Fatalf("list request failed: %v", err)
 	}
 	defer listResp.Body.Close()
 
-	var result types.WhitelistListResponse
+	var result types.AllowlistListResponse
 	if err := json.NewDecoder(listResp.Body).Decode(&result); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -379,13 +379,13 @@ func TestWhitelistDeleteExistingReturnsNoContent(t *testing.T) {
 	}
 }
 
-func TestWhitelistDeleteNonexistentReturnsNotFound(t *testing.T) {
-	app, _, issuer := testWhitelistApp(t)
+func TestAllowlistDeleteNonexistentReturnsNotFound(t *testing.T) {
+	app, _, issuer := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
 	body := fmt.Sprintf(`{"digests":["%s"]}`, digestMissing)
-	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/whitelist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/allowlist", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
@@ -403,13 +403,13 @@ func TestWhitelistDeleteNonexistentReturnsNotFound(t *testing.T) {
 	}
 }
 
-func TestWhitelistDeleteRequiresAuth(t *testing.T) {
-	app, _, _ := testWhitelistApp(t)
+func TestAllowlistDeleteRequiresAuth(t *testing.T) {
+	app, _, _ := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
 	body := fmt.Sprintf(`{"digests":["%s"]}`, digestA)
-	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/whitelist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/allowlist", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
@@ -427,13 +427,13 @@ func TestWhitelistDeleteRequiresAuth(t *testing.T) {
 	}
 }
 
-func TestWhitelistAddRejectsInvalidDigest(t *testing.T) {
-	app, _, issuer := testWhitelistApp(t)
+func TestAllowlistAddRejectsInvalidDigest(t *testing.T) {
+	app, _, issuer := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
 	body := `{"digest":"sha256:abc","image":"test-image"}`
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/whitelist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
@@ -451,11 +451,11 @@ func TestWhitelistAddRejectsInvalidDigest(t *testing.T) {
 	}
 }
 
-// TestWhitelistAddRejectsReplayWithDifferentBody is the H2 regression test:
+// TestAllowlistAddRejectsReplayWithDifferentBody is the H2 regression test:
 // a captured EAR for one body MUST NOT authorize a different body within the
 // EAR's TTL.
-func TestWhitelistAddRejectsReplayWithDifferentBody(t *testing.T) {
-	app, _, issuer := testWhitelistApp(t)
+func TestAllowlistAddRejectsReplayWithDifferentBody(t *testing.T) {
+	app, _, issuer := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -465,7 +465,7 @@ func TestWhitelistAddRejectsReplayWithDifferentBody(t *testing.T) {
 
 	// Attacker replays the same token but ships a different digest.
 	attackerBody := fmt.Sprintf(`{"digest":"%s","image":"attacker-image"}`, digestMissing)
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/whitelist", strings.NewReader(attackerBody))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist", strings.NewReader(attackerBody))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
@@ -483,11 +483,11 @@ func TestWhitelistAddRejectsReplayWithDifferentBody(t *testing.T) {
 	}
 }
 
-// TestWhitelistAddRejectsTokenWithoutBodyHash confirms that the body-binding
+// TestAllowlistAddRejectsTokenWithoutBodyHash confirms that the body-binding
 // claim is REQUIRED — a token issued without `pbh` (e.g. by older callers
 // that didn't use IssueForRequestBody) is rejected, not silently accepted.
-func TestWhitelistAddRejectsTokenWithoutBodyHash(t *testing.T) {
-	app, _, issuer := testWhitelistApp(t)
+func TestAllowlistAddRejectsTokenWithoutBodyHash(t *testing.T) {
+	app, _, issuer := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
@@ -498,7 +498,7 @@ func TestWhitelistAddRejectsTokenWithoutBodyHash(t *testing.T) {
 	}
 
 	body := fmt.Sprintf(`{"digest":"%s","image":"test-image"}`, digestA)
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/whitelist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
@@ -516,12 +516,12 @@ func TestWhitelistAddRejectsTokenWithoutBodyHash(t *testing.T) {
 	}
 }
 
-// TestWhitelistAddRejectsBodyOverConfiguredCap confirms the per-Handler cap
+// TestAllowlistAddRejectsBodyOverConfiguredCap confirms the per-Handler cap
 // is honoured: an over-cap body returns 413 *before* the auth check runs
 // (so the handler doesn't burn CPU hashing megabytes a malicious caller
 // supplied).
-func TestWhitelistAddRejectsBodyOverConfiguredCap(t *testing.T) {
-	store, err := whitelist.OpenInMemory()
+func TestAllowlistAddRejectsBodyOverConfiguredCap(t *testing.T) {
+	store, err := allowlist.OpenInMemory()
 	if err != nil {
 		t.Fatalf("open in-memory store: %v", err)
 	}
@@ -535,9 +535,9 @@ func TestWhitelistAddRejectsBodyOverConfiguredCap(t *testing.T) {
 	}
 	asClient := attestationclient.NewClient("http://localhost:0")
 	checker := readiness.NewChecker(asClient, 10*time.Second)
-	wh := whitelist.Handler{
+	wh := allowlist.Handler{
 		Store: &store,
-		WriteAuthorizer: whitelist.EARWriteAuthorizer{
+		WriteAuthorizer: allowlist.EARWriteAuthorizer{
 			PublicKey:           issuer.PublicKey,
 			ExpectedIssuer:      testIssuer,
 			AllowedMeasurements: map[string]bool{measurementA: true},
@@ -545,11 +545,11 @@ func TestWhitelistAddRejectsBodyOverConfiguredCap(t *testing.T) {
 		}.Authorize,
 		MaxWriteBodyBytes: 64,
 	}
-	srv := httptest.NewServer(whitelistTestRouter(wh, checker.Ready))
+	srv := httptest.NewServer(allowlistTestRouter(wh, checker.Ready))
 	defer srv.Close()
 
 	body := strings.Repeat("x", 1024)
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/whitelist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,12 +566,12 @@ func TestWhitelistAddRejectsBodyOverConfiguredCap(t *testing.T) {
 	}
 }
 
-func TestWhitelistListEmitsETag(t *testing.T) {
-	app, _, _ := testWhitelistApp(t)
+func TestAllowlistListEmitsETag(t *testing.T) {
+	app, _, _ := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/whitelist")
+	resp, err := http.Get(srv.URL + "/allowlist")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -585,12 +585,12 @@ func TestWhitelistListEmitsETag(t *testing.T) {
 	}
 }
 
-func TestWhitelistListMatchingIfNoneMatchReturns304(t *testing.T) {
-	app, _, _ := testWhitelistApp(t)
+func TestAllowlistListMatchingIfNoneMatchReturns304(t *testing.T) {
+	app, _, _ := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
-	req, err := http.NewRequest(http.MethodGet, srv.URL+"/whitelist", nil)
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/allowlist", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
@@ -613,14 +613,14 @@ func TestWhitelistListMatchingIfNoneMatchReturns304(t *testing.T) {
 	}
 }
 
-func TestWhitelistListStaleIfNoneMatchReturns200WithNewETag(t *testing.T) {
-	app, _, issuer := testWhitelistApp(t)
+func TestAllowlistListStaleIfNoneMatchReturns200WithNewETag(t *testing.T) {
+	app, _, issuer := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
 	addDigest(t, srv.URL, issuer, digestA, "test-image")
 
-	req, err := http.NewRequest(http.MethodGet, srv.URL+"/whitelist", nil)
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/allowlist", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}

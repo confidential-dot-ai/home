@@ -384,7 +384,7 @@ func TestBuildDigestArgsPinsEveryComponent(t *testing.T) {
 		"--set-string", "teeProxy.image.repository=ghcr.io/confidential-dot-ai/tee-proxy",
 		"--set-string", "teeProxy.image.digest=sha256:00000000000000000000000000000000000000000000000000000000000000ff",
 		// Resolving component digests enables their derivation into the NRI allowlist.
-		"--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true",
+		"--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true",
 	})
 }
 
@@ -407,7 +407,7 @@ func TestBuildDigestArgsResolvesEachComponentOnce(t *testing.T) {
 }
 
 // A resolution failure for any component must abort: a partially pinned floor
-// would pass the render guard while the served whitelist pointed at a wrong or
+// would pass the render guard while the served allowlist pointed at a wrong or
 // missing digest.
 func TestBuildDigestArgsFailsClosedOnResolveError(t *testing.T) {
 	resolve := func(ref string) (string, error) {

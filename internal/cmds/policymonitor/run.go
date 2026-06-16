@@ -2,7 +2,7 @@
 
 // Package policymonitor implements the in-VM container-digest enforcement
 // daemon baked into kata-guest-base. It replaces the older
-// guest-policy-agent (a Rego renderer that fetched a whitelist from CDS
+// guest-policy-agent (a Rego renderer that fetched a allowlist from CDS
 // over RA-TLS and rendered it informationally without enforcing).
 // policy-monitor instead enforces directly, off a baked seed allowlist it
 // refreshes from CDS at runtime; see docs/kata-image-policy.md.
@@ -83,7 +83,7 @@
 //
 // Mirrors internal/cmds/ratlsmesh/main.go's Run shape: cobra root with
 // signal-wired Context, one default subcommand (`monitor`) that watches
-// indefinitely and, when a CDS URL is configured, polls CDS for whitelist
+// indefinitely and, when a CDS URL is configured, polls CDS for allowlist
 // updates in the background (cds_refresh.go). The systemd unit
 // (kata-guest-base/extra/etc/systemd/system/policy-monitor.service) is the
 // supervisor; failure is signalled by process exit with
@@ -133,7 +133,7 @@ func newMonitorCommand() *cobra.Command {
 
   - Loads the baked /etc/c8s/bootstrap-allowlist.json seed (sha256
     digests on the guest's dm-verity root).
-  - When --cds-url (or $C8S_CDS_URL) is set, polls CDS's /whitelist over
+  - When --cds-url (or $C8S_CDS_URL) is set, polls CDS's /allowlist over
     RA-TLS on an interval and merges new digests on top of the seed.
   - Sets up an inotify watch on /run/kata-containers/.
   - For each new container directory, reads <id>/config.json, extracts
@@ -158,10 +158,10 @@ rather than a transient runtime problem.`,
 	fs.StringVar(&cfg.WatchDir, "watch-dir", defaultWatchDir, "kata-agent container-bundle directory to watch via inotify")
 	fs.StringVar(&cfg.CgroupRoot, "cgroup-root", defaultCgroupRoot, "cgroup hierarchy root (v2 unified)")
 	fs.StringVar(&cfg.LogLevel, "log-level", "info", "log level: debug, info, warn, error")
-	fs.StringVar(&cfg.CDSURL, "cds-url", "", "CDS base URL to refresh the whitelist from over RA-TLS (default $C8S_CDS_URL; empty = baked seed only, no network)")
+	fs.StringVar(&cfg.CDSURL, "cds-url", "", "CDS base URL to refresh the allowlist from over RA-TLS (default $C8S_CDS_URL; empty = baked seed only, no network)")
 	fs.StringVar(&cfg.CDSMeasurements, "cds-measurements", "", "comma-separated SHA-384 hex launch digests CDS's RA-TLS serving cert must match (default $C8S_CDS_MEASUREMENTS)")
 	fs.StringVar(&cfg.AttestationServiceURL, "attestation-service-url", "", "local attestation-service URL for in-guest RA-TLS evidence (default $C8S_ATTESTATION_SERVICE_URL or http://127.0.0.1:8400)")
-	fs.DurationVar(&cfg.RefreshInterval, "whitelist-refresh-interval", defaultRefreshInterval, "interval to poll CDS for whitelist updates (only when --cds-url is set)")
+	fs.DurationVar(&cfg.RefreshInterval, "allowlist-refresh-interval", defaultRefreshInterval, "interval to poll CDS for allowlist updates (only when --cds-url is set)")
 	return cmd
 }
 
@@ -186,7 +186,7 @@ type Config struct {
 	LogLevel string
 
 	// CDSURL, when non-empty, enables the hybrid refresh: the monitor
-	// polls CDS's /whitelist over RA-TLS and merges it on top of the
+	// polls CDS's /allowlist over RA-TLS and merges it on top of the
 	// baked seed. Empty (the default when no cloud-init env is present)
 	// keeps the monitor baked-seed-only and off the network. Defaults
 	// from $C8S_CDS_URL (the same cloud-init value ratls-mesh reads).
@@ -202,7 +202,7 @@ type Config struct {
 	// $C8S_ATTESTATION_SERVICE_URL, else http://127.0.0.1:8400.
 	AttestationServiceURL string
 
-	// RefreshInterval is the CDS whitelist poll cadence (hybrid only).
+	// RefreshInterval is the CDS allowlist poll cadence (hybrid only).
 	RefreshInterval time.Duration
 }
 
@@ -263,7 +263,7 @@ const (
 	// default ratls-mesh uses.
 	defaultAttestationServiceURL = "http://127.0.0.1:8400"
 
-	// defaultRefreshInterval is the CDS whitelist poll cadence — matches
+	// defaultRefreshInterval is the CDS allowlist poll cadence — matches
 	// the host nri-image-policy worker's default pull interval.
 	defaultRefreshInterval = 30 * time.Second
 )

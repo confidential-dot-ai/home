@@ -17,7 +17,7 @@ import (
 // config represents the plugin configuration.
 type config struct {
 	Plugin     pluginConfig     `yaml:"plugin"`
-	Whitelist  whitelistConfig  `yaml:"whitelist"`
+	Allowlist  allowlistConfig  `yaml:"allowlist"`
 	Containerd containerdConfig `yaml:"containerd"`
 	Policy     policyConfig     `yaml:"policy"`
 	Logging    loggingConfig    `yaml:"logging"`
@@ -32,15 +32,15 @@ type pluginConfig struct {
 	HealthAddr string `yaml:"health_addr"`
 }
 
-// whitelistConfig groups the digest-source mechanisms.
+// allowlistConfig groups the digest-source mechanisms.
 //
 // AlwaysAllow is a static baseline, always merged into the cache at
 // startup (used by the chart to self-allow the installer image).
 //
 // Pull and Push are mutually-exclusive runtime-update modes:
 // the worker archetype configures Pull (poll CDS), the CDS-node
-// archetype configures Push (accept PUT /whitelist).
-type whitelistConfig struct {
+// archetype configures Push (accept PUT /allowlist).
+type allowlistConfig struct {
 	AlwaysAllow map[string]string `yaml:"always_allow"`
 	Pull        pullConfig        `yaml:"pull"`
 	Push        pushConfig        `yaml:"push"`
@@ -71,7 +71,7 @@ type containerdConfig struct {
 // policyConfig contains policy enforcement settings.
 type policyConfig struct {
 	Mode                  string      `yaml:"mode"`                    // fail-closed, audit
-	EnforceExisting       bool        `yaml:"enforce_existing"`        // kill non-whitelisted containers on startup
+	EnforceExisting       bool        `yaml:"enforce_existing"`        // kill non-allowlisted containers on startup
 	DenyMissingAnnotation bool        `yaml:"deny_missing_annotation"` // deny containers without image annotation
 	ExemptNamespaces      []string    `yaml:"exempt_namespaces"`
 	LabelRules            []labelRule `yaml:"label_rules"`
@@ -122,7 +122,7 @@ func loadConfig(path string) (*config, error) {
 	}
 
 	cfg := &config{
-		Whitelist: whitelistConfig{
+		Allowlist: allowlistConfig{
 			Pull: pullConfig{
 				Interval: defaultPullInterval,
 				Timeout:  defaultPullTimeout,
@@ -154,54 +154,54 @@ func loadConfig(path string) (*config, error) {
 }
 
 // PullEnabled reports whether the plugin should poll a remote CDS.
-func (c *config) PullEnabled() bool { return c.Whitelist.Pull.URL != "" }
+func (c *config) PullEnabled() bool { return c.Allowlist.Pull.URL != "" }
 
 // PushEnabled reports whether the plugin should accept push payloads.
-func (c *config) PushEnabled() bool { return c.Whitelist.Push.PersistPath != "" }
+func (c *config) PushEnabled() bool { return c.Allowlist.Push.PersistPath != "" }
 
-// WhitelistEnabled reports whether any digest-based enforcement is active.
-func (c *config) WhitelistEnabled() bool {
-	return c.PullEnabled() || c.PushEnabled() || len(c.Whitelist.AlwaysAllow) > 0
+// AllowlistEnabled reports whether any digest-based enforcement is active.
+func (c *config) AllowlistEnabled() bool {
+	return c.PullEnabled() || c.PushEnabled() || len(c.Allowlist.AlwaysAllow) > 0
 }
 
 // Validate checks the configuration for errors.
 func (c *config) Validate() error {
 	if c.PullEnabled() && c.PushEnabled() {
-		return fmt.Errorf("whitelist.pull and whitelist.push are mutually exclusive; configure one runtime-update mode")
+		return fmt.Errorf("allowlist.pull and allowlist.push are mutually exclusive; configure one runtime-update mode")
 	}
-	if (c.PullEnabled() || c.PushEnabled()) && len(c.Whitelist.AlwaysAllow) == 0 {
-		return fmt.Errorf("whitelist.always_allow must be non-empty when pull or push is configured (cold-boot baseline)")
+	if (c.PullEnabled() || c.PushEnabled()) && len(c.Allowlist.AlwaysAllow) == 0 {
+		return fmt.Errorf("allowlist.always_allow must be non-empty when pull or push is configured (cold-boot baseline)")
 	}
-	for d := range c.Whitelist.AlwaysAllow {
+	for d := range c.Allowlist.AlwaysAllow {
 		if _, err := types.ParseDigest(d); err != nil {
-			return fmt.Errorf("whitelist.always_allow: invalid digest %q (expected sha256:<64 hex chars>)", d)
+			return fmt.Errorf("allowlist.always_allow: invalid digest %q (expected sha256:<64 hex chars>)", d)
 		}
 	}
 	if c.PullEnabled() {
-		if c.Whitelist.Pull.Timeout <= 0 {
-			return fmt.Errorf("whitelist.pull.timeout must be > 0 when pull.url is set")
+		if c.Allowlist.Pull.Timeout <= 0 {
+			return fmt.Errorf("allowlist.pull.timeout must be > 0 when pull.url is set")
 		}
-		if c.Whitelist.Pull.Interval <= 0 {
-			return fmt.Errorf("whitelist.pull.interval must be > 0 when pull.url is set")
+		if c.Allowlist.Pull.Interval <= 0 {
+			return fmt.Errorf("allowlist.pull.interval must be > 0 when pull.url is set")
 		}
-		parsed, err := url.Parse(c.Whitelist.Pull.URL)
+		parsed, err := url.Parse(c.Allowlist.Pull.URL)
 		if err != nil {
-			return fmt.Errorf("whitelist.pull.url: %w", err)
+			return fmt.Errorf("allowlist.pull.url: %w", err)
 		}
 		// CDS serves RA-TLS only, so the pull URL must be https — a plaintext
 		// pull would defeat the attestation handshake entirely.
 		if parsed.Scheme != "https" {
-			return fmt.Errorf("whitelist.pull.url scheme must be https, got %q", parsed.Scheme)
+			return fmt.Errorf("allowlist.pull.url scheme must be https, got %q", parsed.Scheme)
 		}
-		if c.Whitelist.Pull.AttestationApiURL == "" {
-			return fmt.Errorf("whitelist.pull.attestation_api_url must be set")
+		if c.Allowlist.Pull.AttestationApiURL == "" {
+			return fmt.Errorf("allowlist.pull.attestation_api_url must be set")
 		}
-		if _, err := ratls.ParseHexMeasurementsList(c.Whitelist.Pull.CDSMeasurements); err != nil {
-			return fmt.Errorf("whitelist.pull.cds_measurements: %w", err)
+		if _, err := ratls.ParseHexMeasurementsList(c.Allowlist.Pull.CDSMeasurements); err != nil {
+			return fmt.Errorf("allowlist.pull.cds_measurements: %w", err)
 		}
 	}
-	if !c.WhitelistEnabled() && len(c.Policy.LabelRules) == 0 {
-		return fmt.Errorf("set whitelist.always_allow (required when pull or push is enabled) or configure policy.label_rules")
+	if !c.AllowlistEnabled() && len(c.Policy.LabelRules) == 0 {
+		return fmt.Errorf("set allowlist.always_allow (required when pull or push is enabled) or configure policy.label_rules")
 	}
 	if c.Policy.Mode != ModeFailClosed && c.Policy.Mode != ModeAudit {
 		return fmt.Errorf("policy.mode must be '%s' or '%s'", ModeFailClosed, ModeAudit)

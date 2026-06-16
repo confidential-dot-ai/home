@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/confidential-dot-ai/c8s/internal/allowlist"
 	"github.com/confidential-dot-ai/c8s/internal/attestation"
 	"github.com/confidential-dot-ai/c8s/internal/ear"
 	"github.com/confidential-dot-ai/c8s/internal/issuer"
-	"github.com/confidential-dot-ai/c8s/internal/whitelist"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/earsigner"
 	"golang.org/x/time/rate"
@@ -27,9 +27,9 @@ func newStubRouter(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatalf("ear issuer: %v", err)
 	}
-	store, err := whitelist.OpenInMemory()
+	store, err := allowlist.OpenInMemory()
 	if err != nil {
-		t.Fatalf("whitelist: %v", err)
+		t.Fatalf("allowlist: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	ca, err := issuer.NewCA("test ca", time.Hour)
@@ -39,7 +39,7 @@ func newStubRouter(t *testing.T) http.Handler {
 	cs := attestation.NewChallengeStore(time.Minute)
 	deps := dependencies{
 		AttestHandler:    AttestHandler{Challenges: &cs, CA: ca, CertTTL: time.Hour},
-		WhitelistHandler: whitelist.Handler{Store: &store, WriteAuthorizer: func(*http.Request, []byte) error { return nil }},
+		AllowlistHandler: allowlist.Handler{Store: &store, WriteAuthorizer: func(*http.Request, []byte) error { return nil }},
 		ReadyFn:          func() bool { return true },
 		EarIssuer:        earIss,
 		CACertPEM:        certutil.EncodeCertPEM(ca.Cert.Raw),
@@ -52,7 +52,7 @@ func newStubRouter(t *testing.T) http.Handler {
 func TestRouter_RateLimitsAttestationEndpoints(t *testing.T) {
 	keyPEM, _ := earsigner.Generate()
 	earIss, _ := ear.NewIssuer(keyPEM, "cds", time.Hour)
-	store, _ := whitelist.OpenInMemory()
+	store, _ := allowlist.OpenInMemory()
 	t.Cleanup(func() { _ = store.Close() })
 	ca, _ := issuer.NewCA("test ca", time.Hour)
 	cs := attestation.NewChallengeStore(time.Minute)
@@ -63,7 +63,7 @@ func TestRouter_RateLimitsAttestationEndpoints(t *testing.T) {
 	}
 	deps := dependencies{
 		AttestHandler:    AttestHandler{Challenges: &cs, CA: ca, CertTTL: time.Hour},
-		WhitelistHandler: whitelist.Handler{Store: &store, WriteAuthorizer: func(*http.Request, []byte) error { return nil }},
+		AllowlistHandler: allowlist.Handler{Store: &store, WriteAuthorizer: func(*http.Request, []byte) error { return nil }},
 		ReadyFn:          func() bool { return true },
 		EarIssuer:        earIss,
 		CACertPEM:        certutil.EncodeCertPEM(ca.Cert.Raw),
@@ -106,7 +106,7 @@ func TestRouter_RoutesMountedWithExpectedMethods(t *testing.T) {
 		{http.MethodGet, "/.well-known/jwks.json", http.StatusOK},
 		{http.MethodGet, "/metrics", http.StatusOK},
 		{http.MethodGet, "/ca", http.StatusOK},
-		{http.MethodGet, "/whitelist", http.StatusOK},
+		{http.MethodGet, "/allowlist", http.StatusOK},
 		{http.MethodGet, "/does-not-exist", http.StatusNotFound},
 		{http.MethodPost, "/healthz", http.StatusMethodNotAllowed},
 	}
@@ -151,13 +151,13 @@ func TestRouter_AttestKeyMounted(t *testing.T) {
 func TestRouter_AttestRejectsOversizedBody(t *testing.T) {
 	keyPEM, _ := earsigner.Generate()
 	earIss, _ := ear.NewIssuer(keyPEM, "cds", time.Hour)
-	store, _ := whitelist.OpenInMemory()
+	store, _ := allowlist.OpenInMemory()
 	t.Cleanup(func() { _ = store.Close() })
 	ca, _ := issuer.NewCA("test ca", time.Hour)
 	cs := attestation.NewChallengeStore(time.Minute)
 	deps := dependencies{
 		AttestHandler:    AttestHandler{Challenges: &cs, CA: ca, CertTTL: time.Hour},
-		WhitelistHandler: whitelist.Handler{Store: &store, WriteAuthorizer: func(*http.Request, []byte) error { return nil }},
+		AllowlistHandler: allowlist.Handler{Store: &store, WriteAuthorizer: func(*http.Request, []byte) error { return nil }},
 		ReadyFn:          func() bool { return true },
 		EarIssuer:        earIss,
 		CACertPEM:        certutil.EncodeCertPEM(ca.Cert.Raw),

@@ -315,7 +315,7 @@ cache_max_entries = 1024
   c8s.components is the single source of truth for the c8s component image set,
   resolved from the declarative .Values.c8sComponents list. It returns a JSON
   list of {name, image, enabled, cdsExempt}, one per component, so the
-  derivation (c8s.imageWhitelist) and the fail-closed coverage guard
+  derivation (c8s.imageAllowlist) and the fail-closed coverage guard
   (validations.yaml) range over the same list — and `c8s install` reads the
   same .Values.c8sComponents via `helm show values`. Adding a component is one
   edit in values.yaml.
@@ -339,24 +339,24 @@ cache_max_entries = 1024
 {{- end -}}
 
 {{/*
-  c8s.imageWhitelist returns the merged image-digest allowlist as a dict
-  (sha256 -> image reference). It is the single source the NRI whitelist is
-  built from — both CDS's served seed (c8s.whitelistSeedJSON) and each plugin's
+  c8s.imageAllowlist returns the merged image-digest allowlist as a dict
+  (sha256 -> image reference). It is the single source the NRI allowlist is
+  built from — both CDS's served seed (c8s.allowlistSeedJSON) and each plugin's
   always_allow (nri-image-policy.bootConfig) render from it.
 
   Contents, lowest precedence first:
     1. derived c8s component images (from c8s.components) whose image.digest is
-       set — only when bootstrapWhitelist.deriveComponents is true, so a
+       set — only when bootstrapAllowlist.deriveComponents is true, so a
        digest-pinned `c8s install` self-allows the c8s components it deploys;
     2. the CDS image self-entry (cds.image), the same one the push-hook pins —
        always present (independent of deriveComponents) so CDS is admitted on
        its own node;
-    3. operator-supplied nriImagePolicy.bootstrapWhitelist.digests, which
+    3. operator-supplied nriImagePolicy.bootstrapAllowlist.digests, which
        override a derived entry for the same sha256 (fleet values win).
 */}}
-{{- define "c8s.imageWhitelist" -}}
+{{- define "c8s.imageAllowlist" -}}
 {{- $digests := dict -}}
-{{- if .Values.nriImagePolicy.bootstrapWhitelist.deriveComponents -}}
+{{- if .Values.nriImagePolicy.bootstrapAllowlist.deriveComponents -}}
 {{- range $c := (include "c8s.components" . | fromJsonArray) -}}
 {{- $img := get $c "image" -}}
 {{- if and (get $c "enabled") (get $img "digest") -}}
@@ -368,20 +368,20 @@ cache_max_entries = 1024
 {{- if $cdsImg.digest -}}
 {{- $_ := set $digests $cdsImg.digest (printf "%s@%s" $cdsImg.repository $cdsImg.digest) -}}
 {{- end -}}
-{{- range $digest, $image := .Values.nriImagePolicy.bootstrapWhitelist.digests -}}
+{{- range $digest, $image := .Values.nriImagePolicy.bootstrapAllowlist.digests -}}
 {{- $_ := set $digests $digest $image -}}
 {{- end -}}
 {{ $digests | toJson }}
 {{- end -}}
 
 {{/*
-  c8s.whitelistSeedJSON renders c8s.imageWhitelist as the JSON shape CDS's
-  --whitelist-seed expects ({"version","digests"}). CDS seeds its served
-  /whitelist from it so the first worker pull returns a real list rather than
+  c8s.allowlistSeedJSON renders c8s.imageAllowlist as the JSON shape CDS's
+  --allowlist-seed expects ({"version","digests"}). CDS seeds its served
+  /allowlist from it so the first worker pull returns a real list rather than
   an empty set.
 */}}
-{{- define "c8s.whitelistSeedJSON" -}}
-{{ dict "version" "1" "digests" (include "c8s.imageWhitelist" . | fromJson) | toJson }}
+{{- define "c8s.allowlistSeedJSON" -}}
+{{ dict "version" "1" "digests" (include "c8s.imageAllowlist" . | fromJson) | toJson }}
 {{- end -}}
 
 {{- define "c8s.commonLabels" -}}

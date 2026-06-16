@@ -6,11 +6,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/confidential-dot-ai/c8s/internal/allowlist"
 	"github.com/confidential-dot-ai/c8s/internal/attestation"
 	"github.com/confidential-dot-ai/c8s/internal/ear"
 	"github.com/confidential-dot-ai/c8s/internal/issuer"
 	"github.com/confidential-dot-ai/c8s/internal/server"
-	"github.com/confidential-dot-ai/c8s/internal/whitelist"
 )
 
 // dependencies bundles everything the cds router needs.
@@ -18,7 +18,7 @@ type dependencies struct {
 	AttestHandler    AttestHandler
 	AttestKeyHandler attestation.Handler
 	SignCSRHandler   SignCSRHandler
-	WhitelistHandler whitelist.Handler
+	AllowlistHandler allowlist.Handler
 	HandoffHandler   *issuer.HandoffHandler // nil disables /handoff (no --handoff-measurements)
 	ReadyFn          attestation.ReadinessFunc
 	EarIssuer        ear.Issuer
@@ -56,9 +56,9 @@ func newRouter(deps dependencies) http.Handler {
 		r.Method(http.MethodPost, "/handoff", deps.protected(http.HandlerFunc(deps.HandoffHandler.HandleHandoff)))
 	}
 
-	r.Get("/whitelist", deps.WhitelistHandler.HandleList)
-	r.Method(http.MethodPost, "/whitelist", capBody(deps.MaxRequestSize, http.HandlerFunc(deps.WhitelistHandler.HandleAdd)))
-	r.Method(http.MethodDelete, "/whitelist", capBody(deps.MaxRequestSize, http.HandlerFunc(deps.WhitelistHandler.HandleDelete)))
+	r.Get("/allowlist", deps.AllowlistHandler.HandleList)
+	r.Method(http.MethodPost, "/allowlist", capBody(deps.MaxRequestSize, http.HandlerFunc(deps.AllowlistHandler.HandleAdd)))
+	r.Method(http.MethodDelete, "/allowlist", capBody(deps.MaxRequestSize, http.HandlerFunc(deps.AllowlistHandler.HandleDelete)))
 
 	r.Get("/ca", handleCA(deps.CACertPEM))
 

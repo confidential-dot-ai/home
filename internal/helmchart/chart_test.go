@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	pkgwhitelist "github.com/confidential-dot-ai/c8s/pkg/whitelist"
+	pkgallowlist "github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"gopkg.in/yaml.v3"
 	admissionregv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -1047,28 +1047,28 @@ func TestChartNRIImagePolicyUsesCDSPushAndPullModes(t *testing.T) {
 	}
 
 	workerCfg := renderedNRIBootConfig(t, out, "c8s-nri-image-policy-worker")
-	if got, want := workerCfg.Whitelist.Pull.URL, "https://127.0.0.1:30808"; got != want {
+	if got, want := workerCfg.Allowlist.Pull.URL, "https://127.0.0.1:30808"; got != want {
 		t.Fatalf("worker pull URL = %q, want %q", got, want)
 	}
-	if got, want := workerCfg.Whitelist.Pull.Interval, "30s"; got != want {
+	if got, want := workerCfg.Allowlist.Pull.Interval, "30s"; got != want {
 		t.Fatalf("worker pull interval = %q, want %q", got, want)
 	}
-	if got, want := workerCfg.Whitelist.Pull.AttestationApiURL, "http://localhost:30840"; got != want {
+	if got, want := workerCfg.Allowlist.Pull.AttestationApiURL, "http://localhost:30840"; got != want {
 		t.Fatalf("runtime attestation-api URL = %q, want %q", got, want)
 	}
-	if want := []string{measurement}; !slices.Equal(workerCfg.Whitelist.Pull.CDSMeasurements, want) {
-		t.Fatalf("worker CDS measurements = %v, want %v", workerCfg.Whitelist.Pull.CDSMeasurements, want)
+	if want := []string{measurement}; !slices.Equal(workerCfg.Allowlist.Pull.CDSMeasurements, want) {
+		t.Fatalf("worker CDS measurements = %v, want %v", workerCfg.Allowlist.Pull.CDSMeasurements, want)
 	}
-	if workerCfg.Whitelist.Push.PersistPath != "" {
-		t.Fatalf("worker boot config has push persist path %q, want empty", workerCfg.Whitelist.Push.PersistPath)
+	if workerCfg.Allowlist.Push.PersistPath != "" {
+		t.Fatalf("worker boot config has push persist path %q, want empty", workerCfg.Allowlist.Push.PersistPath)
 	}
 
 	cdsCfg := renderedNRIBootConfig(t, out, "c8s-nri-image-policy-cds")
-	if got, want := cdsCfg.Whitelist.Push.PersistPath, "/var/lib/nri-image-policy/pushed.json"; got != want {
+	if got, want := cdsCfg.Allowlist.Push.PersistPath, "/var/lib/nri-image-policy/pushed.json"; got != want {
 		t.Fatalf("CDS-node push persist path = %q, want %q", got, want)
 	}
-	if cdsCfg.Whitelist.Pull.URL != "" {
-		t.Fatalf("CDS-node boot config has pull URL %q, want empty", cdsCfg.Whitelist.Pull.URL)
+	if cdsCfg.Allowlist.Pull.URL != "" {
+		t.Fatalf("CDS-node boot config has pull URL %q, want empty", cdsCfg.Allowlist.Pull.URL)
 	}
 }
 
@@ -1108,7 +1108,7 @@ func TestChartAttestationApiNodePortWiresNRI(t *testing.T) {
 	}
 
 	cfg := renderedNRIBootConfig(t, out, "c8s-nri-image-policy-worker")
-	if got, want := cfg.Whitelist.Pull.AttestationApiURL, "http://localhost:31040"; got != want {
+	if got, want := cfg.Allowlist.Pull.AttestationApiURL, "http://localhost:31040"; got != want {
 		t.Fatalf("runtime attestation-api URL = %q, want %q", got, want)
 	}
 }
@@ -1130,14 +1130,14 @@ func TestChartAttestationApiNodePortDisabledWithoutNRI(t *testing.T) {
 	}
 }
 
-func TestChartRejectsPlaintextNRIWhitelist(t *testing.T) {
+func TestChartRejectsPlaintextNRIAllowlist(t *testing.T) {
 	out, err := helmTemplate(t,
 		"--set-string", "nriImagePolicy.cds.url=http://c8s-cds.c8s-system.svc:8443",
 	)
 	if err == nil {
-		t.Fatalf("helm template succeeded, want plaintext NRI whitelist failure\n%s", out)
+		t.Fatalf("helm template succeeded, want plaintext NRI allowlist failure\n%s", out)
 	}
-	assertHelmFailMessage(t, out, `nriImagePolicy.cds.url must start with https:// when nriImagePolicy.enabled=true (got "http://c8s-cds.c8s-system.svc:8443"): the host plugin must fetch the whitelist over RA-TLS`)
+	assertHelmFailMessage(t, out, `nriImagePolicy.cds.url must start with https:// when nriImagePolicy.enabled=true (got "http://c8s-cds.c8s-system.svc:8443"): the host plugin must fetch the allowlist over RA-TLS`)
 }
 
 func TestChartRejectsInvalidAttestationApiNodePortWithNRI(t *testing.T) {
@@ -1726,7 +1726,7 @@ func TestTLSLBVerifyDerivesProxySSLNameFromUpstream(t *testing.T) {
 
 func TestTLSLBAdditionalRoutesConfigureNginxLocations(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
-		"--set-string", "routes[0].path=/whitelist",
+		"--set-string", "routes[0].path=/allowlist",
 		"--set-string", "routes[0].match=exact",
 		"--set-string", "routes[0].backend.address=cds.c8s-system.svc:8080",
 		"--set-string", "routes[1].path=/tenant/",
@@ -1746,7 +1746,7 @@ func TestTLSLBAdditionalRoutesConfigureNginxLocations(t *testing.T) {
 		{
 			name:     "exact",
 			match:    "exact",
-			path:     "/whitelist",
+			path:     "/allowlist",
 			proxyURL: "http://route_0",
 		},
 		{
@@ -1790,7 +1790,7 @@ func TestTLSLBTypedHTTPRouteConfiguresNginxLocation(t *testing.T) {
 
 func TestTLSLBTypedHTTPSRouteConfiguresProxyTLS(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
-		"--set-string", "routes[0].path=/whitelist",
+		"--set-string", "routes[0].path=/allowlist",
 		"--set-string", "routes[0].match=exact",
 		"--set-string", "routes[0].backend.address=cds.c8s-system.svc.cluster.local:8080",
 		"--set-string", "routes[0].backend.protocol=https",
@@ -1802,7 +1802,7 @@ func TestTLSLBTypedHTTPSRouteConfiguresProxyTLS(t *testing.T) {
 	}
 	cfg := renderedTLSLBNginxConfig(t, out)
 	cfg.upstream(t, "route_0").assertServer(t, "cds.c8s-system.svc.cluster.local:8080")
-	route := cfg.location(t, "exact", "/whitelist")
+	route := cfg.location(t, "exact", "/allowlist")
 	route.assertDirective(t, "proxy_ssl_server_name", "on")
 	route.assertDirective(t, "proxy_ssl_name", "cds.c8s-system.svc.cluster.local")
 	route.assertDirective(t, "proxy_ssl_verify", "on")
@@ -1815,7 +1815,7 @@ func TestTLSLBTypedHTTPSRouteConfiguresProxyTLS(t *testing.T) {
 
 func TestTLSLBTypedHTTPSRouteCanUseCDSClientCert(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
-		"--set-string", "routes[0].path=/whitelist",
+		"--set-string", "routes[0].path=/allowlist",
 		"--set-string", "routes[0].backend.address=cds.c8s-system.svc.cluster.local:8080",
 		"--set-string", "routes[0].backend.protocol=https",
 		"--set", "routes[0].backend.tls.useCDSClientCert=true",
@@ -1824,7 +1824,7 @@ func TestTLSLBTypedHTTPSRouteCanUseCDSClientCert(t *testing.T) {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
 	cfg := renderedTLSLBNginxConfig(t, out)
-	route := cfg.location(t, "prefix", "/whitelist")
+	route := cfg.location(t, "prefix", "/allowlist")
 	route.assertDirective(t, "proxy_ssl_certificate", "/tls/cert.pem")
 	route.assertDirective(t, "proxy_ssl_certificate_key", "/tls/key.pem")
 	route.assertDirective(t, "proxy_ssl_name", "cds.c8s-system.svc.cluster.local")
@@ -1833,7 +1833,7 @@ func TestTLSLBTypedHTTPSRouteCanUseCDSClientCert(t *testing.T) {
 
 func TestTLSLBTypedHTTPSRouteCustomTrustedCAPathDoesNotMountMeshCA(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
-		"--set-string", "routes[0].path=/whitelist",
+		"--set-string", "routes[0].path=/allowlist",
 		"--set-string", "routes[0].backend.address=cds.c8s-system.svc.cluster.local:8080",
 		"--set-string", "routes[0].backend.protocol=https",
 		"--set", "routes[0].backend.tls.verify=true",
@@ -1843,7 +1843,7 @@ func TestTLSLBTypedHTTPSRouteCustomTrustedCAPathDoesNotMountMeshCA(t *testing.T)
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
 	cfg := renderedTLSLBNginxConfig(t, out)
-	route := cfg.location(t, "prefix", "/whitelist")
+	route := cfg.location(t, "prefix", "/allowlist")
 	route.assertDirective(t, "proxy_ssl_trusted_certificate", "/etc/ssl/certs/ca-certificates.crt")
 	assertNoTLSLBMeshCAVolume(t, out)
 }
@@ -2092,7 +2092,7 @@ func TestTLSLBMultiRouteVerifiedRouteUsesMeshCABundle(t *testing.T) {
 
 func TestTLSLBRejectsInvalidRouteMatch(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
-		"--set-string", "routes[0].path=/whitelist",
+		"--set-string", "routes[0].path=/allowlist",
 		"--set-string", "routes[0].match=regex",
 		"--set-string", "routes[0].backend.address=cds.c8s-system.svc:8080",
 	)
@@ -2118,14 +2118,14 @@ func TestTLSLBRejectsMissingRouteFields(t *testing.T) {
 		{
 			name: "backend",
 			args: []string{
-				"--set-string", "routes[0].path=/whitelist",
+				"--set-string", "routes[0].path=/allowlist",
 			},
 			want: "tlsLb.routes[0].backend is required",
 		},
 		{
 			name: "backend-address",
 			args: []string{
-				"--set-string", "routes[0].path=/whitelist",
+				"--set-string", "routes[0].path=/allowlist",
 				"--set-string", "routes[0].backend.protocol=https",
 			},
 			want: "tlsLb.routes[0].backend.address is required",
@@ -2143,7 +2143,7 @@ func TestTLSLBRejectsMissingRouteFields(t *testing.T) {
 
 func TestTLSLBRejectsRouteUpstream(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
-		"--set-string", "routes[0].path=/whitelist",
+		"--set-string", "routes[0].path=/allowlist",
 		"--set-string", "routes[0].upstream=http://cds.c8s-system.svc:8080",
 	)
 	if err == nil {
@@ -2154,7 +2154,7 @@ func TestTLSLBRejectsRouteUpstream(t *testing.T) {
 
 func TestTLSLBRejectsInvalidTypedRouteProtocol(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
-		"--set-string", "routes[0].path=/whitelist",
+		"--set-string", "routes[0].path=/allowlist",
 		"--set-string", "routes[0].backend.address=cds.c8s-system.svc:8080",
 		"--set-string", "routes[0].backend.protocol=grpc",
 	)
@@ -3057,7 +3057,7 @@ func TestChartPointsClientsAtCDS(t *testing.T) {
 }
 
 // TestChartCDSWiresInProcessTrustRoot confirms the flag set: the in-memory CA
-// (no Secret/ca-cert flag), the whitelist DB, and the in-process JWKS (no
+// (no Secret/ca-cert flag), the allowlist DB, and the in-process JWKS (no
 // --jwks-url, since signing happens in the same binary).
 func TestChartCDSWiresInProcessTrustRoot(t *testing.T) {
 	out, err := helmTemplate(t)
@@ -3067,7 +3067,7 @@ func TestChartCDSWiresInProcessTrustRoot(t *testing.T) {
 	args := renderedDeploymentContainer(t, out, "c8s-cds", "cds").Args
 	for _, want := range []string{
 		"--attestation-api-url=http://c8s-attestation-api.c8s-system.svc:8400",
-		"--whitelist-db=/data/whitelist.db",
+		"--allowlist-db=/data/allowlist.db",
 		"--ca-common-name=c8s Mesh CA",
 		"--ca-cert-validity=8760h",
 	} {
@@ -3275,7 +3275,7 @@ func renderedDaemonSet(t *testing.T, manifest, name string) appsv1.DaemonSet {
 }
 
 type nriRuntimeConfig struct {
-	Whitelist struct {
+	Allowlist struct {
 		Pull struct {
 			URL               string   `yaml:"url"`
 			Interval          string   `yaml:"interval"`
@@ -3286,7 +3286,7 @@ type nriRuntimeConfig struct {
 		Push struct {
 			PersistPath string `yaml:"persist_path"`
 		} `yaml:"push"`
-	} `yaml:"whitelist"`
+	} `yaml:"allowlist"`
 }
 
 func renderedNRIBootConfig(t *testing.T, manifest, daemonSetName string) nriRuntimeConfig {
@@ -3417,7 +3417,7 @@ func prefixTLSLBSetArgs(args []string) []string {
 }
 
 // Example_tlsLBConfig renders the tls-lb ConfigMap for a representative route
-// set — one plaintext HTTP backend (/whitelist) and one RA-TLS-verified HTTPS
+// set — one plaintext HTTP backend (/allowlist) and one RA-TLS-verified HTTPS
 // backend (/tenant/) — and prints the generated nginx.conf. It doubles as a
 // golden test of templates/configmap.yaml: a template edit that changes the
 // rendered config must be reflected in the Output block, so the full config
@@ -3471,8 +3471,8 @@ func Example_tlsLBConfig() {
 	//         # Large buffers for upstream responses that include TEE attestation headers (~8KB).
 	//         proxy_buffer_size 16k;
 	//         proxy_buffers 4 16k;
-	//         # Route: /whitelist -> http://c8s-cds.c8s-system.svc:8443
-	//         location = /whitelist {
+	//         # Route: /allowlist -> http://c8s-cds.c8s-system.svc:8443
+	//         location = /allowlist {
 	//             proxy_pass http://route_0;
 	//             proxy_set_header Host $host;
 	//             proxy_set_header X-Real-IP $remote_addr;
@@ -3531,29 +3531,29 @@ func podVolume(spec corev1.PodSpec, name string) (corev1.Volume, bool) {
 	return corev1.Volume{}, false
 }
 
-// TestChartSeedsCDSWhitelistFromFloor proves the single authoritative floor
-// (nriImagePolicy.bootstrapWhitelist.digests) plus the CDS image self-entry are
-// rendered into CDS's --whitelist-seed ConfigMap, so CDS's served /whitelist is
-// non-empty on the first worker pull. Decoded with the same typed Whitelist
+// TestChartSeedsCDSAllowlistFromFloor proves the single authoritative floor
+// (nriImagePolicy.bootstrapAllowlist.digests) plus the CDS image self-entry are
+// rendered into CDS's --allowlist-seed ConfigMap, so CDS's served /allowlist is
+// non-empty on the first worker pull. Decoded with the same typed Allowlist
 // shape CDS parses, not substring-matched.
-func TestChartSeedsCDSWhitelistFromFloor(t *testing.T) {
+func TestChartSeedsCDSAllowlistFromFloor(t *testing.T) {
 	const floorDigest = "sha256:abcdef0000000000000000000000000000000000000000000000000000000000"
 	out, err := helmTemplate(t,
-		"--set-string", "nriImagePolicy.bootstrapWhitelist.digests."+floorDigest+"=ghcr.io/x/coredns:v1",
+		"--set-string", "nriImagePolicy.bootstrapAllowlist.digests."+floorDigest+"=ghcr.io/x/coredns:v1",
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
 
-	cm := renderedConfigMap(t, out, "c8s-cds-whitelist-seed")
-	raw, ok := cm.Data["whitelist-seed.json"]
+	cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+	raw, ok := cm.Data["allowlist-seed.json"]
 	if !ok {
-		t.Fatalf("seed ConfigMap missing whitelist-seed.json key: %v", cm.Data)
+		t.Fatalf("seed ConfigMap missing allowlist-seed.json key: %v", cm.Data)
 	}
 
-	seed, err := pkgwhitelist.ParseJSON([]byte(raw))
+	seed, err := pkgallowlist.ParseJSON([]byte(raw))
 	if err != nil {
-		t.Fatalf("seed JSON does not parse as a Whitelist (CDS would fail closed): %v\n%s", err, raw)
+		t.Fatalf("seed JSON does not parse as a Allowlist (CDS would fail closed): %v\n%s", err, raw)
 	}
 
 	// The floor digest the operator supplied.
@@ -3569,11 +3569,11 @@ func TestChartSeedsCDSWhitelistFromFloor(t *testing.T) {
 	}
 }
 
-// TestChartDerivesComponentDigestsIntoWhitelist proves that when the c8s
+// TestChartDerivesComponentDigestsIntoAllowlist proves that when the c8s
 // component images are digest-pinned, each is auto-derived into the NRI
-// whitelist seed with a repo@digest reference matching the rendered pod image —
+// allowlist seed with a repo@digest reference matching the rendered pod image —
 // so a digest-pinned install self-allows the c8s components it deploys (#51).
-func TestChartDerivesComponentDigestsIntoWhitelist(t *testing.T) {
+func TestChartDerivesComponentDigestsIntoAllowlist(t *testing.T) {
 	const (
 		opD  = "sha256:00000000000000000000000000000000000000000000000000000000000000a1"
 		asD  = "sha256:00000000000000000000000000000000000000000000000000000000000000a2"
@@ -3583,7 +3583,7 @@ func TestChartDerivesComponentDigestsIntoWhitelist(t *testing.T) {
 		tpD  = "sha256:00000000000000000000000000000000000000000000000000000000000000a6"
 	)
 	out, err := helmTemplate(t,
-		"--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true",
+		"--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true",
 		"--set-string", "image.digest="+opD,
 		"--set-string", "attestationApi.image.digest="+asD,
 		"--set-string", "cds.image.digest="+cdsD,
@@ -3595,10 +3595,10 @@ func TestChartDerivesComponentDigestsIntoWhitelist(t *testing.T) {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
 
-	cm := renderedConfigMap(t, out, "c8s-cds-whitelist-seed")
-	seed, err := pkgwhitelist.ParseJSON([]byte(cm.Data["whitelist-seed.json"]))
+	cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+	seed, err := pkgallowlist.ParseJSON([]byte(cm.Data["allowlist-seed.json"]))
 	if err != nil {
-		t.Fatalf("seed JSON does not parse: %v\n%s", err, cm.Data["whitelist-seed.json"])
+		t.Fatalf("seed JSON does not parse: %v\n%s", err, cm.Data["allowlist-seed.json"])
 	}
 
 	// Each derived entry's reference must be repo@digest for the image the chart
@@ -3621,8 +3621,8 @@ func TestChartDerivesComponentDigestsIntoWhitelist(t *testing.T) {
 	// decoded as typed config (not substring-matched).
 	worker := bootConfigFromInstaller(t, out, "c8s-nri-image-policy-worker")
 	for digest, ref := range want {
-		if got := worker.Whitelist.AlwaysAllow[digest]; got != ref {
-			t.Errorf("worker always_allow[%s] = %q, want %q\nalways_allow: %v", digest, got, ref, worker.Whitelist.AlwaysAllow)
+		if got := worker.Allowlist.AlwaysAllow[digest]; got != ref {
+			t.Errorf("worker always_allow[%s] = %q, want %q\nalways_allow: %v", digest, got, ref, worker.Allowlist.AlwaysAllow)
 		}
 	}
 }
@@ -3632,7 +3632,7 @@ func TestChartDerivesComponentDigestsIntoWhitelist(t *testing.T) {
 // (internal/cmds/nri-image-policy/config.go, which is unexported) needed by the
 // chart tests, so assertions are against typed fields rather than substrings.
 type installerBootConfig struct {
-	Whitelist struct {
+	Allowlist struct {
 		AlwaysAllow map[string]string `yaml:"always_allow"`
 		Pull        struct {
 			URL string `yaml:"url"`
@@ -3640,7 +3640,7 @@ type installerBootConfig struct {
 		Push struct {
 			PersistPath string `yaml:"persist_path"`
 		} `yaml:"push"`
-	} `yaml:"whitelist"`
+	} `yaml:"allowlist"`
 	Policy struct {
 		Mode string `yaml:"mode"`
 	} `yaml:"policy"`
@@ -3681,7 +3681,7 @@ func TestChartBootConfigParsesAsPluginYAML(t *testing.T) {
 		// deriveComponents on (and a second component digest) so the installer
 		// image appears in always_allow both explicitly and via derivation —
 		// the exact shape of the duplicate-key regression this guards.
-		"--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true",
+		"--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true",
 		"--set-string", "cds.image.digest=sha256:00000000000000000000000000000000000000000000000000000000000000c5",
 	)
 	if err != nil {
@@ -3690,30 +3690,30 @@ func TestChartBootConfigParsesAsPluginYAML(t *testing.T) {
 	// Worker pulls from CDS; the CDS-node accepts pushes. Asserting the
 	// mutually-exclusive field per archetype confirms the typed decode landed
 	// on the right document, not just that some YAML parsed.
-	if wl := bootConfigFromInstaller(t, out, "c8s-nri-image-policy-worker").Whitelist; wl.Pull.URL == "" || wl.Push.PersistPath != "" {
+	if wl := bootConfigFromInstaller(t, out, "c8s-nri-image-policy-worker").Allowlist; wl.Pull.URL == "" || wl.Push.PersistPath != "" {
 		t.Errorf("worker boot config should configure pull, not push: pull.url=%q push.persist_path=%q", wl.Pull.URL, wl.Push.PersistPath)
 	}
-	if wl := bootConfigFromInstaller(t, out, "c8s-nri-image-policy-cds").Whitelist; wl.Push.PersistPath == "" || wl.Pull.URL != "" {
+	if wl := bootConfigFromInstaller(t, out, "c8s-nri-image-policy-cds").Allowlist; wl.Push.PersistPath == "" || wl.Pull.URL != "" {
 		t.Errorf("cds boot config should configure push, not pull: pull.url=%q push.persist_path=%q", wl.Pull.URL, wl.Push.PersistPath)
 	}
 }
 
-// A fleet-supplied bootstrapWhitelist.digests entry must override a derived
+// A fleet-supplied bootstrapAllowlist.digests entry must override a derived
 // entry for the same sha256 (fleet values win).
-func TestChartFleetWhitelistOverridesDerived(t *testing.T) {
+func TestChartFleetAllowlistOverridesDerived(t *testing.T) {
 	const cdsD = "sha256:00000000000000000000000000000000000000000000000000000000000000a3"
 	out, err := helmTemplate(t,
 		// deriveComponents on so cds.image.digest produces a derived entry for
 		// the fleet `digests` value to override.
-		"--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true",
+		"--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true",
 		"--set-string", "cds.image.digest="+cdsD,
-		"--set-string", "nriImagePolicy.bootstrapWhitelist.digests."+cdsD+"=mirror.local/cds@"+cdsD,
+		"--set-string", "nriImagePolicy.bootstrapAllowlist.digests."+cdsD+"=mirror.local/cds@"+cdsD,
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	cm := renderedConfigMap(t, out, "c8s-cds-whitelist-seed")
-	seed, err := pkgwhitelist.ParseJSON([]byte(cm.Data["whitelist-seed.json"]))
+	cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+	seed, err := pkgallowlist.ParseJSON([]byte(cm.Data["allowlist-seed.json"]))
 	if err != nil {
 		t.Fatalf("seed JSON does not parse: %v", err)
 	}
@@ -3734,15 +3734,15 @@ func TestChartDeriveComponentsDefaultsOff(t *testing.T) {
 		args []string
 	}{
 		{"default unset", []string{"--set-string", "image.digest=" + opD}},
-		{"explicit false", []string{"--set-string", "image.digest=" + opD, "--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=false"}},
+		{"explicit false", []string{"--set-string", "image.digest=" + opD, "--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=false"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, err := helmTemplate(t, tc.args...)
 			if err != nil {
 				t.Fatalf("helm template: %v\n%s", err, out)
 			}
-			cm := renderedConfigMap(t, out, "c8s-cds-whitelist-seed")
-			seed, err := pkgwhitelist.ParseJSON([]byte(cm.Data["whitelist-seed.json"]))
+			cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+			seed, err := pkgallowlist.ParseJSON([]byte(cm.Data["allowlist-seed.json"]))
 			if err != nil {
 				t.Fatalf("seed JSON does not parse: %v", err)
 			}
@@ -3757,36 +3757,36 @@ func TestChartDeriveComponentsDefaultsOff(t *testing.T) {
 	}
 }
 
-// TestChartWiresCDSWhitelistSeedFlagAndVolume proves the CDS container receives
-// --whitelist-seed pointing at a read-only mount of the seed ConfigMap. The CDS
+// TestChartWiresCDSAllowlistSeedFlagAndVolume proves the CDS container receives
+// --allowlist-seed pointing at a read-only mount of the seed ConfigMap. The CDS
 // pod runs readOnlyRootFilesystem, so the seed must be a read-only volume, not a
 // writable path.
-func TestChartWiresCDSWhitelistSeedFlagAndVolume(t *testing.T) {
+func TestChartWiresCDSAllowlistSeedFlagAndVolume(t *testing.T) {
 	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
 
 	cds := renderedDeploymentContainer(t, out, "c8s-cds", "cds")
-	assertContainerHasArg(t, "cds", cds.Args, "--whitelist-seed=/etc/cds/whitelist-seed.json")
+	assertContainerHasArg(t, "cds", cds.Args, "--allowlist-seed=/etc/cds/allowlist-seed.json")
 
-	mount, ok := containerVolumeMount(cds, "whitelist-seed")
+	mount, ok := containerVolumeMount(cds, "allowlist-seed")
 	if !ok {
-		t.Fatalf("cds container missing whitelist-seed volume mount; mounts=%v", cds.VolumeMounts)
+		t.Fatalf("cds container missing allowlist-seed volume mount; mounts=%v", cds.VolumeMounts)
 	}
 	if mount.MountPath != "/etc/cds" {
-		t.Errorf("whitelist-seed mountPath = %q, want /etc/cds", mount.MountPath)
+		t.Errorf("allowlist-seed mountPath = %q, want /etc/cds", mount.MountPath)
 	}
 	if !mount.ReadOnly {
-		t.Errorf("whitelist-seed mount must be readOnly (cds has readOnlyRootFilesystem)")
+		t.Errorf("allowlist-seed mount must be readOnly (cds has readOnlyRootFilesystem)")
 	}
 
-	vol, ok := podVolume(renderedDeployment(t, out, "c8s-cds").Spec.Template.Spec, "whitelist-seed")
+	vol, ok := podVolume(renderedDeployment(t, out, "c8s-cds").Spec.Template.Spec, "allowlist-seed")
 	if !ok {
-		t.Fatalf("cds pod missing whitelist-seed volume")
+		t.Fatalf("cds pod missing allowlist-seed volume")
 	}
-	if vol.ConfigMap == nil || vol.ConfigMap.Name != "c8s-cds-whitelist-seed" {
-		t.Errorf("whitelist-seed volume should source ConfigMap c8s-cds-whitelist-seed; got %+v", vol.ConfigMap)
+	if vol.ConfigMap == nil || vol.ConfigMap.Name != "c8s-cds-allowlist-seed" {
+		t.Errorf("allowlist-seed volume should source ConfigMap c8s-cds-allowlist-seed; got %+v", vol.ConfigMap)
 	}
 }
 
@@ -3797,11 +3797,11 @@ func TestChartOmitsCDSSeedWhenImagePolicyDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	if renderedManifestHasNamedKind(t, out, "ConfigMap", "c8s-cds-whitelist-seed") {
+	if renderedManifestHasNamedKind(t, out, "ConfigMap", "c8s-cds-allowlist-seed") {
 		t.Fatalf("seed ConfigMap should not render when nriImagePolicy is disabled")
 	}
 	cds := renderedDeploymentContainer(t, out, "c8s-cds", "cds")
-	assertContainerNoArgPrefix(t, "cds", cds.Args, "--whitelist-seed")
+	assertContainerNoArgPrefix(t, "cds", cds.Args, "--allowlist-seed")
 }
 
 // The CDS image must be admittable by digest in the floor/seed; without
@@ -3818,7 +3818,7 @@ func TestChartRejectsImagePolicyWithoutCDSDigest(t *testing.T) {
 }
 
 // In fail-closed mode with deriveComponents off, a digest-pinned component
-// whose digest is absent from bootstrapWhitelist.digests would be denied on its
+// whose digest is absent from bootstrapAllowlist.digests would be denied on its
 // own node, so the chart fails the render. cds.image is exempt (always seeded).
 func TestChartRejectsUncoveredComponentInFailClosed(t *testing.T) {
 	const nriD = "sha256:aaaa000000000000000000000000000000000000000000000000000000000000"
@@ -3839,8 +3839,8 @@ func TestChartRejectsUncoveredComponentInFailClosed(t *testing.T) {
 		args []string
 	}{
 		{"audit mode is non-blocking", []string{"--set", "nriImagePolicy.policy.mode=audit"}},
-		{"deriveComponents covers it", []string{"--set", "nriImagePolicy.policy.mode=fail-closed", "--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true"}},
-		{"digest listed in floor", []string{"--set", "nriImagePolicy.policy.mode=fail-closed", "--set-string", "nriImagePolicy.bootstrapWhitelist.digests." + nriD + "=ghcr.io/confidential-dot-ai/nri-image-policy@" + nriD}},
+		{"deriveComponents covers it", []string{"--set", "nriImagePolicy.policy.mode=fail-closed", "--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true"}},
+		{"digest listed in floor", []string{"--set", "nriImagePolicy.policy.mode=fail-closed", "--set-string", "nriImagePolicy.bootstrapAllowlist.digests." + nriD + "=ghcr.io/confidential-dot-ai/nri-image-policy@" + nriD}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if out, err := helmTemplate(t, tc.args...); err != nil {
@@ -3865,7 +3865,7 @@ func renderExampleTLSLBNginxConf() string {
 		"--set-string", "tlsLb.upstream.address=vllm:8000",
 		"--set", "tlsLb.upstream.protocol=http",
 		"--set", "tlsLb.nginx.image.tag=dev",
-		"--set-string", "tlsLb.routes[0].path=/whitelist",
+		"--set-string", "tlsLb.routes[0].path=/allowlist",
 		"--set-string", "tlsLb.routes[0].match=exact",
 		"--set-string", "tlsLb.routes[0].backend.address=c8s-cds.c8s-system.svc:8443",
 		"--set-string", "tlsLb.routes[1].path=/tenant/",

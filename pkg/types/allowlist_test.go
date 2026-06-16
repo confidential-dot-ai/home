@@ -6,10 +6,10 @@ import (
 	"testing"
 )
 
-func TestWhitelistListResponseJSONRoundtrip(t *testing.T) {
+func TestAllowlistListResponseJSONRoundtrip(t *testing.T) {
 	raw := `{"version":"3","digests":{"sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2":"docker.io/nginx:latest"}}`
 
-	var resp WhitelistListResponse
+	var resp AllowlistListResponse
 	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
 		t.Fatalf("unmarshal error: %v", err)
 	}
@@ -52,13 +52,13 @@ func TestWhitelistListResponseJSONRoundtrip(t *testing.T) {
 	}
 }
 
-func TestWhitelistAddRequestJSONRoundtrip(t *testing.T) {
+func TestAllowlistAddRequestJSONRoundtrip(t *testing.T) {
 	d, err := ParseDigest("sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
 	if err != nil {
 		t.Fatalf("parse digest: %v", err)
 	}
 
-	req := WhitelistAddRequest{
+	req := AllowlistAddRequest{
 		Digest: d,
 		Image:  "docker.io/nginx:latest",
 	}
@@ -68,7 +68,7 @@ func TestWhitelistAddRequestJSONRoundtrip(t *testing.T) {
 		t.Fatalf("marshal error: %v", err)
 	}
 
-	var decoded WhitelistAddRequest
+	var decoded AllowlistAddRequest
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("unmarshal error: %v", err)
 	}
@@ -81,20 +81,20 @@ func TestWhitelistAddRequestJSONRoundtrip(t *testing.T) {
 	}
 }
 
-func TestWhitelistDeleteRequestJSONRoundtrip(t *testing.T) {
+func TestAllowlistDeleteRequestJSONRoundtrip(t *testing.T) {
 	d, err := ParseDigest("sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
 	if err != nil {
 		t.Fatalf("parse digest: %v", err)
 	}
 
-	req := WhitelistDeleteRequest{Digests: []Digest{d}}
+	req := AllowlistDeleteRequest{Digests: []Digest{d}}
 
 	data, err := json.Marshal(req)
 	if err != nil {
 		t.Fatalf("marshal error: %v", err)
 	}
 
-	var decoded WhitelistDeleteRequest
+	var decoded AllowlistDeleteRequest
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("unmarshal error: %v", err)
 	}
@@ -107,13 +107,13 @@ func TestWhitelistDeleteRequestJSONRoundtrip(t *testing.T) {
 	}
 }
 
-func TestWhitelistAddRequestRejectsUnknownFields(t *testing.T) {
+func TestAllowlistAddRequestRejectsUnknownFields(t *testing.T) {
 	raw := `{"digest":"sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2","image":"nginx","extra":"field"}`
 
 	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
 	dec.DisallowUnknownFields()
 
-	var req WhitelistAddRequest
+	var req AllowlistAddRequest
 	if err := dec.Decode(&req); err == nil {
 		t.Fatal("expected error for unknown field")
 	}

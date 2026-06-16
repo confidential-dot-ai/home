@@ -10,14 +10,14 @@
 # their init PID looked up via the cgroup hierarchy and SIGKILLed.
 #
 # Replaces the earlier guest-policy-agent (Rego renderer that fetched
-# a whitelist from CDS over RA-TLS and only rendered it informationally,
+# a allowlist from CDS over RA-TLS and only rendered it informationally,
 # enforcing nothing). policy-monitor enforces directly. The boot-time
 # seed is baked: the digests in /etc/c8s/bootstrap-allowlist.json sit on
 # the dm-verity root and are folded into the kernel-hashes launch digest,
 # so the operator's pin on kata.guestImage.tag is also a pin on the
 # bootstrap image set — and the guest enforces from t=0 with no network
 # (no boot-path fetch, so no CDS-bootstrap deadlock). At runtime the set
-# is extended by the CDS whitelist refresh (RA-TLS, pinned to
+# is extended by the CDS allowlist refresh (RA-TLS, pinned to
 # cds.measurements) so operator additions land without a guest rebuild;
 # it only ever grows the allowlist, never shrinks it. See
 # docs/kata-image-policy.md for the threat-model discussion and the
@@ -29,7 +29,7 @@
 # pass — closing the window where containers could run with enforcement
 # offline. This is safe from the CDS-bootstrap angle because startup needs
 # only the dm-verity-baked seed, never a network/CDS round-trip. The unit
-# stays decoupled from CDS at runtime (the whitelist refresh is best-effort
+# stays decoupled from CDS at runtime (the allowlist refresh is best-effort
 # and never blocks boot). `Restart=on-failure` below keeps a crashed
 # monitor retrying; while it is down, c8s-ready stays inactive.
 Description=c8s policy-monitor (in-guest container-digest enforcement)
@@ -38,7 +38,7 @@ Documentation=https://github.com/confidential-dot-ai/c8s/tree/main/cmd/policy-mo
 # /etc must be readable so the baked allowlist seed is loadable; the
 # verity-protected /etc layer is mounted by the time local-fs.target
 # is reached. network-online.target + c8s-cloudinit-env.service order
-# the CDS whitelist refresh: the env file (C8S_CDS_URL/measurements) and
+# the CDS allowlist refresh: the env file (C8S_CDS_URL/measurements) and
 # the network must be up before the refresh loop can reach CDS. These
 # are ordering-only (not Requires) — policy-monitor stays decoupled and
 # falls back to baked-seed-only if the env file is absent.
@@ -74,8 +74,8 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 # RestrictAddressFamilies keeps AF_UNIX (journald) and adds AF_INET/
-# AF_INET6 for the CDS whitelist refresh — policy-monitor pulls
-# CDS's /whitelist over RA-TLS (see cds_refresh.go). With no CDS URL
+# AF_INET6 for the CDS allowlist refresh — policy-monitor pulls
+# CDS's /allowlist over RA-TLS (see cds_refresh.go). With no CDS URL
 # configured the refresh loop never starts and no socket is opened, but
 # the families are permitted either way (the unit is static).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

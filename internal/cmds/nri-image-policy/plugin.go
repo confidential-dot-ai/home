@@ -27,7 +27,7 @@ const (
 	annotationImageName = "io.kubernetes.cri.image-name"
 )
 
-// imageVerdict is the result of checking an image against the whitelist.
+// imageVerdict is the result of checking an image against the allowlist.
 type imageVerdict int
 
 const (
@@ -47,7 +47,7 @@ type plugin struct {
 	ready    atomic.Bool
 
 	// Deferred sweep: pods/containers observed during Synchronize before
-	// the plugin is ready, replayed once the cache has a whitelist.
+	// the plugin is ready, replayed once the cache has a allowlist.
 	deferredMu   sync.Mutex
 	deferredPods []*api.PodSandbox
 	deferredCtrs []*api.Container
@@ -96,7 +96,7 @@ func newPlugin(
 	return p, nil
 }
 
-// Ready returns true when the plugin has a whitelist loaded and is serving.
+// Ready returns true when the plugin has a allowlist loaded and is serving.
 func (p *plugin) Ready() bool {
 	return p.ready.Load()
 }
@@ -168,7 +168,7 @@ func (p *plugin) checkLabels(cfg *config, namespace, podName, containerName stri
 	return verdictAllow, ""
 }
 
-// checkImage validates a container's image against the whitelist.
+// checkImage validates a container's image against the allowlist.
 // Returns the verdict and an error string (empty if none).
 func (p *plugin) checkImage(ctx context.Context, cfg *config, namespace, podName, containerName, imageRef string) (imageVerdict, string) {
 	log := p.logger.With(
@@ -238,32 +238,32 @@ func (p *plugin) checkImage(ctx context.Context, cfg *config, namespace, podName
 		log.Debug("resolved tag to digest via containerd", "digest", digest)
 	}
 
-	wl := p.cache.GetWhitelist()
+	wl := p.cache.GetAllowlist()
 	if wl == nil {
-		log.Error("no cached whitelist; denying")
+		log.Error("no cached allowlist; denying")
 		p.audit.Log(audit.Event{
 			Action:    "deny",
-			Reason:    "no_whitelist_available",
+			Reason:    "no_allowlist_available",
 			Namespace: namespace,
 			Pod:       podName,
 			Container: containerName,
 			Image:     imageRef,
 		})
-		return verdictDeny, fmt.Sprintf("no whitelist available for %s", imageRef)
+		return verdictDeny, fmt.Sprintf("no allowlist available for %s", imageRef)
 	}
 
-	// Check digest against whitelist
+	// Check digest against allowlist
 	if !wl.Contains(digest) {
-		log.Warn("image not in whitelist", "digest", digest)
+		log.Warn("image not in allowlist", "digest", digest)
 		p.audit.Log(audit.Event{
 			Action:    "deny",
-			Reason:    "not_in_whitelist",
+			Reason:    "not_in_allowlist",
 			Namespace: namespace,
 			Pod:       podName,
 			Container: containerName,
 			Image:     imageRef,
 		})
-		return verdictDeny, fmt.Sprintf("image not in whitelist: %s", imageRef)
+		return verdictDeny, fmt.Sprintf("image not in allowlist: %s", imageRef)
 	}
 
 	// All checks passed
@@ -280,7 +280,7 @@ func (p *plugin) checkImage(ctx context.Context, cfg *config, namespace, podName
 }
 
 // Synchronize is called when the plugin connects to containerd.
-// It checks all existing containers against the whitelist and kills violations.
+// It checks all existing containers against the allowlist and kills violations.
 func (p *plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, ctrs []*api.Container) ([]*api.ContainerUpdate, error) {
 	cfg := p.cfg
 
@@ -304,7 +304,7 @@ func (p *plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, ctrs [
 	return nil, nil
 }
 
-// runSweep checks all existing containers against the whitelist and kills violations.
+// runSweep checks all existing containers against the allowlist and kills violations.
 func (p *plugin) runSweep(ctx context.Context, cfg *config, pods []*api.PodSandbox, ctrs []*api.Container) {
 	p.logger.Info("startup sweep: checking existing containers", "pods", len(pods), "containers", len(ctrs))
 
@@ -331,7 +331,7 @@ func (p *plugin) runSweep(ctx context.Context, cfg *config, pods []*api.PodSandb
 			denied = true
 		}
 
-		if !denied && cfg.WhitelistEnabled() {
+		if !denied && cfg.AllowlistEnabled() {
 			imageRef := ctr.GetAnnotations()[annotationImageName]
 			imgVerdict, _ := p.checkImage(ctx, cfg, pod.GetNamespace(), pod.GetName(), ctr.GetName(), imageRef)
 			if imgVerdict == verdictDeny {
@@ -389,7 +389,7 @@ func (p *plugin) RunDeferredSweep(ctx context.Context) {
 func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	cfg := p.cfg
 
-	// Not-ready guard: plugin is registered with NRI but whitelist hasn't
+	// Not-ready guard: plugin is registered with NRI but allowlist hasn't
 	// been fetched yet. Deny all non-exempt container creation to close
 	// the startup window.
 	if !p.Ready() {
@@ -433,8 +433,8 @@ func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *
 		return nil, nil, nil
 	}
 
-	// Image whitelist check (only when configured)
-	if cfg.WhitelistEnabled() {
+	// Image allowlist check (only when configured)
+	if cfg.AllowlistEnabled() {
 		annotations := ctr.GetAnnotations()
 		imageRef := annotations[annotationImageName]
 		if imageRef == "" {

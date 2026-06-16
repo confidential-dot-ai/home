@@ -1,4 +1,4 @@
-package whitelistclient
+package allowlistclient
 
 import (
 	"context"
@@ -25,13 +25,13 @@ func TestListSuccess(t *testing.T) {
 	digest2, _ := types.ParseDigest("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/whitelist", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/allowlist", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(types.WhitelistListResponse{
+		json.NewEncoder(w).Encode(types.AllowlistListResponse{
 			Version: "1.0",
 			Digests: map[types.Digest]string{
 				digest1: "image-a",
@@ -61,7 +61,7 @@ func TestAddSuccess(t *testing.T) {
 
 	var gotAuth string
 	mux := http.NewServeMux()
-	mux.HandleFunc("/whitelist", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/allowlist", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -88,7 +88,7 @@ func TestDeleteSuccess(t *testing.T) {
 	digest, _ := types.ParseDigest("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/whitelist", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/allowlist", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -109,7 +109,7 @@ func TestDeleteNotFound(t *testing.T) {
 	digest, _ := types.ParseDigest("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/whitelist", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/allowlist", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	})
 	srv := httptest.NewServer(mux)
@@ -130,12 +130,12 @@ func TestDeleteNotFound(t *testing.T) {
 	}
 }
 
-func TestFetchWhitelistConditionalAcceptsJSONContentTypeWithCharset(t *testing.T) {
+func TestFetchAllowlistConditionalAcceptsJSONContentTypeWithCharset(t *testing.T) {
 	digest, _ := types.ParseDigest("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("ETag", `W/"1"`)
-		_ = json.NewEncoder(w).Encode(types.WhitelistListResponse{
+		_ = json.NewEncoder(w).Encode(types.AllowlistListResponse{
 			Version: "1",
 			Digests: map[types.Digest]string{
 				digest: "image-a",
@@ -145,7 +145,7 @@ func TestFetchWhitelistConditionalAcceptsJSONContentTypeWithCharset(t *testing.T
 	defer srv.Close()
 
 	c := NewClientWithHTTP(srv.URL, srv.Client())
-	wl, etag, notModified, err := c.FetchWhitelistConditional(context.Background(), "")
+	wl, etag, notModified, err := c.FetchAllowlistConditional(context.Background(), "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -156,11 +156,11 @@ func TestFetchWhitelistConditionalAcceptsJSONContentTypeWithCharset(t *testing.T
 		t.Fatalf("etag = %q, want W/\"1\"", etag)
 	}
 	if got := wl.Digests[digest.String()]; got != "image-a" {
-		t.Fatalf("digest missing from whitelist: %q", got)
+		t.Fatalf("digest missing from allowlist: %q", got)
 	}
 }
 
-func TestFetchWhitelistConditionalRejectsOversizedBody(t *testing.T) {
+func TestFetchAllowlistConditionalRejectsOversizedBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("ETag", `W/"big"`)
@@ -169,7 +169,7 @@ func TestFetchWhitelistConditionalRejectsOversizedBody(t *testing.T) {
 		// cap to trip before ParseJSON ever runs.
 		chunk := strings.Repeat("a", 64*1024)
 		written := int64(0)
-		for written <= maxWhitelistResponseBytes {
+		for written <= maxAllowlistResponseBytes {
 			n, err := w.Write([]byte(chunk))
 			if err != nil {
 				return
@@ -180,8 +180,8 @@ func TestFetchWhitelistConditionalRejectsOversizedBody(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClientWithHTTP(srv.URL, &http.Client{Timeout: 5 * time.Second})
-	_, _, _, err := c.FetchWhitelistConditional(context.Background(), "")
-	if !errors.Is(err, errWhitelistResponseTooLarge) {
-		t.Fatalf("expected errWhitelistResponseTooLarge, got %v", err)
+	_, _, _, err := c.FetchAllowlistConditional(context.Background(), "")
+	if !errors.Is(err, errAllowlistResponseTooLarge) {
+		t.Fatalf("expected errAllowlistResponseTooLarge, got %v", err)
 	}
 }

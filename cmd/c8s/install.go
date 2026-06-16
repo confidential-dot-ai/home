@@ -282,7 +282,7 @@ preparation is required beyond a running cluster.
 
 By default each component image tag is resolved to its registry digest (via the
 'crane' CLI) and pinned, including the CDS digest the image-policy floor and
-render guard require, and nriImagePolicy.bootstrapWhitelist.deriveComponents is
+render guard require, and nriImagePolicy.bootstrapAllowlist.deriveComponents is
 enabled so the resolved images are added to the NRI allowlist. This makes a
 plain install satisfy the floor with no hand-written values. Pass
 --resolve-digests=false when you supply the digests yourself via -f; the
@@ -709,10 +709,10 @@ func appendResolvedDigestArgs(ctx context.Context, helmArgs []string, tag string
 // repository too means an operator's -f override of a repository cannot leave
 // the chart deploying repoA@<digest-of-repoB>: helm gives --set strict
 // precedence over -f, so the repository and digest move together. cds.image
-// covers both the CDS Deployment and the NRI push-hook / whitelist-seed
+// covers both the CDS Deployment and the NRI push-hook / allowlist-seed
 // self-entry, which all read it. Any resolution failure aborts: a
 // partially-pinned floor would let the render guard pass while the served
-// whitelist pointed at the wrong digest. The resolver is injected so the arg
+// allowlist pointed at the wrong digest. The resolver is injected so the arg
 // assembly is testable without a registry.
 func buildDigestArgs(helmArgs []string, tag string, components []c8sComponent, resolve func(ref string) (string, error)) ([]string, error) {
 	for _, c := range components {
@@ -729,7 +729,7 @@ func buildDigestArgs(helmArgs []string, tag string, components []c8sComponent, r
 	// Resolving the component digests is exactly when you want them in the NRI
 	// allowlist, so turn on derivation (off by default in the chart; the
 	// resolve path enables it).
-	helmArgs = append(helmArgs, "--set", "nriImagePolicy.bootstrapWhitelist.deriveComponents=true")
+	helmArgs = append(helmArgs, "--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true")
 	return helmArgs, nil
 }
 

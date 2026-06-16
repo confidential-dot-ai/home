@@ -1,5 +1,5 @@
 // Package nriimagepolicy is an NRI plugin that validates container images
-// against a digest whitelist. The whitelist is sourced either from a remote
+// against a digest allowlist. The allowlist is sourced either from a remote
 // CDS service (pull mode) or from an operator-pushed payload on the local
 // unix socket (push mode), with a bootstrap file on disk as the cold-boot
 // baseline in both modes.
@@ -30,28 +30,28 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/fileutil"
 	"github.com/confidential-dot-ai/c8s/internal/httputil"
 	"github.com/confidential-dot-ai/c8s/internal/version"
+	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
+	"github.com/confidential-dot-ai/c8s/pkg/allowlistclient"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
-	"github.com/confidential-dot-ai/c8s/pkg/whitelist"
-	"github.com/confidential-dot-ai/c8s/pkg/whitelistclient"
 )
 
 // Pull-startup retry parameters. Declared as vars so tests can shrink
 // the backoff without exposing test-only knobs on the public surface.
 var (
-	whitelistApiMaxRetries   = 5
-	whitelistApiInitialDelay = 2 * time.Second
+	allowlistApiMaxRetries   = 5
+	allowlistApiInitialDelay = 2 * time.Second
 )
 
 var (
-	errInitialWhitelistNotModified = errors.New("initial whitelist fetch returned not modified without a cached CDS whitelist")
-	errInitialWhitelistNil         = errors.New("initial whitelist fetch returned nil whitelist")
+	errInitialAllowlistNotModified = errors.New("initial allowlist fetch returned not modified without a cached CDS allowlist")
+	errInitialAllowlistNil         = errors.New("initial allowlist fetch returned nil allowlist")
 	errPushHandlerRequiresUnixAddr = errors.New("push mode requires plugin.health_addr to use unix://")
-	errPluginDied                  = errors.New("NRI plugin died during whitelist init")
+	errPluginDied                  = errors.New("NRI plugin died during allowlist init")
 )
 
-// pushBodyLimit caps PUT /whitelist payloads. Push mode carries a
+// pushBodyLimit caps PUT /allowlist payloads. Push mode carries a
 // single digest entry so this is intentionally tight.
 const pushBodyLimit = 16 * 1024
 
@@ -64,7 +64,7 @@ func startupSourceMode(cfg *config) string {
 	}
 
 	sources := make([]string, 0, 2)
-	if len(cfg.Whitelist.AlwaysAllow) > 0 {
+	if len(cfg.Allowlist.AlwaysAllow) > 0 {
 		sources = append(sources, "always_allow")
 	}
 	if len(cfg.Policy.LabelRules) > 0 {
@@ -118,14 +118,14 @@ func Run(args []string) error {
 	policyCache := cache.NewPolicyCache()
 	auditLogger := audit.NewLogger()
 
-	var wlClient whitelistclient.Client
+	var wlClient allowlistclient.Client
 	if cfg.PullEnabled() {
-		logger.Info("initializing whitelist client", "url", cfg.Whitelist.Pull.URL)
-		httpClient, err := whitelistPullHTTPClient(cfg.Whitelist.Pull)
+		logger.Info("initializing allowlist client", "url", cfg.Allowlist.Pull.URL)
+		httpClient, err := allowlistPullHTTPClient(cfg.Allowlist.Pull)
 		if err != nil {
-			return fmt.Errorf("create whitelist client: %w", err)
+			return fmt.Errorf("create allowlist client: %w", err)
 		}
-		wlClient = whitelistclient.NewClientWithHTTP(cfg.Whitelist.Pull.URL, httpClient)
+		wlClient = allowlistclient.NewClientWithHTTP(cfg.Allowlist.Pull.URL, httpClient)
 	}
 
 	plugin, err := newPlugin(cfg, resolver, policyCache, auditLogger, logger)
@@ -144,18 +144,18 @@ func Run(args []string) error {
 		cancel()
 	}()
 
-	bootstrap := alwaysAllowWhitelist(cfg.Whitelist.AlwaysAllow)
+	bootstrap := alwaysAllowAllowlist(cfg.Allowlist.AlwaysAllow)
 
-	var pushed *whitelist.Whitelist
-	if cfg.PushEnabled() && cfg.Whitelist.Push.PersistPath != "" {
-		pushed, err = loadWhitelistFile(cfg.Whitelist.Push.PersistPath, "pushed", logger)
+	var pushed *allowlist.Allowlist
+	if cfg.PushEnabled() && cfg.Allowlist.Push.PersistPath != "" {
+		pushed, err = loadAllowlistFile(cfg.Allowlist.Push.PersistPath, "pushed", logger)
 		if err != nil {
-			return fmt.Errorf("load pushed %q: %w", cfg.Whitelist.Push.PersistPath, err)
+			return fmt.Errorf("load pushed %q: %w", cfg.Allowlist.Push.PersistPath, err)
 		}
 	}
 
-	seed := mergeWhitelists(bootstrap, pushed)
-	policyCache.SetWhitelist(seed)
+	seed := mergeAllowlists(bootstrap, pushed)
+	policyCache.SetAllowlist(seed)
 	logger.Info("cache seeded",
 		"always_allow_entries", entriesOf(bootstrap),
 		"pushed_entries", entriesOf(pushed),
@@ -163,7 +163,7 @@ func Run(args []string) error {
 
 	var pushH *pushHandler
 	if cfg.PushEnabled() {
-		pushH, err = newPushHandler(policyCache, bootstrap, cfg.Whitelist.Push.PersistPath, logger)
+		pushH, err = newPushHandler(policyCache, bootstrap, cfg.Allowlist.Push.PersistPath, logger)
 		if err != nil {
 			return fmt.Errorf("create push handler: %w", err)
 		}
@@ -195,7 +195,7 @@ func Run(args []string) error {
 			client:      wlClient,
 			cache:       policyCache,
 			bootstrap:   bootstrap,
-			timeout:     cfg.Whitelist.Pull.Timeout,
+			timeout:     cfg.Allowlist.Pull.Timeout,
 			pluginErrCh: pluginErrCh,
 			logger:      logger,
 		})
@@ -213,7 +213,7 @@ func Run(args []string) error {
 				// The cache already holds the bootstrap floor (always_allow), so
 				// stay up serving it rather than crash-loop the plugin and block
 				// container creation node-wide. runPullLoop keeps retrying.
-				logger.Warn("initial whitelist pull failed; serving bootstrap floor and retrying in background", "error", err)
+				logger.Warn("initial allowlist pull failed; serving bootstrap floor and retrying in background", "error", err)
 			}
 		}
 	}
@@ -226,8 +226,8 @@ func Run(args []string) error {
 			client:    wlClient,
 			cache:     policyCache,
 			bootstrap: bootstrap,
-			interval:  cfg.Whitelist.Pull.Interval,
-			timeout:   cfg.Whitelist.Pull.Timeout,
+			interval:  cfg.Allowlist.Pull.Interval,
+			timeout:   cfg.Allowlist.Pull.Timeout,
 			etag:      initialETag,
 			logger:    logger,
 		})
@@ -249,16 +249,16 @@ func Run(args []string) error {
 	return nil
 }
 
-// whitelistPullHTTPClient builds the RA-TLS client for the CDS pull. The pull
+// allowlistPullHTTPClient builds the RA-TLS client for the CDS pull. The pull
 // URL is always https (enforced by config.Validate), so this always verifies
 // the CDS attestation handshake.
-func whitelistPullHTTPClient(cfg pullConfig) (*http.Client, error) {
+func allowlistPullHTTPClient(cfg pullConfig) (*http.Client, error) {
 	measurements, err := ratls.ParseHexMeasurementsList(cfg.CDSMeasurements)
 	if err != nil {
 		return nil, fmt.Errorf("parse CDS measurements: %w", err)
 	}
 	if len(measurements) == 0 {
-		slog.Warn("whitelist.pull.cds_measurements not set; nri-image-policy accepts any RA-TLS-attested CDS measurement")
+		slog.Warn("allowlist.pull.cds_measurements not set; nri-image-policy accepts any RA-TLS-attested CDS measurement")
 	}
 	client, err := ratls.NewVerifyingHTTPClient(measurements, cfg.AttestationApiURL)
 	if err != nil {
@@ -268,39 +268,39 @@ func whitelistPullHTTPClient(cfg pullConfig) (*http.Client, error) {
 	return client, nil
 }
 
-// alwaysAllowWhitelist builds an in-memory Whitelist from the config's
+// alwaysAllowAllowlist builds an in-memory Allowlist from the config's
 // AlwaysAllow map. Used to seed the cache at startup with chart-managed
 // entries (typically the installer image so chart upgrades can roll).
-func alwaysAllowWhitelist(entries map[string]string) *whitelist.Whitelist {
-	wl := &whitelist.Whitelist{Digests: make(map[string]string, len(entries))}
+func alwaysAllowAllowlist(entries map[string]string) *allowlist.Allowlist {
+	wl := &allowlist.Allowlist{Digests: make(map[string]string, len(entries))}
 	for d, image := range entries {
 		wl.Digests[d] = image
 	}
 	return wl
 }
 
-// loadWhitelistFile reads a YAML/JSON whitelist from disk. Missing file
+// loadAllowlistFile reads a YAML/JSON allowlist from disk. Missing file
 // returns (nil, nil); parse errors fail closed.
-func loadWhitelistFile(path, kind string, logger *slog.Logger) (*whitelist.Whitelist, error) {
+func loadAllowlistFile(path, kind string, logger *slog.Logger) (*allowlist.Allowlist, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			logger.Info("whitelist file absent", "kind", kind, "path", path)
+			logger.Info("allowlist file absent", "kind", kind, "path", path)
 			return nil, nil
 		}
 		return nil, fmt.Errorf("read: %w", err)
 	}
-	return parseWhitelistFile(data, path)
+	return parseAllowlistFile(data, path)
 }
 
-// parseWhitelistFile decodes YAML/JSON whitelist content. Digest keys
+// parseAllowlistFile decodes YAML/JSON allowlist content. Digest keys
 // are validated via the typed wire shape; empty digest maps are allowed.
-func parseWhitelistFile(data []byte, path string) (*whitelist.Whitelist, error) {
-	var raw types.WhitelistListResponse
+func parseAllowlistFile(data []byte, path string) (*allowlist.Allowlist, error) {
+	var raw types.AllowlistListResponse
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse %q: %w", path, err)
 	}
-	out := &whitelist.Whitelist{
+	out := &allowlist.Allowlist{
 		Version: raw.Version,
 		Digests: make(map[string]string, len(raw.Digests)),
 	}
@@ -310,18 +310,18 @@ func parseWhitelistFile(data []byte, path string) (*whitelist.Whitelist, error) 
 	return out, nil
 }
 
-func entriesOf(wl *whitelist.Whitelist) int {
+func entriesOf(wl *allowlist.Allowlist) int {
 	if wl == nil {
 		return 0
 	}
 	return len(wl.Digests)
 }
 
-// mergeWhitelists overlays b onto a. Entries in b win on conflict; b's
+// mergeAllowlists overlays b onto a. Entries in b win on conflict; b's
 // version is preferred when set. Either argument may be nil. Bootstrap
 // entries (a) cannot be removed by overlay — they're the static floor.
-func mergeWhitelists(a, b *whitelist.Whitelist) *whitelist.Whitelist {
-	out := &whitelist.Whitelist{Digests: map[string]string{}}
+func mergeAllowlists(a, b *allowlist.Allowlist) *allowlist.Allowlist {
+	out := &allowlist.Allowlist{Digests: map[string]string{}}
 	if a != nil {
 		out.Version = a.Version
 		for k, v := range a.Digests {
@@ -340,45 +340,45 @@ func mergeWhitelists(a, b *whitelist.Whitelist) *whitelist.Whitelist {
 }
 
 type pullArgs struct {
-	client      whitelistclient.Client
+	client      allowlistclient.Client
 	cache       *cache.PolicyCache
-	bootstrap   *whitelist.Whitelist
+	bootstrap   *allowlist.Allowlist
 	timeout     time.Duration
 	pluginErrCh <-chan error
 	logger      *slog.Logger
 }
 
-// pullInitial fetches the startup whitelist with bounded retries and
+// pullInitial fetches the startup allowlist with bounded retries and
 // returns the response ETag for the steady-state poll loop.
 //
 // INVARIANT: a nil error return means args.cache holds bootstrap ∪ pulled.
 // Context cancellation surfaces as ctx.Err(); callers must not mark the
 // plugin ready on that path.
 func pullInitial(ctx context.Context, args pullArgs) (string, error) {
-	delay := whitelistApiInitialDelay
-	for attempt := 1; attempt <= whitelistApiMaxRetries; attempt++ {
+	delay := allowlistApiInitialDelay
+	for attempt := 1; attempt <= allowlistApiMaxRetries; attempt++ {
 		select {
 		case err := <-args.pluginErrCh:
 			return "", fmt.Errorf("%w: %w", errPluginDied, err)
 		case <-ctx.Done():
-			args.logger.Info("shutdown requested during whitelist init")
+			args.logger.Info("shutdown requested during allowlist init")
 			return "", ctx.Err()
 		default:
 		}
 
 		reqCtx, reqCancel := context.WithTimeout(ctx, args.timeout)
-		args.logger.Info("fetching initial whitelist from CDS", "attempt", attempt)
-		wl, etag, notModified, err := args.client.FetchWhitelistConditional(reqCtx, "")
+		args.logger.Info("fetching initial allowlist from CDS", "attempt", attempt)
+		wl, etag, notModified, err := args.client.FetchAllowlistConditional(reqCtx, "")
 		reqCancel()
 		if err == nil {
 			if notModified {
-				err = errInitialWhitelistNotModified
+				err = errInitialAllowlistNotModified
 			} else if wl == nil {
-				err = errInitialWhitelistNil
+				err = errInitialAllowlistNil
 			} else {
-				merged := mergeWhitelists(args.bootstrap, wl)
-				args.cache.SetWhitelist(merged)
-				args.logger.Info("initial whitelist pulled from CDS",
+				merged := mergeAllowlists(args.bootstrap, wl)
+				args.cache.SetAllowlist(merged)
+				args.logger.Info("initial allowlist pulled from CDS",
 					"pulled_entries", len(wl.Digests),
 					"merged_entries", len(merged.Digests),
 					"etag", etag,
@@ -387,14 +387,14 @@ func pullInitial(ctx context.Context, args pullArgs) (string, error) {
 			}
 		}
 
-		args.logger.Error("whitelist fetch failed", "attempt", attempt, "error", err)
-		if attempt >= whitelistApiMaxRetries {
-			return "", fmt.Errorf("whitelist fetch failed after %d attempts: %w", whitelistApiMaxRetries, err)
+		args.logger.Error("allowlist fetch failed", "attempt", attempt, "error", err)
+		if attempt >= allowlistApiMaxRetries {
+			return "", fmt.Errorf("allowlist fetch failed after %d attempts: %w", allowlistApiMaxRetries, err)
 		}
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
-			args.logger.Info("shutdown requested during whitelist init")
+			args.logger.Info("shutdown requested during allowlist init")
 			return "", ctx.Err()
 		}
 		delay *= 2
@@ -403,9 +403,9 @@ func pullInitial(ctx context.Context, args pullArgs) (string, error) {
 }
 
 type pullLoopArgs struct {
-	client    whitelistclient.Client
+	client    allowlistclient.Client
 	cache     *cache.PolicyCache
-	bootstrap *whitelist.Whitelist
+	bootstrap *allowlist.Allowlist
 	interval  time.Duration
 	timeout   time.Duration
 	etag      string
@@ -427,7 +427,7 @@ func runPullLoop(ctx context.Context, args pullLoopArgs) {
 		}
 
 		reqCtx, cancel := context.WithTimeout(ctx, args.timeout)
-		wl, newETag, notModified, err := args.client.FetchWhitelistConditional(reqCtx, etag)
+		wl, newETag, notModified, err := args.client.FetchAllowlistConditional(reqCtx, etag)
 		cancel()
 		if err != nil {
 			args.logger.Warn("pull loop fetch failed", "error", err)
@@ -438,13 +438,13 @@ func runPullLoop(ctx context.Context, args pullLoopArgs) {
 			continue
 		}
 		if wl == nil {
-			args.logger.Warn("pull loop fetch returned nil whitelist")
+			args.logger.Warn("pull loop fetch returned nil allowlist")
 			continue
 		}
-		merged := mergeWhitelists(args.bootstrap, wl)
-		args.cache.SetWhitelist(merged)
+		merged := mergeAllowlists(args.bootstrap, wl)
+		args.cache.SetAllowlist(merged)
 		etag = newETag
-		args.logger.Info("pull loop: whitelist refreshed",
+		args.logger.Info("pull loop: allowlist refreshed",
 			"pulled_entries", len(wl.Digests),
 			"merged_entries", len(merged.Digests),
 			"etag", etag,
@@ -452,7 +452,7 @@ func runPullLoop(ctx context.Context, args pullLoopArgs) {
 	}
 }
 
-// pushHandler implements PUT /whitelist for push-mode nodes.
+// pushHandler implements PUT /allowlist for push-mode nodes.
 //
 // INVARIANT: pushedPath is non-empty (enforced by newPushHandler).
 // Persistence to disk is part of the contract; restarting must re-load
@@ -461,14 +461,14 @@ func runPullLoop(ctx context.Context, args pullLoopArgs) {
 type pushHandler struct {
 	mu         sync.Mutex
 	cache      *cache.PolicyCache
-	bootstrap  *whitelist.Whitelist
+	bootstrap  *allowlist.Allowlist
 	pushedPath string
 	logger     *slog.Logger
 }
 
 // newPushHandler returns a handler that persists to pushedPath and
 // applies bootstrap ∪ pushed to cache. pushedPath must be non-empty.
-func newPushHandler(c *cache.PolicyCache, bootstrap *whitelist.Whitelist, pushedPath string, logger *slog.Logger) (*pushHandler, error) {
+func newPushHandler(c *cache.PolicyCache, bootstrap *allowlist.Allowlist, pushedPath string, logger *slog.Logger) (*pushHandler, error) {
 	if pushedPath == "" {
 		return nil, fmt.Errorf("pushedPath must be non-empty")
 	}
@@ -480,7 +480,7 @@ func newPushHandler(c *cache.PolicyCache, bootstrap *whitelist.Whitelist, pushed
 	}, nil
 }
 
-// Body must be a single-entry WhitelistListResponse. pushed.json is
+// Body must be a single-entry AllowlistListResponse. pushed.json is
 // written atomically before the cache is updated.
 func (h *pushHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
@@ -493,7 +493,7 @@ func (h *pushHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	pushed, err := whitelist.ParseJSON(body)
+	pushed, err := allowlist.ParseJSON(body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -518,8 +518,8 @@ func (h *pushHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	merged := mergeWhitelists(h.bootstrap, pushed)
-	h.cache.SetWhitelist(merged)
+	merged := mergeAllowlists(h.bootstrap, pushed)
+	h.cache.SetAllowlist(merged)
 	h.logger.Info("push applied",
 		"pushed_entries", len(pushed.Digests),
 		"merged_entries", len(merged.Digests),
@@ -533,12 +533,12 @@ type healthServerConfig struct {
 	addr         string
 	readTimeout  time.Duration
 	writeTimeout time.Duration
-	pushHandler  *pushHandler // nil disables PUT /whitelist
+	pushHandler  *pushHandler // nil disables PUT /allowlist
 }
 
 // startHealthServer starts an HTTP server for readiness/liveness probes.
 // addr accepts plain `host:port` for TCP or `unix:///path/to.sock` for a
-// Unix socket. PUT /whitelist is registered only when pushHandler is
+// Unix socket. PUT /allowlist is registered only when pushHandler is
 // non-nil and addr is unix://. Shuts down gracefully when ctx is cancelled.
 func startHealthServer(ctx context.Context, cfg healthServerConfig) error {
 	if cfg.pushHandler != nil && !isUnixSocketAddr(cfg.addr) {
@@ -556,7 +556,7 @@ func startHealthServer(ctx context.Context, cfg healthServerConfig) error {
 		}
 	})
 	if cfg.pushHandler != nil {
-		mux.Handle("/whitelist", cfg.pushHandler)
+		mux.Handle("/allowlist", cfg.pushHandler)
 	}
 
 	listener, err := healthListener(cfg.addr)

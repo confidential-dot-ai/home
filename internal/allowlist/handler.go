@@ -1,4 +1,4 @@
-package whitelist
+package allowlist
 
 import (
 	"bytes"
@@ -25,7 +25,7 @@ import (
 // megabytes just to compute a hash for auth.
 const DefaultMaxWriteBodyBytes int64 = 64 * 1024
 
-// Handler holds the dependencies for whitelist HTTP handlers.
+// Handler holds the dependencies for allowlist HTTP handlers.
 type Handler struct {
 	Store           *Store
 	WriteAuthorizer WriteAuthorizer
@@ -41,7 +41,7 @@ type Handler struct {
 // captured-token replay against a different payload).
 type WriteAuthorizer func(r *http.Request, body []byte) error
 
-// HandleList handles GET /whitelist - returns all whitelisted digests.
+// HandleList handles GET /allowlist - returns all allowlisted digests.
 // Emits a weak ETag derived from the store version; matching
 // If-None-Match returns 304.
 func (h Handler) HandleList(w http.ResponseWriter, r *http.Request) {
@@ -60,20 +60,20 @@ func (h Handler) HandleList(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(types.WhitelistListResponse{
+	json.NewEncoder(w).Encode(types.AllowlistListResponse{
 		Version: version,
 		Digests: digests,
 	})
 }
 
-// HandleAdd handles POST /whitelist - adds an image digest.
+// HandleAdd handles POST /allowlist - adds an image digest.
 func (h Handler) HandleAdd(w http.ResponseWriter, r *http.Request) {
 	body, ok := h.authorize(w, r)
 	if !ok {
 		return
 	}
 
-	var req types.WhitelistAddRequest
+	var req types.AllowlistAddRequest
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
@@ -89,14 +89,14 @@ func (h Handler) HandleAdd(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// HandleDelete handles DELETE /whitelist - deletes image digests atomically.
+// HandleDelete handles DELETE /allowlist - deletes image digests atomically.
 func (h Handler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 	body, ok := h.authorize(w, r)
 	if !ok {
 		return
 	}
 
-	var req types.WhitelistDeleteRequest
+	var req types.AllowlistDeleteRequest
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
@@ -140,9 +140,9 @@ func (h Handler) authorize(w http.ResponseWriter, r *http.Request) ([]byte, bool
 	return body, true
 }
 
-// EARWriteAuthorizer authorizes whitelist mutation requests with a CDS EAR.
+// EARWriteAuthorizer authorizes allowlist mutation requests with a CDS EAR.
 // A valid EAR is not enough by itself: the token's launch measurement must be
-// explicitly allowed for resources.WhitelistWrite.
+// explicitly allowed for resources.AllowlistWrite.
 type EARWriteAuthorizer struct {
 	PublicKey           func() *ecdsa.PublicKey
 	ExpectedIssuer      string
@@ -152,7 +152,7 @@ type EARWriteAuthorizer struct {
 
 func (a EARWriteAuthorizer) Authorize(r *http.Request, body []byte) error {
 	if len(a.AllowedMeasurements) == 0 {
-		return fmt.Errorf("no measurements allowed for %s", resources.WhitelistWrite)
+		return fmt.Errorf("no measurements allowed for %s", resources.AllowlistWrite)
 	}
 	auth := r.Header.Get("Authorization")
 	tokenStr, ok := strings.CutPrefix(auth, "Bearer ")
@@ -210,7 +210,7 @@ func (a EARWriteAuthorizer) Authorize(r *http.Request, body []byte) error {
 		return err
 	}
 	if !a.AllowedMeasurements[measurement] {
-		return fmt.Errorf("measurement not allowed for %s", resources.WhitelistWrite)
+		return fmt.Errorf("measurement not allowed for %s", resources.AllowlistWrite)
 	}
 
 	// Body binding: the EAR's pbh claim must match SHA-256 of the request

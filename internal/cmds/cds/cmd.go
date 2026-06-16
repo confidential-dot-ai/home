@@ -60,9 +60,9 @@ func NewCmd() *cobra.Command {
 	flags.StringVar(&cfg.allowedCNPattern, "allowed-cn-pattern", "", "regex the CSR Subject CN must match in full (empty disables)")
 	flags.DurationVar(&cfg.readinessInterval, "readiness-interval", 10*time.Second, "")
 	flags.DurationVar(&cfg.minCAValidity, "min-ca-validity", time.Hour, "/readyz fails when the loaded mesh CA has less than this remaining lifetime")
-	flags.StringVar(&cfg.whitelistDB, "whitelist-db", "", "Path to the whitelist SQLite database")
-	flags.StringVar(&cfg.whitelistSeed, "whitelist-seed", "", "Path to a JSON whitelist (version + digests map) seeded into the store at startup before serving; missing digests are added, existing entries are left untouched (empty disables seeding)")
-	flags.StringSliceVar(&cfg.whitelistWriteMeasurements, "whitelist-write-measurements", nil, "SHA-384 hex launch measurements allowed to mutate the whitelist via a bearer EAR (empty = reject all writes)")
+	flags.StringVar(&cfg.allowlistDB, "allowlist-db", "", "Path to the allowlist SQLite database")
+	flags.StringVar(&cfg.allowlistSeed, "allowlist-seed", "", "Path to a JSON allowlist (version + digests map) seeded into the store at startup before serving; missing digests are added, existing entries are left untouched (empty disables seeding)")
+	flags.StringSliceVar(&cfg.allowlistWriteMeasurements, "allowlist-write-measurements", nil, "SHA-384 hex launch measurements allowed to mutate the allowlist via a bearer EAR (empty = reject all writes)")
 	flags.StringSliceVar(&cfg.handoffMeasurements, "handoff-measurements", nil, "SHA-384 hex launch measurements allowed to pull the mesh CA via /handoff (empty = /handoff disabled)")
 
 	flags.Float64Var(&cfg.rateLimit, "rate-limit", 10, "max requests per second per source IP on attestation endpoints")
@@ -79,7 +79,7 @@ func NewCmd() *cobra.Command {
 	flags.DurationVar(&cfg.ratlsCertTTL, "ratls-cert-ttl", 24*time.Hour, "")
 
 	_ = cmd.MarkFlagRequired("attestation-api-url")
-	_ = cmd.MarkFlagRequired("whitelist-db")
+	_ = cmd.MarkFlagRequired("allowlist-db")
 
 	return cmd
 }
@@ -110,9 +110,9 @@ type config struct {
 	allowedCNPattern           string
 	readinessInterval          time.Duration
 	minCAValidity              time.Duration
-	whitelistDB                string
-	whitelistSeed              string
-	whitelistWriteMeasurements []string
+	allowlistDB                string
+	allowlistSeed              string
+	allowlistWriteMeasurements []string
 	handoffMeasurements        []string
 	rotationInterval           time.Duration
 	rotationOverlap            time.Duration

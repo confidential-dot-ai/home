@@ -89,9 +89,9 @@ func runMonitor(ctx context.Context, cfg *Config) error {
 	// *allowlist with m, whose merge is mutex-guarded. No CDS URL →
 	// baked-seed-only and the network is never touched.
 	if cfg.CDSURL != "" {
-		go runWhitelistRefresh(ctx, logger, cfg, a)
+		go runAllowlistRefresh(ctx, logger, cfg, a)
 	} else {
-		logger.Info("whitelist refresh disabled (no CDS URL); enforcing baked seed only", "entries", a.Size())
+		logger.Info("allowlist refresh disabled (no CDS URL); enforcing baked seed only", "entries", a.Size())
 	}
 
 	return m.run(ctx)

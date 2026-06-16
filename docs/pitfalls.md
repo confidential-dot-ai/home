@@ -93,10 +93,10 @@ and set it in your values file. With every image pinned by digest, the floating
 `:main` movement is invisible to your deployment.
 
 **Runtime mitigation that does the heavy lifting in production:** the
-`policy-monitor` CDS-whitelist-refresh path
+`policy-monitor` CDS-allowlist-refresh path
 (`kata-guest-base/extra/etc/systemd/system/policy-monitor.service` + `internal/
 cmds/policymonitor/cds_refresh.go`) **grows** the in-VM allowlist at runtime
-from CDS's RA-TLS-pinned whitelist, so operator-pinned digests not in the baked
+from CDS's RA-TLS-pinned allowlist, so operator-pinned digests not in the baked
 seed are still admitted. The seed only needs to be "good enough to boot the
 first cds container," after which the in-cluster CDS extends the set. That's
 why bootstrap-allowlist drift is tolerable for any deploy where the operator

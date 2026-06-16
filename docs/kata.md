@@ -156,14 +156,14 @@ kata-guest-base image:
 |---|---|
 | `ratls-mesh` DaemonSet | in-VM ratls routing |
 | `attestation-api` DaemonSet | in-guest attestation-api on loopback `:8400` (`c8s.attestationApiURL`) |
-| `nri-image-policy` (host NRI plugin) | in-guest policy-monitor, fed from CDS's served `/whitelist` |
+| `nri-image-policy` (host NRI plugin) | in-guest policy-monitor, fed from CDS's served `/allowlist` |
 
 `c8s install --kata` sets `ratlsMesh.enabled=false`,
 `attestationApi.enabled=false`, and `nriImagePolicy.enabled=false` for you;
 the chart fails the render (`kind=enforce_host_components`) if any of them is
 left enabled alongside `kata.enabled`, since the host versions would be dead
 weight at best and a second, unattested enforcement path at worst.
-CDS still serves the whitelist seed in this shape — the in-guest
+CDS still serves the allowlist seed in this shape — the in-guest
 policy-monitor consumes it even though the host NRI plugin is gone.
 
 ### Chart-managed mesh components pin their own RuntimeClass

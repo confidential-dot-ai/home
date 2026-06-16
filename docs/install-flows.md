@@ -78,7 +78,7 @@ not a cluster resource.
 | **CDS** (Certificate Distribution Service: verify + EAR + mesh-CA + leaf signing) | ✓ host | ✓ **CVM** | runc in base, `kata-qemu-snp` under kata |
 | attestation-service | ✓ host | ✗ (in-VM) | host DaemonSet in base; baked into the guest image under kata |
 | ratls-mesh | ✓ host | ✗ (in-VM) | host DaemonSet in base; in-VM routing under kata |
-| nri-image-policy | ✓ host | ✗ (in-VM) | host NRI plugin in base; in-guest `policy-monitor` under kata (fed from CDS's served whitelist) |
+| nri-image-policy | ✓ host | ✗ (in-VM) | host NRI plugin in base; in-guest `policy-monitor` under kata (fed from CDS's served allowlist) |
 | kata-deploy DaemonSet | ✗ | ✓ | host (privileged, hostPID/hostNetwork) |
 | kata RuntimeClasses | ✗ | ✓ | cluster |
 | kata-image-puller | ✗ | ✓¹ | host (privileged) |

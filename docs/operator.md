@@ -44,8 +44,8 @@ attestation-api DaemonSet. Enabling injection also requires platform-owned
 prerequisites:
 
 - the chart-managed CDS Service reachable from workload pods;
-- whitelist storage and a measurement allowlist for any workload allowed to
-  mutate the whitelist;
+- allowlist storage and a measurement allowlist for any workload allowed to
+  mutate the allowlist;
 - a CDS public-bundle PVC for CA continuity;
 - nodes with the expected TEE device access for attestation-api;
 
@@ -75,8 +75,8 @@ support a non-CVM install shape or a bring-your-own CDS endpoint shape.
 - CDS verifies evidence, issues EAR tokens, and signs workload CSRs in one
   process; EAR validation and signing share that process, so there is no
   internal Service hop or JWKS fetch between them.
-- whitelist admin is EAR-authorized through CDS; the chart does not render a
-  CDS whitelist password or attestation-api API key into Kubernetes
+- allowlist admin is EAR-authorized through CDS; the chart does not render a
+  CDS allowlist password or attestation-api API key into Kubernetes
   Secrets.
 - `image.tag` or `image.digest`, `attestationApi.image.tag` or
   `attestationApi.image.digest`, and `cds.image.tag` or
@@ -133,11 +133,11 @@ The supported deployment is chart-managed CDS running inside the intended CVM
 trust boundary.
 
 The chart installs a CDS Deployment, Service, ServiceAccount, and either an
-`emptyDir` whitelist DB or a PVC when `cds.persistence.enabled=true`. The
-operator injects pods with the chart-managed CDS Service URL. Whitelist
-writes use `Authorization: Bearer <EAR>`. CDS accepts `POST /whitelist` and
-`DELETE /whitelist` only when the EAR was issued by CDS and the requester's
-normalized launch measurement is listed in `cds.whitelistWriteMeasurements`.
+`emptyDir` allowlist DB or a PVC when `cds.persistence.enabled=true`. The
+operator injects pods with the chart-managed CDS Service URL. Allowlist
+writes use `Authorization: Bearer <EAR>`. CDS accepts `POST /allowlist` and
+`DELETE /allowlist` only when the EAR was issued by CDS and the requester's
+normalized launch measurement is listed in `cds.allowlistWriteMeasurements`.
 
 CA-bundle refresh traffic uses the chart-managed cluster Service. Trust for
 those flows comes from EAR validation, measurement allowlists, and CA
@@ -149,11 +149,11 @@ a Kubernetes Secret. CDS generates its mesh CA key inside the process, keeps it
 in memory, and persists only the public CA bundle in the configured
 public-bundle PVC.
 
-Minimal whitelist-write values:
+Minimal allowlist-write values:
 
 ```yaml
 cds:
-  whitelistWriteMeasurements:
+  allowlistWriteMeasurements:
     - "<sha384-launch-measurement>"
 ```
 
@@ -361,8 +361,8 @@ helm template c8s internal/helmchart/c8s \
   --set cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 >/dev/null && echo OK
 ```
 
-Append `--set 'cds.whitelistWriteMeasurements[0]=<sha384-launch-measurement>'`
-to either command to render the whitelist-write allowlist.
+Append `--set 'cds.allowlistWriteMeasurements[0]=<sha384-launch-measurement>'`
+to either command to render the allowlist-write allowlist.
 
 The rendered manifests should include:
 

@@ -1,4 +1,4 @@
-package whitelist
+package allowlist
 
 import (
 	"database/sql"
@@ -12,32 +12,32 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Store provides persistent storage for the image digest whitelist using SQLite.
+// Store provides persistent storage for the image digest allowlist using SQLite.
 type Store struct {
 	mu sync.Mutex
 	db *sql.DB
 }
 
 const initSQL = `
-CREATE TABLE IF NOT EXISTS whitelist (
+CREATE TABLE IF NOT EXISTS allowlist (
 	digest TEXT PRIMARY KEY,
 	image  TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS whitelist_version (
+CREATE TABLE IF NOT EXISTS allowlist_version (
 	version TEXT NOT NULL DEFAULT '1'
 );
-INSERT INTO whitelist_version (version)
-	SELECT '1' WHERE NOT EXISTS (SELECT 1 FROM whitelist_version);
+INSERT INTO allowlist_version (version)
+	SELECT '1' WHERE NOT EXISTS (SELECT 1 FROM allowlist_version);
 `
 
-// OpenStore opens (or creates) a SQLite-backed whitelist store at the given path.
+// OpenStore opens (or creates) a SQLite-backed allowlist store at the given path.
 func OpenStore(path string) (Store, error) {
 	_, err := os.Stat(path)
 	isNew := os.IsNotExist(err)
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		return Store{}, fmt.Errorf("open whitelist db: %w", err)
+		return Store{}, fmt.Errorf("open allowlist db: %w", err)
 	}
 
 	if isNew {
@@ -46,13 +46,13 @@ func OpenStore(path string) (Store, error) {
 
 	if _, err := db.Exec(initSQL); err != nil {
 		db.Close()
-		return Store{}, fmt.Errorf("init whitelist schema: %w", err)
+		return Store{}, fmt.Errorf("init allowlist schema: %w", err)
 	}
 
 	return Store{db: db}, nil
 }
 
-// OpenInMemory opens an in-memory whitelist store, useful for testing.
+// OpenInMemory opens an in-memory allowlist store, useful for testing.
 func OpenInMemory() (Store, error) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -60,14 +60,14 @@ func OpenInMemory() (Store, error) {
 	}
 
 	initMemSQL := `
-CREATE TABLE whitelist (
+CREATE TABLE allowlist (
 	digest TEXT PRIMARY KEY,
 	image  TEXT NOT NULL
 );
-CREATE TABLE whitelist_version (
+CREATE TABLE allowlist_version (
 	version TEXT NOT NULL DEFAULT '1'
 );
-INSERT INTO whitelist_version (version) VALUES ('1');
+INSERT INTO allowlist_version (version) VALUES ('1');
 `
 	if _, err := db.Exec(initMemSQL); err != nil {
 		db.Close()
@@ -85,14 +85,14 @@ func (s *Store) Close() error {
 	return nil
 }
 
-// row holds a single row from the whitelist query.
+// row holds a single row from the allowlist query.
 type row struct {
 	version   string
 	digestStr sql.NullString
 	image     sql.NullString
 }
 
-// ListAll returns the current version string and all whitelisted digests.
+// ListAll returns the current version string and all allowlisted digests.
 // The mutex is only held while reading rows from SQLite; parsing happens outside the lock.
 func (s *Store) ListAll() (string, map[types.Digest]string, error) {
 	rawRows, err := s.queryAll()
@@ -124,8 +124,8 @@ func (s *Store) queryAll() ([]row, error) {
 
 	rows, err := s.db.Query(`
 		SELECT wv.version, w.digest, w.image
-		FROM whitelist_version wv
-		LEFT JOIN whitelist w ON 1=1
+		FROM allowlist_version wv
+		LEFT JOIN allowlist w ON 1=1
 	`)
 	if err != nil {
 		return nil, err
@@ -148,12 +148,12 @@ func (s *Store) queryAll() ([]row, error) {
 // worker pull ETag, so it is bumped once per mutation that changes the set.
 func bumpVersionTx(tx *sql.Tx) error {
 	_, err := tx.Exec(
-		"UPDATE whitelist_version SET version = CAST(CAST(version AS INTEGER) + 1 AS TEXT)",
+		"UPDATE allowlist_version SET version = CAST(CAST(version AS INTEGER) + 1 AS TEXT)",
 	)
 	return err
 }
 
-// Add inserts or replaces a digest in the whitelist and increments the version.
+// Add inserts or replaces a digest in the allowlist and increments the version.
 func (s *Store) Add(digest types.Digest, image string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -165,7 +165,7 @@ func (s *Store) Add(digest types.Digest, image string) error {
 	defer tx.Rollback()
 
 	if _, err := tx.Exec(
-		"INSERT OR REPLACE INTO whitelist (digest, image) VALUES (?, ?)",
+		"INSERT OR REPLACE INTO allowlist (digest, image) VALUES (?, ?)",
 		digest.String(), image,
 	); err != nil {
 		return err
@@ -182,7 +182,7 @@ func (s *Store) Add(digest types.Digest, image string) error {
 // are left untouched and the version is bumped at most once — and only when at
 // least one digest was new. The version is the worker pull ETag, so a re-seed
 // that adds nothing must not bump it (which would force every worker to
-// re-pull). Operator entries added at runtime via POST /whitelist are never
+// re-pull). Operator entries added at runtime via POST /allowlist are never
 // removed.
 func (s *Store) SeedDigests(digests map[types.Digest]string) (int, error) {
 	if len(digests) == 0 {
@@ -199,12 +199,12 @@ func (s *Store) SeedDigests(digests map[types.Digest]string) (int, error) {
 	defer tx.Rollback()
 
 	// INSERT OR IGNORE is the skip-if-present: an existing digest (e.g. one an
-	// operator added at runtime via POST /whitelist) is left untouched, and
+	// operator added at runtime via POST /allowlist) is left untouched, and
 	// RowsAffected reports 0 for it so it does not count toward the bump.
 	var added int64
 	for digest, image := range digests {
 		res, err := tx.Exec(
-			"INSERT OR IGNORE INTO whitelist (digest, image) VALUES (?, ?)",
+			"INSERT OR IGNORE INTO allowlist (digest, image) VALUES (?, ?)",
 			digest.String(), image,
 		)
 		if err != nil {
@@ -251,7 +251,7 @@ func (s *Store) Delete(digests []types.Digest) (bool, error) {
 	inClause := strings.Join(placeholders, ", ")
 
 	var count int
-	countSQL := fmt.Sprintf("SELECT COUNT(*) FROM whitelist WHERE digest IN (%s)", inClause)
+	countSQL := fmt.Sprintf("SELECT COUNT(*) FROM allowlist WHERE digest IN (%s)", inClause)
 	if err := tx.QueryRow(countSQL, args...).Scan(&count); err != nil {
 		return false, err
 	}
@@ -260,7 +260,7 @@ func (s *Store) Delete(digests []types.Digest) (bool, error) {
 		return false, nil
 	}
 
-	deleteSQL := fmt.Sprintf("DELETE FROM whitelist WHERE digest IN (%s)", inClause)
+	deleteSQL := fmt.Sprintf("DELETE FROM allowlist WHERE digest IN (%s)", inClause)
 	if _, err := tx.Exec(deleteSQL, args...); err != nil {
 		return false, err
 	}

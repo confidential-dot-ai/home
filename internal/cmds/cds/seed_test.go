@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/confidential-dot-ai/c8s/internal/whitelist"
+	"github.com/confidential-dot-ai/c8s/internal/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
@@ -33,7 +33,7 @@ const (
 )
 
 func TestSeedStore_AddsAllEntries(t *testing.T) {
-	store, err := whitelist.OpenInMemory()
+	store, err := allowlist.OpenInMemory()
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestSeedStore_AddsAllEntries(t *testing.T) {
 // the version is the worker pull ETag, so churn would force every worker to
 // re-pull on every CDS restart.
 func TestSeedStore_IdempotentDoesNotBumpVersion(t *testing.T) {
-	store, err := whitelist.OpenInMemory()
+	store, err := allowlist.OpenInMemory()
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -88,9 +88,9 @@ func TestSeedStore_IdempotentDoesNotBumpVersion(t *testing.T) {
 }
 
 // Seeding is additive: an entry an operator added at runtime (via POST
-// /whitelist) must survive a restart's re-seed.
+// /allowlist) must survive a restart's re-seed.
 func TestSeedStore_PreservesExistingEntries(t *testing.T) {
-	store, err := whitelist.OpenInMemory()
+	store, err := allowlist.OpenInMemory()
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestSeedStore_PreservesExistingEntries(t *testing.T) {
 }
 
 func TestSeedStore_FailsClosedOnBadDigest(t *testing.T) {
-	store, err := whitelist.OpenInMemory()
+	store, err := allowlist.OpenInMemory()
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestSeedStore_FailsClosedOnBadDigest(t *testing.T) {
 }
 
 func TestSeedStore_FailsClosedOnMissingFile(t *testing.T) {
-	store, err := whitelist.OpenInMemory()
+	store, err := allowlist.OpenInMemory()
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

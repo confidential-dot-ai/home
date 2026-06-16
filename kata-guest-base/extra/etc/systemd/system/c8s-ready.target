@@ -12,7 +12,7 @@
 # — e.g. policy-monitor died on a bad or unreadable baked allowlist.
 # This does NOT reintroduce the CDS bootstrap cycle: policy-monitor
 # enforces from t=0 on the dm-verity-baked seed with no network (the CDS
-# whitelist refresh is a separate runtime loop, not a startup dependency),
+# allowlist refresh is a separate runtime loop, not a startup dependency),
 # so unlike the old guest-policy-agent it never dials CDS to come up. See
 # docs/kata-guest-base.md for the full rationale.
 #

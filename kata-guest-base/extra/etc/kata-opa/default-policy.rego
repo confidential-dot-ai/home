@@ -42,7 +42,7 @@
 #
 #   An earlier version of this file was symlinked into a tmpfs render
 #   from an in-VM service (`guest-policy-agent`) that fetched a
-#   whitelist from CDS over RA-TLS. That design created a CDS
+#   allowlist from CDS over RA-TLS. That design created a CDS
 #   bootstrap deadlock (kata-agent waited on the render, the render
 #   dialed CDS, CDS was the workload kata-agent was supposed to
 #   start) and didn't actually enforce per-image-digest gating

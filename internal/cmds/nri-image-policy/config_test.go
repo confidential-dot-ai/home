@@ -9,7 +9,7 @@ import (
 
 func validConfig() config {
 	return config{
-		Whitelist: whitelistConfig{
+		Allowlist: allowlistConfig{
 			AlwaysAllow: map[string]string{
 				"sha256:0000000000000000000000000000000000000000000000000000000000000001": "test-installer",
 			},
@@ -46,13 +46,13 @@ func TestValidate_NoEnforcementMechanism(t *testing.T) {
 		Policy: policyConfig{Mode: "fail-closed"},
 	}
 	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected error when neither whitelist nor label_rules configured")
+		t.Fatal("expected error when neither allowlist nor label_rules configured")
 	}
 }
 
 func TestValidate_ZeroTimeout(t *testing.T) {
 	cfg := validConfig()
-	cfg.Whitelist.Pull.Timeout = 0
+	cfg.Allowlist.Pull.Timeout = 0
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for zero timeout")
 	}
@@ -60,7 +60,7 @@ func TestValidate_ZeroTimeout(t *testing.T) {
 
 func TestValidate_NegativeTimeout(t *testing.T) {
 	cfg := validConfig()
-	cfg.Whitelist.Pull.Timeout = -1 * time.Second
+	cfg.Allowlist.Pull.Timeout = -1 * time.Second
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for negative timeout")
 	}
@@ -68,7 +68,7 @@ func TestValidate_NegativeTimeout(t *testing.T) {
 
 func TestValidate_PullRequiresAttestationApi(t *testing.T) {
 	cfg := validConfig()
-	cfg.Whitelist.Pull.AttestationApiURL = ""
+	cfg.Allowlist.Pull.AttestationApiURL = ""
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error when pull lacks attestation_api_url")
 	}
@@ -76,7 +76,7 @@ func TestValidate_PullRequiresAttestationApi(t *testing.T) {
 
 func TestValidate_PullRejectsInvalidCDSMeasurement(t *testing.T) {
 	cfg := validConfig()
-	cfg.Whitelist.Pull.CDSMeasurements = []string{"not-hex"}
+	cfg.Allowlist.Pull.CDSMeasurements = []string{"not-hex"}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for invalid CDS measurement")
 	}
@@ -84,7 +84,7 @@ func TestValidate_PullRejectsInvalidCDSMeasurement(t *testing.T) {
 
 func TestValidate_PullRejectsPlaintextScheme(t *testing.T) {
 	cfg := validConfig()
-	cfg.Whitelist.Pull.URL = "http://localhost:8080"
+	cfg.Allowlist.Pull.URL = "http://localhost:8080"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for plaintext http pull URL")
 	}
@@ -92,7 +92,7 @@ func TestValidate_PullRejectsPlaintextScheme(t *testing.T) {
 
 func TestValidate_PullRejectsUnsupportedScheme(t *testing.T) {
 	cfg := validConfig()
-	cfg.Whitelist.Pull.URL = "ftp://127.0.0.1/whitelist"
+	cfg.Allowlist.Pull.URL = "ftp://127.0.0.1/allowlist"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for unsupported pull URL scheme")
 	}
@@ -100,7 +100,7 @@ func TestValidate_PullRejectsUnsupportedScheme(t *testing.T) {
 
 func TestValidate_PullAndPushMutuallyExclusive(t *testing.T) {
 	cfg := validConfig()
-	cfg.Whitelist.Push.PersistPath = "/tmp/pushed.json"
+	cfg.Allowlist.Push.PersistPath = "/tmp/pushed.json"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error when both pull and push are configured")
 	}
@@ -108,7 +108,7 @@ func TestValidate_PullAndPushMutuallyExclusive(t *testing.T) {
 
 func TestValidate_AlwaysAllowRequiredWithPull(t *testing.T) {
 	cfg := validConfig()
-	cfg.Whitelist.AlwaysAllow = nil
+	cfg.Allowlist.AlwaysAllow = nil
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error when pull is configured but always_allow is empty")
 	}
@@ -116,9 +116,9 @@ func TestValidate_AlwaysAllowRequiredWithPull(t *testing.T) {
 
 func TestValidate_AlwaysAllowRequiredWithPush(t *testing.T) {
 	cfg := validConfig()
-	cfg.Whitelist.Pull = pullConfig{}
-	cfg.Whitelist.Push.PersistPath = "/tmp/pushed.json"
-	cfg.Whitelist.AlwaysAllow = nil
+	cfg.Allowlist.Pull = pullConfig{}
+	cfg.Allowlist.Push.PersistPath = "/tmp/pushed.json"
+	cfg.Allowlist.AlwaysAllow = nil
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error when push is configured but always_allow is empty")
 	}
@@ -126,21 +126,21 @@ func TestValidate_AlwaysAllowRequiredWithPush(t *testing.T) {
 
 func TestValidate_AlwaysAllowRejectsMalformedDigest(t *testing.T) {
 	cfg := validConfig()
-	cfg.Whitelist.AlwaysAllow = map[string]string{
+	cfg.Allowlist.AlwaysAllow = map[string]string{
 		"sha256:not-hex": "installer",
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for non-hex digest in always_allow")
 	}
 
-	cfg.Whitelist.AlwaysAllow = map[string]string{
+	cfg.Allowlist.AlwaysAllow = map[string]string{
 		"sha512:0000000000000000000000000000000000000000000000000000000000000001": "installer",
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for non-sha256 digest in always_allow")
 	}
 
-	cfg.Whitelist.AlwaysAllow = map[string]string{
+	cfg.Allowlist.AlwaysAllow = map[string]string{
 		// 63 hex chars instead of 64.
 		"sha256:000000000000000000000000000000000000000000000000000000000000001": "installer",
 	}
@@ -159,7 +159,7 @@ func TestValidate_InvalidMode(t *testing.T) {
 
 func TestLoadConfig_Defaults(t *testing.T) {
 	yaml := `
-whitelist:
+allowlist:
   always_allow:
     "sha256:0000000000000000000000000000000000000000000000000000000000000001": "installer"
   pull:
@@ -176,11 +176,11 @@ whitelist:
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.Whitelist.Pull.Timeout != 30*time.Second {
-		t.Errorf("expected default timeout 30s, got %s", cfg.Whitelist.Pull.Timeout)
+	if cfg.Allowlist.Pull.Timeout != 30*time.Second {
+		t.Errorf("expected default timeout 30s, got %s", cfg.Allowlist.Pull.Timeout)
 	}
-	if cfg.Whitelist.Pull.Interval != 30*time.Second {
-		t.Errorf("expected default interval 30s, got %s", cfg.Whitelist.Pull.Interval)
+	if cfg.Allowlist.Pull.Interval != 30*time.Second {
+		t.Errorf("expected default interval 30s, got %s", cfg.Allowlist.Pull.Interval)
 	}
 	if cfg.Policy.Mode != "fail-closed" {
 		t.Errorf("expected default mode fail-closed, got %s", cfg.Policy.Mode)
@@ -209,21 +209,21 @@ func TestLoadConfig_MissingFile(t *testing.T) {
 	}
 }
 
-// --- WhitelistEnabled tests ---
+// --- AllowlistEnabled tests ---
 
-func TestWhitelistEnabled_WithURL(t *testing.T) {
+func TestAllowlistEnabled_WithURL(t *testing.T) {
 	cfg := validConfig()
-	if !cfg.WhitelistEnabled() {
-		t.Fatal("expected whitelist to be enabled")
+	if !cfg.AllowlistEnabled() {
+		t.Fatal("expected allowlist to be enabled")
 	}
 }
 
-func TestWhitelistEnabled_WithoutURL(t *testing.T) {
+func TestAllowlistEnabled_WithoutURL(t *testing.T) {
 	cfg := validConfig()
-	cfg.Whitelist.Pull.URL = ""
-	cfg.Whitelist.AlwaysAllow = nil
-	if cfg.WhitelistEnabled() {
-		t.Fatal("expected whitelist to be disabled")
+	cfg.Allowlist.Pull.URL = ""
+	cfg.Allowlist.AlwaysAllow = nil
+	if cfg.AllowlistEnabled() {
+		t.Fatal("expected allowlist to be disabled")
 	}
 }
 
@@ -349,7 +349,7 @@ func TestValidate_LabelRuleRejectsInvalidKubernetesLabelValue(t *testing.T) {
 
 func TestLoadConfig_WithLabelRules(t *testing.T) {
 	yaml := `
-whitelist:
+allowlist:
   always_allow:
     "sha256:0000000000000000000000000000000000000000000000000000000000000001": "installer"
   pull:
@@ -410,8 +410,8 @@ policy:
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.WhitelistEnabled() {
-		t.Fatal("expected whitelist to be disabled")
+	if cfg.AllowlistEnabled() {
+		t.Fatal("expected allowlist to be disabled")
 	}
 	if len(cfg.Policy.LabelRules) != 1 {
 		t.Fatalf("expected 1 label rule, got %d", len(cfg.Policy.LabelRules))

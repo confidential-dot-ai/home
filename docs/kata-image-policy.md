@@ -28,13 +28,13 @@ The allowlist is a **baked seed plus a CDS refresh** (see
 [Allowlist sourcing](#allowlist-sourcing-baked-seed--cds-refresh)). The
 seed — `/etc/c8s/bootstrap-allowlist.json`, on the verity root and part
 of the launch measurement — lets the guest enforce from t=0 with no
-network. At runtime policy-monitor polls CDS's `/whitelist` over RA-TLS
+network. At runtime policy-monitor polls CDS's `/allowlist` over RA-TLS
 (pinned to `cds.measurements`) and merges what CDS serves on top, so
 operator additions land without a guest rebuild. The merge only ever
 *grows* the set, so a compromised or unreachable CDS degrades to "stale
 but no smaller" — never "open".
 
-A previous design (`guest-policy-agent`) also fetched a whitelist from
+A previous design (`guest-policy-agent`) also fetched a allowlist from
 CDS over RA-TLS, but only *rendered* it informationally — it enforced
 nothing inside the VM. policy-monitor keeps the same authenticated CDS
 source and actually enforces (SIGKILL). The trade-off it makes — a
@@ -50,7 +50,7 @@ post-start kill window — is documented in
 | `kata-agent` inside the guest | yes | Installed into the rootfs by kata's osbuilder (version-matched) at build. |
 | `policy-monitor` inside the guest | yes | Built from this repo, baked into the dm-verity root. |
 | `/etc/c8s/bootstrap-allowlist.json` (verity root) | yes | The allowlist **seed** the monitor loads at boot. Part of the launch measurement. |
-| CDS `/whitelist` additions (pulled over RA-TLS) | yes, via attestation | Runtime additions merged on top of the seed. Trusted because the pull is RA-TLS-pinned to `cds.measurements` (the host can't substitute a fake CDS), not because they're measured into this guest. |
+| CDS `/allowlist` additions (pulled over RA-TLS) | yes, via attestation | Runtime additions merged on top of the seed. Trusted because the pull is RA-TLS-pinned to `cds.measurements` (the host can't substitute a fake CDS), not because they're measured into this guest. |
 | `ratls-mesh` + `attestation-service` inside the guest | yes | Same. |
 | Host (containerd, kata-runtime, kata-shim) | **no** | Adversarial. Can call kata-agent RPCs via vsock, cannot read VM memory (SEV-SNP). |
 | Cloud-init user-data (the `C8S_*` env file) | **partially** | Host controls its contents when per-pod injected; pinned values must be verifiable inside the guest. Today this is a single fixed default baked into the rootfs, not per-pod host-injected. |
@@ -195,12 +195,12 @@ policy-monitor's allowlist has two sources, unioned in memory:
    `ratls-mesh` reads — **Status:** today that env file is a single fixed
    default baked into the rootfs, not per-pod host-injected, so a
    non-default-namespace install needs the real injection),
-   policy-monitor polls CDS's `GET /whitelist` on
+   policy-monitor polls CDS's `GET /allowlist` on
    an interval and merges the result on top of the seed. The pull uses
    the **same mechanism the host nri-image-policy worker uses**:
-   `pkg/whitelistclient` over an RA-TLS transport (`pkg/ratls`) whose
+   `pkg/allowlistclient` over an RA-TLS transport (`pkg/ratls`) whose
    peer cert is pinned to `cds.measurements`. So the in-guest enforcer
-   and the host enforcer consult the same authenticated CDS whitelist;
+   and the host enforcer consult the same authenticated CDS allowlist;
    the in-guest one is the strictly-stronger check (the TEE re-deciding
    for itself rather than trusting the host's NRI verdict).
 
@@ -211,7 +211,7 @@ never touches the seed. Consequences:
   (measurement mismatch) leaves the current set intact — at minimum the
   measured seed. Enforcement degrades to "stale but no smaller", never
   "open". (This is the right failure mode for an *allow*-list.)
-- Operator additions to the cluster whitelist propagate to running kata
+- Operator additions to the cluster allowlist propagate to running kata
   guests within one refresh interval, **without a guest-image rebuild**
   — the operational cost the older baked-only model carried (see
   [G2](#g2--allowlist-additions-no-longer-need-a-guest-image-rebuild)).
@@ -432,9 +432,9 @@ digest. The bootstrap allowlist therefore carries only the host-pulled
 component images (`cds`, `get-cert`); the sandbox container is treated as
 measured-by-construction and skipped, not digest-enforced.
 
-## Host can't substitute a fake CDS whitelist
+## Host can't substitute a fake CDS allowlist
 
-policy-monitor *does* fetch the whitelist from CDS at runtime (the
+policy-monitor *does* fetch the allowlist from CDS at runtime (the
 hybrid refresh), so the question is whether a compromised host — which
 brokers the guest's network — can feed it a fake, over-permissive list.
 It cannot, for two independent reasons:
@@ -530,7 +530,7 @@ pre-execve. Future direction, not committed today.
 Earlier baked-only versions of this design required a full guest-image
 rebuild + pod roll to add an allowed digest (the allowlist was *only*
 the measured seed). The hybrid refresh resolves that: operator
-additions land in CDS's whitelist and propagate to running guests over
+additions land in CDS's allowlist and propagate to running guests over
 the RA-TLS pull within one refresh interval — no rebuild. The
 [Allowlist sourcing](#allowlist-sourcing-baked-seed--cds-refresh)
 section covers the mechanism and its grow-only / fail-safe properties.
@@ -548,7 +548,7 @@ no in-guest *revocation* path: removing a digest from CDS does not
 retract it from a guest that already pulled it (until that guest
 restarts and reloads the seed). Image policy is an allow-list, so a
 stale-but-larger set only ever permits images the operator explicitly
-whitelisted at some point — acceptable, and called out for honesty.
+allowlisted at some point — acceptable, and called out for honesty.
 
 ### G3 — Image content is visible to the host during the guest-pull
 
@@ -594,7 +594,7 @@ the full implementation sketch). Not on today's roadmap.
   `/etc/c8s/bootstrap-allowlist.json` is on the verity root and part of
   the launch measurement (S4), and the runtime CDS additions arrive over
   RA-TLS pinned to `cds.measurements`, so the host can't substitute a
-  fake CDS ("Host can't substitute a fake CDS whitelist"). At worst the
+  fake CDS ("Host can't substitute a fake CDS allowlist"). At worst the
   host blocks new additions — it can't shrink enforcement below the
   measured seed.
 - The host cannot kill policy-monitor from outside the VM. (S5.)

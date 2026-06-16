@@ -14,7 +14,7 @@
   host-side components are replaced by their in-guest counterparts baked into
   kata-guest-base: ratls routing runs in-VM, attestation is served by the
   in-guest agent on loopback :8400 (see c8s.attestationApiURL), and image
-  admission is the in-guest policy-monitor fed from CDS's served whitelist.
+  admission is the in-guest policy-monitor fed from CDS's served allowlist.
   Deploying the host versions alongside is at best dead weight and at worst a
   second, unattested enforcement path — require them off explicitly.
 */ -}}
@@ -29,26 +29,26 @@
 {{- end -}}
 {{- if and .Values.nriImagePolicy.enabled (not .Values.cds.image.digest) -}}
 {{- /* Structured marker (kind=...) lets tests discriminate this fail without substring-matching the prose. */ -}}
-{{- fail "VALIDATION_ERROR kind=cds_image_digest: nriImagePolicy.enabled requires cds.image.digest to be set. The CDS digest is seeded into CDS's served /whitelist and pushed to the CDS-node plugin by the push-hook; without it the image policy would deny CDS on its own node. A floating tag cannot be admitted by digest. Pass --resolve-digests to c8s install, or set cds.image.digest via -f." -}}
+{{- fail "VALIDATION_ERROR kind=cds_image_digest: nriImagePolicy.enabled requires cds.image.digest to be set. The CDS digest is seeded into CDS's served /allowlist and pushed to the CDS-node plugin by the push-hook; without it the image policy would deny CDS on its own node. A floating tag cannot be admitted by digest. Pass --resolve-digests to c8s install, or set cds.image.digest via -f." -}}
 {{- end -}}
 {{- /*
   In fail-closed mode with deriveComponents off, every enabled c8s component
-  that is digest-pinned must also be listed in bootstrapWhitelist.digests —
+  that is digest-pinned must also be listed in bootstrapAllowlist.digests —
   otherwise the NRI plugin would deny that component's pod on its own node.
   cds.image is exempt: it is always added to the floor via the seed self-entry,
   independent of derivation. Audit mode (the default) never blocks.
 */ -}}
-{{- if and .Values.nriImagePolicy.enabled (eq .Values.nriImagePolicy.policy.mode "fail-closed") (not .Values.nriImagePolicy.bootstrapWhitelist.deriveComponents) -}}
-{{- $floor := .Values.nriImagePolicy.bootstrapWhitelist.digests -}}
+{{- if and .Values.nriImagePolicy.enabled (eq .Values.nriImagePolicy.policy.mode "fail-closed") (not .Values.nriImagePolicy.bootstrapAllowlist.deriveComponents) -}}
+{{- $floor := .Values.nriImagePolicy.bootstrapAllowlist.digests -}}
 {{- range $c := (include "c8s.components" . | fromJsonArray) -}}
 {{- $img := get $c "image" -}}
 {{- if and (get $c "enabled") (not (get $c "cdsExempt")) (get $img "digest") (not (hasKey $floor (get $img "digest"))) -}}
-{{- fail (printf "VALIDATION_ERROR kind=uncovered_component_digest: nriImagePolicy.policy.mode=fail-closed with deriveComponents=false, but %s is digest-pinned (%s) and that digest is not in nriImagePolicy.bootstrapWhitelist.digests. The plugin would deny it on its own node. Add the digest to bootstrapWhitelist.digests, set deriveComponents=true, or use c8s install --resolve-digests." (get $c "name") (get $img "digest")) -}}
+{{- fail (printf "VALIDATION_ERROR kind=uncovered_component_digest: nriImagePolicy.policy.mode=fail-closed with deriveComponents=false, but %s is digest-pinned (%s) and that digest is not in nriImagePolicy.bootstrapAllowlist.digests. The plugin would deny it on its own node. Add the digest to bootstrapAllowlist.digests, set deriveComponents=true, or use c8s install --resolve-digests." (get $c "name") (get $img "digest")) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if and $nri.enabled (not (hasPrefix "https://" $nriCDSURL)) -}}
-{{- fail (printf "nriImagePolicy.cds.url must start with https:// when nriImagePolicy.enabled=true (got %q): the host plugin must fetch the whitelist over RA-TLS" $nriCDSURL) -}}
+{{- fail (printf "nriImagePolicy.cds.url must start with https:// when nriImagePolicy.enabled=true (got %q): the host plugin must fetch the allowlist over RA-TLS" $nriCDSURL) -}}
 {{- end -}}
 {{- if and $nri.enabled (or (lt $attestationNodePort 30000) (gt $attestationNodePort 32767)) -}}
 {{- fail (printf "attestationApi.service.nodePort must be within the Kubernetes NodePort range 30000-32767 when nriImagePolicy.enabled=true (got %d)" $attestationNodePort) -}}

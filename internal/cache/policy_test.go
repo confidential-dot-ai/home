@@ -4,27 +4,27 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/confidential-dot-ai/c8s/pkg/whitelist"
+	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
 )
 
-func TestGetWhitelist_NilByDefault(t *testing.T) {
+func TestGetAllowlist_NilByDefault(t *testing.T) {
 	c := NewPolicyCache()
-	if c.GetWhitelist() != nil {
-		t.Error("expected nil whitelist initially")
+	if c.GetAllowlist() != nil {
+		t.Error("expected nil allowlist initially")
 	}
 }
 
-func TestSetWhitelist(t *testing.T) {
+func TestSetAllowlist(t *testing.T) {
 	c := NewPolicyCache()
-	wl := &whitelist.Whitelist{
+	wl := &allowlist.Allowlist{
 		Version: "1.0",
 		Digests: map[string]string{"sha256:" + strings.Repeat("a", 64): "test"},
 	}
-	c.SetWhitelist(wl)
+	c.SetAllowlist(wl)
 
-	got := c.GetWhitelist()
+	got := c.GetAllowlist()
 	if got == nil {
-		t.Fatal("expected whitelist after SetWhitelist")
+		t.Fatal("expected allowlist after SetAllowlist")
 	}
 	if len(got.Digests) != 1 {
 		t.Errorf("expected 1 digest, got %d", len(got.Digests))
@@ -33,14 +33,14 @@ func TestSetWhitelist(t *testing.T) {
 
 func TestClear(t *testing.T) {
 	c := NewPolicyCache()
-	wl := &whitelist.Whitelist{
+	wl := &allowlist.Allowlist{
 		Version: "1.0",
 		Digests: map[string]string{"sha256:" + strings.Repeat("a", 64): "test"},
 	}
-	c.SetWhitelist(wl)
+	c.SetAllowlist(wl)
 	c.Clear()
 
-	if c.GetWhitelist() != nil {
-		t.Error("expected nil whitelist after Clear")
+	if c.GetAllowlist() != nil {
+		t.Error("expected nil allowlist after Clear")
 	}
 }

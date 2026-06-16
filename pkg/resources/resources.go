@@ -13,8 +13,8 @@ package resources
 type Resource string
 
 const (
-	// WhitelistWrite authorises POST/DELETE on /whitelist.
-	WhitelistWrite Resource = "cds/whitelist-write"
+	// AllowlistWrite authorises POST/DELETE on /allowlist.
+	AllowlistWrite Resource = "cds/allowlist-write"
 
 	// SignCSR authorises POST /sign-csr.
 	SignCSR Resource = "cds/sign-csr"

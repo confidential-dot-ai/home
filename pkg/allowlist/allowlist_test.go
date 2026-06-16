@@ -1,4 +1,4 @@
-package whitelist
+package allowlist
 
 import (
 	"strings"
@@ -41,7 +41,7 @@ func TestParseJSON_BadJSON(t *testing.T) {
 }
 
 func TestContains(t *testing.T) {
-	wl := &Whitelist{Digests: map[string]string{"sha256:abc": "img"}}
+	wl := &Allowlist{Digests: map[string]string{"sha256:abc": "img"}}
 	if !wl.Contains("sha256:abc") {
 		t.Error("expected Contains=true")
 	}

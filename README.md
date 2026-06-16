@@ -10,7 +10,7 @@ Confidential computing infrastructure for Kubernetes. Provides TEE attestation, 
 | [`cmd/c8s`](cmd/c8s/) | Operator and install CLI for CRDs, status mirroring, webhook injection, and the embedded Helm chart | [operator docs](docs/operator.md) |
 | [`cmd/get-cert`](cmd/get-cert/) | CLI tool and init-container for TEE-attested certificate provisioning | [README](cmd/get-cert/README.md) |
 | [`cmd/ratls-mesh`](cmd/ratls-mesh/) | Transparent L4 proxy wrapping inter-node K8s traffic in RA-TLS | [README](cmd/ratls-mesh/README.md) |
-| [`cmd/nri-image-policy`](cmd/nri-image-policy/) | NRI plugin enforcing container image digest whitelists | - |
+| [`cmd/nri-image-policy`](cmd/nri-image-policy/) | NRI plugin enforcing container image digest allowlists | - |
 
 ## Libraries
 
@@ -20,8 +20,8 @@ Confidential computing infrastructure for Kubernetes. Provides TEE attestation, 
 | [`pkg/ratls/cdsclient`](pkg/ratls/cdsclient/) | CDS attestation client for certificate provisioning |
 | [`pkg/attestclient`](pkg/attestclient/) | High-level client for the CDS attestation flow |
 | [`pkg/attestationclient`](pkg/attestationclient/) | Low-level HTTP client for the attestation-api |
-| [`pkg/whitelistclient`](pkg/whitelistclient/) | CRUD client for the CDS whitelist API |
-| [`pkg/whitelist`](pkg/whitelist/) | Whitelist types and JSON parsing |
+| [`pkg/allowlistclient`](pkg/allowlistclient/) | CRUD client for the CDS allowlist API |
+| [`pkg/allowlist`](pkg/allowlist/) | Allowlist types and JSON parsing |
 | [`pkg/types`](pkg/types/) | Shared request/response types |
 | [`pkg/issuerapi`](pkg/issuerapi/) | Certificate issuer API types |
 | [`pkg/earsigner`](pkg/earsigner/) | EAR token-signing key lifecycle, rotation, and JWKS serving |
@@ -46,17 +46,17 @@ internal/
   readiness/               Background health checker
   server/                  Chi router and middleware
   webhook/                 Pod injection admission webhook
-  whitelist/               Whitelist handlers and SQLite store
+  allowlist/               Allowlist handlers and SQLite store
   audit/                   NRI policy audit logging
-  cache/                   NRI policy whitelist cache
+  cache/                   NRI policy allowlist cache
   containerd/              Containerd tag-to-digest resolver
 pkg/
   ratls/                   RA-TLS library (AMD SEV-SNP, Intel TDX)
     cdsclient/             CDS attestation client
   attestclient/            High-level attestation flow client
   attestationclient/       attestation-api HTTP client
-  whitelistclient/         Whitelist CRUD + fetch client
-  whitelist/               Whitelist types
+  allowlistclient/         Allowlist CRUD + fetch client
+  allowlist/               Allowlist types
   types/                   Shared request/response types
   issuerapi/               Cert issuer API types
   earsigner/               EAR token-signing key rotation and JWKS

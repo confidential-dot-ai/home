@@ -57,7 +57,7 @@ spec:
                 if curl --unix-socket "$SOCKET" \
                         --fail --silent --show-error \
                         --max-time "$MAX_TIME" \
-                        -X PUT http://localhost/whitelist \
+                        -X PUT http://localhost/allowlist \
                         -H 'Content-Type: application/json' \
                         --data "$PAYLOAD"; then
                   echo "push succeeded"

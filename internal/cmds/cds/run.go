@@ -13,12 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/confidential-dot-ai/c8s/internal/allowlist"
 	"github.com/confidential-dot-ai/c8s/internal/attestation"
 	"github.com/confidential-dot-ai/c8s/internal/cmds/cmdsutil"
 	"github.com/confidential-dot-ai/c8s/internal/ear"
 	"github.com/confidential-dot-ai/c8s/internal/issuer"
 	"github.com/confidential-dot-ai/c8s/internal/readiness"
-	"github.com/confidential-dot-ai/c8s/internal/whitelist"
 	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
 	"github.com/confidential-dot-ai/c8s/pkg/attestclient"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
@@ -106,36 +106,36 @@ func run(cfg config) error {
 	challengeStore := attestation.NewChallengeStore(cfg.challengeTTL)
 	checker := readiness.NewChecker(asClient, cfg.readinessInterval)
 
-	whitelistStore, err := whitelist.OpenStore(cfg.whitelistDB)
+	allowlistStore, err := allowlist.OpenStore(cfg.allowlistDB)
 	if err != nil {
-		return fmt.Errorf("open whitelist database: %w", err)
+		return fmt.Errorf("open allowlist database: %w", err)
 	}
-	defer whitelistStore.Close()
+	defer allowlistStore.Close()
 
-	// Seed before serving so the first GET /whitelist returns the bootstrap
+	// Seed before serving so the first GET /allowlist returns the bootstrap
 	// allowlist (CDS, attestation-api, system images) rather than an empty
 	// set; an unseeded store would deny every worker pull until an operator
 	// populated it. Fail closed on any seed error.
-	if cfg.whitelistSeed != "" {
-		if err := seedStore(&whitelistStore, cfg.whitelistSeed); err != nil {
-			return fmt.Errorf("seed whitelist: %w", err)
+	if cfg.allowlistSeed != "" {
+		if err := seedStore(&allowlistStore, cfg.allowlistSeed); err != nil {
+			return fmt.Errorf("seed allowlist: %w", err)
 		}
 	}
 
-	// /whitelist mutations require a bearer EAR whose launch measurement is in
-	// --whitelist-write-measurements. Empty allowlist rejects all writes.
-	whitelistWriteMeasurements := parseMeasurementAllowlist(cfg.whitelistWriteMeasurements)
-	var writeAuthorizer whitelist.WriteAuthorizer = func(*http.Request, []byte) error {
-		return fmt.Errorf("whitelist writes are disabled: set --whitelist-write-measurements")
+	// /allowlist mutations require a bearer EAR whose launch measurement is in
+	// --allowlist-write-measurements. Empty allowlist rejects all writes.
+	allowlistWriteMeasurements := parseMeasurementAllowlist(cfg.allowlistWriteMeasurements)
+	var writeAuthorizer allowlist.WriteAuthorizer = func(*http.Request, []byte) error {
+		return fmt.Errorf("allowlist writes are disabled: set --allowlist-write-measurements")
 	}
-	if len(whitelistWriteMeasurements) > 0 {
-		writeAuthorizer = whitelist.EARWriteAuthorizer{
+	if len(allowlistWriteMeasurements) > 0 {
+		writeAuthorizer = allowlist.EARWriteAuthorizer{
 			PublicKey:           earIssuer.PublicKey,
 			ExpectedIssuer:      cfg.earIssuerName,
-			AllowedMeasurements: whitelistWriteMeasurements,
+			AllowedMeasurements: allowlistWriteMeasurements,
 			ClockSkew:           time.Duration(cfg.jwtClockSkew) * time.Second,
 		}.Authorize
-		slog.Info("whitelist write authorization enabled", "count", len(whitelistWriteMeasurements))
+		slog.Info("allowlist write authorization enabled", "count", len(allowlistWriteMeasurements))
 	}
 
 	policy := issuer.CSRPolicy{
@@ -180,8 +180,8 @@ func run(cfg config) error {
 			Policy:         policy,
 			SANValidation:  cfg.sanValidation,
 		},
-		WhitelistHandler: whitelist.Handler{
-			Store:           &whitelistStore,
+		AllowlistHandler: allowlist.Handler{
+			Store:           &allowlistStore,
 			WriteAuthorizer: writeAuthorizer,
 		},
 		AttestKeyHandler: attestKeyHandler,

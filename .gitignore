@@ -11,7 +11,7 @@ build/
 # subdir at repo root is an accidental compile output).
 /c8s
 /get-cert
-/node-container-whitelist
+/node-container-allowlist
 /nri-image-policy
 /ratls-mesh
 

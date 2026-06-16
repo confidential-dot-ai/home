@@ -160,8 +160,8 @@ echo "==> nri-image-policy {{ .archetype }} installer finished; plugin healthy"
 
 {{/*
 Boot config (image-policy.yaml). Caller passes a dict with .root and .archetype
-("cds" or "worker"). CDS-node activates whitelist.push; workers activate
-whitelist.pull. whitelist.always_allow is identical on both and pins the
+("cds" or "worker"). CDS-node activates allowlist.push; workers activate
+allowlist.pull. allowlist.always_allow is identical on both and pins the
 install image so chart upgrades can roll.
 */}}
 {{- define "nri-image-policy.bootConfig" -}}
@@ -170,7 +170,7 @@ install image so chart upgrades can roll.
 {{- $attestationNodePort := int $root.Values.attestationApi.service.nodePort -}}
 plugin:
   health_addr: {{ printf "unix://%s" (include "nri-image-policy.hostHealthSocket" $root) | quote }}
-whitelist:
+allowlist:
 {{- if $cds }}
   push:
     persist_path: {{ printf "%s/pushed.json" $root.Values.nriImagePolicy.hostPaths.cacheDir | quote }}
@@ -188,13 +188,13 @@ whitelist:
 {{- end }}
 {{- end }}
 {{- /* Self-allow the installer image first (load-bearing when
-       bootstrapWhitelist.deriveComponents=false, where the floor omits it), then
+       bootstrapAllowlist.deriveComponents=false, where the floor omits it), then
        add the floor — skipping the installer digest so the map has no
        duplicate key (the plugin loads this with yaml.v3, which rejects dups). */ -}}
 {{- $selfDigest := required "image.digest is required (chart self-allow for installer rollouts)" $root.Values.nriImagePolicy.image.digest }}
   always_allow:
     {{ $selfDigest | quote }}: {{ printf "%s@%s" $root.Values.nriImagePolicy.image.repository $selfDigest | quote }}
-{{- range $digest, $image := (include "c8s.imageWhitelist" $root | fromJson) }}
+{{- range $digest, $image := (include "c8s.imageAllowlist" $root | fromJson) }}
 {{- if ne $digest $selfDigest }}
     {{ $digest | quote }}: {{ $image | quote }}
 {{- end }}

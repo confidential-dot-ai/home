@@ -1,5 +1,5 @@
-// Package whitelist provides types and file loading for image digest whitelists.
-package whitelist
+// Package allowlist provides types and file loading for image digest allowlists.
+package allowlist
 
 import (
 	"encoding/json"
@@ -8,25 +8,25 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
-// Whitelist represents an image digest whitelist.
+// Allowlist represents an image digest allowlist.
 // Digests is a map of sha256 digest -> image reference (e.g. "sha256:abc..." -> "docker.io/istio/pilot:1.24.6-distroless").
-type Whitelist struct {
+type Allowlist struct {
 	Version string            `json:"version"`
 	Digests map[string]string `json:"digests"`
 }
 
-// Contains checks if a digest is in the whitelist.
-func (w *Whitelist) Contains(digest string) bool {
+// Contains checks if a digest is in the allowlist.
+func (w *Allowlist) Contains(digest string) bool {
 	_, ok := w.Digests[digest]
 	return ok
 }
 
-// ParseJSON parses a whitelist from JSON data. An empty Digests map is
+// ParseJSON parses a allowlist from JSON data. An empty Digests map is
 // allowed — callers decide whether emptiness is operationally acceptable.
-func ParseJSON(data []byte) (*Whitelist, error) {
-	var wl Whitelist
+func ParseJSON(data []byte) (*Allowlist, error) {
+	var wl Allowlist
 	if err := json.Unmarshal(data, &wl); err != nil {
-		return nil, fmt.Errorf("decode whitelist: %w", err)
+		return nil, fmt.Errorf("decode allowlist: %w", err)
 	}
 	for digest := range wl.Digests {
 		if _, err := types.ParseDigest(digest); err != nil {

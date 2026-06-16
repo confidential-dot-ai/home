@@ -3,11 +3,11 @@
 ##   - valuePath:   dotted path to the component's image object (repository/
 ##                  tag/digest live there).
 ##   - enabledPath: dotted path to its deploy toggle ("" = always deployed); a
-##                  disabled component is neither derived into the NRI whitelist
+##                  disabled component is neither derived into the NRI allowlist
 ##                  nor coverage-checked.
 ##   - cdsExempt:   cds is always seeded via its self-entry (independent of
 ##                  deriveComponents), so the fail-closed coverage guard skips it.
-## Consumed by the c8s.components helper (NRI whitelist derivation + render
+## Consumed by the c8s.components helper (NRI allowlist derivation + render
 ## guard) and by `c8s install` (digest resolution, via `helm show values`).
 c8sComponents:
   - valuePath: image
@@ -119,7 +119,7 @@ webhook:
 
 ## Certificate Distribution Service (cds): the c8s trust root. One binary, one Service,
 ## one ServiceAccount, and one measurement allowlist serve EAR issuance,
-## whitelist, JWKS, mesh-CA leaf signing, and handoff.
+## allowlist, JWKS, mesh-CA leaf signing, and handoff.
 ##
 ## The mesh CA key is generated inside the cds process and stays in memory
 ## only — it is never rendered into a Kubernetes Secret or volume. EAR signing
@@ -165,7 +165,7 @@ cds:
         value: cds
         effect: NoSchedule
   logLevel: info
-  whitelistDB: /data/whitelist.db
+  allowlistDB: /data/allowlist.db
   earIssuer: cds
   expectedIssuer: ""
   jwtClockSkew: 30
@@ -198,9 +198,9 @@ cds:
   ##      serving cert against it when they dial CDS.
   ## Empty = no pinning (UNSAFE outside dev).
   measurements: []
-  ## SHA-384 hex launch digests whose bearer EAR may mutate the whitelist via
-  ## POST/DELETE /whitelist. Empty = whitelist writes are rejected.
-  whitelistWriteMeasurements: []
+  ## SHA-384 hex launch digests whose bearer EAR may mutate the allowlist via
+  ## POST/DELETE /allowlist. Empty = allowlist writes are rejected.
+  allowlistWriteMeasurements: []
   tokenSignerRotationInterval: 720h
   tokenSignerOverlap: 25h
   tokenSignerRotationJitter: 0.1
@@ -646,7 +646,7 @@ ratlsMesh:
 nriImagePolicy:
   ## Host-side NRI image admission. Must be false under kata.enabled — image
   ## admission is the in-guest policy-monitor in that shape, fed from CDS's
-  ## served whitelist (`c8s install --kata` sets it). The bootstrapWhitelist
+  ## served allowlist (`c8s install --kata` sets it). The bootstrapAllowlist
   ## below still feeds CDS's served seed when disabled.
   enabled: true
   ## Host Kubernetes distro for the nri-image-policy installer: k8s | rke2.
@@ -751,7 +751,7 @@ nriImagePolicy:
     restartCommand: ""
 
   refresh:
-    # How often the worker plugin pulls the current whitelist from CDS.
+    # How often the worker plugin pulls the current allowlist from CDS.
     interval: 30s
 
   # --- Bootstrap allowlist (the authoritative floor) ---
@@ -759,8 +759,8 @@ nriImagePolicy:
   #   1. Rendered into every plugin's always_allow (both installer DaemonSets,
   #      via nri-image-policy.bootConfig), so the cluster can bring itself up
   #      before CDS is reachable.
-  #   2. Rendered into CDS's --whitelist-seed (templates/cds.yaml), so CDS's
-  #      served /whitelist is non-empty on the first worker pull.
+  #   2. Rendered into CDS's --allowlist-seed (templates/cds.yaml), so CDS's
+  #      served /allowlist is non-empty on the first worker pull.
   # `digests` is the floor: everything needed to reach a Ready CDS on the CDS
   # node and a working kubelet on every node — the c8s component images plus
   # kube-proxy, coredns, pause/sandbox, CNI — supplied via values or `-f`
@@ -768,7 +768,7 @@ nriImagePolicy:
   # here; deriveComponents below is a demo convenience for the c8s images only.
   #
   # Format: map of "sha256:<hex>" -> "<image reference>"
-  bootstrapWhitelist:
+  bootstrapAllowlist:
     # deriveComponents: a demo convenience (off by default, like
     # `c8s install --resolve-digests`, which turns it on). When true, the c8s
     # component images this chart installs (operator, cds, attestation-api,
@@ -964,7 +964,7 @@ tlsLb:
   # Useful for preserving control-plane endpoints while the catch-all route
   # points at an inference backend.
   routes: []
-    # - path: /whitelist
+    # - path: /allowlist
     #   match: exact  # exact | prefix (default)
     #   backend:
     #     address: cds.default.svc.cluster.local:8080

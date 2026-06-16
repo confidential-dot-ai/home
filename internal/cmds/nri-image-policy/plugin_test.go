@@ -222,7 +222,7 @@ func TestCreateContainer_Ready_PassesThrough(t *testing.T) {
 	policyCache := cache.NewPolicyCache()
 	p := &plugin{
 		cfg: &config{
-			Whitelist: whitelistConfig{Pull: pullConfig{URL: "http://wl.local:8080", Timeout: 30}},
+			Allowlist: allowlistConfig{Pull: pullConfig{URL: "http://wl.local:8080", Timeout: 30}},
 			Policy: policyConfig{
 				Mode:                  "fail-closed",
 				DenyMissingAnnotation: true,
@@ -243,7 +243,7 @@ func TestCreateContainer_Ready_PassesThrough(t *testing.T) {
 
 	_, _, err := p.CreateContainer(context.Background(), pod, ctr)
 	if err == nil {
-		t.Fatal("expected error from normal whitelist check path")
+		t.Fatal("expected error from normal allowlist check path")
 	}
 	// Should be the "no image annotation" denial, not the "initializing" denial
 	if err.Error() == "image policy plugin initializing, container creation denied" {
@@ -467,7 +467,7 @@ func TestCreateContainer_LabelRuleDeny_AuditMode(t *testing.T) {
 	}
 }
 
-func TestCreateContainer_WhitelistDisabled_SkipsImageCheck(t *testing.T) {
+func TestCreateContainer_AllowlistDisabled_SkipsImageCheck(t *testing.T) {
 	p := newTestPlugin(&config{
 		Policy: policyConfig{
 			Mode:                  "fail-closed",
@@ -482,12 +482,12 @@ func TestCreateContainer_WhitelistDisabled_SkipsImageCheck(t *testing.T) {
 	p.SetReady()
 
 	// Pod has tenant label, no image annotation — should pass because
-	// whitelist is disabled (no URL), image check is skipped.
+	// allowlist is disabled (no URL), image check is skipped.
 	pod := makePodWithLabels("default", "mypod", map[string]string{"tenant": "acme"})
 	ctr := makeCtr(pod.Id, "myctr")
 
 	_, _, err := p.CreateContainer(context.Background(), pod, ctr)
 	if err != nil {
-		t.Fatalf("expected no error with whitelist disabled, got: %v", err)
+		t.Fatalf("expected no error with allowlist disabled, got: %v", err)
 	}
 }

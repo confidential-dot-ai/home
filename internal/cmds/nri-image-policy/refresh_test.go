@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/internal/cache"
+	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
+	"github.com/confidential-dot-ai/c8s/pkg/allowlistclient"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
-	"github.com/confidential-dot-ai/c8s/pkg/whitelist"
-	"github.com/confidential-dot-ai/c8s/pkg/whitelistclient"
 )
 
 const (
@@ -31,15 +31,15 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func TestMergeWhitelistsOverlay(t *testing.T) {
-	a := &whitelist.Whitelist{Version: "a", Digests: map[string]string{
+func TestMergeAllowlistsOverlay(t *testing.T) {
+	a := &allowlist.Allowlist{Version: "a", Digests: map[string]string{
 		pushDigestA: "image-a",
 	}}
-	b := &whitelist.Whitelist{Version: "b", Digests: map[string]string{
+	b := &allowlist.Allowlist{Version: "b", Digests: map[string]string{
 		pushDigestB: "image-b",
 	}}
 
-	merged := mergeWhitelists(a, b)
+	merged := mergeAllowlists(a, b)
 
 	if got := merged.Version; got != "b" {
 		t.Fatalf("version = %q, want b", got)
@@ -52,25 +52,25 @@ func TestMergeWhitelistsOverlay(t *testing.T) {
 	}
 }
 
-func TestMergeWhitelistsOverlayOverrides(t *testing.T) {
-	a := &whitelist.Whitelist{Digests: map[string]string{
+func TestMergeAllowlistsOverlayOverrides(t *testing.T) {
+	a := &allowlist.Allowlist{Digests: map[string]string{
 		pushDigestA: "old-image",
 	}}
-	b := &whitelist.Whitelist{Digests: map[string]string{
+	b := &allowlist.Allowlist{Digests: map[string]string{
 		pushDigestA: "new-image",
 	}}
 
-	merged := mergeWhitelists(a, b)
+	merged := mergeAllowlists(a, b)
 	if got := merged.Digests[pushDigestA]; got != "new-image" {
 		t.Fatalf("override entry = %q, want new-image", got)
 	}
 }
 
-func TestMergeWhitelistsNilOverlay(t *testing.T) {
-	a := &whitelist.Whitelist{Version: "a", Digests: map[string]string{
+func TestMergeAllowlistsNilOverlay(t *testing.T) {
+	a := &allowlist.Allowlist{Version: "a", Digests: map[string]string{
 		pushDigestA: "image-a",
 	}}
-	merged := mergeWhitelists(a, nil)
+	merged := mergeAllowlists(a, nil)
 	if merged.Digests[pushDigestA] != "image-a" || merged.Version != "a" {
 		t.Fatalf("nil overlay should return a copy of a, got %+v", merged)
 	}
@@ -89,21 +89,21 @@ func TestStartupSourceMode(t *testing.T) {
 	}{
 		{
 			name: "pull",
-			cfg: &config{Whitelist: whitelistConfig{
+			cfg: &config{Allowlist: allowlistConfig{
 				Pull: pullConfig{URL: "https://cds.example"},
 			}},
 			want: "pull",
 		},
 		{
 			name: "push",
-			cfg: &config{Whitelist: whitelistConfig{
+			cfg: &config{Allowlist: allowlistConfig{
 				Push: pushConfig{PersistPath: "/run/nri/pushed.json"},
 			}},
 			want: "push",
 		},
 		{
 			name: "always allow only",
-			cfg: &config{Whitelist: whitelistConfig{
+			cfg: &config{Allowlist: allowlistConfig{
 				AlwaysAllow: map[string]string{pushDigestA: "image-a"},
 			}},
 			want: "always_allow",
@@ -118,7 +118,7 @@ func TestStartupSourceMode(t *testing.T) {
 		{
 			name: "static and label rules",
 			cfg: &config{
-				Whitelist: whitelistConfig{
+				Allowlist: allowlistConfig{
 					AlwaysAllow: map[string]string{pushDigestA: "image-a"},
 				},
 				Policy: policyConfig{
@@ -138,8 +138,8 @@ func TestStartupSourceMode(t *testing.T) {
 	}
 }
 
-func TestLoadWhitelistFileMissingReturnsNil(t *testing.T) {
-	wl, err := loadWhitelistFile(filepath.Join(t.TempDir(), "absent.yaml"), "bootstrap", discardLogger())
+func TestLoadAllowlistFileMissingReturnsNil(t *testing.T) {
+	wl, err := loadAllowlistFile(filepath.Join(t.TempDir(), "absent.yaml"), "bootstrap", discardLogger())
 	if err != nil {
 		t.Fatalf("missing file should not error: %v", err)
 	}
@@ -148,17 +148,17 @@ func TestLoadWhitelistFileMissingReturnsNil(t *testing.T) {
 	}
 }
 
-func TestLoadWhitelistFileParseError(t *testing.T) {
+func TestLoadAllowlistFileParseError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad.yaml")
 	if err := os.WriteFile(path, []byte("digests: not-a-map\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadWhitelistFile(path, "bootstrap", discardLogger()); err == nil {
+	if _, err := loadAllowlistFile(path, "bootstrap", discardLogger()); err == nil {
 		t.Fatal("expected parse error")
 	}
 }
 
-func TestLoadWhitelistFileYAML(t *testing.T) {
+func TestLoadAllowlistFileYAML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bootstrap.yaml")
 	yamlSrc := `version: "1"
 digests:
@@ -167,7 +167,7 @@ digests:
 	if err := os.WriteFile(path, []byte(yamlSrc), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	wl, err := loadWhitelistFile(path, "bootstrap", discardLogger())
+	wl, err := loadAllowlistFile(path, "bootstrap", discardLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -178,10 +178,10 @@ digests:
 
 // --- push handler ---
 
-func makePushHandler(t *testing.T, bootstrap *whitelist.Whitelist) (*pushHandler, *cache.PolicyCache, string) {
+func makePushHandler(t *testing.T, bootstrap *allowlist.Allowlist) (*pushHandler, *cache.PolicyCache, string) {
 	t.Helper()
 	c := cache.NewPolicyCache()
-	c.SetWhitelist(bootstrap)
+	c.SetAllowlist(bootstrap)
 	pushedPath := filepath.Join(t.TempDir(), "pushed.json")
 	h, err := newPushHandler(c, bootstrap, pushedPath, discardLogger())
 	if err != nil {
@@ -195,7 +195,7 @@ func pushBody(t *testing.T, entries ...string) string {
 	if len(entries)%2 != 0 {
 		t.Fatalf("pushBody: entries must be pairs, got %d", len(entries))
 	}
-	payload := types.WhitelistListResponse{Version: "1", Digests: map[types.Digest]string{}}
+	payload := types.AllowlistListResponse{Version: "1", Digests: map[types.Digest]string{}}
 	for i := 0; i < len(entries); i += 2 {
 		d, err := types.ParseDigest(entries[i])
 		if err != nil {
@@ -212,25 +212,25 @@ func pushBody(t *testing.T, entries ...string) string {
 
 func TestNewPushHandlerRejectsEmptyPath(t *testing.T) {
 	c := cache.NewPolicyCache()
-	if _, err := newPushHandler(c, &whitelist.Whitelist{Digests: map[string]string{}}, "", discardLogger()); err == nil {
+	if _, err := newPushHandler(c, &allowlist.Allowlist{Digests: map[string]string{}}, "", discardLogger()); err == nil {
 		t.Fatal("expected error for empty pushedPath")
 	}
 }
 
 func TestPushHandlerValidSingleEntry(t *testing.T) {
-	bootstrap := &whitelist.Whitelist{Digests: map[string]string{
+	bootstrap := &allowlist.Allowlist{Digests: map[string]string{
 		pushDigestA: "bootstrap-image",
 	}}
 	h, c, pushedPath := makePushHandler(t, bootstrap)
 
-	req := httptest.NewRequest(http.MethodPut, "/whitelist", strings.NewReader(pushBody(t, pushDigestB, "pushed-image")))
+	req := httptest.NewRequest(http.MethodPut, "/allowlist", strings.NewReader(pushBody(t, pushDigestB, "pushed-image")))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
 	}
-	wl := c.GetWhitelist()
+	wl := c.GetAllowlist()
 	if wl.Digests[pushDigestA] != "bootstrap-image" {
 		t.Fatal("bootstrap entry lost after push")
 	}
@@ -243,12 +243,12 @@ func TestPushHandlerValidSingleEntry(t *testing.T) {
 }
 
 func TestPushHandlerTwoEntriesRejected(t *testing.T) {
-	h, c, pushedPath := makePushHandler(t, &whitelist.Whitelist{Digests: map[string]string{
+	h, c, pushedPath := makePushHandler(t, &allowlist.Allowlist{Digests: map[string]string{
 		pushDigestA: "bootstrap-image",
 	}})
 	body := pushBody(t, pushDigestA, "a", pushDigestB, "b")
 
-	req := httptest.NewRequest(http.MethodPut, "/whitelist", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/allowlist", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -258,28 +258,28 @@ func TestPushHandlerTwoEntriesRejected(t *testing.T) {
 	if _, err := os.Stat(pushedPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("pushed.json should not exist on 422, err=%v", err)
 	}
-	if got := c.GetWhitelist().Digests[pushDigestA]; got != "bootstrap-image" {
+	if got := c.GetAllowlist().Digests[pushDigestA]; got != "bootstrap-image" {
 		t.Fatalf("cache mutated on 422; bootstrap entry = %q", got)
 	}
 }
 
 func TestPushHandlerMalformedJSON(t *testing.T) {
-	h, c, _ := makePushHandler(t, &whitelist.Whitelist{Digests: map[string]string{}})
-	req := httptest.NewRequest(http.MethodPut, "/whitelist", strings.NewReader("{not json"))
+	h, c, _ := makePushHandler(t, &allowlist.Allowlist{Digests: map[string]string{}})
+	req := httptest.NewRequest(http.MethodPut, "/allowlist", strings.NewReader("{not json"))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
-	if c.GetWhitelist() == nil || len(c.GetWhitelist().Digests) != 0 {
+	if c.GetAllowlist() == nil || len(c.GetAllowlist().Digests) != 0 {
 		t.Fatal("cache should be untouched on 400")
 	}
 }
 
 func TestPushHandlerWrongMethod(t *testing.T) {
-	h, _, _ := makePushHandler(t, &whitelist.Whitelist{Digests: map[string]string{}})
-	req := httptest.NewRequest(http.MethodPost, "/whitelist", strings.NewReader(pushBody(t, pushDigestA, "img")))
+	h, _, _ := makePushHandler(t, &allowlist.Allowlist{Digests: map[string]string{}})
+	req := httptest.NewRequest(http.MethodPost, "/allowlist", strings.NewReader(pushBody(t, pushDigestA, "img")))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -289,7 +289,7 @@ func TestPushHandlerWrongMethod(t *testing.T) {
 }
 
 func TestStartHealthServerRejectsPushHandlerOnTCP(t *testing.T) {
-	h, _, _ := makePushHandler(t, &whitelist.Whitelist{Digests: map[string]string{}})
+	h, _, _ := makePushHandler(t, &allowlist.Allowlist{Digests: map[string]string{}})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -318,19 +318,19 @@ func TestPushHandlerDiskWriteFailure(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("file"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	bootstrap := &whitelist.Whitelist{Digests: map[string]string{
+	bootstrap := &allowlist.Allowlist{Digests: map[string]string{
 		pushDigestA: "bootstrap-image",
 	}}
 	c := cache.NewPolicyCache()
-	c.SetWhitelist(bootstrap)
+	c.SetAllowlist(bootstrap)
 	h, err := newPushHandler(c, bootstrap, filepath.Join(blocker, "pushed.json"), discardLogger())
 	if err != nil {
 		t.Fatalf("newPushHandler: %v", err)
 	}
 
-	preCache := c.GetWhitelist()
+	preCache := c.GetAllowlist()
 
-	req := httptest.NewRequest(http.MethodPut, "/whitelist", strings.NewReader(pushBody(t, pushDigestB, "img")))
+	req := httptest.NewRequest(http.MethodPut, "/allowlist", strings.NewReader(pushBody(t, pushDigestB, "img")))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -338,7 +338,7 @@ func TestPushHandlerDiskWriteFailure(t *testing.T) {
 		t.Fatalf("status = %d, want 500", rec.Code)
 	}
 	// Contract: cache pointer unchanged from pre-PUT state on disk failure.
-	if c.GetWhitelist() != preCache {
+	if c.GetAllowlist() != preCache {
 		t.Fatal("cache pointer should be unchanged on disk-write failure")
 	}
 }
@@ -394,10 +394,10 @@ func TestPullLoopOnly200UpdatesCacheAndETag(t *testing.T) {
 	})
 	defer srv.Close()
 
-	client := whitelistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
+	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
 	c := cache.NewPolicyCache()
-	bootstrap := &whitelist.Whitelist{Digests: map[string]string{}}
-	c.SetWhitelist(bootstrap)
+	bootstrap := &allowlist.Allowlist{Digests: map[string]string{}}
+	c.SetAllowlist(bootstrap)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -419,7 +419,7 @@ func TestPullLoopOnly200UpdatesCacheAndETag(t *testing.T) {
 	// Wait until the cache has reflected both 200 responses.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		wl := c.GetWhitelist()
+		wl := c.GetAllowlist()
 		if wl != nil && wl.Digests[pushDigestB] != "" {
 			break
 		}
@@ -441,11 +441,11 @@ func TestPullLoop304LeavesCacheUntouched(t *testing.T) {
 	})
 	defer srv.Close()
 
-	client := whitelistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
+	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
 	c := cache.NewPolicyCache()
-	preload := &whitelist.Whitelist{Digests: map[string]string{pushDigestA: "image-1"}}
-	c.SetWhitelist(preload)
-	bootstrap := &whitelist.Whitelist{Digests: map[string]string{}}
+	preload := &allowlist.Allowlist{Digests: map[string]string{pushDigestA: "image-1"}}
+	c.SetAllowlist(preload)
+	bootstrap := &allowlist.Allowlist{Digests: map[string]string{}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -468,7 +468,7 @@ func TestPullLoop304LeavesCacheUntouched(t *testing.T) {
 	// Give the loop time to run a few ticks; verify cache is unchanged
 	// (i.e. still references preload, not a merge with empty bootstrap).
 	time.Sleep(100 * time.Millisecond)
-	wl := c.GetWhitelist()
+	wl := c.GetAllowlist()
 	if wl != preload {
 		t.Fatalf("304 ticks should leave cache pointer unchanged; got=%p want=%p", wl, preload)
 	}
@@ -481,10 +481,10 @@ func TestPullLoop5xxLeavesCacheAndETagUntouched(t *testing.T) {
 	srv := httptest.NewServer(&flippingHandler{statusCode: http.StatusInternalServerError})
 	defer srv.Close()
 
-	client := whitelistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
+	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
 	c := cache.NewPolicyCache()
-	preload := &whitelist.Whitelist{Digests: map[string]string{pushDigestA: "image-1"}}
-	c.SetWhitelist(preload)
+	preload := &allowlist.Allowlist{Digests: map[string]string{pushDigestA: "image-1"}}
+	c.SetAllowlist(preload)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -494,7 +494,7 @@ func TestPullLoop5xxLeavesCacheAndETagUntouched(t *testing.T) {
 		runPullLoop(ctx, pullLoopArgs{
 			client:    client,
 			cache:     c,
-			bootstrap: &whitelist.Whitelist{Digests: map[string]string{}},
+			bootstrap: &allowlist.Allowlist{Digests: map[string]string{}},
 			interval:  10 * time.Millisecond,
 			timeout:   time.Second,
 			etag:      `W/"5"`,
@@ -504,7 +504,7 @@ func TestPullLoop5xxLeavesCacheAndETagUntouched(t *testing.T) {
 	}()
 
 	time.Sleep(80 * time.Millisecond)
-	if c.GetWhitelist() != preload {
+	if c.GetAllowlist() != preload {
 		t.Fatal("5xx ticks should leave cache pointer unchanged")
 	}
 
@@ -513,12 +513,12 @@ func TestPullLoop5xxLeavesCacheAndETagUntouched(t *testing.T) {
 }
 
 func TestPushHandlerMergesBootstrapWithPushed(t *testing.T) {
-	bootstrap := &whitelist.Whitelist{Digests: map[string]string{
+	bootstrap := &allowlist.Allowlist{Digests: map[string]string{
 		pushDigestA: "bootstrap-image",
 	}}
 	h, c, _ := makePushHandler(t, bootstrap)
 
-	req := httptest.NewRequest(http.MethodPut, "/whitelist",
+	req := httptest.NewRequest(http.MethodPut, "/allowlist",
 		strings.NewReader(pushBody(t, pushDigestB, "pushed-image")))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -526,7 +526,7 @@ func TestPushHandlerMergesBootstrapWithPushed(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", rec.Code)
 	}
-	wl := c.GetWhitelist()
+	wl := c.GetAllowlist()
 	if wl.Digests[pushDigestA] != "bootstrap-image" {
 		t.Fatal("bootstrap entry must survive push (always_allow is the static floor)")
 	}
@@ -543,12 +543,12 @@ func TestPullLoopMergesBootstrapWithPulled(t *testing.T) {
 	})
 	defer srv.Close()
 
-	client := whitelistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
-	bootstrap := &whitelist.Whitelist{Digests: map[string]string{
+	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
+	bootstrap := &allowlist.Allowlist{Digests: map[string]string{
 		pushDigestA: "bootstrap-image",
 	}}
 	c := cache.NewPolicyCache()
-	c.SetWhitelist(bootstrap)
+	c.SetAllowlist(bootstrap)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -569,7 +569,7 @@ func TestPullLoopMergesBootstrapWithPulled(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		wl := c.GetWhitelist()
+		wl := c.GetAllowlist()
 		if wl != nil && wl.Digests[pushDigestB] != "" {
 			if wl.Digests[pushDigestA] != "bootstrap-image" {
 				t.Fatalf("bootstrap entry lost after pull; cache=%+v", wl.Digests)
@@ -587,16 +587,16 @@ func TestPullLoopMergesBootstrapWithPulled(t *testing.T) {
 }
 
 func TestPullInitialSucceedsAfterTransientFailures(t *testing.T) {
-	orig := whitelistApiInitialDelay
-	whitelistApiInitialDelay = time.Millisecond
-	defer func() { whitelistApiInitialDelay = orig }()
+	orig := allowlistApiInitialDelay
+	allowlistApiInitialDelay = time.Millisecond
+	defer func() { allowlistApiInitialDelay = orig }()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
 
 	// We can't easily inject a mock Client (concrete type), so spin up
 	// an httptest server that fails the first two requests then returns
-	// 200 with valid JSON. Reuse the existing whitelistclient.Client.
+	// 200 with valid JSON. Reuse the existing allowlistclient.Client.
 	var n atomic.Int32
 	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if n.Add(1) <= 2 {
@@ -608,10 +608,10 @@ func TestPullInitialSucceedsAfterTransientFailures(t *testing.T) {
 		_, _ = w.Write([]byte(`{"version":"1","digests":{"` + pushDigestB + `":"pulled-image"}}`))
 	})
 
-	client := whitelistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
+	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
 	c := cache.NewPolicyCache()
-	bootstrap := &whitelist.Whitelist{Digests: map[string]string{pushDigestA: "bootstrap-image"}}
-	c.SetWhitelist(bootstrap)
+	bootstrap := &allowlist.Allowlist{Digests: map[string]string{pushDigestA: "bootstrap-image"}}
+	c.SetAllowlist(bootstrap)
 
 	pluginErrCh := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -631,22 +631,22 @@ func TestPullInitialSucceedsAfterTransientFailures(t *testing.T) {
 	if etag != `W/"1"` {
 		t.Fatalf("etag = %q, want W/\"1\"", etag)
 	}
-	if got := c.GetWhitelist().Digests[pushDigestB]; got != "pulled-image" {
-		t.Fatalf("cache missing pulled entry: %+v", c.GetWhitelist().Digests)
+	if got := c.GetAllowlist().Digests[pushDigestB]; got != "pulled-image" {
+		t.Fatalf("cache missing pulled entry: %+v", c.GetAllowlist().Digests)
 	}
 }
 
 func TestPullInitialFailsAfterMaxRetries(t *testing.T) {
-	orig := whitelistApiInitialDelay
-	whitelistApiInitialDelay = time.Millisecond
-	defer func() { whitelistApiInitialDelay = orig }()
+	orig := allowlistApiInitialDelay
+	allowlistApiInitialDelay = time.Millisecond
+	defer func() { allowlistApiInitialDelay = orig }()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer srv.Close()
 
-	client := whitelistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 200 * time.Millisecond})
+	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 200 * time.Millisecond})
 	c := cache.NewPolicyCache()
 	pluginErrCh := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -655,7 +655,7 @@ func TestPullInitialFailsAfterMaxRetries(t *testing.T) {
 	_, err := pullInitial(ctx, pullArgs{
 		client:      client,
 		cache:       c,
-		bootstrap:   &whitelist.Whitelist{Digests: map[string]string{}},
+		bootstrap:   &allowlist.Allowlist{Digests: map[string]string{}},
 		timeout:     200 * time.Millisecond,
 		pluginErrCh: pluginErrCh,
 		logger:      discardLogger(),
@@ -676,9 +676,9 @@ func TestPullInitialPluginDeathWrapsErrPluginDied(t *testing.T) {
 	pluginErrCh := make(chan error, 1)
 	pluginErrCh <- errors.New("nri socket closed")
 	_, err := pullInitial(context.Background(), pullArgs{
-		client:      whitelistclient.NewClientWithHTTP("https://unused", &http.Client{}),
+		client:      allowlistclient.NewClientWithHTTP("https://unused", &http.Client{}),
 		cache:       cache.NewPolicyCache(),
-		bootstrap:   &whitelist.Whitelist{Digests: map[string]string{}},
+		bootstrap:   &allowlist.Allowlist{Digests: map[string]string{}},
 		timeout:     time.Second,
 		pluginErrCh: pluginErrCh,
 		logger:      discardLogger(),
@@ -688,14 +688,14 @@ func TestPullInitialPluginDeathWrapsErrPluginDied(t *testing.T) {
 	}
 }
 
-func TestPullInitialNotModifiedDoesNotDereferenceNilWhitelist(t *testing.T) {
-	origDelay := whitelistApiInitialDelay
-	origRetries := whitelistApiMaxRetries
-	whitelistApiInitialDelay = time.Millisecond
-	whitelistApiMaxRetries = 1
+func TestPullInitialNotModifiedDoesNotDereferenceNilAllowlist(t *testing.T) {
+	origDelay := allowlistApiInitialDelay
+	origRetries := allowlistApiMaxRetries
+	allowlistApiInitialDelay = time.Millisecond
+	allowlistApiMaxRetries = 1
 	defer func() {
-		whitelistApiInitialDelay = origDelay
-		whitelistApiMaxRetries = origRetries
+		allowlistApiInitialDelay = origDelay
+		allowlistApiMaxRetries = origRetries
 	}()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -703,10 +703,10 @@ func TestPullInitialNotModifiedDoesNotDereferenceNilWhitelist(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := whitelistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 200 * time.Millisecond})
+	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 200 * time.Millisecond})
 	c := cache.NewPolicyCache()
-	bootstrap := &whitelist.Whitelist{Digests: map[string]string{pushDigestA: "bootstrap-image"}}
-	c.SetWhitelist(bootstrap)
+	bootstrap := &allowlist.Allowlist{Digests: map[string]string{pushDigestA: "bootstrap-image"}}
+	c.SetAllowlist(bootstrap)
 	pluginErrCh := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -720,12 +720,12 @@ func TestPullInitialNotModifiedDoesNotDereferenceNilWhitelist(t *testing.T) {
 		logger:      discardLogger(),
 	})
 	if err == nil {
-		t.Fatal("expected error for initial 304 without cached CDS whitelist")
+		t.Fatal("expected error for initial 304 without cached CDS allowlist")
 	}
-	if !errors.Is(err, errInitialWhitelistNotModified) {
-		t.Fatalf("expected errInitialWhitelistNotModified, got %v", err)
+	if !errors.Is(err, errInitialAllowlistNotModified) {
+		t.Fatalf("expected errInitialAllowlistNotModified, got %v", err)
 	}
-	if c.GetWhitelist() != bootstrap {
+	if c.GetAllowlist() != bootstrap {
 		t.Fatal("initial 304 should leave cache pointer unchanged")
 	}
 }
@@ -736,7 +736,7 @@ func TestPullInitialCancelledMidRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := whitelistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 200 * time.Millisecond})
+	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 200 * time.Millisecond})
 	c := cache.NewPolicyCache()
 	pluginErrCh := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -750,7 +750,7 @@ func TestPullInitialCancelledMidRetry(t *testing.T) {
 	etag, err := pullInitial(ctx, pullArgs{
 		client:      client,
 		cache:       c,
-		bootstrap:   &whitelist.Whitelist{Digests: map[string]string{}},
+		bootstrap:   &allowlist.Allowlist{Digests: map[string]string{}},
 		timeout:     200 * time.Millisecond,
 		pluginErrCh: pluginErrCh,
 		logger:      discardLogger(),

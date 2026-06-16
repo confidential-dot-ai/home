@@ -16,7 +16,7 @@ package policymonitor
 // digests into the template before osbuilder materializes the rootfs.
 // It is the SEED: read once at boot so the guest can enforce from t=0
 // with no network. The set is then extended at runtime by the CDS
-// whitelist refresh (cds_refresh.go) — the effective allowlist is the
+// allowlist refresh (cds_refresh.go) — the effective allowlist is the
 // baked seed UNION every digest CDS has served. See MergePulled and
 // docs/kata-image-policy.md.
 //

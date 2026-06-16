@@ -8,7 +8,7 @@ The current milestone enforces these gates:
 |---|---|---|
 | TEE evidence is valid | attestation-api and CDS | hardware evidence verification |
 | A CSR can be signed | CDS | EAR JWT, plus `cds.measurements` when configured |
-| Image digest is allowed | nri-image-policy | CDS-served whitelist |
+| Image digest is allowed | nri-image-policy | CDS-served allowlist |
 | Mesh peer cert chains to the mesh CA | ratls-mesh | mesh CA bundle |
 | Workload is injection candidate | admission webhook | pod annotation `confidential.ai/cw` |
 
@@ -43,7 +43,7 @@ binary:
   Chart-managed ratls-mesh accepts CA bundle updates only when each new CA is
   signed by an already trusted CA, so unauthenticated bundle reads cannot add
   unrelated trust roots.
-- CDS's whitelist write EAR is bound to the request body: the EAR carries
+- CDS's allowlist write EAR is bound to the request body: the EAR carries
   a `pbh` claim equal to SHA-256 of the canonicalised body, and the handler
   re-hashes and compares before accepting the mutation. A captured token
   cannot be replayed against a different payload within the EAR's TTL.

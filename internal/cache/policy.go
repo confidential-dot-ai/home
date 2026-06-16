@@ -1,16 +1,16 @@
-// Package cache provides caching for the image digest whitelist.
+// Package cache provides caching for the image digest allowlist.
 package cache
 
 import (
 	"sync"
 
-	"github.com/confidential-dot-ai/c8s/pkg/whitelist"
+	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
 )
 
-// PolicyCache caches the whitelist fetched from KBS.
+// PolicyCache caches the allowlist fetched from KBS.
 type PolicyCache struct {
 	mu        sync.RWMutex
-	whitelist *whitelist.Whitelist
+	allowlist *allowlist.Allowlist
 }
 
 // NewPolicyCache creates a new policy cache.
@@ -18,21 +18,21 @@ func NewPolicyCache() *PolicyCache {
 	return &PolicyCache{}
 }
 
-// GetWhitelist returns the cached whitelist.
-func (c *PolicyCache) GetWhitelist() *whitelist.Whitelist {
+// GetAllowlist returns the cached allowlist.
+func (c *PolicyCache) GetAllowlist() *allowlist.Allowlist {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.whitelist
+	return c.allowlist
 }
 
-// SetWhitelist stores the whitelist in the cache.
-func (c *PolicyCache) SetWhitelist(wl *whitelist.Whitelist) {
+// SetAllowlist stores the allowlist in the cache.
+func (c *PolicyCache) SetAllowlist(wl *allowlist.Allowlist) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.whitelist = wl
+	c.allowlist = wl
 }
 
-// Clear removes the cached whitelist. Next CreateContainer triggers a fresh KBS fetch.
+// Clear removes the cached allowlist. Next CreateContainer triggers a fresh KBS fetch.
 func (c *PolicyCache) Clear() {
-	c.SetWhitelist(nil)
+	c.SetAllowlist(nil)
 }

@@ -27,13 +27,13 @@ metadata:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "c8s.cdsName" . }}-whitelist-seed
+  name: {{ include "c8s.cdsName" . }}-allowlist-seed
   namespace: {{ .Release.Namespace }}
   labels:
 {{ include "c8s.commonLabels" . | indent 4 }}
     app.kubernetes.io/component: cds
 data:
-  whitelist-seed.json: {{ include "c8s.whitelistSeedJSON" . | trim | quote }}
+  allowlist-seed.json: {{ include "c8s.allowlistSeedJSON" . | trim | quote }}
 ---
 {{- end }}
 {{- if .Values.cds.persistence.enabled }}
@@ -119,7 +119,7 @@ spec:
         # In a kata-qemu-snp guest with shared_fs="none", the kubelet fsGroup
         # chown lands on a host emptyDir the guest never mounts, so the agent
         # creates a fresh root-owned /data inside the guest and UID 65532 cannot
-        # write whitelist.db. Run as in-guest root — safe, since the SNP VM is the
+        # write allowlist.db. Run as in-guest root — safe, since the SNP VM is the
         # trust boundary and cds is its sole workload.
         runAsUser: 0
         runAsNonRoot: false
@@ -137,9 +137,9 @@ spec:
             # under kata.enabled (CDS runs inside the CVM where the baked
             # attestation-service listens) and to the host Service otherwise.
             - --attestation-api-url={{ include "c8s.attestationApiURL" . }}
-            - --whitelist-db={{ .Values.cds.whitelistDB }}
+            - --allowlist-db={{ .Values.cds.allowlistDB }}
             {{- if .Values.nriImagePolicy.enabled }}
-            - --whitelist-seed=/etc/cds/whitelist-seed.json
+            - --allowlist-seed=/etc/cds/allowlist-seed.json
             {{- end }}
             - --ear-issuer={{ .Values.cds.earIssuer }}
             {{- if .Values.cds.expectedIssuer }}
@@ -169,8 +169,8 @@ spec:
             {{- with .Values.cds.measurements }}
             - --measurements={{ join "," . }}
             {{- end }}
-            {{- with .Values.cds.whitelistWriteMeasurements }}
-            - --whitelist-write-measurements={{ join "," . }}
+            {{- with .Values.cds.allowlistWriteMeasurements }}
+            - --allowlist-write-measurements={{ join "," . }}
             {{- end }}
             {{- if .Values.cds.handoff.enabled }}
             - --handoff-measurements={{ join "," .Values.cds.measurements }}
@@ -222,7 +222,7 @@ spec:
             - name: data
               mountPath: /data
             {{- if .Values.nriImagePolicy.enabled }}
-            - name: whitelist-seed
+            - name: allowlist-seed
               mountPath: /etc/cds
               readOnly: true
             {{- end }}
@@ -248,9 +248,9 @@ spec:
           emptyDir: {}
           {{- end }}
         {{- if .Values.nriImagePolicy.enabled }}
-        - name: whitelist-seed
+        - name: allowlist-seed
           configMap:
-            name: {{ include "c8s.cdsName" . }}-whitelist-seed
+            name: {{ include "c8s.cdsName" . }}-allowlist-seed
         {{- end }}
 ---
 apiVersion: v1
