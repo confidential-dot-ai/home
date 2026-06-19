@@ -119,6 +119,29 @@ func TestAppendInstallCRDArgsLeavesStatusMirrorEnabledWithCRDs(t *testing.T) {
 	}
 }
 
+// The helm argv ordering is load-bearing: operator -f files before the computed
+// file (last -f wins, so computed values win on the keys they set), and
+// --skip-crds present iff CRDs are skipped.
+func TestBuildInstallHelmArgsOrdering(t *testing.T) {
+	prevRel, prevNs := installRelease, installNamespace
+	defer func() { installRelease, installNamespace = prevRel, prevNs }()
+	installRelease, installNamespace = "c8s", "c8s-system"
+
+	// CRDs installed, two operator -f files, wait on: computed file is LAST -f.
+	assertArgsEqual(t, buildInstallHelmArgs("/chart", "/tmp/computed.yaml", []string{"a.yaml", "b.yaml"}, true, true), []string{
+		"upgrade", "--install", "c8s", "/chart", "--namespace", "c8s-system",
+		"-f", "a.yaml", "-f", "b.yaml", "-f", "/tmp/computed.yaml",
+		"--wait", "--timeout=5m",
+	})
+
+	// CRDs skipped, no operator -f, wait off: --skip-crds present, computed file
+	// still the last (only) -f, no --wait.
+	assertArgsEqual(t, buildInstallHelmArgs("/chart", "/tmp/computed.yaml", nil, false, false), []string{
+		"upgrade", "--install", "c8s", "/chart", "--namespace", "c8s-system",
+		"--skip-crds", "-f", "/tmp/computed.yaml",
+	})
+}
+
 func TestAppendKataInstallArgsDisabledIsNoOp(t *testing.T) {
 	got := appendKataInstallArgs([]string{"upgrade"}, false, false)
 	assertArgsEqual(t, got, []string{"upgrade"})

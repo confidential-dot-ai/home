@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
@@ -1267,6 +1268,65 @@ func TestChartWebhookRendersSecurityKnobs(t *testing.T) {
 		if !slices.Contains(args, want) {
 			t.Fatalf("operator args missing %q\n%v", want, args)
 		}
+	}
+}
+
+// A -f values file decodes ints as float64; helm renders float64 >= 1e6 as
+// scientific notation (7000000 -> 7e+06), which is invalid in a numeric
+// securityContext field and a type error in CEL. c8s.int must keep these plain
+// integers. This drives the bug's actual path (a -f file, value >= 1e6), which
+// --set does not reproduce.
+func TestChartIntValuesFromValuesFileRenderPlain(t *testing.T) {
+	dir := t.TempDir()
+	vals := filepath.Join(dir, "vals.yaml")
+	if err := os.WriteFile(vals, []byte(
+		"ratlsMesh:\n  uid: 7000000\n"+
+			"tlsLb:\n  nginx:\n    runAsUser: 7000000\n    runAsGroup: 7000000\n"+
+			"webhook:\n  certVolume:\n    fsGroup: 1500000\n  getCert:\n    runAsUser: 2000000000\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := helmTemplate(t, "-f", vals)
+	if err != nil {
+		t.Fatalf("helm template -f: %v\n%s", err, out)
+	}
+	// No value anywhere may render in scientific notation.
+	if strings.Contains(out, "e+0") {
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "e+0") {
+				t.Errorf("scientific-notation int leaked: %q", strings.TrimSpace(line))
+			}
+		}
+	}
+	// Spot-check the plain-integer renders, including the CEL admission policy
+	// (where int != double would be an uninstallable compile error).
+	for _, want := range []string{
+		"--cert-fs-group=1500000",
+		"--get-cert-run-as-user=2000000000",
+		"runAsUser: 7000000",
+		"runAsUser != 7000000",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("render missing %q", want)
+		}
+	}
+}
+
+// c8s.int must fail the render on a non-integer rather than silently coercing to
+// 0 (sprig int64's fail-open behavior — 0 is root). Guards against a malformed
+// hand-written -f.
+func TestChartIntValueRejectsNonInteger(t *testing.T) {
+	dir := t.TempDir()
+	vals := filepath.Join(dir, "vals.yaml")
+	if err := os.WriteFile(vals, []byte("webhook:\n  getCert:\n    runAsUser: notanumber\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := helmTemplate(t, "-f", vals)
+	if err == nil {
+		t.Fatalf("expected render to fail on a non-integer runAsUser, got success:\n%s", out)
+	}
+	if !strings.Contains(out, "expected an integer") {
+		t.Errorf("want 'expected an integer' error, got: %s", out)
 	}
 }
 

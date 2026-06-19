@@ -54,13 +54,11 @@ spec:
             {{- range .Values.webhook.extraExcluded }}
             - --exclude-namespaces={{ . }}
             {{- end }}
-            {{/* int64: a -f values file decodes ints as float64, which render
-            as scientific notation (7000000 -> 7e+06) for values >= 1e6. */}}
-            - --cert-fs-group={{ int64 .Values.webhook.certVolume.fsGroup }}
+            - --cert-fs-group={{ include "c8s.int" .Values.webhook.certVolume.fsGroup }}
             - --cert-key-mode={{ .Values.webhook.certVolume.keyMode }}
             - --get-cert-renew-interval={{ .Values.webhook.getCert.renewInterval }}
-            - --get-cert-run-as-user={{ int64 .Values.webhook.getCert.runAsUser }}
-            - --get-cert-run-as-group={{ int64 .Values.webhook.getCert.runAsGroup }}
+            - --get-cert-run-as-user={{ include "c8s.int" .Values.webhook.getCert.runAsUser }}
+            - --get-cert-run-as-group={{ include "c8s.int" .Values.webhook.getCert.runAsGroup }}
             - --get-cert-run-as-non-root={{ .Values.webhook.getCert.runAsNonRoot }}
             {{- if .Values.kata.enabled }}
             - --kata-enforce=true

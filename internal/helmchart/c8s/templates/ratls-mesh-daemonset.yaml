@@ -156,7 +156,7 @@ spec:
             - --outbound-port
             - {{ .Values.ratlsMesh.ports.outbound | quote }}
             - --uid
-            - {{ .Values.ratlsMesh.uid | quote }}
+            - {{ include "c8s.int" .Values.ratlsMesh.uid | quote }}
             - --exclude-uids
             - {{ .Values.ratlsMesh.excludeUids | quote }}
             - --exclude-source-namespaces
@@ -196,8 +196,8 @@ spec:
           imagePullPolicy: {{ .Values.ratlsMesh.image.pullPolicy }}
           workingDir: /tmp
           securityContext:
-            runAsUser: {{ .Values.ratlsMesh.uid }}
-            runAsGroup: {{ .Values.ratlsMesh.uid }}
+            runAsUser: {{ include "c8s.int" .Values.ratlsMesh.uid }}
+            runAsGroup: {{ include "c8s.int" .Values.ratlsMesh.uid }}
             runAsNonRoot: true
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false

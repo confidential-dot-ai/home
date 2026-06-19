@@ -45,8 +45,8 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             runAsNonRoot: {{ .Values.tlsLb.nginx.runAsNonRoot }}
-            runAsUser: {{ .Values.tlsLb.nginx.runAsUser }}
-            runAsGroup: {{ .Values.tlsLb.nginx.runAsGroup }}
+            runAsUser: {{ include "c8s.int" .Values.tlsLb.nginx.runAsUser }}
+            runAsGroup: {{ include "c8s.int" .Values.tlsLb.nginx.runAsGroup }}
             capabilities:
               drop:
                 - ALL
@@ -150,7 +150,7 @@ spec:
             name: {{ include "tls-lb.fullname" . }}-nginx
       securityContext:
         runAsNonRoot: {{ .Values.tlsLb.nginx.runAsNonRoot }}
-        fsGroup: {{ .Values.tlsLb.nginx.runAsGroup }}
+        fsGroup: {{ include "c8s.int" .Values.tlsLb.nginx.runAsGroup }}
         seccompProfile:
           type: RuntimeDefault
 {{- end }}

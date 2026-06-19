@@ -23,6 +23,15 @@
 {{- printf "%s-kata-deploy" .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{/* int64 (fixes float64 -f values rendering as 7e+06) + reject non-ints so a
+   bad -f can't fall open to UID 0. */}}
+{{- define "c8s.int" -}}
+{{- if and (not (kindIs "int" .)) (not (kindIs "float64" .)) (not (regexMatch "^-?[0-9]+$" (toString .))) -}}
+{{- fail (printf "expected an integer, got %q" (toString .)) -}}
+{{- end -}}
+{{- int64 . -}}
+{{- end -}}
+
 {{/*
   Image refs prefer digest when set — floating tags silently drift the
   binary running inside the TEE and invalidate the measurement allowlist.
@@ -248,8 +257,8 @@ runAsUser, runAsGroup, runAsNonRoot.
 allowPrivilegeEscalation: false
 readOnlyRootFilesystem: true
 runAsNonRoot: {{ .runAsNonRoot }}
-runAsUser: {{ .runAsUser }}
-runAsGroup: {{ .runAsGroup }}
+runAsUser: {{ include "c8s.int" .runAsUser }}
+runAsGroup: {{ include "c8s.int" .runAsGroup }}
 capabilities:
   drop:
     - ALL

@@ -348,7 +348,7 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 		// override an operator's -f is preserved by ordering: the computed file
 		// is the LAST -f, so it wins on the keys it sets (matching the previous
 		// "--set beats -f" precedence) while the operator's files supply the rest.
-		setArgs, err := buildValueArgs(cmd.Context(), cmd, components, imageTag, distro)
+		setArgs, err := buildValueArgs(cmd.Context(), cmd, components, imageTag, distro, appendResolvedDigestArgs)
 		if err != nil {
 			return err
 		}
@@ -357,22 +357,7 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 			return err
 		}
 		defer os.Remove(computedValues)
-		helmArgs := []string{
-			"upgrade", "--install", installRelease, chartPath,
-			"--namespace", installNamespace,
-		}
-		if !installCRDs {
-			// helm-invocation flag, not a value: skip applying the chart's crds/
-			// dir (appendInstallCRDArgs emits the matching statusMirror value).
-			helmArgs = append(helmArgs, "--skip-crds")
-		}
-		for _, vf := range installValues {
-			helmArgs = append(helmArgs, "-f", vf)
-		}
-		helmArgs = append(helmArgs, "-f", computedValues)
-		if installWait {
-			helmArgs = append(helmArgs, "--wait", "--timeout=5m")
-		}
+		helmArgs := buildInstallHelmArgs(chartPath, computedValues, installValues, installCRDs, installWait)
 
 		// Fail fast on the default path if the CDS node is unlabelled, before
 		// mutating the cluster. Skipped when -f is supplied: a custom values
@@ -486,6 +471,29 @@ func defaultInstallImageTag(buildVersion string) string {
 		return buildVersion
 	}
 	return fallbackImageTag
+}
+
+// buildInstallHelmArgs assembles the `helm upgrade --install` argv. Ordering is
+// load-bearing: the operator's -f files come first and the computed values file
+// LAST, so the CLI's computed values win on the keys they set (helm merges -f
+// last-wins) — matching the prior "--set beats -f" precedence. --skip-crds is a
+// helm invocation flag (not a value), emitted iff CRDs are skipped.
+func buildInstallHelmArgs(chartPath, computedValues string, valueFiles []string, installCRDs, wait bool) []string {
+	helmArgs := []string{
+		"upgrade", "--install", installRelease, chartPath,
+		"--namespace", installNamespace,
+	}
+	if !installCRDs {
+		helmArgs = append(helmArgs, "--skip-crds")
+	}
+	for _, vf := range valueFiles {
+		helmArgs = append(helmArgs, "-f", vf)
+	}
+	helmArgs = append(helmArgs, "-f", computedValues)
+	if wait {
+		helmArgs = append(helmArgs, "--wait", "--timeout=5m")
+	}
+	return helmArgs
 }
 
 // writeComputedValues turns the buildValueArgs --set/--set-string pairs into a

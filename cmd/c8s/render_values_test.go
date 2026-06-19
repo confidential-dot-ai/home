@@ -125,7 +125,7 @@ func TestBuildValueArgsOmitsDistroWhenUnset(t *testing.T) {
 	installResolveDigests = false
 	defer func() { installResolveDigests = prev }()
 
-	args, err := buildValueArgs(context.Background(), cmd, nil, "main", "")
+	args, err := buildValueArgs(context.Background(), cmd, nil, "main", "", appendResolvedDigestArgs)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestBuildValueArgsOmitsDistroWhenUnset(t *testing.T) {
 		t.Fatalf("unset distro should emit no distro keys, got %v", args)
 	}
 
-	args, err = buildValueArgs(context.Background(), cmd, nil, "main", "rke2")
+	args, err = buildValueArgs(context.Background(), cmd, nil, "main", "rke2", appendResolvedDigestArgs)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestBuildValueArgsKeepsNumericImageTagAString(t *testing.T) {
 
 	args, err := buildValueArgs(context.Background(), cmd,
 		[]c8sComponent{{valuePrefix: "cds.image", repository: "ghcr.io/x/cds"}},
-		"0640", "")
+		"0640", "", appendResolvedDigestArgs)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -172,27 +172,28 @@ func TestBuildValueArgsKeepsNumericImageTagAString(t *testing.T) {
 
 // When digests are resolved, the bundle must pin by digest only — emitting .tag
 // too is redundant and contradicts the chart's digest-XOR-tag convention (kata
-// helpers fail the render on both). resolveDigestArgs is stubbed to keep crane
-// off PATH.
+// helpers fail the render on both). The injected resolver mirrors the real
+// appendResolvedDigestArgs (repository + digest + deriveComponents) so the test
+// also confirms allowlist derivation survives to the tree, and keeps crane off
+// PATH.
 func TestBuildValueArgsOmitsTagWhenDigestsResolved(t *testing.T) {
 	cmd := &cobra.Command{}
 	cmd.Flags().String(flagCvmMode, "baremetal", "")
 
-	prevResolve := resolveDigestArgs
 	prevFlag := installResolveDigests
-	defer func() { resolveDigestArgs = prevResolve; installResolveDigests = prevFlag }()
+	defer func() { installResolveDigests = prevFlag }()
 	installResolveDigests = true
-	resolveDigestArgs = func(_ context.Context, args []string, _ string, comps []c8sComponent) ([]string, error) {
+	stubResolver := func(_ context.Context, args []string, _ string, comps []c8sComponent) ([]string, error) {
 		for _, c := range comps {
 			args = append(args, "--set-string", c.valuePrefix+".repository="+c.repository,
 				"--set-string", c.valuePrefix+".digest=sha256:abc")
 		}
-		return args, nil
+		return append(args, "--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true"), nil
 	}
 
 	got, err := buildValueArgs(context.Background(), cmd,
 		[]c8sComponent{{valuePrefix: "cds.image", repository: "ghcr.io/x/cds"}},
-		"main", "")
+		"main", "", stubResolver)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -206,6 +207,9 @@ func TestBuildValueArgsOmitsTagWhenDigestsResolved(t *testing.T) {
 	}
 	if img["digest"] != "sha256:abc" {
 		t.Errorf("digest: got %#v, want sha256:abc", img["digest"])
+	}
+	if got := tree["nriImagePolicy"].(map[string]any)["bootstrapAllowlist"].(map[string]any)["deriveComponents"]; got != true {
+		t.Errorf("deriveComponents: got %#v, want bool true", got)
 	}
 }
 
@@ -292,7 +296,7 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 	installCRDs, installSingleNode, installKata, installResolveDigests = false, true, true, false
 	installImagePullSecret, installCvmMode = "regcred", "aks"
 
-	args, err := buildValueArgs(context.Background(), cmd, nil, "main", "rke2")
+	args, err := buildValueArgs(context.Background(), cmd, nil, "main", "rke2", appendResolvedDigestArgs)
 	if err != nil {
 		t.Fatalf("buildValueArgs: %v", err)
 	}
