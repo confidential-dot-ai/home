@@ -31,7 +31,7 @@ Two TEEs, connected privately:
 1. **Your VM** runs in a TEE, an AMD SEV-SNP confidential virtual machine. Memory is hardware-encrypted. The cloud provider can't read it.
 2. **Inference** runs in a separate TEE. Prompts are encrypted in transit and during processing.
 
-The [verification CLI](https://github.com/lunal-dev/privateclaw-cli) is open source. Run it from your VM and confirm the properties yourself in seconds.
+The [verification CLI](https://github.com/confidential-dot-ai/privateclaw-cli) is open source. Run it from your VM and confirm the properties yourself in seconds.
 
 ## The Confidential stack underneath
 

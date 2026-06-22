@@ -78,7 +78,7 @@ export default function RootLayout({
                 </svg>
               </a>
               <a
-                href="https://github.com/lunal-dev"
+                href="https://github.com/confidential-dot-ai"
                 target="_blank"
                 rel="noopener noreferrer"
                 aria-label="GitHub"

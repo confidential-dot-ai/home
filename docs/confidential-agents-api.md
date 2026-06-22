@@ -123,7 +123,7 @@ Example output:
 [5/5] External Access Lockout       PASS  (FAIL on staging — debug SSH access intentional)
 ```
 
-The tool is open source: [github.com/lunal-dev/confidential-cvm-cli](https://github.com/lunal-dev/confidential-cvm-cli).
+The tool is open source: [github.com/confidential-dot-ai/confidential-cvm-cli](https://github.com/confidential-dot-ai/confidential-cvm-cli).
 
 #### 7. Delete the instance
 

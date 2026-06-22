@@ -58,19 +58,19 @@ Kettle is open source and installs via Cargo:
 
 ```bash
 # From GitHub Releases
-curl -LO https://github.com/lunal-dev/kettle/releases/latest/download/kettle
+curl -LO https://github.com/confidential-dot-ai/kettle/releases/latest/download/kettle
 
 # From source
-cargo install --git https://github.com/lunal-dev/kettle
+cargo install --git https://github.com/confidential-dot-ai/kettle
 
 # Inside a TEE (enables hardware attestation)
 apt-get install -y libtss2-dev
-cargo install --features attest --git https://github.com/lunal-dev/kettle
+cargo install --features attest --git https://github.com/confidential-dot-ai/kettle
 ```
 
 Rust, Nix, JavaScript, and TypeScript (via pnpm) projects are supported today. Python and Go support is coming.
 
-Full documentation, architecture, and threat model: [github.com/lunal-dev/kettle](https://github.com/lunal-dev/kettle)
+Full documentation, architecture, and threat model: [github.com/confidential-dot-ai/kettle](https://github.com/confidential-dot-ai/kettle)
 
 ---
 

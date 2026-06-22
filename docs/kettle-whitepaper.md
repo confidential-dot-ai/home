@@ -725,7 +725,7 @@ In the attested model, the trust surface contracts to the TEE hardware vendor, t
 
 ### 7.3 Kettle
 
-[Kettle](https://github.com/lunal-dev/kettle) is an open-source implementation of attested builds [10]. By committing the SHA-256 digest of each build's provenance document into the TEE attestation report and recording every input, output, and environment measurement in an in-toto Statement carrying an SLSA Provenance v1.2 predicate, Kettle provides supply-chain assertions of comparable strength to bit-for-bit reproducible builds without requiring deterministic compilation.
+[Kettle](https://github.com/confidential-dot-ai/kettle) is an open-source implementation of attested builds [10]. By committing the SHA-256 digest of each build's provenance document into the TEE attestation report and recording every input, output, and environment measurement in an in-toto Statement carrying an SLSA Provenance v1.2 predicate, Kettle provides supply-chain assertions of comparable strength to bit-for-bit reproducible builds without requiring deterministic compilation.
 
 Kettle releases are themselves fully reproducible, built on top of the Stage<sup>x</sup> deterministic toolchain [9] and published into the project repository. Any release of Kettle can be independently verified by cloning the repo and executing the reproducible build script, creating a new binary with the same checksum.
 
@@ -751,4 +751,4 @@ Kettle releases are themselves fully reproducible, built on top of the Stage<sup
 
 [9]: Stage<sup>x</sup>. *A container-native, full-source bootstrapped, reproducible toolchain*. https://stagex.tools, source at https://codeberg.org/stagex/stagex.
 
-[10]: Lunal Dev. *Kettle: attested builds for verifiable software provenance*. https://github.com/lunal-dev/kettle.
+[10]: Lunal Dev. *Kettle: attested builds for verifiable software provenance*. https://github.com/confidential-dot-ai/kettle.

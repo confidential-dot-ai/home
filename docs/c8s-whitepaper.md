@@ -1404,7 +1404,7 @@ Each of these sits on top of the architecture described here rather than changin
 
 [3] NVIDIA. *NVIDIA Confidential Computing*. NVIDIA Technical Brief, 2023.
 
-[4] confidential.ai. *TEE Performance on CPUs*. https://github.com/lunal-dev/home/blob/main/blog/tee-performance-cpus.md, 2025.
+[4] confidential.ai. *TEE Performance on CPUs*. https://github.com/confidential-dot-ai/home/blob/main/blog/tee-performance-cpus.md, 2025.
 
 [5] W. Kwon, Z. Li, S. Zhuang, et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." *Proceedings of the 29th Symposium on Operating Systems Principles (SOSP)*, 2023.
 
