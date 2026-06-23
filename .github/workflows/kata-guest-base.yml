@@ -87,18 +87,28 @@ jobs:
   build:
     name: Build kata-guest-base
     # workflow_run fires for every Docker completion — including its PR runs,
-    # which don't publish. Gate the AUTOMATIC path to "Docker succeeded on a
-    # push to main or a release tag (v*)": those are the only refs we publish
-    # a kata-guest-base image for, so a side-branch push never triggers the
+    # which don't publish. Gate the AUTOMATIC path to "Docker succeeded on main
+    # or a release tag (v*)": those are the only refs we publish a
+    # kata-guest-base image for, so a side-branch push never triggers the
     # ~45-min build or pushes a branch-* tag (head_branch is the source ref of
     # the triggering Docker event — "main", the tag name, or a branch name).
-    # workflow_dispatch stays the manual-rebuild escape hatch and always runs
-    # — it can still be invoked on a side branch on purpose, and that path
-    # does publish a branch-* tag (see Compute tags).
+    #
+    # Accept BOTH origins of that Docker run: a push (the normal merge-to-main
+    # path) and a workflow_dispatch (the manual rebuild — e.g. re-baking a
+    # rotated READ_PRIVATE_GHCR_TOKEN into the measured rootfs without a source
+    # change). A dispatched Docker run on main publishes every component at this
+    # commit's :<short-sha> just like a push does, so cascading off it produces
+    # a correct measured image; the head_branch == main / v* guard still keeps a
+    # dispatched side-branch Docker run from auto-triggering this build.
+    #
+    # This workflow's OWN workflow_dispatch stays the manual-rebuild escape
+    # hatch and always runs — it can be invoked on a side branch on purpose, and
+    # that path does publish a branch-* tag (see Compute tags).
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
+       (github.event.workflow_run.event == 'push' ||
+        github.event.workflow_run.event == 'workflow_dispatch') &&
        (github.event.workflow_run.head_branch == 'main' ||
         startsWith(github.event.workflow_run.head_branch, 'v')))
     # Self-hosted runner (the SEV-SNP build host) rather than a GitHub-hosted

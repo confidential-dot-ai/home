@@ -26,6 +26,18 @@ on:
   pull_request:
     branches: [main]
     paths: *docker-paths
+  # Manual rebuild escape hatch. The push trigger above is path-gated to source
+  # changes, so a rebuild driven by something OFF the source tree — a rotated
+  # secret baked into a downstream image (e.g. READ_PRIVATE_GHCR_TOKEN, which
+  # the Kata guest base bakes into the measured rootfs), a base-image refresh,
+  # or a registry re-push — has no commit that would trip the paths filter and
+  # cannot otherwise run. workflow_dispatch publishes EVERY component image at
+  # this commit's tags (the matrix fans out to all of them — see
+  # docker-build-matrix.sh), exactly as a tag push does, so the downstream
+  # "Kata guest base" workflow can resolve every component's :<short-sha> and
+  # cascade off this run (its workflow_run gate accepts a workflow_dispatch
+  # origin on main / v* — see kata-guest-base.yml).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -56,7 +68,8 @@ jobs:
     # redundant same-repo PR copy; still run for PRs opened from forks, which
     # can't push to this repo and so have no push run to cover them. The
     # dependent jobs (needs: changes) cascade-skip when this one is skipped.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    # workflow_dispatch always runs (manual rebuild of every component).
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.docker-matrix.outputs.matrix }}
@@ -69,8 +82,15 @@ jobs:
       has_retag: ${{ steps.docker-matrix.outputs.has_retag }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # Skip on workflow_dispatch: a manual run has no before/after diff base for
+      # paths-filter to compute against, and we fan out to every component anyway
+      # (docker-build-matrix.sh treats workflow_dispatch like a tag push). With
+      # this step skipped its outputs read empty downstream, which the matrix
+      # script correctly sees as "no per-component filter" before falling through
+      # to the fan-out.
       - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
         id: filter
+        if: github.event_name != 'workflow_dispatch'
         with:
           predicate-quantifier: every
           filters: |
@@ -142,7 +162,7 @@ jobs:
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Log in to GHCR
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -167,8 +187,11 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          push: ${{ github.event_name == 'push' }}
-          load: ${{ !(github.event_name == 'push') }}
+          # Publish on push AND on workflow_dispatch (the manual rebuild path —
+          # its whole purpose is to re-publish these images so the Kata guest
+          # base can resolve them). PR runs still only `load` for the scan.
+          push: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+          load: ${{ !(github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
           # Apply ALL computed tags, not just tags[0]. metadata-action emits
           # `type=sha,prefix=` (the 7-char short SHA), and the "Kata guest base"
           # build resolves cds/get-cert by that short SHA (IMAGE_TAG=${HEAD_SHA::7})
