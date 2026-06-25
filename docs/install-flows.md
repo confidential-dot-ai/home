@@ -309,6 +309,17 @@ and distinct from the operator's Service selector) and tolerates all taints so
 a single kata-tainted node cannot strand it. kata-deploy separately runs
 `kata-deploy cleanup` on `preStop` to unwind the host runtime install.
 
+**`c8s uninstall`** wraps the helm step and adds the kata host sweep the
+preStop hook cannot guarantee: after the release is gone, a short-lived
+privileged DaemonSet removes whatever survived on each node — `/opt/kata`, the
+containerd runtime drop-in (restarting the runtime only if it was still
+registered), the pulled kata-guest-base artifact, the RKE2 containerd-prep
+template — plus the `katacontainers.io/kata-runtime` node labels. It refuses
+to run under live kata pods (`--force` overrides), reads the release values
+before deletion so install-time `-f` overrides are honored, and
+`--host-sweep-only` recovers a cluster whose release a bare `helm uninstall`
+already deleted. See [`kata.md`](kata.md#uninstalling).
+
 ---
 
 ## Quick reference
@@ -329,6 +340,9 @@ c8s install --kata
 # The puller + node-taint are on by default; switch them off via a values file:
 #   kata: {guestImage: {enabled: false}, nodeTaint: {enabled: false}}
 c8s install --kata -f single-node.values.yaml
+
+# Uninstall: helm uninstall + sweep the kata artifacts off every node.
+c8s uninstall
 ```
 
 For the deeper "why" behind any of the kata pieces, follow the cross-links at

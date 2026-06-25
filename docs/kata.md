@@ -435,11 +435,35 @@ boundary is the per-pod SEV-SNP attestation of each `kata-qemu-snp` pod.
 
 ## Uninstalling
 
-`helm uninstall` (or removing `kata.enabled`) deletes the kata-deploy
-DaemonSet. Its `preStop` hook runs `kata-deploy cleanup`, which removes
-`/opt/kata`, the containerd drop-in, and restarts the runtime — Kata is
-removed from each node cleanly. The RuntimeClass objects and the
-enforcement policy are deleted with the release.
+`c8s uninstall` wraps `helm uninstall` and then sweeps the host-side kata
+artifacts off every node. The helm step deletes the kata-deploy DaemonSet,
+whose `preStop` hook runs `kata-deploy cleanup` (removes `/opt/kata`,
+deregisters the containerd drop-in, restarts the runtime, unlabels the
+node) — but that hook is best-effort: it is bounded by the pod's termination
+grace period, the runtime restart it triggers can kill the pod mid-cleanup,
+and it knows nothing about the c8s-side artifacts. The sweep is the
+idempotent last word. It reads the release's computed values before the
+release is deleted (so install-time `-f` overrides are honored), then runs a
+short-lived privileged DaemonSet (the same digest-pinned busybox image as the
+containerd-prep initContainer) on the nodes kata-deploy targeted, removing:
+
+- `/opt/kata` and the `containerd-shim-kata-*` symlinks, if the preStop
+  cleanup was cut short — restarting containerd/RKE2 only when the runtime
+  drop-in was still registered;
+- the pulled kata-guest-base artifact (`kata.guestImage.hostPath`,
+  multi-GB) — nothing else cleans this up;
+- on RKE2, the sentinel-marked containerd template the containerd-prep
+  initContainer wrote, and its lock file;
+- the `katacontainers.io/kata-runtime` node labels (via kubectl).
+
+The RuntimeClass objects and the enforcement policy are deleted with the
+release. The uninstall refuses to run while pods with a kata RuntimeClass
+are still running (`--force` overrides). If the release is already gone but
+the hosts are dirty — e.g. a previous bare `helm uninstall` — run
+`c8s uninstall --host-sweep-only`.
+
+A bare `helm uninstall` (or removing `kata.enabled`) still works: you keep
+the preStop-hook cleanup, but none of the sweep guarantees above.
 
 ## Future work
 

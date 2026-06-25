@@ -47,5 +47,9 @@ Expected injected pieces:
 ```sh
 kubectl delete -f samples/nginx-confidential-pod.yaml
 kubectl delete -f samples/confidentialworkload.yaml
-helm uninstall c8s -n c8s-system
+c8s uninstall
 ```
+
+`c8s uninstall` wraps `helm uninstall c8s -n c8s-system`; on a `--kata`
+install it also sweeps the kata runtime artifacts off the nodes (see
+[`kata.md`](kata.md#uninstalling)).
