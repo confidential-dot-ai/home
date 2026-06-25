@@ -1088,6 +1088,28 @@ tlsLb:
     #    SIGHUPs nginx. Must be shorter than the cert TTL issued by CDS.
     renewInterval: "1h"
 
+  # -- Attestation + over-encryption sidecar (c8s-verify/v1). When enabled, an
+  # in-pod `c8s cds-attest` container serves the *dynamic* browser-facing
+  # endpoints (the per-session attestation challenge and the post-quantum
+  # over-encryption handshake) and nginx reverse-proxies `/.well-known/c8s/` to
+  # it on loopback. The static CDS/mesh-CA certs are still served by nginx via
+  # `discovery`. The browser client is lunal-dev/c8s-verify-js (wire contract:
+  # c8s-verify-js/PROTOCOL.md). Defaults off; pin measurements before exposing.
+  attest:
+    enabled: false
+    # -- Loopback port the sidecar listens on; nginx proxies `/.well-known/c8s/`
+    # to 127.0.0.1 on this port.
+    port: 8800
+    # -- TEE platform and AMD processor generation advertised to the browser
+    # WASM verifier.
+    platform: snp
+    generation: genoa
+    # -- Attestation-api URL the sidecar binds session keys against. Empty
+    # defaults to this chart's attestation-api.
+    attestationApiURL: ""
+    # -- Container resource requests/limits for the sidecar.
+    resources: {}
+
   nginx:
     image:
       repository: nginxinc/nginx-unprivileged

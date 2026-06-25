@@ -1524,6 +1524,75 @@ func TestChartTLSLBServiceType(t *testing.T) {
 	}
 }
 
+func TestChartRendersTLSLBAttestSidecar(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set", "tlsLb.attest.enabled=true",
+		"--set", "tlsLb.attest.port=8800",
+		"--set-string", "tlsLb.attest.generation=milan",
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+
+	// The cds-attest sidecar runs the operator multi-mode image with the
+	// cds-attest subcommand, bound to loopback for nginx to proxy to.
+	deployment := renderedDeployment(t, out, "c8s-tls-lb")
+	sidecar := renderedDeploymentContainer(t, out, "c8s-tls-lb", "cds-attest")
+	if len(sidecar.Args) == 0 || sidecar.Args[0] != "cds-attest" {
+		t.Fatalf("cds-attest args = %v, want first arg 'cds-attest'", sidecar.Args)
+	}
+	joined := strings.Join(sidecar.Args, " ")
+	for _, want := range []string{
+		"--host=127.0.0.1",
+		"--port=8800",
+		"--generation=milan",
+		"--attestation-api-url=http://",
+		// The default upstream is the mutual attested TLS tee-proxy hop (#156):
+		// the sidecar presents the CDS client cert and trusts tee-proxy via the
+		// CDS CA chain get-cert writes to /tls/cert.pem (#158), not the mesh CA.
+		"--upstream=https://c8s-tee-proxy:443",
+		"--upstream-ca=/tls/cert.pem",
+		"--upstream-cert=/tls/cert.pem",
+		"--upstream-key=/tls/key.pem",
+		"--upstream-server-name=c8s-tee-proxy.c8s-system.svc",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("cds-attest args missing %q: %v", want, sidecar.Args)
+		}
+	}
+	// --cds-cert-file must NOT be set: nginx serves /.well-known/c8s/cds-cert.pem
+	// statically (hot-reloaded), while the sidecar would embed a stale copy.
+	if strings.Contains(joined, "--cds-cert-file") {
+		t.Fatalf("cds-attest must not set --cds-cert-file (nginx serves it statically): %v", sidecar.Args)
+	}
+	// The sidecar must not mount the mesh-CA for the default cert.pem trust path.
+	if _, ok := containerVolumeMount(sidecar, "mesh-ca"); ok {
+		t.Fatalf("cds-attest should not mount mesh-ca with the default /tls/cert.pem trust; mounts=%v", sidecar.VolumeMounts)
+	}
+	if got := len(deployment.Spec.Template.Spec.Containers); got != 2 {
+		t.Fatalf("tls-lb should have nginx + cds-attest, got %d containers", got)
+	}
+
+	// nginx reverse-proxies the dynamic well-known prefix to the sidecar.
+	for _, want := range []string{
+		"location /.well-known/c8s/ {",
+		"proxy_pass http://127.0.0.1:8800;",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("nginx config missing %q\n%s", want, out)
+		}
+	}
+
+	// Default off: no sidecar, no well-known proxy.
+	offOut, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template (defaults): %v\n%s", err, offOut)
+	}
+	if strings.Contains(offOut, "name: cds-attest") || strings.Contains(offOut, "location /.well-known/c8s/ {") {
+		t.Fatal("cds-attest sidecar should not render when tlsLb.attest.enabled is false")
+	}
+}
+
 func TestChartRendersTeeProxyStaticTLSSecret(t *testing.T) {
 	out, err := helmTemplate(t,
 		// The static-secret TLS mode is the non-default alternative to

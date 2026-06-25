@@ -11,6 +11,7 @@ The current milestone enforces these gates:
 | Image digest is allowed | nri-image-policy | CDS-served allowlist |
 | Mesh peer cert chains to the mesh CA | ratls-mesh | mesh CA bundle |
 | Workload is injection candidate | admission webhook | pod annotation `confidential.ai/cw` |
+| LB attestation + session key are TEE-bound | `c8s cds-attest` sidecar | SNP report `report_data = SHA-384(session_pubkey \|\| nonce)` |
 
 CRDs are not security inputs. `ConfidentialWorkload` is an operator UX/status
 surface. A workload can be injected without a CR.
@@ -131,3 +132,37 @@ freely.
 - Measurement pinning in peer certificate verification.
 - Attestation-gated application secret release.
 - Multi-tenant isolation and federated multi-cluster control planes.
+
+## Browser / out-of-cluster verification (c8s-verify)
+
+The `c8s cds-attest` sidecar (proxied by the tls-lb nginx front-end) exposes a browser-facing surface over plain HTTPS so an
+out-of-cluster client (the `c8s-verify-js` library, or `TEErminator`) can verify
+the Load Balancer and open a post-quantum over-encrypted channel to its enclave.
+The wire contract is `c8s-verify-js/PROTOCOL.md`.
+
+- `GET /.well-known/c8s/cds-cert.pem` — the mesh CA / LB cert chain. Served
+  **unauthenticated by design** (same reasoning as in-cluster `GET /ca`): the
+  client MUST chain it through attested evidence before trusting it, never on the
+  strength of the TLS connection it arrived over.
+- `GET /.well-known/c8s/attestation?nonce=` — raw SEV-SNP evidence whose
+  `report_data = SHA-384(x25519 || mlkem768 || nonce)` binds the per-session
+  over-encryption key and the client nonce. The client verifies the hardware
+  signature, the launch measurement against its pinned allowlist, and this
+  binding before deriving the channel.
+- `POST /.well-known/c8s/handshake` + over-encrypted application records —
+  X25519 + ML-KEM-768 → HKDF-SHA256 → AES-256-GCM (`pkg/overenc`). The channel
+  terminates inside the LB CVM, so a TLS-terminating proxy in front of the LB
+  cannot read or forge application traffic even though it terminates the outer
+  TLS.
+
+The tls-lb nginx serves the static `cds-cert.pem`/`mesh-ca.pem` and reverse-proxies the dynamic `/.well-known/c8s/` paths to the sidecar on loopback.
+
+Trust is transitive from this point: the user verifies only the LB (and, through
+the served cert, the mesh CA); the in-cluster RA-TLS mesh vouches for the backend
+pods the LB talks to.
+
+The sidecar's `--evidence-fixture` flag serves recorded evidence for demos/tests and is
+**DEV ONLY**: its `report_data` is fixed and does not bind a live session key, so
+clients must run with freshness enforcement downgraded. Production uses
+`--attestation-api-url`, where each session gets a fresh report bound to its
+key and nonce.

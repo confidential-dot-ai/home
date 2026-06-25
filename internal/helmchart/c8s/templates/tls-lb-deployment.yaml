@@ -1,4 +1,8 @@
 {{- if .Values.tlsLb.enabled }}
+{{- $defaultMeshCAPath := printf "%s/ca.pem" .Values.tlsLb.tlsMountPath -}}
+{{- $upstreamTrustedCAPath := default $defaultMeshCAPath .Values.tlsLb.upstream.tls.trustedCAPath -}}
+{{- $attestUsesHTTPSUpstream := and .Values.tlsLb.attest.enabled (eq .Values.tlsLb.upstream.protocol "https") -}}
+{{- $attestUpstreamServerName := default (include "tls-lb.upstreamServerName" .) .Values.tlsLb.upstream.tls.serverName -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -111,6 +115,68 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+        {{- if .Values.tlsLb.attest.enabled }}
+        - name: cds-attest
+          image: {{ include "c8s.image" . }}
+          imagePullPolicy: {{ default "IfNotPresent" .Values.image.pullPolicy }}
+          args:
+            - cds-attest
+            - --host=127.0.0.1
+            - --port={{ .Values.tlsLb.attest.port }}
+            - --platform={{ .Values.tlsLb.attest.platform }}
+            - --generation={{ .Values.tlsLb.attest.generation }}
+            - --attestation-api-url={{ default (include "c8s.attestationApiURL" .) .Values.tlsLb.attest.attestationApiURL }}
+            # Bind the *exact* leaf nginx presents on the wire (ssl_certificate =
+            # publicCertPath), so the tls-cert attestation binding (GET
+            # .../attestation?pq=false) commits report_data to the SPKI a direct-TLS
+            # client (e.g. TEErminator Flow B) actually sees. With the default
+            # (publicTLS unset) this is the mesh leaf at tlsMountPath/cert.pem; with a
+            # publicTLS secret it is that cert (mounted below). Re-read per request, so
+            # get-cert renewals are picked up.
+            - --serving-cert-file={{ include "tls-lb.publicCertPath" . }}
+            # --cds-cert-file is intentionally NOT set: nginx serves the same cert
+            # statically at /.well-known/c8s/cds-cert.pem from the shared cert volume
+            # and hot-reloads it on get-cert renewal (SIGHUP), whereas cds-attest
+            # would read it once at startup and embed a stale copy in every bundle.
+            # The cds_cert_pem is not bound to the attestation (report_data binds the
+            # session key), so the client pins the mesh CA out of band instead.
+            # Terminate over-encryption here and forward to the same tee-proxy
+            # backend nginx proxies to, over the same mutual attested TLS hop
+            # (CDS client cert + verify against the CDS CA chain). c8s-system is
+            # excluded as a mesh source, so this hop is secured at the app layer
+            # rather than by the raTLS mesh.
+            - --upstream={{ .Values.tlsLb.upstream.protocol }}://{{ .Values.tlsLb.upstream.address }}
+            {{- if $attestUsesHTTPSUpstream }}
+            - --upstream-ca={{ $upstreamTrustedCAPath }}
+            {{- if .Values.tlsLb.upstream.tls.useCDSClientCert }}
+            - --upstream-cert={{ .Values.tlsLb.tlsMountPath }}/cert.pem
+            - --upstream-key={{ .Values.tlsLb.tlsMountPath }}/key.pem
+            {{- end }}
+            - --upstream-server-name={{ $attestUpstreamServerName }}
+            {{- end }}
+          volumeMounts:
+            - name: tls-certs
+              mountPath: {{ .Values.tlsLb.tlsMountPath }}
+              readOnly: true
+            {{- if .Values.tlsLb.publicTLS.secretName }}
+            # cds-attest reads the same public leaf nginx serves (for the tls-cert
+            # binding's --serving-cert-file).
+            - name: public-tls
+              mountPath: {{ .Values.tlsLb.publicTLS.mountPath }}
+              readOnly: true
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          {{- with .Values.tlsLb.attest.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
       volumes:
         - name: tls-certs
           emptyDir:
