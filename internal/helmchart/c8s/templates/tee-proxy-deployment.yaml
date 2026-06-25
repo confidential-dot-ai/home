@@ -6,6 +6,11 @@
 {{- $certProvision := .Values.teeProxy.certProvisioning.enabled -}}
 {{- $tlsDir := .Values.teeProxy.tls.mountPath -}}
 {{- $useTLSDir := or .Values.teeProxy.tls.enabled $certProvision -}}
+{{- /* Autocert cache dir. Only used in --host autocert mode (the else of
+  $useTLSDir): tee-proxy serves Let's Encrypt and persists the issued certs +
+  ACME account key here. Backed by an in-memory tmpfs (see volumes) so this
+  tenant-adjacent key material never lands on host storage outside the TEE. */ -}}
+{{- $certCacheDir := "/tmp/certs" -}}
 {{- $tlsMode := or $useTLSDir (ne .Values.teeProxy.domain "") -}}
 {{- $probePort := ternary .Values.teeProxy.ports.https .Values.teeProxy.ports.http $tlsMode -}}
 apiVersion: apps/v1
@@ -91,6 +96,9 @@ spec:
             {{- if $useTLSDir }}
             - --tls-dir
             - {{ $tlsDir | quote }}
+            {{- else }}
+            - --cert-cache-dir
+            - {{ $certCacheDir | quote }}
             {{- end }}
           ports:
             - name: https
@@ -106,9 +114,6 @@ spec:
               {{- end }}
               protocol: TCP
           workingDir: /tmp
-          env:
-            - name: AUTOCERT_DIR
-              value: /app/certs
           securityContext:
             runAsNonRoot: true
             runAsUser: 65534
@@ -118,8 +123,10 @@ spec:
               drop:
                 - ALL
           volumeMounts:
+            {{- if not $useTLSDir }}
             - name: autocert-cache
-              mountPath: /app/certs
+              mountPath: {{ $certCacheDir }}
+            {{- end }}
             {{- if $certProvision }}
             - name: tls-certs
               mountPath: {{ $tlsDir }}
@@ -175,9 +182,19 @@ spec:
             periodSeconds: {{ .Values.teeProxy.probes.liveness.periodSeconds }}
           {{- end }}
       volumes:
+        {{- if not $useTLSDir }}
+        # In-memory only: autocert's ACME account key and issued cert/key
+        # bundles are tenant-adjacent secrets and must never land on host-backed
+        # storage outside the TEE. medium: Memory is also load-bearing under
+        # kata-qemu-snp (shared_fs="none"), where a disk-backed emptyDir fails
+        # the guest's CDH secure mount while a tmpfs one is mounted directly by
+        # the guest kernel (see tls-lb's nginx-cache). An ACME account key plus a
+        # few host cert/key bundles is ~tens of KB; 1Mi is ample headroom.
         - name: autocert-cache
-          persistentVolumeClaim:
-            claimName: {{ include "tee-proxy.fullname" . }}-certs
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        {{- end }}
         {{- if $certProvision }}
         - name: tls-certs
           emptyDir:

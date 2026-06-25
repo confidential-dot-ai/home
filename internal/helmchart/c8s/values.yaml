@@ -864,9 +864,12 @@ teeProxy:
     pullPolicy: IfNotPresent
   imagePullSecrets: []
   replicas: 1
-  ## Rollout strategy. Recreate, not surge: tee-proxy mounts a RWO autocert
-  ## PVC, so two concurrent pods would deadlock on Multi-Attach. get-cert's
-  ## in-process retry covers the brief gap while the single pod restarts.
+  ## Rollout strategy. Recreate, not surge: tee-proxy binds the node's host
+  ## ports (hostPort 80/443 by default), so two concurrent pods on a node would
+  ## collide on the port; and its autocert cache is now a per-pod in-memory
+  ## volume rather than shared storage, so a surge pod would re-provision rather
+  ## than share. get-cert's in-process retry covers the brief gap while the
+  ## single pod restarts.
   strategy:
     type: Recreate
   # Domain for autocert TLS
@@ -930,10 +933,6 @@ teeProxy:
     limits:
       cpu: 500m
       memory: 128Mi
-  # Autocert PVC
-  persistence:
-    storageClass: ""
-    size: 1Gi
   # Probe timings
   probes:
     readiness:

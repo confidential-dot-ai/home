@@ -1555,6 +1555,50 @@ func TestChartRendersTeeProxyStaticTLSSecret(t *testing.T) {
 	}
 }
 
+// TestChartTeeProxyAutocertCacheIsInMemory pins the --host autocert TLS mode:
+// tee-proxy's Let's Encrypt cache (ACME account key + issued certs) is located
+// via --cert-cache-dir and backed by an in-memory tmpfs, never a host-backed
+// volume, so the key material stays inside the TEE. The default certProvisioning
+// shape uses --tls-dir and renders no autocert-cache volume at all.
+func TestChartTeeProxyAutocertCacheIsInMemory(t *testing.T) {
+	// Autocert mode: a domain, with neither certProvisioning nor a static
+	// secret. The domain alone satisfies the HTTPS-listener validation.
+	out, err := helmTemplate(t,
+		"--set", "teeProxy.certProvisioning.enabled=false",
+		"--set-string", "teeProxy.domain=proxy.example.com",
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"- --cert-cache-dir",
+		"- \"/tmp/certs\"",
+		"name: autocert-cache",
+		"mountPath: /tmp/certs",
+		"medium: Memory",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("autocert render missing %q\n%s", want, out)
+		}
+	}
+	// Must not regress to the removed host-backed certs PVC.
+	if strings.Contains(out, "c8s-tee-proxy-certs") {
+		t.Errorf("autocert mode must not render the removed tee-proxy certs PVC\n%s", out)
+	}
+
+	// Default shape (certProvisioning on): --tls-dir, and no autocert-cache.
+	base, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template (default): %v\n%s", err, base)
+	}
+	if strings.Contains(base, "name: autocert-cache") {
+		t.Errorf("default shape should not render the autocert-cache volume\n%s", base)
+	}
+	if strings.Contains(base, "--cert-cache-dir") {
+		t.Errorf("default shape should use --tls-dir, not --cert-cache-dir\n%s", base)
+	}
+}
+
 func TestTLSLBCertProvisioningValuesDriveGetCertContainers(t *testing.T) {
 	out, err := helmTemplate(t,
 		"--set-string", "tlsLb.certProvisioning.renewInterval=30m",
@@ -3270,11 +3314,11 @@ func TestChartCDSDnsSanPatternsAppendPublicHostname(t *testing.T) {
 }
 
 // TestChartCertDependentPodStrategies pins each cert-dependent pod's rollout
-// strategy to its storage constraint: tls-lb has no PVC so it surges (new
+// strategy to its constraint: tls-lb has no host-port binding so it surges (new
 // cert-holding pod Ready before the old one retires, no serving gap), while
-// tee-proxy mounts a RWO autocert PVC and must stay Recreate — surge would
-// deadlock two pods on Multi-Attach. get-cert's in-process retry covers
-// tee-proxy's brief restart gap.
+// tee-proxy binds the node's host ports (80/443) and must stay Recreate — a
+// surge would collide two pods on the host port. get-cert's in-process retry
+// covers tee-proxy's brief restart gap.
 func TestChartCertDependentPodStrategies(t *testing.T) {
 	out, err := helmTemplate(t)
 	if err != nil {
@@ -3292,10 +3336,10 @@ func TestChartCertDependentPodStrategies(t *testing.T) {
 		t.Errorf("c8s-tls-lb should surge (maxSurge=1, maxUnavailable=0), got %+v", ru)
 	}
 
-	// tee-proxy: Recreate, because of its RWO autocert PVC.
+	// tee-proxy: Recreate, because it binds the node's host ports.
 	teeProxy := renderedDeployment(t, out, "c8s-tee-proxy")
 	if teeProxy.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
-		t.Errorf("c8s-tee-proxy strategy = %q, want Recreate (RWO autocert PVC forbids two concurrent pods)", teeProxy.Spec.Strategy.Type)
+		t.Errorf("c8s-tee-proxy strategy = %q, want Recreate (host-port binding forbids two concurrent pods on a node)", teeProxy.Spec.Strategy.Type)
 	}
 }
 
