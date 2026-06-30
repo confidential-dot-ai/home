@@ -10,7 +10,7 @@ Data and weights stay private and untamperable while being processed.
 
 * **Private inference.** Guarantee data privacy during inference. Customer prompts, responses, and model interactions are never visible.
 * **Confidential Agents.** Agents run inside TEEs with hardware-enforced credential isolation. Tokens and API keys never exist in plaintext outside a TEE.
-* **Weight protection.** Protect proprietary weights from extraction during inference or fine-tuning. Weights never leave hardware-enforced secure enclaves unencrypted.
+* **Model weight protection.** Protect proprietary model weights during inference, training, and fine-tuning. Weights never leave hardware-encrypted enclaves.
 * **Private training.** Train on sensitive data and cryptographically prove exactly what data was used.
 
 ## Get Started

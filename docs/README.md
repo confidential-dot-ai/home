@@ -19,7 +19,6 @@ New to confidential computing at large? Start with the [Confidential Computing P
 - **[Introduction to TEEs](intro-to-tees.md)**: A high-level introduction to Trusted Execution Environments: what they are, how they work, and their limitations.
 - **[Attestable Builds](attestable-builds/)**: Learn what attestable builds are, why they matter, and how TEEs make software verification possible.
 - **[Zero Knowledge](zk.md)**: Learn about zero-knowledge (ZK) proofs and their applications.
-- **[Confidential Agents API](confidential-agents-api/)**: Reference for the public REST API that provisions and manages confidential VM instances.
 
 ## Need Help?
 

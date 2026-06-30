@@ -12,14 +12,14 @@
 **Yolan Romailler**, Head of Security
 · [GitHub](https://github.com/AnomalRoil) · [LinkedIn](https://www.linkedin.com/in/anomalroil/)
 
-**André Arko**, Software Engineer
+**André Arko**, Member of Technical Staff
 · [GitHub](https://github.com/indirect) · [LinkedIn](https://www.linkedin.com/in/andrearko/)
 
-**Aamir Rasheed**, Software Engineer
+**Aamir Rasheed**, Member of Technical Staff
 · [GitHub](https://github.com/aamirrasheed) · [LinkedIn](https://www.linkedin.com/in/aamir1rasheed/)
 
-**João Sousa Andrade**, Software Engineer
+**João Sousa Andrade**, Member of Technical Staff
 · [GitHub](https://github.com/joaosa) · [LinkedIn](https://www.linkedin.com/in/thejoaosa/)
 
-**Patrick McClurg**, Software Engineer
+**Patrick McClurg**, Member of Technical Staff
 · [GitHub](https://github.com/CluEleSsUK) · [LinkedIn](https://www.linkedin.com/in/patrickmcclurg/)
