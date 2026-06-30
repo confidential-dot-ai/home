@@ -1,13 +1,13 @@
 # Products
 
-Private AI, built in layers from the hardware up. Prompts, weights, data, and agent state stay encrypted in memory while they run, and every result carries a cryptographic attestation of what ran and where.
+Confidential AI is a stack of licensed software for running private AI on your infrastructure. Prompts, weights, data, and agent state stay encrypted in memory while they run, and every result carries a cryptographic attestation of what ran and where.
 
-Run the whole stack yourself, take a single layer, or have us operate all of it as a service.
+The stack is built in layers. Confidential Metal and Confidential Kubernetes are the foundation; Confidential Inference and Confidential Agents are private AI workloads you run on top of them. License the pieces you need and run them on your own hardware or any major cloud. Confidential AI also runs all of these layers on the Confidential Cloud.
 
 ```
 ┌────────────────────────────────────────────────────────┐
 │     Confidential Inference  /  Confidential Agents     │
-│       private AI, operated for you as a service        │
+│            private AI you run on the stack             │
 ╞════════════════════════════════════════════════════════╡
 │             Confidential Kubernetes  (C8s)             │
 │        one CVM becomes a platform you can scale        │
@@ -60,7 +60,7 @@ One CVM is not a service. Confidential Kubernetes (C8s) turns it into a platform
 
 ## Confidential Inference
 
-Private AI without running any of it yourself. Swap one base URL for our OpenAI-compatible API; your prompts, responses, and the model weights stay encrypted in CVM memory, with an attestation on every response.
+Private inference you run on top of your own confidential stack. It serves open-weight models behind an OpenAI-compatible API as a drop-in replacement: switch one base URL and your prompts, responses, and the model weights stay encrypted in CVM memory, with an attestation on every response. Deploy it on Confidential Kubernetes and it inherits the guarantees of the layers beneath it.
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -82,26 +82,26 @@ Private AI without running any of it yourself. Swap one base URL for our OpenAI-
 
 ## Confidential Agents
 
-A private, isolated environment for your AI agent, ready over SSH in under 15 seconds, preloaded with an agent runtime and attested inference. The code, data, and keys inside are invisible to everyone but you, including us. Treat each one as disposable: spin it up for a task, run it, throw it away.
+Private, isolated environments for your AI agents, running on top of your confidential stack. Each agent runs in its own Confidential VM with hardware-encrypted memory, ready over SSH in seconds and preloaded with an agent runtime and attested inference. The code, data, and keys inside stay invisible to the infrastructure they run on. Treat each one as disposable: spin it up for a task, run it, throw it away.
 
 ```
 ┌────────────────────────────────────────────────┐
 │              You hold the SSH key              │
 └────────────────────────────────────────────────┘
-                        │  ssh, ready in <15s
+                        │  ssh
                         ▼
 ╔════════════════════════════════════════════════╗
 ║                   Agent CVM                    ║
 ║                                                ║
 ║       agent runtime + attested inference       ║
-║        code, data, keys invisible to us        ║
-║                                                ║
-║           disposable - one per task            ║
+║     code, data, keys invisible to the host     ║
 ╚════════════════════════════════════════════════╝
 ```
 
 ## How they fit together
 
-Confidential Metal produces trustworthy CVMs. Confidential Kubernetes turns them into a platform that can host and scale a real service. Confidential Inference and Confidential Agents are that platform, run for you. Operate it yourself from the metal up, or hand off any layer, the attestation guarantees are the same either way.
+Confidential Metal produces trustworthy CVMs. Confidential Kubernetes turns them into a platform that can host and scale a real service. Confidential Inference and Confidential Agents are the private AI workloads that run on top. License the whole stack and run it yourself, from the metal up, on your own hardware or any major cloud.
 
-To scope a deployment, [contact sales](mailto:hello@confidential.ai).
+## Or let us run it for you
+
+Confidential Inference and Confidential Agents are also available as a managed service on our own cloud: we operate the entire stack so you get private AI behind an API without running any of it yourself. See [Cloud](/cloud), or [contact sales](mailto:hello@confidential.ai) to scope a deployment.
