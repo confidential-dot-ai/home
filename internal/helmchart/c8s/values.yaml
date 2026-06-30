@@ -705,7 +705,12 @@ nriImagePolicy:
     ## verifies CDS RA-TLS instead of trusting cluster DNS or ClusterIP routing.
     url: "https://127.0.0.1:30808"
   policy:
-    mode: audit  # audit | fail-closed
+    # Secure by default: match the plugin binary's own default and reject images
+    # not on the allowlist. Set to `audit` only for bring-up — it logs would-be
+    # denials to journald and admits everything, so you can populate the
+    # allowlist and review the audit log before enforcing. Don't ship `audit` to
+    # production: a permissive default that only docs tell you to harden leaks.
+    mode: fail-closed  # fail-closed | audit
     enforceExisting: true
     denyMissingAnnotation: true
     exemptNamespaces:

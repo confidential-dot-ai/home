@@ -3043,6 +3043,10 @@ func hostPathVolume(t *testing.T, ds appsv1.DaemonSet, name string) string {
 	return ""
 }
 
+// baseNRIDigest is the nri-image-policy image digest the shared harness pins
+// and covers in the allowlist floor, so the default fail-closed render is valid.
+const baseNRIDigest = "sha256:aaaa000000000000000000000000000000000000000000000000000000000000"
+
 func helmTemplate(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 	if _, err := exec.LookPath("helm"); err != nil {
@@ -3061,7 +3065,15 @@ func helmTemplate(t *testing.T, args ...string) (string, error) {
 		"--set", "ratlsMesh.image.tag=dev",
 		"--set", "teeProxy.image.tag=dev",
 		"--set", "nriImagePolicy.image.tag=dev",
-		"--set", "nriImagePolicy.image.digest=sha256:aaaa000000000000000000000000000000000000000000000000000000000000",
+		"--set", "nriImagePolicy.image.digest=" + baseNRIDigest,
+		// The fail-closed default (this PR) activates the
+		// uncovered_component_digest guard: every digest-pinned component must be
+		// covered in the allowlist floor or the plugin would deny it on its own
+		// node. The nri installer also self-allows by digest, so the image must
+		// stay digest-pinned. Cover the base nri digest in the floor so the
+		// default render is a valid fail-closed config. Tests that exercise the
+		// guard pin a different, deliberately-uncovered digest.
+		"--set-string", "nriImagePolicy.bootstrapAllowlist.digests." + baseNRIDigest + "=ghcr.io/confidential-dot-ai/nri-image-policy@" + baseNRIDigest,
 		"--set", "cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001",
 	}
 	cmd := exec.Command("helm", append(base, args...)...)
@@ -3936,7 +3948,9 @@ func TestChartFleetAllowlistOverridesDerived(t *testing.T) {
 // deriveComponents is OFF by default (a demo convenience, like
 // --resolve-digests): the seed carries only the CDS push-hook self-entry and
 // operator-supplied digests, not the auto-derived component images. Covers both
-// the default (unset) and an explicit =false.
+// the default (unset) and an explicit =false. Rendered in audit mode so the
+// deliberately-uncovered operator digest exercises derivation, not the
+// fail-closed uncovered_component_digest guard.
 func TestChartDeriveComponentsDefaultsOff(t *testing.T) {
 	const opD = "sha256:00000000000000000000000000000000000000000000000000000000000000a1"
 	const cdsDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000001"
@@ -3944,8 +3958,8 @@ func TestChartDeriveComponentsDefaultsOff(t *testing.T) {
 		name string
 		args []string
 	}{
-		{"default unset", []string{"--set-string", "image.digest=" + opD}},
-		{"explicit false", []string{"--set-string", "image.digest=" + opD, "--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=false"}},
+		{"default unset", []string{"--set", "nriImagePolicy.policy.mode=audit", "--set-string", "image.digest=" + opD}},
+		{"explicit false", []string{"--set", "nriImagePolicy.policy.mode=audit", "--set-string", "image.digest=" + opD, "--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=false"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, err := helmTemplate(t, tc.args...)
@@ -4032,11 +4046,16 @@ func TestChartRejectsImagePolicyWithoutCDSDigest(t *testing.T) {
 // whose digest is absent from bootstrapAllowlist.digests would be denied on its
 // own node, so the chart fails the render. cds.image is exempt (always seeded).
 func TestChartRejectsUncoveredComponentInFailClosed(t *testing.T) {
-	const nriD = "sha256:aaaa000000000000000000000000000000000000000000000000000000000000"
+	// A digest distinct from the harness floor (baseNRIDigest), so it is
+	// genuinely uncovered unless a case below covers it.
+	const nriD = "sha256:bbbb000000000000000000000000000000000000000000000000000000000000"
 
-	// Uncovered: nriImagePolicy.image is digest-pinned (by the harness) but not
-	// in digests, deriveComponents off, fail-closed -> guard fires.
-	out, err := helmTemplate(t, "--set", "nriImagePolicy.policy.mode=fail-closed")
+	// Uncovered: nriImagePolicy.image is digest-pinned but not in digests,
+	// deriveComponents off, fail-closed -> guard fires.
+	out, err := helmTemplate(t,
+		"--set", "nriImagePolicy.policy.mode=fail-closed",
+		"--set-string", "nriImagePolicy.image.digest="+nriD,
+	)
 	if err == nil {
 		t.Fatalf("helm template succeeded with an uncovered component in fail-closed, want guard failure\n%s", out)
 	}
@@ -4049,9 +4068,9 @@ func TestChartRejectsUncoveredComponentInFailClosed(t *testing.T) {
 		name string
 		args []string
 	}{
-		{"audit mode is non-blocking", []string{"--set", "nriImagePolicy.policy.mode=audit"}},
-		{"deriveComponents covers it", []string{"--set", "nriImagePolicy.policy.mode=fail-closed", "--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true"}},
-		{"digest listed in floor", []string{"--set", "nriImagePolicy.policy.mode=fail-closed", "--set-string", "nriImagePolicy.bootstrapAllowlist.digests." + nriD + "=ghcr.io/confidential-dot-ai/nri-image-policy@" + nriD}},
+		{"audit mode is non-blocking", []string{"--set-string", "nriImagePolicy.image.digest=" + nriD, "--set", "nriImagePolicy.policy.mode=audit"}},
+		{"deriveComponents covers it", []string{"--set-string", "nriImagePolicy.image.digest=" + nriD, "--set", "nriImagePolicy.policy.mode=fail-closed", "--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true"}},
+		{"digest listed in floor", []string{"--set-string", "nriImagePolicy.image.digest=" + nriD, "--set", "nriImagePolicy.policy.mode=fail-closed", "--set-string", "nriImagePolicy.bootstrapAllowlist.digests." + nriD + "=ghcr.io/confidential-dot-ai/nri-image-policy@" + nriD}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if out, err := helmTemplate(t, tc.args...); err != nil {
