@@ -198,3 +198,23 @@ and is build output — **never commit it.** But, unlike before, the CI build
 4. **A locally hand-placed `ghcr-auth.json` is preserved.** `fetch.sh` only
    overwrites it when `READ_PRIVATE_GHCR_TOKEN` is set, so a developer's
    pre-staged file for local guest-pull testing survives a no-token `fetch.sh`.
+
+## Bump `KATA_SRC_COMMIT` in lockstep with `KATA_VERSION`
+
+`kata-guest-base/scripts/build.sh:79`
+
+The kata source (osbuilder) is fetched by **immutable commit** (`KATA_SRC_COMMIT`),
+not by the `KATA_VERSION` git tag — a git tag is mutable, and a re-pointed
+`3.30.0` would silently swap the osbuilder source baked into the dm-verity root
+and thus the SNP launch measurement. The gotcha: `KATA_VERSION` and
+`KATA_SRC_COMMIT` are two separate knobs that **must move together**. Bumping
+`KATA_VERSION` alone leaves the source pinned to the old release's commit while
+`stage-kata-conf.sh` pulls the new `kata-static` asset — a silent source/asset
+mismatch. On a version bump, re-resolve the commit and update both:
+
+```fish
+gh api repos/kata-containers/kata-containers/git/refs/tags/<ver> --jq .object.sha
+```
+
+(The `kata-static` release asset is separately sha256-pinned in
+`stage-kata-conf.sh`, so only the git-tag source fetch needed this treatment.)

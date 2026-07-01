@@ -67,6 +67,16 @@ IMAGE_DIR="$(cd "${HERE}/.." && pwd)"
 WORKSPACE="$(cd "${IMAGE_DIR}/../.." && pwd)"
 
 KATA_VERSION="${KATA_VERSION:-3.30.0}"
+# Immutable commit that the KATA_VERSION git tag resolved to at pin time —
+# used to fetch the kata source (osbuilder) below. A git tag is mutable: a
+# re-pointed 3.30.0 would silently swap the osbuilder source baked into the
+# dm-verity measured rootfs, and thus the SNP launch measurement. So pin the
+# commit, not the tag. Keep it in lockstep with KATA_VERSION; re-resolve on a
+# bump with:
+#   gh api repos/kata-containers/kata-containers/git/refs/tags/<ver> --jq .object.sha
+# (The kata-static release asset in stage-kata-conf.sh is separately
+# sha256-pinned, so that download already can't drift.)
+KATA_SRC_COMMIT="${KATA_SRC_COMMIT:-86e5975ad6a20f091ed686e492672c70496d0400}"
 # ext4, not erofs: kata 3.30.0's osbuilder only implements the dm-verity /
 # measured-rootfs path for ext4 (create_rootfs_image). Its erofs path
 # (create_erofs_rootfs_image) loop-attaches the image before creating it
@@ -234,10 +244,12 @@ echo "    kernel: ${VMLINUZ_OUT}"
 # --- Fetch kata source (for osbuilder) ---------------------------------
 OSBUILDER="${KATA_SRC}/tools/osbuilder"
 if [[ ! -d "${OSBUILDER}" ]]; then
-    log "Fetching kata-containers ${KATA_VERSION} source (osbuilder) via gh"
+    log "Fetching kata-containers ${KATA_VERSION} source (osbuilder) at ${KATA_SRC_COMMIT} via gh"
     command -v gh >/dev/null 2>&1 || die "gh not found — needed to fetch the kata source tarball (the repo's git remote is SSH-gated)."
     mkdir -p "${KATA_SRC}"
-    gh api "repos/kata-containers/kata-containers/tarball/${KATA_VERSION}" \
+    # Pin the commit, not the tag: the tarball feeds the measured rootfs (see
+    # KATA_SRC_COMMIT). gh api resolves a commit SHA the same as a tag ref.
+    gh api "repos/kata-containers/kata-containers/tarball/${KATA_SRC_COMMIT}" \
         > "${WORK_DIR}/kata-src.tar.gz"
     tar xzf "${WORK_DIR}/kata-src.tar.gz" -C "${KATA_SRC}" --strip-components=1
     [[ -d "${OSBUILDER}" ]] || die "osbuilder not found at ${OSBUILDER} after extract — kata source layout changed?"
