@@ -3850,6 +3850,55 @@ func TestChartDerivesComponentDigestsIntoAllowlist(t *testing.T) {
 	}
 }
 
+// The tls-lb nginx image is a chart-deployed non-c8s system image: it is not in
+// the tag-locked c8sComponents derive set, so a default install would otherwise
+// leave it out of the allowlist and the NRI plugin would reject the tls-lb
+// nginx container (#250). It must be self-seeded from its pinned digest whenever
+// tls-lb is enabled — independent of deriveComponents (off here) — and dropped
+// when tls-lb is disabled.
+func TestChartAllowlistsTlsLbNginxSelfEntry(t *testing.T) {
+	const (
+		nxDigest = "sha256:00000000000000000000000000000000000000000000000000000000000000b1"
+		nxRepo   = "example.test/nginx-unprivileged"
+	)
+	t.Run("enabled: self-entry present without deriveComponents", func(t *testing.T) {
+		out, err := helmTemplate(t,
+			"--set-string", "tlsLb.nginx.image.repository="+nxRepo,
+			"--set-string", "tlsLb.nginx.image.digest="+nxDigest,
+		)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+		seed, err := pkgallowlist.ParseJSON([]byte(cm.Data["allowlist-seed.json"]))
+		if err != nil {
+			t.Fatalf("seed JSON does not parse: %v", err)
+		}
+		if got, want := seed.Digests[nxDigest], nxRepo+"@"+nxDigest; got != want {
+			t.Errorf("tls-lb nginx self-entry = %q, want %q\nseed: %v", got, want, seed.Digests)
+		}
+	})
+
+	t.Run("disabled: no self-entry", func(t *testing.T) {
+		out, err := helmTemplate(t,
+			"--set", "tlsLb.enabled=false",
+			"--set-string", "tlsLb.nginx.image.repository="+nxRepo,
+			"--set-string", "tlsLb.nginx.image.digest="+nxDigest,
+		)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+		seed, err := pkgallowlist.ParseJSON([]byte(cm.Data["allowlist-seed.json"]))
+		if err != nil {
+			t.Fatalf("seed JSON does not parse: %v", err)
+		}
+		if _, ok := seed.Digests[nxDigest]; ok {
+			t.Errorf("tls-lb nginx self-entry present with tls-lb disabled: %v", seed.Digests)
+		}
+	})
+}
+
 // installerBootConfig is a typed view of the image-policy.yaml the installer
 // writes. It mirrors the fields of the plugin's own config
 // (internal/cmds/nri-image-policy/config.go, which is unexported) needed by the
