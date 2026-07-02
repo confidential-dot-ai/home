@@ -41,11 +41,44 @@ func TestParseJSON_BadJSON(t *testing.T) {
 }
 
 func TestContains(t *testing.T) {
-	wl := &Allowlist{Digests: map[string]string{"sha256:abc": "img"}}
-	if !wl.Contains("sha256:abc") {
-		t.Error("expected Contains=true")
+	present := "sha256:" + strings.Repeat("a", 64)
+	absent := "sha256:" + strings.Repeat("b", 64)
+	wl := &Allowlist{Digests: map[string]string{present: "img"}}
+	if !wl.Contains(present) {
+		t.Error("expected Contains=true for present digest")
 	}
-	if wl.Contains("sha256:missing") {
-		t.Error("expected Contains=false")
+	if wl.Contains(absent) {
+		t.Error("expected Contains=false for absent digest")
 	}
+	if wl.Contains("not-a-digest") {
+		t.Error("expected Contains=false for a malformed digest")
+	}
+}
+
+// TestContainsIsCaseInsensitive guards the enforcement bug where an uppercase
+// allowlist entry would miss the lowercase digest containerd resolves (and the
+// reverse). Both the stored key and the lookup are canonicalized to lowercase.
+func TestContainsIsCaseInsensitive(t *testing.T) {
+	lower := "sha256:" + strings.Repeat("a", 64)
+	upper := "sha256:" + strings.Repeat("A", 64)
+
+	t.Run("uppercase entry, lowercase lookup", func(t *testing.T) {
+		wl, err := ParseJSON([]byte(`{"version":"1","digests":{"` + upper + `":"img"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !wl.Contains(lower) {
+			t.Error("lowercase lookup missed an uppercase allowlist entry")
+		}
+	})
+
+	t.Run("lowercase entry, uppercase lookup", func(t *testing.T) {
+		wl, err := ParseJSON([]byte(`{"version":"1","digests":{"` + lower + `":"img"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !wl.Contains(upper) {
+			t.Error("uppercase lookup missed a lowercase allowlist entry")
+		}
+	})
 }

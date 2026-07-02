@@ -17,6 +17,17 @@ func TestParseDigestValid(t *testing.T) {
 	}
 }
 
+func TestParseDigestCanonicalizesToLowercase(t *testing.T) {
+	upper := "sha256:A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2"
+	d, err := ParseDigest(upper)
+	if err != nil {
+		t.Fatalf("uppercase hex must be valid: %v", err)
+	}
+	if d.String() != validDigest {
+		t.Fatalf("got %q, want lowercase %q", d.String(), validDigest)
+	}
+}
+
 func TestParseDigestRejectsMissingPrefix(t *testing.T) {
 	_, err := ParseDigest("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
 	if err == nil {

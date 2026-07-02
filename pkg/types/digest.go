@@ -12,7 +12,10 @@ type Digest struct {
 	value string
 }
 
-// ParseDigest validates and returns a Digest from the given string.
+// ParseDigest validates and returns a Digest from the given string. Hex is
+// canonicalized to lowercase: a digest is compared by exact string match, and
+// containerd emits lowercase, so a valid uppercase entry (e.g. "sha256:ABCD…")
+// must not miss the lowercase resolved digest at lookup time.
 func ParseDigest(s string) (Digest, error) {
 	hex, ok := strings.CutPrefix(s, "sha256:")
 	if !ok {
@@ -26,7 +29,7 @@ func ParseDigest(s string) (Digest, error) {
 			return Digest{}, fmt.Errorf("invalid digest: expected sha256:<64 hex chars>")
 		}
 	}
-	return Digest{value: s}, nil
+	return Digest{value: "sha256:" + strings.ToLower(hex)}, nil
 }
 
 func isHexDigit(b byte) bool {
