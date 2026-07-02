@@ -40,7 +40,7 @@ Additional models available on request: [hello@confidential.ai](mailto:hello@con
 | AMD SEV-SNP | $0.05 | $0.012 |
 | Intel TDX | $0.05 | $0.012 |
 
-## Attestable Builds
+## Attested Builds
 
 Base rate: $0.008 per vCPU-minute. Runners scale linearly.
 

@@ -31,7 +31,7 @@ Here are a few examples of the hard problems you'll work on at Confidential:
 - Scale infra globally across on prem, bare metal, and every hyperscalar & neocloud.
 - Write Linux kernel modules for private logging and telemetry.
 - Optimize AI workloads across TEE hardware from NVIDIA, AMD, and Intel.
-- Build and package software securely in TEEs for attestable builds and supply chain security.
+- Build and package software securely in TEEs for attested builds and supply chain security.
 - Collaborate with the TEE hardware vendors on next generation TEE implementations.
 
 ### Requirements

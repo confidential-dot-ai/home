@@ -171,7 +171,7 @@ export function buildLlmsText(): string {
     "{{gpu_vms_table}}": extractTableAfter("pricing.md", "**GPU VMs**"),
     "{{cpu_vms_table}}": extractTableAfter("pricing.md", "**CPU VMs**"),
     "{{inference_pricing_table}}": extractTableAfter("pricing.md", "## Confidential Inference"),
-    "{{attestable_builds_table}}": extractTableAfter("pricing.md", "## Attestable Builds"),
+    "{{attested_builds_table}}": extractTableAfter("pricing.md", "## Attested Builds"),
     "{{blog_index}}": buildBlogIndex(files),
     "{{docs_index}}": buildDocsIndex(files),
   };

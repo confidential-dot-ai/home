@@ -10,7 +10,7 @@ Confidential runs AI workloads (inference, training, agents) inside hardware-enc
 - **Confidential Cloud** — hosted TEE-backed infrastructure: pay-per-token inference, GPU and CPU VMs, attested CI/CD builds (Kettle), and a Confidential Agents API for spinning up private agent environments.
 - **Enterprise / Licensed** — deploy the modular component stack on your own infrastructure (on-prem, bare metal, all major clouds).
 
-**Components:** Attestation service, CDS (attestation-gated secrets), attestable build pipeline (SLSA L3), TEE networking (mTLS + multi-recipient hybrid encryption), OHTTP gateway, control plane (with optional ZK proofs), hardened VM image, client/server SDKs. All modular — use individually or together.
+**Components:** Attestation service, CDS (attestation-gated secrets), attested build pipeline (SLSA L3), TEE networking (mTLS + multi-recipient hybrid encryption), OHTTP gateway, control plane (with optional ZK proofs), hardened VM image, client/server SDKs. All modular — use individually or together.
 
 **Enterprise model:** Discovery (free) → Pilot (1-4 months, deploy on your infra) → Production. On-prem, bare metal, all major clouds.
 
