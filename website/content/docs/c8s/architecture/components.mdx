@@ -19,9 +19,9 @@ and how requests flow between them.
 | **nri-image-policy** | `cmd/nri-image-policy` | host NRI plugin | in-guest `policy-monitor` |
 | **get-cert** | `cmd/get-cert` | webhook-injected init/sidecar | webhook-injected init/sidecar |
 
-The CDS is the trust root. It performs attestation verification, EAR issuance, mesh-CA
-signing, and optional CA handoff **all in one process**, so there is no internal RA-TLS hop
-to an external signer and the CA private key never leaves CDS memory.
+The CDS is the trust root. It performs attestation verification, mesh-CA signing, and
+optional CA handoff **all in one process**, so there is no internal RA-TLS hop to an external
+signer and the CA private key never leaves CDS memory.
 
 <Callout type="warn">
   The **c8s operator and its admission webhook are untrusted.** Even under pod-as-CVM (Kata)

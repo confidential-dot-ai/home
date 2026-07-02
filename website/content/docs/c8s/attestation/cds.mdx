@@ -1,12 +1,12 @@
 ---
 title: CDS Bootstrapping & Verification
-description: How the Certificate Distribution Service comes up — the in-memory mesh CA, EAR tokens and JWKS rotation, the challenge/attest flow, leaf signing, CA handoff, and how clients verify the CDS itself.
+description: How the Certificate Distribution Service comes up — the in-memory mesh CA, token signing and JWKS rotation, the challenge/attest flow, leaf signing, CA handoff, and how clients verify the CDS itself.
 ---
 
 <JourneyNav current={4} />
 
 The **Certificate Distribution Service (CDS)** is the trust root of a c8s cluster. In one
-process it verifies TEE attestation evidence, issues **EAR** tokens, manages an in-memory
+process it verifies TEE attestation evidence, issues short-lived **attestation-bound tokens**, manages an in-memory
 **mesh CA**, signs leaf certificates, and — optionally — hands its CA off to peer replicas.
 There is no internal RA-TLS hop to an external signer, so the CA private key never leaves CDS
 memory.
@@ -24,13 +24,13 @@ Because the key lives only in memory, any CDS restart generates a *new* CA and i
 previously issued leaves. That is acceptable for the chart-managed default; the production
 direction keeps the CA in attested CVM memory and replicates it via [handoff](#ca-handoff).
 
-## EAR tokens and JWKS rotation
+## Token signing and JWKS rotation
 
-An **EAR** (Entity Attestation Result) is a JWT, signed with **ES256** (ECDSA P-256), that the
+The **attestation-bound token** is a JWT, signed with **ES256** (ECDSA P-256), that the
 CDS mints (via `/attest-key`) after a successful attestation. It is the cluster's
-attestation-bound **bearer credential**: a caller presents it to authorize an
+attestation-bound **bearer credential**: a caller presents the token to authorize an
 [allowlist write](/docs/c8s/attestation/allowlist#authorizing-mutations) or a [CA handoff](#ca-handoff).
-(Certificate issuance does **not** use an EAR — `/attest` verifies evidence and returns the signed
+(Certificate issuance does **not** use this token — `/attest` verifies evidence and returns the signed
 leaf in one step.) Key claims:
 
 | Claim | Meaning |
@@ -85,9 +85,9 @@ goes *through the CDS*; there is no side channel.
 Who may update it is decided by the operator **at CDS bootstrap**: the install-time value
 `cds.allowlistWriteMeasurements` (`--allowlist-write-measurements`) pins the launch measurement(s)
 of the authorized writer(s); empty rejects every write. The credential itself is not a static
-secret — a writer attests to the CDS (`/attest-key`), receives a short-lived CDS-signed
-[EAR](#ear-tokens-and-jwks-rotation) bound to its key and to the exact change, and presents it as
-`Authorization: Bearer` on `POST` / `DELETE /allowlist`. The CDS re-verifies the EAR signature,
+secret — a writer attests to the CDS (`/attest-key`), receives a short-lived
+[CDS-signed token](#token-signing-and-jwks-rotation) bound to its key and to the exact change, and presents it as
+`Authorization: Bearer` on `POST` / `DELETE /allowlist`. The CDS re-verifies the token signature,
 the writer's measurement against `cds.allowlistWriteMeasurements`, and a body-hash binding before
 committing.
 
@@ -106,8 +106,8 @@ Handoff resolves this by moving the *live* CA from one attested CDS to another, 
 an attested channel — never through disk or a third party:
 
 1. A successor replica starts, generates an ephemeral **X25519** keypair, attests itself, and
-   calls `POST /handoff` on the active CDS, presenting its EAR and that ephemeral public key.
-2. The active CDS verifies the EAR's signature and checks the recipient's `launch_digest`
+   calls `POST /handoff` on the active CDS, presenting its attestation-bound token and that ephemeral public key.
+2. The active CDS verifies the token's signature and checks the recipient's `launch_digest`
    against `--handoff-measurements` — so the CA only ever leaves for another CDS whose exact
    launch measurement you have pinned.
 3. It returns the CA payload (cert **and** private key) **AES-GCM-wrapped to the recipient's
@@ -287,10 +287,10 @@ Each flag wants the digest of a different party:
 | --- | --- | --- |
 | `POST` | `/authenticate` | issue a one-time challenge nonce |
 | `POST` | `/attest` | verify evidence + sign a CSR, returning the leaf PEM chain |
-| `POST` | `/attest-key` | verify evidence + issue an EAR bound to the caller's key (the allowlist-write / handoff credential) |
+| `POST` | `/attest-key` | verify evidence + issue an attestation-bound token bound to the caller's key (the allowlist-write / handoff credential) |
 | `POST` | `/handoff` | hand the mesh CA to an attested peer replica |
-| `GET` `POST` `DELETE` | `/allowlist` | read / add / remove image digests (writes require a bearer EAR) |
-| `GET` | `/.well-known/jwks.json` | the EAR-signing JWKS (ES256) |
+| `GET` `POST` `DELETE` | `/allowlist` | read / add / remove image digests (writes require a bearer token) |
+| `GET` | `/.well-known/jwks.json` | the token-signing JWKS (ES256) |
 | `GET` | `/ca` | the mesh CA bundle |
 | `GET` | `/readyz` | readiness (fails if CA validity < `--min-ca-validity`) |
 

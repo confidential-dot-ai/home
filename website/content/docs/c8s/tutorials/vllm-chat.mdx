@@ -108,7 +108,7 @@ nriImagePolicy:
 <Callout type="info">
   This is the **bootstrap** path — a chart value applied at install. To add an image to a *running*
   cluster without re-applying, an attested writer can `POST /allowlist` with a short-lived
-  CDS-issued EAR — see [Authorizing mutations](/docs/c8s/attestation/allowlist#authorizing-mutations).
+  CDS-signed token — see [Authorizing mutations](/docs/c8s/attestation/allowlist#authorizing-mutations).
   Either way the write goes through the CDS; there's no static token.
 </Callout>
 

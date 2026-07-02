@@ -142,9 +142,11 @@ body {
   }
 }
 
-/* ── Markdown prose styling (marketing pages, react-markdown) ────
-   Fumadocs docs bodies do NOT use `.prose` (neutral/preset styles them via their
-   own selectors), so `.prose` here is scoped in practice to the marketing pages. */
+/* ── Markdown prose styling ─────────────────────────────────────
+   Used by the marketing pages (react-markdown) AND Fumadocs' <DocsBody>, which
+   also renders a `.prose` container — so these rules style the docs too. Where
+   that leaks into custom docs boxes (Cards, FourSteps, JourneyNav) the link rule
+   below opts them out via `.not-prose` / `[data-card]`. */
 .prose {
   max-width: none;
   line-height: 1.7;
@@ -202,7 +204,11 @@ body {
   color: var(--foreground);
 }
 
-.prose a {
+/* Links inside `.not-prose` (custom docs boxes like FourSteps / JourneyNav) and
+   inside Fumadocs Cards (`[data-card]`) are styled by their own component, not as
+   prose links — exclude them so the whole box isn't underlined. `:where()` keeps
+   specificity identical to a plain `.prose a`, so normal inline links are unchanged. */
+.prose a:not(:where(.not-prose, .not-prose *, [data-card])) {
   color: var(--accent);
   text-decoration-line: underline;
   text-decoration-color: color-mix(in srgb, var(--accent) 45%, transparent);
@@ -210,8 +216,16 @@ body {
   text-underline-offset: 3px;
 }
 
-.prose a:hover {
+.prose a:not(:where(.not-prose, .not-prose *, [data-card])):hover {
   text-decoration-color: var(--accent);
+}
+
+/* Underline only the Card title ("the title bits"), not the description. */
+.prose a[data-card] > h3 {
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--color-fd-muted-foreground);
 }
 
 .prose :is(h1, h2, h3, h4) a[aria-label="Link to section"] {
@@ -295,6 +309,12 @@ body {
 
 .prose blockquote p:last-child {
   margin-bottom: 0;
+}
+
+/* Fumadocs' prose adds a top margin to <p>; zero it on a blockquote's first
+   child so text isn't pushed down inside the quote's own padding. */
+.prose blockquote > :first-child {
+  margin-top: 0;
 }
 
 .prose code {
@@ -388,13 +408,13 @@ body {
   font-weight: 700;
   color: var(--heading);
   border-bottom: 1px solid var(--border);
-  padding: 0.5rem 0.75rem 0.5rem 0;
+  padding: 0.5rem 0.85rem;
   font-size: 0.8rem;
 }
 
 .prose tbody td {
   border-bottom: 1px solid var(--border);
-  padding: 0.5rem 0.75rem 0.5rem 0;
+  padding: 0.5rem 0.85rem;
   font-variant-numeric: tabular-nums;
 }
 

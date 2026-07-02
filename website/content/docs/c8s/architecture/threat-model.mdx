@@ -30,7 +30,7 @@ cannot break it *silently* — detection is by attestation, not by trust.
 | Gate | Enforced by | Source of truth |
 | --- | --- | --- |
 | TEE evidence is valid | attestation-api + CDS | hardware evidence verification |
-| A CSR can be signed | CDS | EAR JWT (+ `cds.measurements` when configured) |
+| A CSR can be signed | CDS | verified attestation evidence (+ `cds.measurements` when configured) |
 | Image digest is allowed | nri-image-policy (node-as-CVM) / policy-monitor (pod-as-CVM) | CDS-served allowlist |
 | Mesh peer chains to the mesh CA | ratls-mesh | mesh CA bundle |
 | Pod is an injection candidate | admission webhook | pod annotation `confidential.ai/cw` |

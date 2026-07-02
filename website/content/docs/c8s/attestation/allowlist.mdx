@@ -1,6 +1,6 @@
 ---
 title: The Allowlist
-description: How c8s controls exactly which container images may run — the allowlist data model, the CRUD API, EAR-signed mutations, seeding, and enforcement.
+description: How c8s controls exactly which container images may run — the allowlist data model, the CRUD API, attestation-authorized mutations, seeding, and enforcement.
 ---
 
 <JourneyNav current={5} />
@@ -8,7 +8,7 @@ description: How c8s controls exactly which container images may run — the all
 The **allowlist** is the set of container-image digests c8s permits to run. Nothing not on the
 list starts. It is **owned and served by the [CDS](/docs/c8s/attestation/cds)**, enforced at
 container-creation time by the `nri-image-policy` plugin (node-as-CVM) or the in-guest
-`policy-monitor` (pod-as-CVM), and managed through an EAR-authenticated API.
+`policy-monitor` (pod-as-CVM), and managed through an attestation-authenticated API.
 
 ## Data model
 
@@ -36,8 +36,8 @@ The CDS exposes the allowlist at `/allowlist`:
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | `GET` | `/allowlist` | none | list all digests; returns a weak ETag `W/"<version>"` and honours `If-None-Match` (304 when unchanged) |
-| `POST` | `/allowlist` | bearer EAR | add one `{ digest, image }`; bumps the version; `204` |
-| `DELETE` | `/allowlist` | bearer EAR | delete `{ digests: [...] }` **atomically** (all-or-nothing; `404` if any is missing) |
+| `POST` | `/allowlist` | bearer token | add one `{ digest, image }`; bumps the version; `204` |
+| `DELETE` | `/allowlist` | bearer token | delete `{ digests: [...] }` **atomically** (all-or-nothing; `404` if any is missing) |
 
 Workers poll `GET /allowlist` and use the ETag to avoid redundant work — the version only
 changes when the set actually changes.
@@ -51,12 +51,12 @@ The allowlist is the source of truth for what may run, so the right to change it
 Empty — the default — rejects every mutation.
 
 There is no static credential to hand out. The write credential is a short-lived,
-attestation-bound **EAR** the CDS itself mints: at startup the CDS generates its **EAR-signing
-key** (ES256 / P-256, see [CDS bootstrap](/docs/c8s/attestation/cds#ear-tokens-and-jwks-rotation))
-and publishes the public half as a JWKS, and it only ever signs an EAR for a caller it has just
-verified — so holding a CDS-signed EAR *is* the credential, and there is nothing else to steal.
+attestation-bound **token** the CDS itself mints: at startup the CDS generates its **token-signing
+key** (ES256 / P-256, see [CDS bootstrap](/docs/c8s/attestation/cds#token-signing-and-jwks-rotation))
+and publishes the public half as a JWKS, and it only ever signs a token for a caller it has just
+verified — so holding a CDS-signed token *is* the credential, and there is nothing else to steal.
 
-![Allowlist write flow: an attested writer attests to the CDS, receives an EAR bound to the exact change (pbh), then POSTs to /allowlist with that EAR; the CDS re-verifies the signature, the writer's measurement, and the body hash before committing.](/diagrams/allowlist-write.svg)
+![Allowlist write flow: an attested writer attests to the CDS, receives a token bound to the exact change (pbh), then POSTs to /allowlist with that token; the CDS re-verifies the signature, the writer's measurement, and the body hash before committing.](/diagrams/allowlist-write.svg)
 
 A write is four steps:
 
@@ -65,18 +65,18 @@ A write is four steps:
    `--allowlist-write-measurements`.
    The CDS verifies that evidence the same way it does for the
    [attestation flow](/docs/c8s/attestation/cds#the-attestation-flow).
-2. **The CDS issues an EAR bound to the change.** Via `/attest-key`, it mints a short-lived EAR —
+2. **The CDS issues a token bound to the change.** Via `/attest-key`, it mints a short-lived token —
    signed with its bootstrap key — carrying the writer's `launch_digest` and a **`pbh`**
    (payload-body-hash) claim set to `SHA-256` of the *exact* `{ digest, image }` (or delete) body
    the writer is about to send.
-3. **The writer calls the API** — `POST`/`DELETE /allowlist` with that EAR as
+3. **The writer calls the API** — `POST`/`DELETE /allowlist` with that token as
    `Authorization: Bearer`.
 4. **The CDS re-checks everything** before committing: the ES256 signature against its own JWKS,
    `exp` + clock skew and the issuer, that the `launch_digest` is in
-   `--allowlist-write-measurements`, and — with a constant-time compare — that the EAR's `pbh`
+   `--allowlist-write-measurements`, and — with a constant-time compare — that the token's `pbh`
    equals `SHA-256` of the body it actually received.
 
-The `pbh` binding is the load-bearing part: an EAR minted to add image A **cannot** be replayed
+The `pbh` binding is the load-bearing part: a token minted to add image A **cannot** be replayed
 to add image B, delete an entry, or be reused at all once the change lands. Combined with the
 measurement gate, a captured token is worthless — only genuinely-attested code can touch the
 list.
@@ -183,7 +183,7 @@ change is attributable to an attested identity.
 **In CI.** A pipeline that builds a workload image knows the resulting digest at build time. If
 the build/release job runs inside an attested TEE whose measurement you've added to
 `--allowlist-write-measurements`, it can add that digest to the allowlist as its final step — no
-human in the loop, no static token, and the `pbh` binding means the EAR it's handed can only make
+human in the loop, no static token, and the `pbh` binding means the token it's handed can only make
 that one change. The allowlist becomes a function of *what your attested pipeline produced*,
 updated on every release and trivially auditable.
 
@@ -191,7 +191,7 @@ updated on every release and trivially auditable.
 system, produces images whose digest is tied to a cryptographic attestation of *how they were
 built* — reproducible source → measured artifact. The natural next step is to let a
 kettle-attested build feed the allowlist directly: because the build itself is attested, its
-output digest can be admitted with an attestation-backed EAR, closing the loop from **source →
+output digest can be admitted with an attestation-backed token, closing the loop from **source →
 reproducible build → measured image → allowed to run in the TEE** with nobody hand-curating
-digests. This isn't wired up yet — but the EAR-gated write API above is exactly the seam it
+digests. This isn't wired up yet — but the attestation-gated write API above is exactly the seam it
 plugs into.
