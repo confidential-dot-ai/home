@@ -1,9 +1,12 @@
 package allowlist_test
 
 import (
+	"context"
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,10 +17,12 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/attestation"
 	"github.com/confidential-dot-ai/c8s/internal/ear"
 	"github.com/confidential-dot-ai/c8s/internal/earclaims"
+	"github.com/confidential-dot-ai/c8s/internal/issuer"
 	"github.com/confidential-dot-ai/c8s/internal/readiness"
 	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/earsigner"
+	"github.com/confidential-dot-ai/c8s/pkg/jwks"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -47,11 +52,30 @@ func signedEAR(t *testing.T, keyPEM []byte, claims jwt.MapClaims) string {
 	if err != nil {
 		t.Fatalf("parse EAR key: %v", err)
 	}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(key)
+	kid, err := jwks.Thumbprint(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("thumbprint EAR key: %v", err)
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	token.Header["kid"] = kid
+	signed, err := token.SignedString(key)
 	if err != nil {
 		t.Fatalf("sign EAR: %v", err)
 	}
-	return token
+	return signed
+}
+
+// keyProviderFor builds the production KeyProvider (an earsigner.Rotator) from
+// a key PEM so tests verify tokens through the same kid-resolving path CDS uses.
+func keyProviderFor(t *testing.T, keyPEM []byte) issuer.KeyProvider {
+	t.Helper()
+	rotator, err := earsigner.NewRotator(earsigner.RotatorConfig{
+		Interval: time.Hour, Overlap: time.Hour, Logger: slog.Default(),
+	}, keyPEM, func(*ecdsa.PrivateKey, string) {})
+	if err != nil {
+		t.Fatalf("new rotator: %v", err)
+	}
+	return rotator
 }
 
 func testAllowlistApp(t *testing.T) (http.Handler, *readiness.Checker, ear.Issuer) {
@@ -76,10 +100,9 @@ func testAllowlistApp(t *testing.T) (http.Handler, *readiness.Checker, ear.Issue
 	wh := allowlist.Handler{
 		Store: &store,
 		WriteAuthorizer: allowlist.EARWriteAuthorizer{
-			PublicKey:           issuer.PublicKey,
+			KeyProvider:         keyProviderFor(t, keyPEM),
 			ExpectedIssuer:      testIssuer,
 			AllowedMeasurements: map[string]bool{measurementA: true},
-			ClockSkew:           30 * time.Second,
 		}.Authorize,
 	}
 
@@ -218,10 +241,6 @@ func TestAllowlistWriteAuthorizerRejectsMissingExpiration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate EAR key: %v", err)
 	}
-	issuer, err := ear.NewIssuer(keyPEM, testIssuer, 5*time.Minute)
-	if err != nil {
-		t.Fatalf("new EAR issuer: %v", err)
-	}
 
 	token := signedEAR(t, keyPEM, jwt.MapClaims{
 		earclaims.Issuer:   testIssuer,
@@ -236,10 +255,9 @@ func TestAllowlistWriteAuthorizerRejectsMissingExpiration(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	err = (allowlist.EARWriteAuthorizer{
-		PublicKey:           issuer.PublicKey,
+		KeyProvider:         keyProviderFor(t, keyPEM),
 		ExpectedIssuer:      testIssuer,
 		AllowedMeasurements: map[string]bool{measurementA: true},
-		ClockSkew:           30 * time.Second,
 	}).Authorize(req, nil)
 	if err == nil {
 		t.Fatal("expected missing expiration to be rejected")
@@ -250,10 +268,6 @@ func TestAllowlistWriteAuthorizerRejectsExpiredToken(t *testing.T) {
 	keyPEM, err := earsigner.Generate()
 	if err != nil {
 		t.Fatalf("generate EAR key: %v", err)
-	}
-	issuer, err := ear.NewIssuer(keyPEM, testIssuer, 5*time.Minute)
-	if err != nil {
-		t.Fatalf("new EAR issuer: %v", err)
 	}
 
 	token := signedEAR(t, keyPEM, jwt.MapClaims{
@@ -270,13 +284,71 @@ func TestAllowlistWriteAuthorizerRejectsExpiredToken(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	err = (allowlist.EARWriteAuthorizer{
-		PublicKey:           issuer.PublicKey,
+		KeyProvider:         keyProviderFor(t, keyPEM),
 		ExpectedIssuer:      testIssuer,
 		AllowedMeasurements: map[string]bool{measurementA: true},
-		ClockSkew:           30 * time.Second,
 	}).Authorize(req, nil)
 	if err == nil {
 		t.Fatal("expected expired EAR to be rejected")
+	}
+}
+
+// TestAllowlistWriteAuthorizerAcceptsRetiringKey is the rotation-window
+// regression guard: an EAR signed by the previous (now retiring) key must still
+// authorize writes. The old hand-rolled authorizer resolved only the active
+// key, so a token minted moments before a rotation failed. Routing through the
+// rotator's kid-based KeyProvider fixes it.
+func TestAllowlistWriteAuthorizerAcceptsRetiringKey(t *testing.T) {
+	keyPEM, err := earsigner.Generate()
+	if err != nil {
+		t.Fatalf("generate EAR key: %v", err)
+	}
+	// The issuer signs with the initial key's kid; after one rotation that kid
+	// is retiring, not active.
+	iss, err := ear.NewIssuer(keyPEM, testIssuer, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("new EAR issuer: %v", err)
+	}
+
+	swapped := make(chan struct{}, 1)
+	rotator, err := earsigner.NewRotator(earsigner.RotatorConfig{
+		Interval: time.Millisecond,
+		Overlap:  time.Hour, // keep the retiring key resolvable
+		Logger:   slog.Default(),
+	}, keyPEM, func(*ecdsa.PrivateKey, string) {
+		select {
+		case swapped <- struct{}{}:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("new rotator: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rotator.Run(ctx)
+	select {
+	case <-swapped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for key rotation")
+	}
+	cancel()
+
+	body := []byte(`{"digest":"` + digestA + `","image":"retiring"}`)
+	token, err := iss.IssueForRequestBody(json.RawMessage(`{"test":"evidence"}`), measurementA, body)
+	if err != nil {
+		t.Fatalf("issue EAR: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/allowlist", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	if err := (allowlist.EARWriteAuthorizer{
+		KeyProvider:         rotator,
+		ExpectedIssuer:      testIssuer,
+		AllowedMeasurements: map[string]bool{measurementA: true},
+	}).Authorize(req, body); err != nil {
+		t.Fatalf("EAR signed by retiring key must still authorize: %v", err)
 	}
 }
 
@@ -538,10 +610,9 @@ func TestAllowlistAddRejectsBodyOverConfiguredCap(t *testing.T) {
 	wh := allowlist.Handler{
 		Store: &store,
 		WriteAuthorizer: allowlist.EARWriteAuthorizer{
-			PublicKey:           issuer.PublicKey,
+			KeyProvider:         keyProviderFor(t, keyPEM),
 			ExpectedIssuer:      testIssuer,
 			AllowedMeasurements: map[string]bool{measurementA: true},
-			ClockSkew:           30 * time.Second,
 		}.Authorize,
 		MaxWriteBodyBytes: 64,
 	}

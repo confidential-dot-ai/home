@@ -2,7 +2,6 @@ package allowlist
 
 import (
 	"bytes"
-	"crypto/ecdsa"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -10,13 +9,12 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/confidential-dot-ai/c8s/internal/earclaims"
 	"github.com/confidential-dot-ai/c8s/internal/httputil"
+	"github.com/confidential-dot-ai/c8s/internal/issuer"
 	"github.com/confidential-dot-ai/c8s/pkg/resources"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
-	"github.com/golang-jwt/jwt/v5"
 )
 
 // DefaultMaxWriteBodyBytes is the cap applied when Handler.MaxWriteBodyBytes
@@ -142,12 +140,17 @@ func (h Handler) authorize(w http.ResponseWriter, r *http.Request) ([]byte, bool
 
 // EARWriteAuthorizer authorizes allowlist mutation requests with a CDS EAR.
 // A valid EAR is not enough by itself: the token's launch measurement must be
-// explicitly allowed for resources.AllowlistWrite.
+// explicitly allowed for resources.AllowlistWrite, and its pbh claim must bind
+// the exact request body.
+//
+// Verification routes through issuer.ValidateEARToken so allowlist writes share
+// one audited validator with /sign-csr and /handoff: kid-based key resolution
+// (so a token signed by a retiring key still verifies during rotation), the EAR
+// profile/submods/audience structural checks, and the ES256/ES384 method pin.
 type EARWriteAuthorizer struct {
-	PublicKey           func() *ecdsa.PublicKey
+	KeyProvider         issuer.KeyProvider
 	ExpectedIssuer      string
 	AllowedMeasurements map[string]bool
-	ClockSkew           time.Duration
 }
 
 func (a EARWriteAuthorizer) Authorize(r *http.Request, body []byte) error {
@@ -160,69 +163,23 @@ func (a EARWriteAuthorizer) Authorize(r *http.Request, body []byte) error {
 		return fmt.Errorf("missing bearer EAR")
 	}
 
-	claims := jwt.MapClaims{}
-	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (any, error) {
-		if token.Method.Alg() != jwt.SigningMethodES256.Alg() {
-			return nil, fmt.Errorf("unexpected signing method %s", token.Method.Alg())
-		}
-		if a.PublicKey == nil {
-			return nil, fmt.Errorf("missing EAR public key provider")
-		}
-		pub := a.PublicKey()
-		if pub == nil {
-			return nil, fmt.Errorf("missing EAR public key")
-		}
-		return pub, nil
-	}, jwt.WithValidMethods([]string{jwt.SigningMethodES256.Alg()}))
+	claims, err := issuer.ValidateEARToken(tokenStr, a.KeyProvider, a.ExpectedIssuer)
 	if err != nil {
 		return err
 	}
-	if !token.Valid {
-		return fmt.Errorf("invalid EAR")
-	}
-
-	now := time.Now()
-	exp, err := claims.GetExpirationTime()
-	if err != nil || exp == nil {
-		return fmt.Errorf("EAR missing expiration")
-	}
-	if now.After(exp.Add(a.ClockSkew)) {
-		return fmt.Errorf("EAR expired")
-	}
-	if iat, err := claims.GetIssuedAt(); err == nil && iat != nil {
-		if iat.After(now.Add(a.ClockSkew)) {
-			return fmt.Errorf("EAR issued in the future")
-		}
-	}
-	if a.ExpectedIssuer != "" {
-		issuer, err := claims.GetIssuer()
-		if err != nil || issuer != a.ExpectedIssuer {
-			return fmt.Errorf("unexpected EAR issuer")
-		}
-	}
-
-	rawSubmods, err := json.Marshal(claims[earclaims.Submods])
-	if err != nil {
-		return fmt.Errorf("marshal EAR submods: %w", err)
-	}
-	measurement, err := earclaims.LaunchDigestFromSubmods(rawSubmods)
-	if err != nil {
+	if err := issuer.CheckMeasurement(claims, a.AllowedMeasurements, string(resources.AllowlistWrite)); err != nil {
 		return err
-	}
-	if !a.AllowedMeasurements[measurement] {
-		return fmt.Errorf("measurement not allowed for %s", resources.AllowlistWrite)
 	}
 
 	// Body binding: the EAR's pbh claim must match SHA-256 of the request
 	// body the server received. This stops a captured token from being
 	// replayed against a different payload within the EAR's TTL.
-	pbh, _ := claims[earclaims.PayloadBodyHash].(string)
-	if pbh == "" {
+	if claims.PayloadBodyHash == "" {
 		return fmt.Errorf("EAR missing %s claim", earclaims.PayloadBodyHash)
 	}
 	wantHash := sha256.Sum256(body)
 	want := base64.RawURLEncoding.EncodeToString(wantHash[:])
-	if subtle.ConstantTimeCompare([]byte(pbh), []byte(want)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(claims.PayloadBodyHash), []byte(want)) != 1 {
 		return fmt.Errorf("EAR %s does not match request body", earclaims.PayloadBodyHash)
 	}
 	return nil

@@ -29,6 +29,10 @@ type EARClaims struct {
 	TEEPubKey string
 	// VerifierID identifies the verifier that appraised the evidence.
 	VerifierID json.RawMessage
+	// PayloadBodyHash is the optional pbh claim: base64url(SHA-256(body)) that
+	// binds a body-scoped EAR (e.g. allowlist writes) to a specific request
+	// body. Empty when the token is not body-bound.
+	PayloadBodyHash string
 	// Submods is the raw EAR submodule map.
 	Submods json.RawMessage
 	// RawEvidence is the raw attestation evidence for audit hashing.
@@ -49,6 +53,7 @@ func (c *EARClaims) UnmarshalJSON(raw []byte) error {
 		earclaims.Bind(earclaims.ExpiresAt, &c.Expiry),
 		earclaims.Bind(earclaims.EARVerifierID, &c.VerifierID),
 		earclaims.Bind(earclaims.TEEPublicKey, &c.TEEPubKey),
+		earclaims.Bind(earclaims.PayloadBodyHash, &c.PayloadBodyHash),
 		earclaims.Bind(earclaims.Submods, &rawEvidence),
 		earclaims.Bind(earclaims.Audience, &c.audience),
 	); err != nil {

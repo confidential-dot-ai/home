@@ -130,10 +130,9 @@ func run(cfg config) error {
 	}
 	if len(allowlistWriteMeasurements) > 0 {
 		writeAuthorizer = allowlist.EARWriteAuthorizer{
-			PublicKey:           earIssuer.PublicKey,
+			KeyProvider:         rotator,
 			ExpectedIssuer:      cfg.earIssuerName,
 			AllowedMeasurements: allowlistWriteMeasurements,
-			ClockSkew:           time.Duration(cfg.jwtClockSkew) * time.Second,
 		}.Authorize
 		slog.Info("allowlist write authorization enabled", "count", len(allowlistWriteMeasurements))
 	}
