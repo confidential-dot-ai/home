@@ -30,7 +30,7 @@ The client verifies that report against AMD's and NVIDIA's public key chains *be
 Every agent has three ingredients, and each has an attack surface. Each is closed through TEEs.
 
 - **Data.** The sensitive prompts and documents that agents receive. TLS protects the data en route to your compute, but once inside, it's vulnerable to a malicious hypervisor or host that can read your instance's RAM. TEEs prevent this by encrypting RAM, so the host sees only ciphertext.
-- **Runtime.** The agent harness that's reading data and making tool calls. [Attestable builds](/blog/kettle-attested-builds), powered by TEEs, enables you to verify what software is running so it can be audited for security purposes.
+- **Runtime.** The agent harness that's reading data and making tool calls. [Attested builds](/blog/kettle-attested-builds), powered by TEEs, enables you to verify what software is running so it can be audited for security purposes.
 - **Intelligence.** Sensitive data is fed into large language models on inference hosts. The inference provider sees your sensitive data in the form of prompts. The GPU TEE closes this gap, similarly to the CPU TEE.
 
 When all three are sealed, no party in the stack — host, inference, or software vendor — can see your data, and every claim is verifiable to the client.

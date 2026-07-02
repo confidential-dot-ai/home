@@ -445,7 +445,7 @@ If there's no SVSM and the guest kernel runs at VMPL0, it has VMPCK0 and can use
 
 We abstract the measurement workflow so you don't need to manage IGVM files, initramfs builds, or dm-verity setup yourself.
 
-**Attestable builds:** When you push code to your connected GitHub repo, we build an attestable image. The build process is recorded, and the resulting measurement is tied to your git commit hash.
+**Attested builds:** When you push code to your connected GitHub repo, we build an attestable image. The build process is recorded, and the resulting measurement is tied to your git commit hash.
 
 **The measurement chain:**
 ```
