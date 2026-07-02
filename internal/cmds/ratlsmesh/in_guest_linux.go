@@ -737,8 +737,18 @@ func buildInGuestIptablesRules(outboundPort, inboundPort, healthPort int) []ipta
 	// In-guest root is trusted TCB infrastructure (the c8s threat model
 	// trusts the guest's own kernel); the workload that the mesh exists to
 	// wrap runs unprivileged (the c8s image is UID 65532) and is still
-	// redirected by the catch-all below. So exempting root here narrows the
-	// mesh to workload traffic without opening a workload bypass.
+	// redirected by the catch-all below.
+	//
+	// REQUIREMENT / LIMITATION: this exemption assumes the wrapped workload
+	// runs unprivileged (the c8s image is UID 65532). A workload running as
+	// UID 0 (an explicit runAsUser: 0, or simply an image whose default USER
+	// is root) matches this rule and egresses in PLAINTEXT, bypassing the
+	// mesh. Matching on UID cannot distinguish attestation-service from a
+	// root workload, and admission control can pin runAsUser but cannot see
+	// an image's default USER, so neither layer fully closes this.
+	// Deployments relying on the mesh's confidentiality MUST run workloads
+	// non-root. A follow-up should scope this exemption to
+	// attestation-service (cgroup or binary match) instead of all of UID 0.
 	rules = append(rules, iptablesRule{
 		table: "nat", chain: chainName,
 		label: "in-guest-output-skip-infra-uid",

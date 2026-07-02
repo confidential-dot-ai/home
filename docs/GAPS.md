@@ -19,6 +19,10 @@ final security model. Each bullet links to the tracking issue.
 - SPIFFE-style URI SANs are not implemented (tracked at [#47](https://github.com/confidential-dot-ai/c8s/issues/47)).
 - Strict/permissive mTLS modes are not configurable (tracked at [#47](https://github.com/confidential-dot-ai/c8s/issues/47)).
 - Per-workload `allowedPeers` policy is not enforced (tracked at [#47](https://github.com/confidential-dot-ai/c8s/issues/47)).
+- The in-guest mesh exempts all UID-0 egress so attestation-service can reach
+  AMD KDS, so a workload running as root egresses in plaintext and bypasses the
+  mesh. Workloads MUST run non-root; the exemption should be scoped to
+  attestation-service rather than all of UID 0.
 
 ## Image and pod spec
 
