@@ -148,6 +148,14 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Deliberately no teardown here. Graceful shutdown is owned by the
+			// dedicated `iptables-cleanup` native sidecar's preStop hook, which
+			// runs runIptablesCleanup() last (sidecars stop in reverse init
+			// order) so cleanup happens after the proxy drains. Cleaning up here
+			// too would be redundant and could race that sidecar; and it would
+			// not cover a SIGKILL/OOM (which never reaches this branch anyway).
+			// A crash without preStop is handled on restart: installIptablesRules
+			// flushes the managed chains before reinstalling.
 			return nil
 		case <-ticker.C:
 		case <-syncCh:
