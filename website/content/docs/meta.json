@@ -3,8 +3,8 @@
   "root": true,
   "pages": [
     "index",
-    "c8s",
     "concepts",
+    "c8s",
     "attestable-builds",
     "whitepapers",
     "api"

@@ -1,7 +1,6 @@
 {
   "title": "Confidential Computing Primer",
   "pages": [
-    "index",
     "01-threat-model",
     "02-hardware-foundations",
     "03-memory-integrity",

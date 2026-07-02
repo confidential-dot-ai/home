@@ -1,7 +1,6 @@
 {
   "title": "c8s: Confidential Kubernetes",
   "pages": [
-    "index",
     "architecture",
     "runtime",
     "install",

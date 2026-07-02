@@ -88,17 +88,31 @@ function nodeContainsActive(node: DocsNavNode, pathname: string): boolean {
   return node.url === pathname || node.children.some((c) => nodeContainsActive(c, pathname));
 }
 
-const indent = (depth: number) => ({ paddingLeft: `${depth * 0.7 + 0.6}rem` });
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      aria-hidden="true"
+      className={`shrink-0 text-muted transition-transform ${open ? "rotate-90" : ""}`}
+    >
+      <path d="M9 6l6 6-6 6" />
+    </svg>
+  );
+}
 
+/** Leaf page — muted, no chevron; indented to sit under the section titles. */
 function DocsPageLink({
   node,
   pathname,
-  depth,
   onNavigate,
 }: {
   node: Extract<DocsNavNode, { type: "page" }>;
   pathname: string;
-  depth: number;
   onNavigate?: () => void;
 }) {
   const active = pathname === node.url;
@@ -107,9 +121,8 @@ function DocsPageLink({
       href={node.url}
       onClick={onNavigate}
       aria-current={active ? "page" : undefined}
-      style={indent(depth)}
-      className={`font-mono text-[0.8rem] no-underline py-0.5 transition-colors hover:text-foreground ${
-        active ? "text-accent" : "text-foreground/70"
+      className={`block py-1 pl-[1.4rem] font-mono text-[0.8rem] no-underline transition-colors hover:text-foreground ${
+        active ? "text-accent" : "text-foreground/60"
       }`}
     >
       {node.title}
@@ -117,53 +130,66 @@ function DocsPageLink({
   );
 }
 
+/** Section header — a chevron plus a bolder title. The title links to the
+ *  section overview when the folder has an index page, otherwise it toggles.
+ *  Children sit inside an indented rail so the hierarchy reads at a glance. */
 function DocsFolder({
   node,
   pathname,
-  depth,
   onNavigate,
 }: {
   node: Extract<DocsNavNode, { type: "folder" }>;
   pathname: string;
-  depth: number;
   onNavigate?: () => void;
 }) {
+  const selfActive = pathname === node.url;
   const active = useMemo(() => nodeContainsActive(node, pathname), [node, pathname]);
-  // `null` follows the active state (auto-open the section for the current page);
-  // once the user toggles the folder, their choice sticks.
+  // `null` follows the active state (auto-open the current section); once the
+  // user toggles the folder, their choice sticks.
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const open = userOpen ?? active;
+  const toggle = () => setUserOpen(!open);
 
   return (
     <div className="flex flex-col">
-      <button
-        type="button"
-        onClick={() => setUserOpen(!open)}
-        style={indent(depth)}
-        aria-expanded={open}
-        className="flex items-center gap-1.5 font-mono text-[0.8rem] py-0.5 text-left text-foreground/85 hover:text-foreground transition-colors"
-      >
-        <svg
-          width="9"
-          height="9"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2.5"
-          aria-hidden="true"
-          className={`shrink-0 text-muted transition-transform ${open ? "rotate-90" : ""}`}
+      <div className="flex items-center gap-1 py-1">
+        <button
+          type="button"
+          onClick={toggle}
+          aria-expanded={open}
+          aria-label={open ? "Collapse section" : "Expand section"}
+          className="flex size-4 items-center justify-center"
         >
-          <path d="M9 6l6 6-6 6" />
-        </svg>
-        {node.title}
-      </button>
+          <Chevron open={open} />
+        </button>
+        {node.url ? (
+          <Link
+            href={node.url}
+            onClick={onNavigate}
+            aria-current={selfActive ? "page" : undefined}
+            className={`font-mono text-[0.8rem] font-medium no-underline transition-colors hover:text-foreground ${
+              selfActive ? "text-accent" : "text-foreground"
+            }`}
+          >
+            {node.title}
+          </Link>
+        ) : (
+          <button
+            type="button"
+            onClick={toggle}
+            className="text-left font-mono text-[0.8rem] font-medium text-foreground transition-colors hover:text-foreground"
+          >
+            {node.title}
+          </button>
+        )}
+      </div>
       {open && (
-        <div className="flex flex-col">
+        <div className="ml-2 flex flex-col border-l border-border pl-1">
           {node.children.map((c, i) =>
             c.type === "folder" ? (
-              <DocsFolder key={i} node={c} pathname={pathname} depth={depth + 1} onNavigate={onNavigate} />
+              <DocsFolder key={i} node={c} pathname={pathname} onNavigate={onNavigate} />
             ) : (
-              <DocsPageLink key={c.url} node={c} pathname={pathname} depth={depth + 1} onNavigate={onNavigate} />
+              <DocsPageLink key={c.url} node={c} pathname={pathname} onNavigate={onNavigate} />
             )
           )}
         </div>
@@ -185,9 +211,9 @@ function DocsTree({
     <div className="mt-1 mb-1 ml-1 flex flex-col border-l border-border pl-1">
       {nodes.map((n, i) =>
         n.type === "folder" ? (
-          <DocsFolder key={i} node={n} pathname={pathname} depth={0} onNavigate={onNavigate} />
+          <DocsFolder key={i} node={n} pathname={pathname} onNavigate={onNavigate} />
         ) : (
-          <DocsPageLink key={n.url} node={n} pathname={pathname} depth={0} onNavigate={onNavigate} />
+          <DocsPageLink key={n.url} node={n} pathname={pathname} onNavigate={onNavigate} />
         )
       )}
     </div>

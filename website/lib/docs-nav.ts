@@ -35,17 +35,14 @@ function walk(nodes: TreeNode[] | undefined): DocsNavNode[] {
   for (const n of nodes ?? []) {
     if (n.type === 'separator') continue;
     if (n.type === 'folder') {
-      const children = walk(n.children);
       const idxUrl = n.index?.url;
-      // Surface a folder's index page as its first child ("Overview"), and drop
-      // any duplicate of it from the children.
-      const withIndex: DocsNavNode[] = idxUrl
-        ? [
-            { type: 'page', title: nodeText(n.index?.name), url: idxUrl },
-            ...children.filter((c) => !(c.type === 'page' && c.url === idxUrl)),
-          ]
-        : children;
-      out.push({ type: 'folder', title: nodeText(n.name), url: idxUrl, children: withIndex });
+      // The folder's own title links to its index (its "overview") — so we drop
+      // the index page from the children to avoid a duplicate row that repeats
+      // the folder name.
+      const children = walk(n.children).filter(
+        (c) => !(c.type === 'page' && c.url === idxUrl),
+      );
+      out.push({ type: 'folder', title: nodeText(n.name), url: idxUrl, children });
     } else if (n.url) {
       out.push({ type: 'page', title: nodeText(n.name), url: n.url });
     }
