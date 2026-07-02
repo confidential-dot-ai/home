@@ -34,8 +34,8 @@ curl -sS -X POST https://api.confidential.ai/v1/instances \
   -d "{\"public_key\": \"$(cat ~/.ssh/id_ed25519.pub)\", \"agent\": \"openclaw\"}"
 ```
 
-See the [Agents API reference](/docs/confidential-agents-api) for the full request and response surface.
+See the [Agents API reference](/docs/api/confidential-agents) for the full request and response surface.
 
 ## Get access
 
-API keys are issued per organization. [Contact us](mailto:hello@confidential.ai) to request access, and see the [Agents API reference](/docs/confidential-agents-api) for the full endpoint surface.
+API keys are issued per organization. [Contact us](mailto:hello@confidential.ai) to request access, and see the [Agents API reference](/docs/api/confidential-agents) for the full endpoint surface.

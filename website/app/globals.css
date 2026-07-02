@@ -1,9 +1,21 @@
 @import "tailwindcss";
+@import "fumadocs-ui/css/neutral.css";
+@import "fumadocs-ui/css/preset.css";
+
+@source '../node_modules/fumadocs-ui/dist/**/*.js';
+
+/* Serif everywhere (incl. Fumadocs, which uses --font-sans); shared mono stack. */
+@theme {
+  --font-sans: var(--font-source-serif), Georgia, "Times New Roman", serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+}
 
 /* ── Theme tokens ───────────────────────────────────────────────
    Default :root is the light theme (the default everyone sees on first load).
    [data-theme] is set before paint by the inline script in layout.tsx; a saved
-   toggle choice wins, otherwise the site stays light. */
+   toggle choice wins, otherwise the site stays light. The `.dark` class is set
+   in lockstep so Fumadocs' dark tokens and `dark:` utilities track the toggle. */
 :root,
 :root[data-theme="light"] {
   --background: #fbfbf9;
@@ -35,6 +47,48 @@
   --cta-text: #1a1a1a;
 }
 
+/* ── Fumadocs tokens, mapped onto the home palette ──────────────
+   Light values live on :root; the .dark class overrides them. Un-layered so
+   they win over Fumadocs' own layered defaults. Text-facing accents use the
+   dark-gold `--accent` (readable on light); bright yellow stays for CTA fills. */
+:root {
+  --color-fd-background: var(--background);
+  --color-fd-foreground: var(--foreground);
+  --color-fd-muted: #f0eee8;
+  --color-fd-muted-foreground: var(--muted);
+  --color-fd-popover: #ffffff;
+  --color-fd-popover-foreground: var(--foreground);
+  --color-fd-card: #ffffff;
+  --color-fd-card-foreground: var(--foreground);
+  --color-fd-border: var(--border);
+  --color-fd-primary: var(--accent);
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-secondary: #f0eee8;
+  --color-fd-secondary-foreground: var(--heading);
+  --color-fd-accent: #f2f0ea;
+  --color-fd-accent-foreground: var(--heading);
+  --color-fd-ring: var(--accent);
+}
+
+.dark {
+  --color-fd-background: var(--background);
+  --color-fd-foreground: var(--foreground);
+  --color-fd-muted: #232323;
+  --color-fd-muted-foreground: var(--muted);
+  --color-fd-popover: #141414;
+  --color-fd-popover-foreground: var(--foreground);
+  --color-fd-card: #141414;
+  --color-fd-card-foreground: var(--foreground);
+  --color-fd-border: var(--border);
+  --color-fd-primary: var(--accent);
+  --color-fd-primary-foreground: #1a1a1a;
+  --color-fd-secondary: #232323;
+  --color-fd-secondary-foreground: #e8e8e8;
+  --color-fd-accent: #262626;
+  --color-fd-accent-foreground: #ffffff;
+  --color-fd-ring: var(--accent);
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -48,6 +102,16 @@
   50% { opacity: 0; }
 }
 
+html {
+  scrollbar-gutter: stable;
+}
+
+/* Neutralize react-remove-scroll's body padding when the search dialog opens. */
+html > body[data-scroll-locked] {
+  margin-right: 0 !important;
+  --removed-body-scroll-bar-size: 0 !important;
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
@@ -55,12 +119,6 @@ body {
   font-size: 1rem;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
-}
-
-/* Monospace stack used for code, labels, and ASCII diagrams. */
-:root {
-  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
-    "Liberation Mono", "Courier New", monospace;
 }
 
 ::selection {
@@ -74,7 +132,19 @@ body {
   border-radius: 2px;
 }
 
-/* ── Markdown prose styling ─────────────────────────────────────── */
+/* Tailwind v4 Preflight makes buttons `cursor: default`; restore the pointer on
+   interactive controls (sidebar folder toggles, search, pagination, etc.). */
+@layer base {
+  button:not(:disabled),
+  [role='button']:not(:disabled),
+  summary {
+    cursor: pointer;
+  }
+}
+
+/* ── Markdown prose styling (marketing pages, react-markdown) ────
+   Fumadocs docs bodies do NOT use `.prose` (neutral/preset styles them via their
+   own selectors), so `.prose` here is scoped in practice to the marketing pages. */
 .prose {
   max-width: none;
   line-height: 1.7;
@@ -394,4 +464,102 @@ nav[aria-label="Primary"]::-webkit-scrollbar-thumb {
 
 .prose > div[align="center"]:first-child:has(nav) + br {
   display: none;
+}
+
+/* ── Docs (Fumadocs) chrome ─────────────────────────────────────── */
+
+/* Keep the sidebar's scroll self-contained so the wheel never chains through. */
+#nd-sidebar [data-radix-scroll-area-viewport],
+#nd-sidebar [class*='overflow-'] {
+  overscroll-behavior: contain;
+}
+
+/* Native <details> sidebar folders (components/native-folder.tsx): strip the
+   default disclosure marker and rotate our own chevron on open. */
+#nd-sidebar details.fd-folder > summary {
+  list-style: none;
+  cursor: pointer;
+}
+#nd-sidebar details.fd-folder > summary::-webkit-details-marker {
+  display: none;
+}
+#nd-sidebar details.fd-folder > summary .fd-folder-chevron {
+  transition: transform 0.2s ease;
+  transform: rotate(-90deg);
+}
+#nd-sidebar details.fd-folder[open] > summary .fd-folder-chevron {
+  transform: rotate(0deg);
+}
+
+/* Collapsible boxes in docs content — native <details> (reliable, no JS). */
+details[data-collapse] {
+  border: 1px solid var(--color-fd-border);
+  border-radius: 8px;
+  background: var(--color-fd-card);
+  padding: 0 0.9rem;
+  margin: 1.25rem 0;
+}
+details[data-collapse] > summary {
+  cursor: pointer;
+  list-style: none;
+  font-weight: 500;
+  padding: 0.65rem 0;
+  color: var(--color-fd-foreground);
+}
+details[data-collapse] > summary::-webkit-details-marker {
+  display: none;
+}
+details[data-collapse] > summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-inline-end: 0.5rem;
+  color: var(--color-fd-muted-foreground);
+  transition: transform 0.15s ease;
+}
+details[data-collapse][open] > summary::before {
+  transform: rotate(90deg);
+}
+details[data-collapse] > :not(summary):last-child {
+  margin-bottom: 0.9rem;
+}
+
+/* Top navbar: let it span the full width with comfortable gutters. */
+#nd-nav > div > * {
+  max-width: none;
+}
+@media (min-width: 768px) {
+  #nd-nav nav {
+    padding-inline: 2rem;
+  }
+}
+
+/* Architecture / flow diagrams (Next-optimized <img> in docs content only). */
+img[data-nimg] {
+  display: block;
+  width: 100%;
+  max-width: 720px;
+  height: auto;
+  margin: 1.5rem auto;
+}
+
+/* Theme-aware diagrams (components/diagram.tsx): show the light variant by
+   default, the dark original under `.dark`. No JS, tracks the theme toggle. */
+.diagram-frame {
+  display: block;
+}
+.diagram-frame img {
+  display: block;
+  width: 100%;
+  max-width: 720px;
+  height: auto;
+  margin: 1.5rem auto;
+}
+.diagram-frame .diagram-dark {
+  display: none;
+}
+.dark .diagram-frame .diagram-light {
+  display: none;
+}
+.dark .diagram-frame .diagram-dark {
+  display: block;
 }

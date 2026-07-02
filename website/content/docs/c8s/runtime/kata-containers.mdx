@@ -1,0 +1,105 @@
+---
+title: Kata Containers
+description: How c8s uses Kata Containers to run each pod as its own SEV-SNP confidential VM — measured direct-kernel boot, the sealed guest image, and the guest-pull model.
+---
+
+When you install c8s with `--kata`, every workload pod becomes its own **SEV-SNP confidential
+VM**. This is the *pod-as-kata-cvm* model: "each pod is its own confidential VM." Kata
+Containers provides the per-pod micro-VM; c8s provides the attestation, identity, and policy
+that make it confidential and verifiable.
+
+## What gets installed
+
+`c8s install --kata` deploys the Kata runtime stack and registers three RuntimeClasses:
+
+- **`kata-deploy`** (DaemonSet, digest-pinned) installs the Kata runtime and
+  `containerd-shim-kata-v2` on every node — including the SEV-SNP-capable QEMU build used by
+  `kata-qemu-snp`, the guest kernel, guest image, and OVMF firmware. It restarts
+  containerd/RKE2 after install; running pods survive via shim persistence.
+- **RuntimeClasses:**
+
+  | RuntimeClass | Hypervisor | Confidential? |
+  | --- | --- | --- |
+  | `kata-qemu` | QEMU micro-VM | No — VM isolation from the host only |
+  | `kata-clh` | Cloud Hypervisor | No — VM isolation only |
+  | `kata-qemu-snp` | QEMU + SEV-SNP | **Yes** — pod memory is encrypted against the host |
+
+Installing `--kata` also **disables** the host-side `ratls-mesh`, `attestation-api`, and
+`nri-image-policy`: under Kata their function moves *inside* the guest image, where the host
+cannot tamper with it.
+
+## Measured direct-kernel boot
+
+Kata's confidential path does **not** use IGVM or a UKI. It uses **measured direct-kernel
+boot with dm-verity**:
+
+| Component | What's supplied |
+| --- | --- |
+| kernel | a bare `vmlinuz` (a hardened kernel) |
+| image | `kata-rootfs.img` — an ext4 rootfs plus a dm-verity hash tree |
+| verity params | `root_hash=…,salt=…,data_blocks=…` on the kernel cmdline |
+
+The dm-verity **root hash rides on the kernel cmdline**, and the cmdline is folded into the
+**SNP launch measurement** at boot. So the launch digest commits to OVMF + `vmlinuz` + the
+exact rootfs. To keep the digest stable it is measured at **1 vCPU** and predicted with
+`sev-snp-measure`, then published so an operator can pre-attest it and pin it in
+`kata.guestImage.tag`.
+
+## The sealed guest image
+
+The **`kata-guest-base`** image is the dm-verity-sealed guest rootfs. Because it is part of
+the launch measurement, everything baked into it is transitively attested:
+
+| Baked-in | Role |
+| --- | --- |
+| `attestation-service` | localhost-only attester at `127.0.0.1:8400` |
+| `ratls-mesh` | in-guest mesh proxy (`ratls-mesh in-guest`) |
+| `policy-monitor` | watches container creation and SIGKILLs non-allowlisted images |
+| `/etc/c8s/bootstrap-allowlist.json` | the baked image-digest allowlist (part of the measurement) |
+| `/etc/kata-opa/default-policy.rego` | OPA policy denying host `exec`/`log` RPCs and `SetPolicyRequest` |
+
+A peer that verifies an RA-TLS handshake therefore transitively verifies that the attestation
+service, mesh proxy, and policy monitor are the genuine, sealed versions — they cannot be
+swapped out by the host.
+
+<Callout type="info">
+  In debug builds (`--kata --debug`), the guest policy allows host log/exec streams so
+  `kubectl logs` and `kubectl exec` work — but container I/O becomes readable by the
+  untrusted host, and the launch measurement differs from the locked image. Development only.
+</Callout>
+
+## Three layers of attestation
+
+![Three layers of attestation: the guest image (SNP launch digest), the container image (OCI digest checked against the allowlist), and the workload identity (RA-TLS certificate).](/diagrams/attestation-layers.svg)
+
+1. **Guest image** — the SNP launch digest over OVMF + `vmlinuz` + cmdline (embedding the
+   dm-verity root hash). Operator pre-attests and pins it.
+2. **Container image** — the OCI image digest, checked against the
+   [allowlist](/docs/c8s/attestation/allowlist). The pod webhook injects `get-cert`, which fetches
+   a leaf cert from the CDS — the CDS verifies the container measurement and signs in one step.
+3. **Workload identity** — an RA-TLS cert carrying attestation evidence; peers verify it on
+   the mTLS handshake.
+
+## The guest-pull model
+
+With `shared_fs="none"` and `experimental_force_guest_pull=true`, the kata-agent's
+confidential-data-hub **pulls the OCI image inside the guest over virtio-net** — not from a
+host bind-mount. The host never sees the unpacked workload rootfs, only encrypted VM memory.
+
+A consequence worth planning for: a **private** workload image needs *two* credentials — one
+host-side (for the kubelet's pull) and one in-guest at `/run/image-security/auth.json` (for
+the confidential-data-hub's pull).
+
+## Constraints
+
+- **x86-64 + SEV-SNP today.** The confidential *pod* path currently requires an AMD SEV-SNP host
+  (Genoa / Milan / Turin class) — Intel TDX runs the rest of the c8s stack and node-as-CVM, but
+  the per-pod Kata runtime is SEV-SNP for now, with TDX in progress. On a non-SNP host you can
+  still run `kata-qemu` (isolation, not confidentiality) but not `kata-qemu-snp`.
+- **No GPU confidential computing yet.** GPU CC (NVIDIA H100 CC-mode) is intentionally out of
+  scope for the initial pod runtime — see [Limitations](/docs/c8s/limitations).
+- **Per-pod, not per-node.** Pod-as-CVM attests each pod; it does not by itself attest the
+  node. If you need a single confidential node instead, see
+  [pod-as-CVM vs node-as-CVM](/docs/c8s/runtime/pod-vs-node-cvm).
+- **Not available on Azure AKS.** Per-pod CVMs need nesting that AKS does not provide; use
+  the node-as-CVM shape there — see [Provisioning on Azure](/docs/c8s/install/azure).

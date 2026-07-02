@@ -1,0 +1,82 @@
+---
+title: "Introduction to TEEs"
+description: "A high-level introduction to Trusted Execution Environments — what they are, how they work, and their limitations."
+---
+
+This document is a high-level introduction to what TEEs are, how they work, and what their limitations are. For a detailed technical deep dive, see the [Confidential Computing Primer](/docs/concepts/confidential-computing-primer).
+
+A Trusted Execution Environment (TEE) is a tamper-proof isolated computing environment that maintains data confidentiality and allows verifiability of its running workloads. TEEs have recently been implemented in modern CPU and GPU hardware. Intel and AMD have provided CPU-based TEEs for several years. More critically for AI workloads, NVIDIA introduced TEE capabilities in their GPUs starting 2024.
+
+## Core Security Properties
+
+A TEE provides four critical security properties:
+
+**Integrity**: Once software is initialized in a TEE, it becomes tamper-proof. An attacker with root access to the host system cannot modify the running software without detection.
+
+**Confidentiality**: Data within the TEE is encrypted at the hardware level in memory pages. Data being processed remains private even from privileged system administrators.
+
+**Verifiability**: The TEE cryptographically measures exactly what software is running. Clients can verify they're communicating with the specific software they expect.
+
+**Attestation**: The TEE produces signed attestation reports that provide cryptographic proof of all the above properties. These attestations are signed by hardware manufacturers (Intel, AMD, NVIDIA) and cannot be forged.
+
+## The HTTPS Analogy
+
+A useful analogy is the transition from HTTP to HTTPS. With HTTP you sent your data in plaintext, and you could not confirm who you're talking to. HTTPS allows you to confirm who you're talking to and encrypt your data in transit. TEE attestation goes a step further and allows you to prove that your data is encrypted during computation, letting you verify not just who you're talking to, but also what software they're running. All of this, like HTTPS, is available at a negligible performance cost.
+
+## How TEEs Work in Practice
+
+Here's how this works in practice: Suppose that a user wants to submit a sensitive query to a large language model running on a remote server. They require that their query and the model's response remain confidential from all parties, including the server operator, and they need cryptographic proof that only the specified model version processed their data without any unauthorized access.
+
+The server runs the LLM inside a TEE. When the user sends their query, it gets encrypted with the TEE's public key before transmission. Inside the TEE, the model processes the encrypted query using weights that remain encrypted in memory and are never accessible in plaintext to any software outside the enclave. The model returns an encrypted response along with a cryptographic attestation that proves exactly which model version and code processed the query and verifies that no other software could access the user's data or the model weights.
+
+Without a TEE, this interaction would expose the user's query in plaintext during processing, allow system administrators and other processes to access both the query and model weights in memory, enable potential interception by malicious software on the host system, and provide no verifiable guarantee about which software actually processed the request. The TEE provides hardware-backed isolation and cryptographic verification that creates a secure computation environment even on untrusted infrastructure.
+
+## How TEEs Actually Work
+
+The security guarantees of TEEs emerge from cryptographic primitives built into the silicon itself. Understanding how these guarantees work requires walking through the chain of trust from hardware to application.
+
+### The TEE Module
+
+TEE implementations embed dedicated security modules directly into CPU hardware. These modules introduce new CPU execution modes and partition system resources at the hardware level. The TEE module operates in a privileged mode that sits alongside or above the hypervisor. Memory is divided between secure regions (accessible only to the TEE module) and regular regions. Current TEE module implementations can utilize the full resources of the CPU.
+
+### Hardware Root of Trust
+
+TEE security properties are built from a hardware root of trust. During manufacturing, chip manufacturers fuse unique private keys directly into the chip using specialized one-time programmable memory. The fusing methods are designed so that keys cannot be extracted without destroying the chip. Attempts to read the keys through physical analysis would destroy the chip.
+
+These manufacturer-unique root keys establish the hardware root of trust. Manufacturers then can generate certificates which can be used to verify the authenticity of TEEs. The root keys are never used directly. Instead, TEEs implement key derivation hierarchies where application-specific keys are derived from root keys. This ensures that compromising one derived key doesn't expose others or the root. These derived keys have different use cases, most notably they are used to encrypt and decrypt memory pages for confidentiality guarantees.
+
+### Establishing Confidentiality
+
+To establish confidentiality, clients first verify they're communicating with a legitimate TEE running on genuine hardware. A client receives an attestation report signed with keys that trace back to the hardware root of trust. Once verified, clients can verify that they are speaking with a legitimate TEE module.
+
+Clients can then encrypt their data with keys derived uniquely from the TEE, trusting that only the legitimate TEE can decrypt it. Confidentiality is maintained through memory encryption whenever the data is written to memory. Even privileged system software like hypervisors can only access encrypted data without the corresponding decryption keys.
+
+### Establishing Verifiability
+
+The verifiability guarantee emerges from a process called "measured boot", a cryptographic chain that measures every piece of software before it executes. It begins with the hardware root of trust and builds a chain of confidence, step by step, through the entire system:
+
+1. **Hardware Root Established**: The TEE module's authenticity is verified using the unforgeable hardware keys, establishing the foundation of trust.
+
+2. **Firmware Trust**: Now that we trust the TEE module, it measures and cryptographically signs the firmware before execution. The trusted TEE vouches for the firmware's integrity.
+
+3. **Kernel Trust**: The now-trusted firmware measures and signs the kernel before transferring control, extending the chain of trust.
+
+4. **Application Trust**: The trusted kernel measures each application component before execution, completing the chain.
+
+Each measurement gets cryptographically signed and chained to the previous measurement using keys derived from the hardware root. The result is a tamper-evident record of exactly what software is running, anchored to the hardware root of trust. Any modification to any component in the chain produces a completely different measurement signature.
+
+### The Attestation Proof
+
+TEEs generate attestation reports that can be handed to external parties to verify they are communicating with a legitimate TEE. These reports also contain the complete chain of measured boot with all measurements signed and traceable back to the hardware manufacturer's certificate chain. The client can verify this entire chain independently, confirming they're communicating with the exact software they expect, running with hardware-level confidentiality guarantees.
+
+## TEE Vulnerabilities
+
+TEEs remain vulnerable to sophisticated attack vectors that exploit both hardware limitations and implementation flaws. Side-channel attacks represent the most prominent threat, where attackers analyze power consumption, electromagnetic emissions, timing variations, or cache behavior to extract sensitive information from supposedly secure enclaves. Physical access attacks, including fault injection and glitching techniques, can manipulate hardware behavior to bypass security mechanisms or extract cryptographic keys. These attacks typically require specialized equipment and physical proximity to the target system, making them difficult to execute at scale but representing real vulnerabilities that have been demonstrated against commercial TEE implementations in research environments.
+
+Supply chain attacks pose an emerging and particularly concerning threat vector. Malicious actors could compromise TEE hardware during the manufacturing process, embed backdoors in firmware or microcode, or subvert the cryptographic foundations that underpin attestation mechanisms. Nation-state actors with manufacturing capabilities represent the most significant risk in this category. Software vulnerabilities within TEE implementations also create attack surfaces, including bugs in the secure kernel, improper memory management, or flawed cryptographic implementations that could allow privilege escalation or information disclosure.
+
+Additionally, TEEs face architectural limitations that sophisticated adversaries can exploit. Rollback attacks can revert TEE state to previous versions, potentially exposing stale cryptographic material. Denial of service attacks can render TEE services unavailable, and in some implementations, certain classes of speculative execution vulnerabilities can leak information across security boundaries. While these attacks often require significant resources and expertise, they demonstrate that TEEs provide strong but not absolute security guarantees.
+
+## Further Reading
+
+For a detailed technical deep dive into how confidential computing works under the hood using AMD SEV-SNP as a reference implementation, see the [Confidential Computing Primer](/docs/concepts/confidential-computing-primer). For how TEEs apply specifically to AI security, see our blog [Secure AI Needs TEEs](/blog/secure-ai-needs-tees).

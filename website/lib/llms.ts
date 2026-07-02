@@ -3,10 +3,13 @@ import path from "path";
 
 const CONTENT_ROOT = path.resolve(process.cwd(), "..");
 const WEBSITE_ROOT = process.cwd();
+const DOCS_ROOT = path.join(WEBSITE_ROOT, "content", "docs");
 const SITE_URL = "https://confidential.ai";
 
 const EXCLUDED_ROOT_FILES = new Set(["CLAUDE.md"]);
-const CONTENT_SUBDIRS = ["blog", "careers", "docs"];
+// Docs are handled separately (Fumadocs content tree); blog/careers still live
+// at the repo root as plain markdown.
+const CONTENT_SUBDIRS = ["blog", "careers"];
 
 export interface ContentFile {
   relPath: string;
@@ -79,9 +82,69 @@ function walkDir(dirRelPath: string): string[] {
   return result;
 }
 
-export function discoverContent(): ContentFile[] {
-  const allFiles: string[] = [];
+// ── Docs (Fumadocs MDX tree under website/content/docs) ─────────────
 
+/** Strip a leading YAML frontmatter block, returning { title, body }. */
+function parseFrontmatter(raw: string): { title?: string; body: string } {
+  const m = raw.match(/^---\n([\s\S]*?)\n---\n?/);
+  if (!m) return { body: raw };
+  const titleMatch = m[1].match(/^title:\s*(.+)$/m);
+  let title = titleMatch?.[1]?.trim();
+  if (title && /^["'].*["']$/.test(title)) title = title.slice(1, -1);
+  return { title, body: raw.slice(m[0].length) };
+}
+
+/** File path relative to content/docs → site URL. */
+function docsRelToUrl(rel: string): string {
+  let url = "/docs/" + rel.replace(/\.mdx?$/, "");
+  url = url.replace(/\/index$/, "");
+  return url.replace(/\/$/, "");
+}
+
+/** Walk the docs tree; index files first within a folder, then alphabetical. */
+function walkDocs(dirAbs: string, relPrefix: string): string[] {
+  if (!fs.existsSync(dirAbs)) return [];
+  const entries = fs.readdirSync(dirAbs, { withFileTypes: true });
+  const files: string[] = [];
+  const subdirs: string[] = [];
+  for (const entry of entries) {
+    const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+    if (entry.isFile() && /\.mdx?$/.test(entry.name)) files.push(rel);
+    else if (entry.isDirectory()) subdirs.push(rel);
+  }
+  files.sort((a, b) => {
+    const ai = /(^|\/)index\.mdx?$/.test(a);
+    const bi = /(^|\/)index\.mdx?$/.test(b);
+    if (ai && !bi) return -1;
+    if (!ai && bi) return 1;
+    return a.localeCompare(b);
+  });
+  const result = [...files];
+  for (const sub of subdirs.sort()) {
+    result.push(...walkDocs(path.join(dirAbs, path.basename(sub)), sub));
+  }
+  return result;
+}
+
+function discoverDocs(): ContentFile[] {
+  return walkDocs(DOCS_ROOT, "").map((rel) => {
+    const raw = fs.readFileSync(path.join(DOCS_ROOT, rel), "utf-8");
+    const { title, body } = parseFrontmatter(raw);
+    const url = docsRelToUrl(rel);
+    const resolvedTitle = title ?? extractTitle(body, rel);
+    return {
+      // Synthetic repo-relative path so buildDocsIndex's `docs/` filter + depth
+      // math keep working with the new tree.
+      relPath: "docs/" + rel,
+      url,
+      fullUrl: SITE_URL + url,
+      title: resolvedTitle,
+      content: `# ${resolvedTitle}\n\n${body.trim()}`,
+    };
+  });
+}
+
+export function discoverContent(): ContentFile[] {
   const rootEntries = fs.readdirSync(CONTENT_ROOT, { withFileTypes: true });
   const rootFiles: string[] = [];
   for (const entry of rootEntries) {
@@ -93,13 +156,8 @@ export function discoverContent(): ContentFile[] {
       rootFiles.push(entry.name);
     }
   }
-  allFiles.push(...sortContentFiles(rootFiles));
 
-  for (const subdir of CONTENT_SUBDIRS) {
-    allFiles.push(...walkDir(subdir));
-  }
-
-  return allFiles.map((relPath) => {
+  const result: ContentFile[] = sortContentFiles(rootFiles).map((relPath) => {
     const content = readRepoFile(relPath);
     const url = relPathToUrl(relPath);
     return {
@@ -110,6 +168,26 @@ export function discoverContent(): ContentFile[] {
       content,
     };
   });
+
+  // Docs (Fumadocs tree).
+  result.push(...discoverDocs());
+
+  // Blog + careers (repo-root markdown).
+  for (const subdir of CONTENT_SUBDIRS) {
+    for (const relPath of walkDir(subdir)) {
+      const content = readRepoFile(relPath);
+      const url = relPathToUrl(relPath);
+      result.push({
+        relPath,
+        url,
+        fullUrl: SITE_URL + url,
+        title: extractTitle(content, relPath),
+        content,
+      });
+    }
+  }
+
+  return result;
 }
 
 export function buildLlmsFullText(): string {

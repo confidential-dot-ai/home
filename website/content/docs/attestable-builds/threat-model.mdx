@@ -1,0 +1,116 @@
+---
+title: "Threat Model & Security Boundaries"
+description: "What attestable builds protect against and what they don't — trust boundaries and residual assumptions."
+---
+
+<<<<<<<< HEAD:docs/attested-builds/threat-model.md
+This document explains what attested builds protect against and what they don't. After reading it, you'll understand where the trust boundaries lie, what specific attacks are prevented, and which assumptions you're still making. We assume familiarity with the concepts from the previous sections: [What Are Attested Builds?](what-are-attested-builds.md), [How It Works](how-it-works.md), and [Provenance & Standards](provenance-standards.md).
+========
+This document explains what attestable builds protect against and what they don't. After reading it, you'll understand where the trust boundaries lie, what specific attacks are prevented, and which assumptions you're still making. We assume familiarity with the concepts from the previous sections: [What Are Attestable Builds?](/docs/attestable-builds/what-are-attestable-builds), [How It Works](/docs/attestable-builds/how-it-works), and [Provenance & Standards](/docs/attestable-builds/provenance-standards).
+>>>>>>>> 4176109 (feat(docs): integrated c8s docs from separate site):website/content/docs/attestable-builds/threat-model.mdx
+
+Security claims without clear boundaries are marketing. This document draws the boundaries.
+
+## The Trust Model
+
+Every security system has a root of trust: something you assume is correct because you can't verify it further down. The question isn't whether you trust something, but what you trust and whether that trust is well-placed.
+
+Attested builds shift where the root of trust sits. Instead of trusting the entire infrastructure stack (cloud provider's software, employees, other tenants, build systems), you trust a much smaller set of components.
+
+### What You Trust
+
+**TEE hardware and firmware.** You trust that the CPU vendor's manufacturing process didn't embed backdoors in the silicon. You trust that their key management practices keep root keys secure. You trust that the security processor firmware doesn't have exploitable vulnerabilities.
+
+**The physical host of the hardware.** Whoever physically hosts the hardware can perform classes of physical attacks that compromise TEE protections. This includes cold boot attacks, hardware interposers, and other physical tampering. If you don't control the physical infrastructure, you're trusting whoever does.
+
+**Cryptographic primitives.** AES for memory encryption, ECDSA for attestation signatures, SHA for measurements. If these break, the guarantees break.
+
+**Source repository integrity.** You trust that the commit you're building represents legitimate code. If your repository is compromised and contains a backdoor, the attested build faithfully builds the backdoor. Attestation proves what code was used, not that the code is trustworthy.
+
+**Package registries and toolchain distribution (in upstream mode).** When Kettle fetches dependencies or toolchains directly from external sources, you trust those sources to serve legitimate packages. In cached mode, these artifacts are verified once when cached and can be pinned into the TEE at initialization, removing external sources from the runtime trust path.
+
+### What You Don't Trust
+
+**Host software.** The hypervisor, host OS, management plane, monitoring agents, and other tenants are all outside the trust boundary. They can be compromised without affecting the confidentiality or integrity of your build. They cannot read your build environment's memory or tamper with it undetected.
+
+**Host employees.** Administrators with root access, datacenter technicians, operators, and anyone else in the operational chain cannot access your build environment's data or tamper with it undetected. This includes cloud provider employees and your own infrastructure team.
+
+**Build infrastructure outside the TEE.** Your CI system, build servers, artifact storage, and distribution channels are untrusted. They can trigger builds and receive outputs, but they cannot observe or tamper with the build process itself.
+
+## What Attested Builds Protect Against
+
+The protection comes from two sources: TEE isolation during the build, and cryptographic binding between inputs, the build process, and outputs.
+
+### Tampering During the Build
+
+An attacker who compromises the build platform and injects malicious behavior during builds would normally be undetectable. The source code is clean, but the resulting binaries are backdoored.
+
+Attested builds address this by running the build inside a TEE. The build environment is hardware-isolated from the host. The attestation proves what code was loaded and that the environment wasn't tampered with. If someone modifies the build process, the measurement changes, and verification fails.
+
+### Tampering After the Build
+
+An attacker who gains access to artifact storage could replace legitimate builds with malicious ones. Users download what they think is the official binary.
+
+Attested builds address this by cryptographically binding outputs to the attested build. The provenance contains hashes of all output artifacts, and the provenance itself is bound to the TEE attestation. If someone replaces an artifact, the hash won't match. If someone forges new provenance, it won't have a valid TEE attestation.
+
+### Forged Provenance
+
+Without TEEs, provenance is just a claim. Anyone with access to signing keys can create a JSON file saying "this binary came from this source."
+
+Attested builds change this. The provenance is bound to a hardware-signed attestation. The attestation is signed by a key derived from secrets fused into the CPU at manufacturing, keys that no software can access. Forging provenance requires compromising the TEE hardware itself.
+
+### Dependency Substitution
+
+If an attacker tries to swap in a different dependency during the build (different from what's pinned in your lockfile), the checksum won't match, and verification fails. The provenance records exact versions and checksums for every dependency, making substitution attacks detectable.
+
+## What Attested Builds Do NOT Protect Against
+
+These aren't weaknesses to be fixed. They're architectural constraints. Being clear about them is essential for understanding the actual security posture.
+
+### Malicious Source Code
+
+Attested builds verify that specific source was used, not that the source is safe. If the upstream repository contains a backdoor, the attested build faithfully builds the backdoor. The provenance accurately records that the backdoored commit was used. Everything works as designed, and you still have malware.
+
+Attestation proves identity, not intent.
+
+### Compromised Upstream Dependencies
+
+This depends on how Kettle handles dependencies.
+
+**In cached mode:** Dependencies are fetched and verified once when the cache is populated. After that, builds use the cached artifacts. The registry is only trusted at cache population time. If a malicious version enters the cache, subsequent builds will use it, but the window of exposure is limited to when the cache was built.
+
+**In upstream mode:** Dependencies are fetched from registries for each build. If a registry serves a malicious package (with a valid checksum because the malicious version is what's actually published), attested builds will verify that you built with that malicious package. The checksums match because you're building exactly what's in the registry.
+
+In both cases, attested builds verify the integrity of the build process given specific inputs. They don't verify that the inputs themselves are trustworthy.
+
+### TEE Hardware or Firmware Compromise
+
+The trust anchor is the CPU vendor's hardware and key management. If these are compromised, the guarantees break. Firmware vulnerabilities have been found in TEE implementations before; they will be found again.
+
+This is a much smaller attack surface than trusting the entire host. But it's not zero. You're trading a large, complex trust surface for a small, well-defined one.
+
+### Side-Channel Attacks
+
+TEEs share microarchitectural state with the host. Cache timing, branch prediction, and other side channels can leak information. TEE vendors have added mitigations that raise the bar significantly, but side channels remain an active research area.
+
+Attested builds reduce the attack surface compared to unprotected builds. They don't eliminate all information leakage.
+
+### Availability
+
+The host controls whether your build runs. It can terminate the TEE at any time. Attested builds protect confidentiality and integrity, not availability.
+
+### Bugs in Your Own Code
+
+The TEE protects the execution environment, not the code running in it. If your application has a vulnerability, an attacker can exploit it. Attestation proves what code loaded, not that the code is correct.
+
+## The Security Delta
+
+### Before Attested Builds
+
+You trust your build infrastructure, its operators, and the distribution channel. Verification is policy-based: you trust that people followed the right procedures, that access controls were configured correctly, that credentials weren't compromised.
+
+### After Attested Builds
+
+You trust the TEE hardware vendor, the physical host, and source infrastructure. The build infrastructure and distribution channel become untrusted. Verification is cryptographic: you check signatures against hardware-rooted keys, verify that provenance hashes match attestation reports, confirm that artifact hashes match provenance claims.
+
+The trust model shifts from trusting infrastructure to trusting hardware vendors. This is a much smaller trust surface.

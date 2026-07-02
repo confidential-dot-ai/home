@@ -1,0 +1,197 @@
+---
+title: The Allowlist
+description: How c8s controls exactly which container images may run — the allowlist data model, the CRUD API, EAR-signed mutations, seeding, and enforcement.
+---
+
+<JourneyNav current={5} />
+
+The **allowlist** is the set of container-image digests c8s permits to run. Nothing not on the
+list starts. It is **owned and served by the [CDS](/docs/c8s/attestation/cds)**, enforced at
+container-creation time by the `nri-image-policy` plugin (node-as-CVM) or the in-guest
+`policy-monitor` (pod-as-CVM), and managed through an EAR-authenticated API.
+
+## Data model
+
+An entry maps an **image digest** to its image reference. The store keeps a monotonically
+increasing **version** used as an ETag:
+
+```json
+{
+  "version": "7",
+  "digests": {
+    "sha256:abc…": "ghcr.io/example/inference:v3",
+    "sha256:def…": "docker.io/vllm/vllm-openai:v0.6.3"
+  }
+}
+```
+
+Digests are validated as `sha256:<64 hex chars>` (the OCI image-digest format). The store is a
+small SQLite database (`--allowlist-db`), with two tables — the digest→image map and a single
+version row that is bumped on every mutation.
+
+## The CRUD API
+
+The CDS exposes the allowlist at `/allowlist`:
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/allowlist` | none | list all digests; returns a weak ETag `W/"<version>"` and honours `If-None-Match` (304 when unchanged) |
+| `POST` | `/allowlist` | bearer EAR | add one `{ digest, image }`; bumps the version; `204` |
+| `DELETE` | `/allowlist` | bearer EAR | delete `{ digests: [...] }` **atomically** (all-or-nothing; `404` if any is missing) |
+
+Workers poll `GET /allowlist` and use the ETag to avoid redundant work — the version only
+changes when the set actually changes.
+
+## Authorizing mutations
+
+The allowlist is the source of truth for what may run, so the right to change it is gated on
+**hardware attestation of the writer** — not an API key. The operator establishes that authority
+**at CDS bootstrap**: the install-time value `cds.allowlistWriteMeasurements`
+(`--allowlist-write-measurements`) pins the launch measurement(s) of whoever is allowed to write.
+Empty — the default — rejects every mutation.
+
+There is no static credential to hand out. The write credential is a short-lived,
+attestation-bound **EAR** the CDS itself mints: at startup the CDS generates its **EAR-signing
+key** (ES256 / P-256, see [CDS bootstrap](/docs/c8s/attestation/cds#ear-tokens-and-jwks-rotation))
+and publishes the public half as a JWKS, and it only ever signs an EAR for a caller it has just
+verified — so holding a CDS-signed EAR *is* the credential, and there is nothing else to steal.
+
+![Allowlist write flow: an attested writer attests to the CDS, receives an EAR bound to the exact change (pbh), then POSTs to /allowlist with that EAR; the CDS re-verifies the signature, the writer's measurement, and the body hash before committing.](/diagrams/allowlist-write.svg)
+
+A write is four steps:
+
+1. **The writer attests.** A component that wants to change the allowlist proves with hardware
+   evidence (SEV-SNP or TDX) that it runs in a TEE whose launch measurement is in
+   `--allowlist-write-measurements`.
+   The CDS verifies that evidence the same way it does for the
+   [attestation flow](/docs/c8s/attestation/cds#the-attestation-flow).
+2. **The CDS issues an EAR bound to the change.** Via `/attest-key`, it mints a short-lived EAR —
+   signed with its bootstrap key — carrying the writer's `launch_digest` and a **`pbh`**
+   (payload-body-hash) claim set to `SHA-256` of the *exact* `{ digest, image }` (or delete) body
+   the writer is about to send.
+3. **The writer calls the API** — `POST`/`DELETE /allowlist` with that EAR as
+   `Authorization: Bearer`.
+4. **The CDS re-checks everything** before committing: the ES256 signature against its own JWKS,
+   `exp` + clock skew and the issuer, that the `launch_digest` is in
+   `--allowlist-write-measurements`, and — with a constant-time compare — that the EAR's `pbh`
+   equals `SHA-256` of the body it actually received.
+
+The `pbh` binding is the load-bearing part: an EAR minted to add image A **cannot** be replayed
+to add image B, delete an entry, or be reused at all once the change lands. Combined with the
+measurement gate, a captured token is worthless — only genuinely-attested code can touch the
+list.
+
+<Callout type="info">
+  Writes are off unless you set `--allowlist-write-measurements`; an empty list rejects every
+  mutation. See [Obtaining launch measurements](/docs/c8s/attestation/cds#obtaining-launch-measurements)
+  for getting the writer's digest.
+</Callout>
+
+## Seeding and bootstrap
+
+- **At startup**, `--allowlist-seed <json>` loads a `{ version, digests }` file into the store.
+  Seeding is idempotent — it inserts only missing entries and bumps the version only if at
+  least one was new. Any seed error halts startup (fail-closed).
+- **Under pod-as-CVM**, the guest image bakes `/etc/c8s/bootstrap-allowlist.json`, which is part of
+  the guest's launch measurement. `policy-monitor` enforces against that baked list from `t=0`,
+  before the first container starts, and CDS-served additions only ever *grow* the in-memory
+  set — they never shrink it.
+
+## Enforcement
+
+The enforcement point is container creation:
+
+- **Node-as-CVM** — `nri-image-policy` is an NRI plugin on the host. On the `CreateContainer`
+  hook it extracts the image digest and checks the allowlist. In **enforce** mode a
+  non-allowlisted image is denied; in **audit** mode the violation is logged and allowed.
+- **Pod-as-CVM** — `policy-monitor` runs *inside* the guest VM. It watches the kata-agent's
+  container bundles and, on a non-allowlisted image, reads `cgroup.procs` and `SIGKILL`s the
+  init PID immediately. Because it is baked into the launch measurement, the host cannot
+  disable or bypass it.
+
+<Callout type="warn">
+  The allowlist gates the image **digest** only — not container args, env, mounts, or
+  capabilities. Treat it as image-identity control, not a full pod-spec policy. See
+  [Limitations](/docs/c8s/limitations).
+</Callout>
+
+## Managing it in practice
+
+Add the digests of every image a confidential workload needs (the workload image and any init
+containers) before you deploy — otherwise `policy-monitor` will kill the container at start.
+The installer helps here: with the default `--resolve-digests=true`, `c8s install` resolves
+each c8s component image to its digest and adds it to the allowlist automatically, so the
+platform's own images are covered from first boot.
+
+## Getting an image's digest
+
+Every allowlist entry is keyed by an image's **`sha256:` manifest digest** — the immutable
+content address, not a tag. A few ways to get one, no full pull required:
+
+**With `crane`** (already on the box if you kept `--resolve-digests=true`) — works against any
+OCI registry: ghcr.io, Docker Hub, an internal mirror:
+
+```bash
+crane digest ghcr.io/example/inference:v3
+# sha256:9f2c…
+```
+
+**With Docker** — `buildx imagetools` reads it straight from the registry without pulling:
+
+```bash
+docker buildx imagetools inspect ghcr.io/example/inference:v3 --format '{{.Manifest.Digest}}'
+```
+
+…or, if you've already pulled the image, read the digest it resolved to:
+
+```bash
+docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/example/inference:v3
+# ghcr.io/example/inference@sha256:9f2c…
+```
+
+**With `skopeo`** — handy in CI where Docker isn't running:
+
+```bash
+skopeo inspect docker://ghcr.io/example/inference:v3 | jq -r .Digest
+```
+
+Registry UIs show it too — ghcr.io lists the digest on a package's version page, and Docker Hub
+shows it per tag.
+
+<Callout type="warn">
+  **Multi-arch images:** a tag like `…:v3` can point to a manifest *list* with one entry per
+  platform. `crane digest` returns the **index** digest by default, but a node resolves that tag
+  to its **platform-specific** manifest when it pulls — and the enforcer matches the
+  `…@sha256:…` digest the runtime actually resolved. Pin *that* one, e.g.
+  `crane digest --platform linux/amd64 ghcr.io/example/inference:v3`, or read it back from a
+  running pod:
+
+  ```bash
+  kubectl get pod <pod> -o jsonpath='{.status.containerStatuses[*].imageID}'
+  ```
+
+  Pin the index digest of a multi-arch image and the check will reject the very image you meant
+  to allow.
+</Callout>
+
+## Automating the allowlist
+
+Because writes are gated on *attestation of the writer* rather than a shared secret, the
+allowlist is safe to drive from automation — there's no long-lived credential to leak, and every
+change is attributable to an attested identity.
+
+**In CI.** A pipeline that builds a workload image knows the resulting digest at build time. If
+the build/release job runs inside an attested TEE whose measurement you've added to
+`--allowlist-write-measurements`, it can add that digest to the allowlist as its final step — no
+human in the loop, no static token, and the `pbh` binding means the EAR it's handed can only make
+that one change. The allowlist becomes a function of *what your attested pipeline produced*,
+updated on every release and trivially auditable.
+
+**With kettle (planned).** [kettle](/docs/papers/kettle.pdf), Confidential AI's attestable-builds
+system, produces images whose digest is tied to a cryptographic attestation of *how they were
+built* — reproducible source → measured artifact. The natural next step is to let a
+kettle-attested build feed the allowlist directly: because the build itself is attested, its
+output digest can be admitted with an attestation-backed EAR, closing the loop from **source →
+reproducible build → measured image → allowed to run in the TEE** with nobody hand-curating
+digests. This isn't wired up yet — but the EAR-gated write API above is exactly the seam it
+plugs into.

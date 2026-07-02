@@ -1,0 +1,255 @@
+---
+title: Operator & service verification
+description: Verify a c8s deployment from the operator side — the `c8s verify` CLI for checking any component (CDS, load balancer, workload) by hand or in CI — plus how backend services trust each other automatically over RA-TLS.
+---
+
+`c8s verify` is the operator-side tool for confirming that a deployed component is a **genuine
+TEE running the exact code you expect** — after install, from your laptop or a CI runner. Where
+[consumer verification](/docs/c8s/verification/consumer) is the *browser / end-user*
+path (over-encryption inside an untrusted TLS terminator), this guide is the *backend /
+operator* path: dial a component, pull its SEV-SNP (or TDX) evidence, and check it against the
+AMD signature chain plus a pinned launch measurement.
+
+<Callout type="info">
+  `c8s verify` (and the `c8s cds verify` shorthand) is the operator/CI verification entry point;
+  the full flag list is in the [CLI Reference](/docs/c8s/install/cli-reference#c8s-verify).
+</Callout>
+
+## Service-to-service verification (RA-TLS)
+
+Inside the cluster you rarely verify by hand. Backend components authenticate each other with
+**[RA-TLS](/docs/c8s/attestation/cds#verifying-the-cds-itself-ra-tls)**: a workload's `get-cert` and
+the ratls-mesh proxies pull the peer's attestation evidence out of its serving certificate during
+the handshake, check it against the mesh CA, and only then complete the connection. That
+verification is automatic and continuous — there is no operator step.
+
+What you verify by hand is the trust root: confirm the **CDS** itself is a genuine TEE at your
+expected measurement with `c8s cds verify` (below). Everything else chains to it.
+
+## How it works
+
+`c8s verify` does not embed a verifier of its own. It verifies **in-process** with
+`attestation-go` — the Go port of the same `attestation-rs` engine the cluster runs — so there's
+**no container to launch and no service to reach**. Using the cluster's own engine means the
+product line never has to be supplied by hand: it auto-detects the platform and AMD product,
+including **Zen4c (Siena / Bergamo)**, which stock `go-sev-guest` cannot classify. Any AMD
+collateral that isn't shipped inline (e.g. the VCEK for a bare report) is fetched from **AMD
+KDS**.
+
+The AMD chain, the REPORTDATA binding, the debug flag, and the minimum-TCB floor are proven by
+the verifier. The **launch-measurement allowlist** (`--measurements`) has no verifier-side input,
+so it is enforced client-side and **fails closed**: if the report's launch digest isn't in your
+allowlist, verification fails.
+
+## Requirements
+
+On the machine running `c8s verify`:
+
+- **Outbound HTTPS to AMD KDS** (`kdsintf.amd.com`), which the verifier uses to fetch the VCEK
+  when verifying a bare report. (A discovery document ships the VCEK inline, so the LB path
+  verifies offline.)
+- **Network reach to the component** you're verifying (see [Reachability](#reachability-under-kata)).
+
+No container runtime is required — verification is entirely in-process.
+
+## What you can verify
+
+| `--kind` | Default evidence mode | What you point it at |
+| --- | --- | --- |
+| `cds` | `ratls-cert` | the CDS RA-TLS endpoint (its serving cert carries a bare report) |
+| `lb` | `discovery` | the load balancer's `/v1/discovery` document (cert + evidence, VCEK inline) |
+| `workload` | `ratls-cert` | a workload's RA-TLS serving endpoint |
+| `auto` | `ratls-cert` | when you don't pass `--kind` |
+
+Override the chosen mode with `--mode` (`ratls-cert`, `discovery`, `attestation-endpoint`, or
+`auto`). The `attestation-endpoint` mode GETs a component's `/.well-known/c8s/attestation`
+document directly. You can also skip the network entirely and verify saved evidence with
+[`--from-file`](#verify-saved-evidence-from-file).
+
+## Verify the CDS
+
+`c8s cds verify` is a shorthand for `c8s verify --kind cds --mode ratls-cert` (default port
+`8443`). The CDS serves [RA-TLS](/docs/c8s/attestation/cds#verifying-the-cds-itself-ra-tls): its
+serving certificate carries the TEE report (SEV-SNP or TDX) in an X.509 extension, and `verify` trusts *that*
+attestation, not the certificate chain.
+
+```bash
+# The CDS runs as a locked kata guest, so `kubectl port-forward` / `exec` are denied by the
+# guest policy (only the --debug guest image enables them) — localhost forwarding won't work.
+# Dial the pod IP directly from somewhere with cluster-network reach (a node, or over a VPN).
+# c8s-cds is a headless Service, so read its endpoint IP:
+CDS_IP=$(kubectl get endpoints c8s-cds -n c8s-system -o jsonpath='{.subsets[0].addresses[0].ip}')
+
+c8s cds verify "https://$CDS_IP:8443" --measurements <sha384-launch-digest>
+```
+
+A PKI / SAN mismatch when you dial the raw IP is expected and fine — `verify` trusts the
+attestation embedded in the serving cert, not the hostname on the certificate.
+
+## Verify the load balancer
+
+The LB exposes its evidence over a plain HTTPS **discovery document** (the same one the browser
+library reads), so no special network path is needed:
+
+```bash
+c8s verify "https://lb.example.com:443" --kind lb --measurements <sha384-launch-digest>
+```
+
+`--kind lb` selects `discovery` mode, which GETs `/v1/discovery` (override the path with
+`--discovery-path`). The discovery doc ships the VCEK inline, so this works even without KDS
+egress.
+
+## Verify a workload
+
+A workload that serves RA-TLS is verified like the CDS — point at its serving endpoint and pin
+its launch digest:
+
+```bash
+c8s verify "https://<workload-host>:<port>" --kind workload --measurements <sha384-launch-digest>
+```
+
+## Verify saved evidence (`--from-file`)
+
+To verify evidence you've already captured — a saved RA-TLS PEM certificate or an
+attestation-response JSON — skip the dial:
+
+```bash
+c8s verify --from-file cds-cert.pem --measurements <sha384-launch-digest>
+```
+
+For a *bare* evidence file with no transport to bind REPORTDATA to, supply the expected value
+with `--expected-report-data <hex>` (up to 64 bytes, zero-padded).
+
+## Pin the launch measurement
+
+This is the part that makes verification mean anything. With **no** `--measurements`, the
+command still runs and reports the report's digest, but prints an **UNSAFE** warning — *any*
+genuine TEE is accepted:
+
+```text
+WARNING:  no --measurements pinned — any genuine TEE is accepted (UNSAFE for production)
+```
+
+Pin one or more allowed SHA-384 launch digests so only your exact, audited image passes:
+
+```bash
+# repeatable / comma-separated
+c8s cds verify "https://$CDS_IP:8443" --measurements <digest-a>,<digest-b>
+
+# or from a file, one hex digest per line
+c8s cds verify "https://$CDS_IP:8443" --measurements-file digests.txt
+```
+
+These are the same digests described under
+[Obtaining launch measurements](/docs/c8s/attestation/cds#obtaining-launch-measurements) — for the
+CDS, pin the CDS's own launch digest. You can additionally require minimum TCB component
+versions (`--min-tcb-bootloader`, `--min-tcb-tee`, `--min-tcb-snp`, `--min-tcb-microcode`, each
+`0`–`255`) and reject debug-enabled guests by leaving `--allow-debug` off (the default).
+
+## Use it in CI
+
+The exit codes are a **stable contract**, so a wrong measurement is distinguishable from an
+unreachable endpoint:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | verified |
+| `1` | usage error |
+| `2` | evidence obtained, but verification / policy failed (e.g. wrong measurement) |
+| `3` | evidence unavailable (unreachable / unparseable) |
+
+Pair that with `-o json` for a machine-readable verdict:
+
+```bash
+c8s cds verify "https://$CDS_IP:8443" --measurements-file digests.txt -o json
+```
+
+```json
+{
+  "verified": true,
+  "backend": "attestation-go",
+  "source": "RA-TLS serving certificate at 10.42.0.153:8443",
+  "fresh": false,
+  "binding": "REPORTDATA binds the certificate public key (no per-request nonce — not a freshness proof)",
+  "platform": "snp",
+  "measurement": "f894e79d20ab98ba8fc878425739d1b5900999835fe3f94c90fa8603e0636325c131192eb0005f5d3b8134e363d434a3",
+  "current_tcb": "bootloader=12 tee=0 snp=28 microcode=28",
+  "cert_sha256": "0109d41e0907ab4ecd5823b5d08c3a6b5d69751322338e28c78f8378c56f92f9",
+  "measurement_pinned": true
+}
+```
+
+For a field-by-field reading of this output — including the `verified: true` /
+`measurement_pinned: false` gotcha — see the
+[CDS verification walkthrough](/docs/c8s/attestation/cds#verifying-the-cds-itself-ra-tls).
+
+## Independently recompute the measurement
+
+The "spicier" cross-check: rather than trusting the digest you were handed, **recompute it
+yourself** with AMD's [`sev-snp-measure`](https://github.com/virtee/sev-snp-measure) and confirm
+that what a live node reports matches what the code *should* produce.
+
+<Steps>
+
+<Step>
+
+### Recompute the expected digest
+
+From the launch components — the OVMF firmware, the guest `vmlinuz`, and the kernel cmdline
+(which carries the dm-verity `root_hash`) — at the **same vCPU count used at launch** (c8s
+measures at 1 vCPU for a stable digest):
+
+```bash
+# illustrative — see the sev-snp-measure docs for the exact flags for your image
+sev-snp-measure --mode snp --vcpus 1 \
+  --ovmf OVMF.fd --kernel vmlinuz \
+  --append "<kernel cmdline, including root_hash=...>" \
+  --output-format hex
+```
+
+A reproducible build yields the same digest published in the image manifest. A mismatch means
+the image isn't what you think it is. (`sev-snp-measure` is AMD-specific; on **Intel TDX** the
+equivalent launch values — `MRTD` and the `RTMR`s — are predicted with TDX's own tooling.)
+
+</Step>
+
+<Step>
+
+### Pin it and verify the live component
+
+Feed the recomputed digest straight into `c8s verify`. If the live node's report carries a
+different launch digest, verification fails with exit code `2`:
+
+```bash
+c8s cds verify "https://$CDS_IP:8443" --measurements <recomputed-sha384>
+```
+
+This closes the loop end-to-end: *the code you audited → the digest you computed → the digest
+the hardware actually measured.* Inspecting what a node reports first (`--show-evidence`, or
+reading `claims.launch_digest` from a verify result) is fine for discovery — but always pin the
+**recomputed or published** value, or you've only achieved trust-on-first-use.
+
+</Step>
+
+</Steps>
+
+## Caveats
+
+- **Freshness.** Verifying an RA-TLS serving cert binds REPORTDATA to the certificate key, not a
+  per-request nonce — so it proves *"this key was born in a TEE with this measurement,"* not
+  *"freshly, right now"* (`fresh: false` in the output). The CDS's own challenge/attest flow
+  uses a one-time nonce; `c8s verify` of a serving cert does not.
+- <span id="reachability-under-kata">**Reachability under kata.**</span> Reach each component on
+  its **public / host address**, not the in-cluster ClusterIP. The ClusterIP path goes through
+  the RA-TLS mesh and demands an attested client cert (`tls: certificate required`). The CDS
+  RA-TLS endpoint and the tls-lb's nginx serving port both answer unattested clients on their
+  public address (the tls-lb serves `/v1/discovery` there with no client cert), so
+  `c8s cds verify` and `c8s verify <lb>` work with no mesh changes.
+
+## See also
+
+- [CLI Reference → `c8s verify`](/docs/c8s/install/cli-reference#c8s-verify) — every flag.
+- [CDS Bootstrapping & Verification](/docs/c8s/attestation/cds) — how the CDS verifies *clients*,
+  and where launch measurements come from.
+- [Consumer Verification](/docs/c8s/verification/consumer) — the browser / end-user
+  verification path.

@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 360" role="img" aria-label="c8s architecture: CDS, attestation-api, workload and ratls-mesh inside the TEE boundary; the c8s operator and nri-image-policy act on the workload from the untrusted host.">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L7.5,3 L0,6 z" fill="#8a8a8a" />
+    </marker>
+  </defs>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .card { fill: #121212; stroke: #2a2a2a; }
+    .box { fill: #1c1c1c; stroke: #3c3c3c; stroke-width: 1; }
+    .t { fill: #ededed; font-size: 14px; font-weight: 600; }
+    .s { fill: #8c8c8c; font-size: 11px; }
+    .tee { fill: rgba(254,220,81,0.05); stroke: #fedc51; stroke-width: 1.2; stroke-dasharray: 6 5; }
+    .teelbl { fill: #fedc51; font-size: 11px; letter-spacing: 0.05em; }
+    .ln { stroke: #8a8a8a; stroke-width: 1.5; fill: none; }
+    .lbl { fill: #b6b6b6; font-size: 11px; }
+    .lblbg { fill: #121212; }
+  </style>
+
+  <rect class="card" x="0.5" y="0.5" width="719" height="359" rx="10" />
+
+  <!-- TEE boundary -->
+  <rect class="tee" x="32" y="40" width="470" height="288" rx="10" />
+  <text class="teelbl" x="48" y="62">TEE BOUNDARY · HOST CANNOT READ</text>
+
+  <!-- CDS (top-left) -->
+  <rect class="box" x="56" y="84" width="172" height="62" rx="7" />
+  <text class="t" x="142" y="111" text-anchor="middle">CDS</text>
+  <text class="s" x="142" y="130" text-anchor="middle">evidence · EAR · mesh CA</text>
+
+  <!-- Workload (top-right) -->
+  <rect class="box" x="300" y="84" width="172" height="62" rx="7" />
+  <text class="t" x="386" y="111" text-anchor="middle">Workload pod</text>
+  <text class="s" x="386" y="130" text-anchor="middle">+ get-cert sidecar</text>
+
+  <!-- attestation-api (bottom-left) -->
+  <rect class="box" x="56" y="234" width="172" height="62" rx="7" />
+  <text class="t" x="142" y="261" text-anchor="middle">attestation-api</text>
+  <text class="s" x="142" y="280" text-anchor="middle">SEV-SNP / TDX verifier</text>
+
+  <!-- ratls-mesh (bottom-right) -->
+  <rect class="box" x="300" y="234" width="172" height="62" rx="7" />
+  <text class="t" x="386" y="261" text-anchor="middle">ratls-mesh</text>
+  <text class="s" x="386" y="280" text-anchor="middle">RA-TLS L4 proxy</text>
+
+  <!-- Host (right, outside TEE) -->
+  <text x="618" y="64" text-anchor="middle" fill="#8c8c8c" font-size="11" letter-spacing="0.05em">UNTRUSTED HOST</text>
+  <rect class="box" x="540" y="84" width="156" height="62" rx="7" />
+  <text class="t" x="618" y="111" text-anchor="middle">c8s operator</text>
+  <text class="s" x="618" y="130" text-anchor="middle">webhook · CRDs</text>
+
+  <rect class="box" x="540" y="234" width="156" height="62" rx="7" />
+  <text class="t" x="618" y="261" text-anchor="middle">nri-image-policy</text>
+  <text class="s" x="618" y="280" text-anchor="middle">digest allowlist</text>
+
+  <!-- Workload -> CDS : challenge + CSR (top line) -->
+  <line class="ln" x1="300" y1="103" x2="232" y2="103" marker-end="url(#ah)" />
+  <rect class="lblbg" x="222" y="86" width="88" height="13" />
+  <text class="lbl" x="266" y="96" text-anchor="middle">challenge + CSR</text>
+
+  <!-- CDS -> Workload : leaf cert (bottom line) -->
+  <line class="ln" x1="228" y1="127" x2="296" y2="127" marker-end="url(#ah)" />
+  <rect class="lblbg" x="238" y="131" width="56" height="13" />
+  <text class="lbl" x="266" y="141" text-anchor="middle">leaf cert</text>
+
+  <!-- CDS -> attestation-api : verify -->
+  <line class="ln" x1="142" y1="146" x2="142" y2="234" marker-end="url(#ah)" />
+  <rect class="lblbg" x="150" y="183" width="40" height="13" />
+  <text class="lbl" x="154" y="193">verify</text>
+
+  <!-- Workload <-> ratls-mesh : RA-TLS -->
+  <line class="ln" x1="386" y1="146" x2="386" y2="234" marker-start="url(#ah)" marker-end="url(#ah)" />
+  <rect class="lblbg" x="394" y="183" width="50" height="13" />
+  <text class="lbl" x="398" y="193">RA-TLS</text>
+
+  <!-- operator -> Workload : inject -->
+  <line class="ln" x1="540" y1="115" x2="476" y2="115" marker-end="url(#ah)" />
+  <rect class="lblbg" x="484" y="98" width="44" height="13" />
+  <text class="lbl" x="506" y="108" text-anchor="middle">inject</text>
+
+  <!-- nri-image-policy -> Workload : enforce (orthogonal) -->
+  <path class="ln" d="M540,258 L516,258 L516,131 L476,131" marker-end="url(#ah)" />
+  <rect class="lblbg" x="520" y="196" width="52" height="13" />
+  <text class="lbl" x="524" y="206">enforce</text>
+</svg>

@@ -1,0 +1,130 @@
+---
+title: Components & Data Flow
+description: The c8s components, how they fit together, and the difference between the two trust boundaries — node-as-CVM and pod-as-CVM (Kata) — including the certificate and attestation flows.
+---
+
+c8s adds four capabilities to a Kubernetes cluster: **TEE attestation verification**,
+**certificate management** (RA-TLS + a mesh CA), **RA-TLS mesh networking**, and
+**container-image policy enforcement**. This page describes the components that provide them
+and how requests flow between them.
+
+## The components
+
+| Component | Binary | Node-as-CVM (default) | Pod-as-CVM (`--kata`) |
+| --- | --- | --- | --- |
+| **CDS** — Certificate Distribution Service | `cmd/cds` | runc container | `kata-qemu-snp` CVM |
+| **c8s operator** + admission webhook | `cmd/c8s` | runc container (untrusted host) | runc container (untrusted host, exempt) |
+| **attestation-api** | `attestation-rs` (Rust) | host DaemonSet | in-guest `127.0.0.1:8400` |
+| **ratls-mesh** | `cmd/ratls-mesh` | host DaemonSet (L4 proxy) | in-guest service |
+| **nri-image-policy** | `cmd/nri-image-policy` | host NRI plugin | in-guest `policy-monitor` |
+| **get-cert** | `cmd/get-cert` | webhook-injected init/sidecar | webhook-injected init/sidecar |
+
+The CDS is the trust root. It performs attestation verification, EAR issuance, mesh-CA
+signing, and optional CA handoff **all in one process**, so there is no internal RA-TLS hop
+to an external signer and the CA private key never leaves CDS memory.
+
+<Callout type="warn">
+  The **c8s operator and its admission webhook are untrusted.** Even under pod-as-CVM (Kata)
+  they stay in a plain `runc` container on the host — outside the per-pod TEE boundary — and
+  they are *exempt*
+  from the workload enforcement they configure. They are control-plane orchestration, **not**
+  part of the trust boundary: a compromised operator can disrupt scheduling (e.g. refuse to
+  inject `get-cert`, which fails closed under the webhook's `Fail` policy) but it **cannot**
+  forge attestation, mint certificates, or read TEE memory — those happen inside the CDS, in
+  the TEE. The cluster's confidentiality never depends on trusting the operator.
+</Callout>
+
+## Node-as-CVM and Pod-as-CVM
+
+The trust boundary is a deployment-time choice — see
+[Pod-as-CVM vs Node-as-CVM](/docs/c8s/runtime/pod-vs-node-cvm) for the full tradeoff. `c8s install`
+selects which one you get, and **Kata is the mechanism c8s uses to give each pod its own CVM** —
+not the name of a mode:
+
+- **Node-as-CVM** (default install, no `--kata`) — the c8s services run as ordinary node
+  containers and the mesh and attestation operate at node level. When the node itself is a
+  confidential VM (an Azure AKS confidential node, or a bare-metal AMD SEV-SNP / Intel TDX
+  host), the whole node is the trust boundary and everything on it inherits it. The same
+  default install on a non-confidential host gives you the operational shape **without** a
+  hardware boundary — the development / baseline configuration.
+- **Pod-as-CVM** (`--kata`) — each workload pod runs in its own confidential VM, launched via
+  **Kata Containers**. The security services (`attestation-api`, `ratls-mesh`,
+  `policy-monitor`) are **baked into the measured guest image**, so they are covered by the
+  launch measurement and the host — adversarial here, since it sits outside every pod CVM —
+  cannot MITM them. The per-pod runtime is **AMD SEV-SNP today** (`kata-qemu-snp`); Intel TDX
+  per-pod support is in progress.
+
+Pod-as-CVM enforcement is two cooperating pieces — both, or nothing:
+
+1. A **mutating webhook** injects a `runtimeClassName` into workload pods that lack one —
+   `kata-qemu-snp` for pods annotated `confidential.ai/cw` (confidential + c8s identity), or
+   `kata-qemu` otherwise.
+2. A **ValidatingAdmissionPolicy** (`c8s-kata-enforcement`) rejects workload pods that
+   request a non-Kata `runtimeClassName`.
+
+The webhook's failure policy is **Fail**: if the webhook is unreachable, pod creation is
+rejected, so an unmutated `runc` pod can never slip through.
+
+## Trust boundaries
+
+Under **node-as-CVM**, the boundary is the node. When the node is a confidential VM, the whole
+node — c8s services and workload pods alike — sits inside one TEE the host cannot read:
+
+```text
+═════════ TEE boundary — the whole node is one CVM, host cannot read ═════════
+ ┌──────────────────────────── node CVM ────────────────────────────┐
+ │  CDS · attestation-api · ratls-mesh · nri-image-policy            │
+ │  operator + webhook · workload pods (runc)                        │
+ └────────────────────────────────────────────────────────────────────┘
+═════════════════════════════════════════════════════════════════════════════
+   host-side (adversarial): hypervisor · cloud operator
+```
+
+On a non-confidential host the same layout runs with no hardware boundary — the dev / baseline
+case, where everything is in containers the host kernel can read.
+
+Under **pod-as-CVM**, the boundary is each pod's own CVM (AMD SEV-SNP today); the host is
+outside every one of them:
+
+```text
+══════ TEE boundary — per-pod confidential CVM, host cannot read ══════
+ ┌──────── kata-qemu-snp CVM ────────┐   ┌──── kata-qemu-snp CVM ────┐
+ │ CDS                               │   │ workload                  │
+ │  RA-TLS serving cert (snp evid.)  │   │  + get-cert sidecar       │
+ │ baked in: attestation-service ·   │   │  (leaf cert from CDS)     │
+ │           ratls-mesh · policy-mon │   │                           │
+ └───────────────────────────────────┘   └───────────────────────────┘
+═══════════════════════════════════════════════════════════════════════
+   host-side (adversarial): containerd · kata-runtime · kata-shim
+```
+
+## Certificate flow — node-as-CVM
+
+A workload obtains a TEE-bound certificate from the CDS in a single in-process round trip:
+
+![Node-as-CVM certificate flow: the workload requests a challenge, generates evidence bound to its CSR, and the CDS verifies it via the attestation-api before signing a leaf certificate.](/diagrams/cert-flow-base.svg)
+
+## Certificate flow — pod-as-CVM (Kata)
+
+Under pod-as-CVM the same flow happens **inside the pod's TEE boundary**. The CDS mints its
+own RA-TLS serving cert from SNP evidence, the workload reaches it over RA-TLS, and the
+attestation-api is the in-guest service at `127.0.0.1:8400`. The trust anchor is the
+**launch measurement** — CDS, attestation-service, ratls-mesh, and policy-monitor are all
+baked into the guest image and therefore covered by it.
+
+![Pod-as-CVM certificate flow: the workload CVM attests to the CDS CVM, which verifies evidence via the in-guest attestation-service and returns a leaf certificate — all inside the TEE boundary.](/diagrams/cert-flow-kata.svg)
+
+## Install & admission ordering
+
+The install sequence is load-bearing:
+
+1. A pre-install hook creates the `MutatingWebhookConfiguration` **first**, so the webhook
+   exists before any workload pods are admitted.
+2. The main install deploys the operator, CDS, and the rest.
+3. The operator mints its PKI and patches the webhook `caBundle` once at startup.
+4. Pods created after the `caBundle` is patched are admitted and mutated correctly.
+5. On uninstall, a pre-delete hook removes the webhook config, so a `Fail`-policy webhook
+   can't orphan and block all future pod creation.
+
+Next: the [threat model](/docs/c8s/architecture/threat-model) makes the trust assumptions
+explicit and lists what is — and isn't — enforced today.

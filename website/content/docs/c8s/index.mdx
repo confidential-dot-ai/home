@@ -1,0 +1,100 @@
+---
+title: Overview
+description: c8s makes any Kubernetes cluster confidential — your workloads' data and artifacts stay encrypted in TEE memory while they're in the cluster, and the guarantee is provable to any independent third party.
+---
+
+**c8s** (confidential Kubernetes) makes any Kubernetes cluster confidential. You have a
+cluster, you want it confidential — c8s is the switch. Your workloads' data and artifacts —
+model weights, prompts, responses, datasets, and credentials — stay encrypted in
+hardware-backed Trusted Execution Environment (TEE) memory from the moment they enter the
+cluster until they leave it, and that property is **cryptographically provable** to any
+independent third party.
+
+Private inference, training and fine-tuning, agents, or any existing Kubernetes workload can
+inherit that guarantee with minimal changes — c8s keeps the Kubernetes surface you already
+use.
+
+The design assumption is simple and uncompromising: **the host is adversarial.** The cloud
+provider, the bare-metal operator, and anything that can read raw host memory or inspect a
+QEMU command line are all outside the trust boundary. "It works on a normal cluster" is not
+the bar. It must work on a confidential one, with the threat model intact.
+
+<Callout type="info">
+  New here? This site walks you end to end: **understand the runtime model → provision a TEE
+  node → install c8s → run a confidential workload → verify its confidentiality.** Start with
+  this page, then choose your [deployment shape](/docs/c8s/runtime/pod-vs-node-cvm).
+</Callout>
+
+## Why confidential Kubernetes
+
+Running workloads on someone else's infrastructure creates a **three-sided trust
+problem**, and contractual promises do not solve any side of it:
+
+- **Artifact owners** — model weights, datasets, proprietary code — risk exfiltration the
+  moment their artifacts touch third-party infrastructure.
+- **Compute providers** want to host valuable workloads without being able (or liable) to
+  observe them.
+- **End users** in healthcare, legal, financial, and national-security settings need a hard
+  guarantee that their inputs and outputs stay opaque to the operator.
+
+Hardware TEEs (AMD SEV-SNP, Intel TDX, and NVIDIA Confidential Computing) resolve all three
+at once: they **encrypt the runtime** in hardware, **measure the code** that booted, and let
+that measurement be **attested** to a remote verifier. c8s turns those primitives into a
+working Kubernetes platform — even on managed services like EKS, GKE, and AKS where the
+control plane itself cannot be attested.
+
+> Read the full design in the [c8s whitepaper](https://arxiv.org/abs/2604.26974) *(arXiv)*.
+
+## The five principles
+
+c8s applies the same five principles end-to-end:
+
+1. **Encrypt the runtime** — workloads run in hardware-encrypted memory the host cannot read.
+2. **Measure the code** — the hardware computes a launch digest over exactly what booted.
+3. **Bind identity to measurement** — credentials are issued *only* after the measurement is
+   verified, so a certificate is proof of what is running.
+4. **Verify before connecting** — peers require an attestation-rooted identity before traffic
+   flows.
+5. **Secure the egress** — all traffic is encrypted to verified destinations.
+
+## How the pieces fit
+
+![c8s architecture: CDS, attestation-api, the workload pod, and ratls-mesh run inside the TEE boundary; the c8s operator and nri-image-policy act on the workload from the untrusted host.](/diagrams/architecture.svg)
+
+| Component | Role |
+| --- | --- |
+| **CDS** — Certificate Distribution Service | Verifies TEE attestation evidence, issues EAR tokens, and signs workload CSRs with an in-process **mesh CA** whose key never leaves the TEE. The trust root of the cluster. |
+| **c8s operator** | Runs the CRDs, status mirroring, and the admission **webhook** that injects the `get-cert` init/sidecar container into workload pods. Runs on the **untrusted host**, outside the trust boundary — confidentiality never depends on it. |
+| **attestation-api** | Verifies hardware evidence (AMD SEV-SNP, Intel TDX). Runs as a host DaemonSet under node-as-CVM, or inside the guest at `127.0.0.1:8400` under pod-as-CVM (Kata). |
+| **ratls-mesh** | Transparent L4 proxy that wraps inter-node Kubernetes traffic in **RA-TLS** (attested mTLS). |
+| **nri-image-policy** | NRI plugin (or in-guest `policy-monitor`) enforcing a container-image **digest allowlist**. |
+| **get-cert** | CLI / init-container that runs the attestation flow to obtain a TEE-bound certificate for a workload. |
+
+Two terms you will see throughout:
+
+- **RA-TLS** (Remote-Attestation TLS) — mTLS where each certificate carries hardware
+  attestation evidence, so a peer verifies *both* identity and that the peer runs in a
+  genuine TEE at an expected measurement.
+- **EAR** (Entity Attestation Result) — an ES256 JWT the CDS issues after a successful
+  attestation, binding the attested key and evidence to later requests.
+
+## Two deployment shapes
+
+c8s supports two trust boundaries; the choice is the most important architectural decision
+you will make:
+
+<Cards>
+  <Card title="Pod-as-CVM" href="/docs/c8s/runtime/pod-vs-node-cvm" description="Each pod is its own confidential VM (via Kata). Per-pod attestation; strongest isolation from the cluster operator. Needs a bare-metal-class confidential host." />
+  <Card title="Node-as-CVM" href="/docs/c8s/runtime/pod-vs-node-cvm" description="The whole Kubernetes node is one confidential VM; pods are ordinary containers inside it. Simpler and denser; the deployment shape available on Azure AKS." />
+</Cards>
+
+## Your path through the docs
+
+<Cards>
+  <Card title="1 · Understand the runtime" href="/docs/c8s/runtime/pod-vs-node-cvm" description="Pod-as-CVM vs node-as-CVM — the unit of trust — plus Kata, measured boot, and the guest image." />
+  <Card title="2 · Provision a confidential cluster" href="/docs/c8s/install/azure" description="Create a managed AKS cluster on a confidential node pool — node-as-CVM, ready for c8s." />
+  <Card title="3 · Install c8s" href="/docs/c8s/install/installation" description="One CLI command, with every flag explained." />
+  <Card title="4 · Bootstrap trust" href="/docs/c8s/attestation/cds" description="CDS bootstrapping, the mesh CA, and EAR tokens." />
+  <Card title="5 · Manage the allowlist" href="/docs/c8s/attestation/allowlist" description="Control exactly which container images may run." />
+  <Card title="6 · Verify confidentiality" href="/docs/c8s/verification/consumer" description="How an end consumer — even a browser — proves the enclave." />
+</Cards>

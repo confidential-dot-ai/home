@@ -1,0 +1,490 @@
+---
+title: "Privilege & Communication"
+description: "Privilege separation within TEEs and secure communication with untrusted components."
+---
+
+Confidential's privacy-preserving infrastructure services—firewalls, DDoS protection, routing, load balancing—run in their own TEE-protected layer. This document explains the mechanisms that make this possible: privilege separation within TEEs and secure communication with untrusted components.
+
+After reading this, you'll understand VMPLs (the privilege hierarchy inside the guest), how CPU state is protected, and the GHCB protocol (safe guest-hypervisor communication). This assumes familiarity with basic virtualization concepts and the RMP from [Document 3](/docs/concepts/confidential-computing-primer/03-memory-integrity).
+
+## The Problem: Cooperation Without Trust
+
+Even with memory encryption and integrity protection, an SNP guest still needs the hypervisor for certain things. The guest can't directly access hardware devices. It can't allocate physical memory. It needs information about the CPU it's running on.
+
+In traditional virtualization, the hypervisor handles all of this transparently. When the guest executes certain instructions, control transfers to the hypervisor, which can see the guest's complete state (all register values, what instruction was executing, everything) and handle the request.
+
+With SNP, this model breaks. The guest's state is encrypted. The hypervisor can't read register values, which means it can't see what the guest was trying to do or help it. But the guest still needs help.
+
+SEV-SNP solves this with two key ideas:
+
+1. **The guest controls what information the hypervisor sees.** Instead of the hypervisor automatically seeing everything, the guest explicitly shares only what's needed for each specific request.
+
+2. **The guest validates everything the hypervisor returns.** A malicious hypervisor might lie. The guest checks responses against known-good values before trusting them.
+
+This document covers how these ideas are implemented, along with a third mechanism: privilege separation within the guest itself.
+
+## What Operations Need the Hypervisor?
+
+Before diving into mechanisms, let's understand what operations require hypervisor involvement. These will come up throughout the document.
+
+**CPUID** is an instruction that returns information about the CPU: what features it supports, cache sizes, vendor string, etc. Operating systems use CPUID at boot to know what they're running on. In virtualized environments, the hypervisor typically intercepts CPUID and returns values appropriate for the virtual machine (possibly hiding features the VM shouldn't use).
+
+**MSRs (Model-Specific Registers)** are CPU configuration registers. Reading or writing certain MSRs requires hypervisor involvement because they affect system-wide state or need emulation.
+
+**I/O operations** (reading/writing to devices) go through the hypervisor because the hypervisor mediates access to physical hardware. When your guest writes to a virtual disk, that eventually becomes a request to the hypervisor.
+
+**Memory allocation** happens when the guest needs more RAM. The hypervisor decides which physical pages to give the guest.
+
+In traditional virtualization, the hypervisor handles all of these by examining guest state directly. In SNP, the guest must explicitly participate in each interaction.
+
+## VM Permission Levels (VMPLs)
+
+Before we get to guest-hypervisor communication, we need to understand VMPLs. They solve a different problem: what if you want privilege separation *inside* the encrypted guest?
+
+### The Problem VMPLs Solve
+
+Consider what happens without VMPLs. Everything inside the SNP guest runs at the same privilege level from the hardware's perspective. The guest kernel can access all guest memory. Any code in the guest can execute any guest instruction.
+
+This is fine if you trust everything in the guest equally. But what if you want:
+
+- A security monitor that even a compromised guest kernel can't tamper with?
+- A virtual TPM whose keys are inaccessible to the guest OS?
+- To run an unmodified legacy OS that doesn't know about SNP, with a small trusted shim handling SNP-specific operations?
+
+Without some form of isolation, a bug or exploit in the guest kernel could compromise any security service running alongside it. VMPLs provide that isolation.
+
+### The Four Levels
+
+VMPLs are a hardware-enforced privilege hierarchy with four levels:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                       VMPL Privilege Hierarchy                       │
+│                                                                      │
+│   VMPL0 ──────── Highest privilege                                   │
+│     │                                                                │
+│     │   This level can:                                              │
+│     │   • Access all guest memory                                    │
+│     │   • Validate pages (PVALIDATE instruction)                     │
+│     │   • Control permissions for lower levels                       │
+│     │   • Read/modify lower levels' saved CPU state                  │
+│     │                                                                │
+│   VMPL1 ──────── Intermediate (rarely used in practice)              │
+│     │                                                                │
+│   VMPL2 ──────── Typically where the guest OS kernel runs            │
+│     │                                                                │
+│   VMPL3 ──────── Lowest privilege (guest userspace)                  │
+│                                                                      │
+│   The numbering is counterintuitive: lower number = higher privilege │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Think of VMPLs as an additional privilege axis, separate from the familiar ring 0/ring 3 distinction. A process could be running at VMPL3 (lowest VMPL privilege) while in ring 0 (kernel mode). The two are independent.
+
+Every virtual CPU runs at exactly one VMPL at any time. Which VMPL it's running at determines what memory it can access and what instructions it can execute.
+
+### How VMPL Permissions Work
+
+VMPLs are enforced through the RMP (the same structure that tracks page ownership, covered in Document 3). Each RMP entry has four permission fields, one per VMPL:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                      Per-Page VMPL Permissions                       │
+│                                                                      │
+│   For each 4KB page, the RMP stores:                                 │
+│                                                                      │
+│   VMPL0 permissions: [Read] [Write] [Execute]                        │
+│   VMPL1 permissions: [Read] [Write] [Execute]                        │
+│   VMPL2 permissions: [Read] [Write] [Execute]                        │
+│   VMPL3 permissions: [Read] [Write] [Execute]                        │
+│                                                                      │
+│   When code at VMPL2 accesses a page, hardware checks                │
+│   the VMPL2 permission bits. If the access isn't allowed,            │
+│   the CPU raises an exception.                                       │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+When a page is first validated, VMPL0 gets full access and all other VMPLs get none. VMPL0 must explicitly grant permissions to lower levels.
+
+The RMPADJUST instruction modifies these permissions. It has restrictions:
+- You can only modify permissions for less-privileged VMPLs (VMPL0 can grant permissions to VMPL1/2/3; VMPL2 can only grant to VMPL3)
+- You can't grant more permission than you have (if you only have read access, you can only grant read access)
+- You can't increase your own permissions
+
+This creates a top-down delegation model: VMPL0 decides what each lower level can access.
+
+### The SVSM: What Runs at VMPL0
+
+With VMPLs, the natural question is: what runs at VMPL0? In most configurations, it's the **SVSM (Secure VM Service Module)**.
+
+The SVSM is a small piece of software that runs at the highest privilege level inside the guest. It's measured during launch (so it appears in attestation reports) and provides services to the guest OS running at a lower VMPL. Think of it as a trusted shim between the guest OS and the SNP hardware.
+
+Why is this necessary? Certain operations can only be executed at VMPL0:
+
+- **PVALIDATE**: The instruction that validates pages (see Document 3). If the guest OS runs at VMPL2, it can't validate pages directly.
+- **RMPADJUST**: Modifying VMPL permissions. Lower VMPLs can't escalate their own access.
+- **Creating new vCPU contexts**: Adding processors to the guest requires VMPL0 access.
+
+If you want the guest OS at a lower VMPL (for isolation), something at VMPL0 must proxy these operations. That's the SVSM.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                        SNP Guest with SVSM                           │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  VMPL0: SVSM                                                   │  │
+│  │                                                                │  │
+│  │  • Small, measured code                                        │  │
+│  │  • Validates pages on behalf of guest OS                       │  │
+│  │  • Can provide additional services (vTPM, attestation)         │  │
+│  │  • Its memory is inaccessible to lower VMPLs                   │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                               │                                      │
+│                    SVSM call interface                               │
+│                               │                                      │
+│  ┌────────────────────────────▼───────────────────────────────────┐  │
+│  │  VMPL2: Guest OS Kernel                                        │  │
+│  │                                                                │  │
+│  │  • Linux, Windows, or other OS                                 │  │
+│  │  • Cannot read SVSM memory (hardware enforced)                 │  │
+│  │  • Requests page validation through SVSM                       │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                               │                                      │
+│                    Normal syscall interface                          │
+│                               │                                      │
+│  ┌────────────────────────────▼───────────────────────────────────┐  │
+│  │  VMPL3: Guest Applications                                     │  │
+│  │                                                                │  │
+│  │  • Your workload                                               │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The SVSM's memory region has permissions that grant access only to VMPL0. The guest kernel literally cannot read, write, or execute SVSM code, even if it's compromised. This is hardware-enforced isolation.
+
+Not all SNP deployments use SVSM. In the "enlightened guest" model, the guest OS itself runs at VMPL0 and handles SNP operations directly. This is simpler but provides less isolation.
+
+## Protecting CPU State: The VMSA
+
+Now we can talk about how CPU state is protected. When a virtual machine pauses (to let the hypervisor run, handle an exception, etc.), the CPU's current state, registers, instruction pointer, flags, needs to be saved somewhere. This saved state is called the **VMSA (VM Save Area)**.
+
+### Why the VMSA Matters
+
+The VMSA contains everything about the CPU's execution context:
+
+- **Instruction pointer**: Where execution will resume. If an attacker could modify this, they could redirect the guest to execute arbitrary code.
+- **Stack pointer**: Where the current stack is. Stack pivots are a common exploit technique.
+- **General registers**: These often hold sensitive data, function arguments, intermediate computations, cryptographic keys during operations.
+- **Control registers**: CR3 holds the page table base. Modifying it could remap memory.
+
+In traditional virtualization, the hypervisor can read and write all of this. SEV-SNP changes that.
+
+### How the VMSA Is Protected
+
+The VMSA is a special page with three protections:
+
+1. **Encryption**: The contents are encrypted with the guest's key. The hypervisor sees only ciphertext.
+
+2. **Integrity**: The RMP marks VMSA pages specially (VMSA=1). The hypervisor cannot write to them.
+
+3. **Controlled access**: Only hardware operations (saving/restoring state on VM transitions) can modify the VMSA. Software, even the guest itself at lower VMPLs, cannot directly write it.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                          VMSA Protection                             │
+│                                                                      │
+│   When guest is running:                                             │
+│   ┌────────────────────────────────────────────────────────────┐     │
+│   │  CPU registers contain live values (plaintext in CPU)      │     │
+│   └────────────────────────────────────────────────────────────┘     │
+│                                                                      │
+│   When guest pauses (VM exit):                                       │
+│   ┌────────────────────────────────────────────────────────────┐     │
+│   │  Hardware saves registers to VMSA                          │     │
+│   │  Hardware encrypts the VMSA with guest's key               │     │
+│   └────────────────────────────────────────────────────────────┘     │
+│                               │                                      │
+│                               ▼                                      │
+│   ┌────────────────────────────────────────────────────────────┐     │
+│   │  VMSA page in DRAM (encrypted)                             │     │
+│   │  • Hypervisor sees ciphertext                              │     │
+│   │  • RMP prevents hypervisor writes                          │     │
+│   │  • Contains: RIP, RSP, RAX-R15, CR3, flags, etc.           │     │
+│   └────────────────────────────────────────────────────────────┘     │
+│                                                                      │
+│   When guest resumes:                                                │
+│   ┌────────────────────────────────────────────────────────────┐     │
+│   │  Hardware decrypts VMSA                                    │     │
+│   │  Hardware loads values back into CPU registers             │     │
+│   └────────────────────────────────────────────────────────────┘     │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The hypervisor still has a control area it can access (to configure intercepts, read exit codes, etc.), but this is separate from the VMSA. The hypervisor knows *that* an exit happened and *why* (the exit code), but not the detailed register values.
+
+### Multiple VMSAs
+
+An SNP guest has at least one VMSA per vCPU. With VMPL separation, there may be more: separate VMSAs for VMPL0 (SVSM) and VMPL2 (guest OS) on the same vCPU. This allows switching between privilege levels while keeping state separate.
+
+## Guest-Hypervisor Communication
+
+Now we can address the main question: how does an encrypted guest communicate with the hypervisor it doesn't trust?
+
+### The #VC Exception
+
+When the guest needs hypervisor involvement (CPUID, MSR access, I/O), a **#VC exception** is raised. The #VC (VMM Communication) exception is new with SEV-ES/SNP, exception vector 29.
+
+Instead of the hypervisor directly seeing what happened, the #VC exception runs a handler inside the guest. This handler decides what to share with the hypervisor.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                        #VC Exception Flow                            │
+│                                                                      │
+│   1. Guest executes CPUID instruction                                │
+│                     │                                                │
+│                     ▼                                                │
+│   2. Hardware raises #VC exception (not #VMEXIT to hypervisor)       │
+│                     │                                                │
+│                     ▼                                                │
+│   3. Guest's #VC handler runs                                        │
+│      • Examines what operation was requested                         │
+│      • Decides what info to share with hypervisor                    │
+│      • Prepares a message in the GHCB (shared page)                  │
+│                     │                                                │
+│                     ▼                                                │
+│   4. Guest executes VMGEXIT (voluntary exit to hypervisor)           │
+│                     │                                                │
+│                     ▼                                                │
+│   5. Hypervisor reads request from GHCB, provides response           │
+│                     │                                                │
+│                     ▼                                                │
+│   6. Guest resumes, #VC handler validates response                   │
+│                     │                                                │
+│                     ▼                                                │
+│   7. If valid, handler provides result to original code              │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+The key insight: the guest controls the information flow. Instead of the hypervisor automatically seeing all state, the guest explicitly shares only what's needed.
+
+### The GHCB: A Shared Mailbox
+
+The **GHCB (Guest-Hypervisor Communication Block)** is a shared memory page (marked C=0, unencrypted) that both guest and hypervisor can read and write. It's like a mailbox for passing messages.
+
+The guest puts its request in the GHCB, then exits to the hypervisor. The hypervisor reads the request, writes a response, and returns. The guest reads the response.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                            GHCB Layout                               │
+│                                                                      │
+│   The GHCB is a 4KB page with defined fields:                        │
+│                                                                      │
+│   ┌────────────────────────────────────────────────────────────────┐ │
+│   │  Exit code: What operation the guest wants (CPUID, MSR, etc.)  │ │
+│   │  Exit info: Additional parameters for the operation            │ │
+│   │  Register fields: Space for register values (RAX, RBX, etc.)   │ │
+│   │  Valid bitmap: Which fields the guest actually filled in       │ │
+│   └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│   The valid bitmap is important: the guest marks only the fields     │
+│   it's actually using. This minimizes information exposure.          │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Example: CPUID Emulation
+
+Let's trace through a concrete example. The guest wants to execute CPUID to learn about CPU features.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           CPUID Request Flow                                │
+│                                                                             │
+│        Guest                                        Hypervisor              │
+│          │                                              │                   │
+│  1. CPUID EAX=1                                         │                   │
+│          │                                              │                   │
+│  2. #VC exception                                       │                   │
+│          │                                              │                   │
+│  3. #VC handler prepares GHCB:                          │                   │
+│     • EAX=1, exit code=CPUID                            │                   │
+│     • Mark valid fields                                 │                   │
+│          │                                              │                   │
+│          │────────────── 4. VMGEXIT ───────────────────►│                   │
+│          │                                              │                   │
+│          │                                   5. Read CPUID leaf             │
+│          │                                              │                   │
+│          │                                   6. Look up values              │
+│          │                                              │                   │
+│          │                                   7. Write EAX/EBX/ECX/EDX       │
+│          │                                              │                   │
+│          │◄───────────── 8. VM Entry ────────────────── │                   │
+│          │                                              │                   │
+│  9. #VC handler validates:                              │                   │
+│     • Compare against CPUID page                        │                   │
+│     • Mismatch = attack                                 │                   │
+│     • OK = return to caller                             │                   │
+│          │                                              │                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+Step 8 is critical. The guest doesn't blindly trust the hypervisor's CPUID response. SNP guests have a "CPUID page" that's measured during launch and contains known-good values. The guest compares the hypervisor's response against this trusted data.
+
+### Validating Hypervisor Responses
+
+For different operations, validation looks different:
+
+**CPUID**: Compare against the measured CPUID page. Mismatches indicate potential attack.
+
+**MSR reads**: Check that the value is within expected ranges for that MSR. Some MSRs have architecturally defined constraints.
+
+**I/O operations**: Often can't be validated directly. Device responses are whatever the device (which the hypervisor controls) says. For sensitive data, use application-level encryption (TLS, etc.).
+
+**Memory allocation**: The RMP and page validation mechanism handle this (see Document 3).
+
+### What Can Go Wrong
+
+Even with this protocol, a malicious hypervisor has options:
+
+- **Return wrong data**: Lie about CPUID, MSR values. Mitigated by validation.
+- **Refuse to respond**: The hypervisor controls scheduling. It can hang the guest indefinitely. This is denial of service, explicitly out of scope for SNP.
+- **Return stale data**: Replay old responses. Mitigated by sequence numbers where applicable.
+- **Modify GHCB during processing**: Race condition. Mitigated by copying values to private memory before use.
+
+The guest must be paranoid about everything in the GHCB.
+
+## Interrupt Handling
+
+There's one more communication channel to protect: interrupts. Traditionally, the hypervisor can inject interrupts into guests at will. A malicious hypervisor could:
+
+- Inject interrupts while they're supposed to be disabled
+- Inject spurious exceptions to confuse the guest
+- Manipulate interrupt priority to alter behavior
+
+SNP provides two optional modes to address this:
+
+### Restricted Injection
+
+In restricted injection mode, the hypervisor can only inject one specific exception: **#HV** (hypervisor exception). This acts as a simple doorbell: "hey, something happened."
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Restricted Injection                               │
+│                                                                             │
+│      Hypervisor                                      Guest                  │
+│          │                                              │                   │
+│  [Has event for guest]                                  │                   │
+│          │                                              │                   │
+│          │──────────── Inject #HV ─────────────────────►│                   │
+│          │             (only allowed)                   │                   │
+│          │                                              │                   │
+│          │                                   #HV handler runs:              │
+│          │                                   • Check event queue            │
+│          │                                   • Process events               │
+│          │                                   • Return when done             │
+│          │                                              │                   │
+│                                                                             │
+│   The guest controls when and how to process events.                        │
+│   Hypervisor can only signal "check the queue."                             │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Alternate Injection
+
+Alternate injection mode keeps the standard interrupt interface but moves the control fields into the encrypted VMSA. Only code with VMSA access (VMPL0) can actually inject interrupts into lower VMPLs. The hypervisor can't directly inject.
+
+With both modes combined in a VMPL setup:
+- Hypervisor signals VMPL0 via #HV
+- VMPL0 (SVSM) decides what to inject into VMPL2 (guest OS)
+- Guest OS sees normal interrupts, doesn't need to know about the indirection
+
+## The SVSM Calling Convention
+
+When the guest OS needs VMPL0 services (page validation, vTPM operations, etc.), it uses a defined calling convention:
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                                 SVSM Call Flow                                     │
+│                                                                                    │
+│   Guest OS (VMPL2)                SVSM (VMPL0)                    Hypervisor       │
+│          │                             │                              │            │
+│  1. Write request to                   │                              │            │
+│     Calling Area                       │                              │            │
+│          │                             │                              │            │
+│  2. Set SVSM_CALL_PENDING=1            │                              │            │
+│          │                             │                              │            │
+│          │─────────────────── 3. VMGEXIT ────────────────────────────►│            │
+│          │                             │                              │            │
+│          │                             │◄──── 4. Schedule VMPL0 ──────│            │
+│          │                             │                              │            │
+│          │                  5. Verify entry:                          │            │
+│          │                     • Real VMGEXIT?                        │            │
+│          │                     • PENDING set?                         │            │
+│          │                             │                              │            │
+│          │                  6. Execute operation                      │            │
+│          │                     (e.g., PVALIDATE)                      │            │
+│          │                             │                              │            │
+│          │                  7. Write result                           │            │
+│          │                             │                              │            │
+│          │                  8. Clear PENDING                          │            │
+│          │                             │                              │            │
+│          │◄───────────── 9. Return to guest ─────────────────────────►│            │
+│          │                             │                              │            │
+│  10. Check SVSM_CALL_PENDING:          │                              │            │
+│      • If 1: SVSM never ran, retry     │                              │            │
+│      • If 0: call done, check result   │                              │            │
+│          │                             │                              │            │
+│                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Step 10 is important. The guest OS can't trust that the hypervisor actually ran the SVSM. By checking the pending flag atomically, it detects if the hypervisor returned without invoking SVSM.
+
+### SVSM Security
+
+The SVSM zeros VMPCK0 (the VMPL0 communication key) from the secrets page after startup. This prevents the guest OS from impersonating VMPL0 when talking to the PSP. The guest OS uses VMPCK2 or VMPCK3 for its own PSP communication.
+
+This matters for attestation: only SVSM can generate VMPL0 attestation reports.
+
+## Security Summary
+
+### What's Protected
+
+| Mechanism            | Protection                                                                            |
+| -------------------- | ------------------------------------------------------------------------------------- |
+| VMPLs                | Code at VMPL2 can't access VMPL0 memory; hardware-enforced isolation within the guest |
+| VMSA encryption      | Hypervisor can't read register values (stack pointer, instruction pointer, etc.)      |
+| VMSA integrity       | Hypervisor can't modify registers to redirect execution                               |
+| GHCB protocol        | Guest controls what information hypervisor sees; validates all responses              |
+| Interrupt protection | Hypervisor can't directly inject arbitrary interrupts                                 |
+| SVSM                 | Trusted code at highest privilege level; proxies VMPL0-only operations                |
+
+### What's Not Protected
+
+**Timing information**: The hypervisor knows when exits occur and how long operations take.
+
+**Anything in shared pages**: The GHCB contents are visible to the hypervisor. Don't put secrets there.
+
+**I/O data paths**: Device communication goes through the hypervisor. Use TLS or application-level encryption for sensitive data.
+
+**Availability**: The hypervisor can refuse to schedule the guest, run SVSM, or provide memory. Denial of service is explicitly out of scope.
+
+### Guest Responsibilities
+
+The guest must:
+1. Validate hypervisor responses (check CPUID against measured values, verify MSR ranges)
+2. Minimize GHCB exposure (only mark fields valid that are needed)
+3. Verify SVSM call completion (check the pending flag)
+4. Handle failures appropriately (terminate if validation fails)
+
+## Further Reading
+
+- [Document 3: Memory Integrity](/docs/concepts/confidential-computing-primer/03-memory-integrity) for RMP and page validation details
+- [Document 5: Attestation](/docs/concepts/confidential-computing-primer/05-attestation) for how SVSM and VMPLs appear in attestation reports
