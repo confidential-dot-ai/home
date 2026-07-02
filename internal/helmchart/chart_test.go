@@ -4134,6 +4134,7 @@ func TestChartRejectsUncoveredComponentInFailClosed(t *testing.T) {
 func renderExampleTLSLBNginxConf() string {
 	cmd := exec.Command("helm",
 		"template", "c8s", "c8s",
+		"--kube-version", "1.30.0",
 		"--namespace", "c8s-system",
 		"--set", "image.tag=dev",
 		"--set", "attestationApi.image.tag=dev",
