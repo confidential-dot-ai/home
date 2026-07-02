@@ -13,6 +13,11 @@ const nextConfig: NextConfig = {
         permanent: true,
       },
       { source: "/docs/attestable-builds/:path*", destination: "/docs/attested-builds/:path*", permanent: true },
+      {
+        source: "/attested-builds/v1",
+        destination: "https://github.com/confidential-dot-ai/kettle/blob/main/docs/slsa-definitions.md",
+        permanent: true,
+      },
     ];
   },
 };
