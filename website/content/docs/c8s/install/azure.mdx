@@ -1,0 +1,169 @@
+---
+title: Provisioning a confidential cluster on Azure (AKS)
+description: Stand up a single-node AKS cluster backed by a confidential node pool — a managed Kubernetes cluster ready for c8s, with no VM to build or Kubernetes to install by hand.
+---
+
+<JourneyNav current={2} />
+
+The simplest way to get a confidential Kubernetes cluster on Azure is a managed **AKS** cluster
+with a **confidential VM node pool**: Azure runs the control plane and gives you nodes that are
+already confidential VMs, so there is no VM to build and no Kubernetes to install by
+hand. You point `kubectl` at it from your laptop and install c8s. The AKS control plane is
+managed by Azure and — like any control plane — stays **outside** the trust boundary; the
+confidential node pool is your **node-as-CVM**. When the cluster is up, continue to
+**[Install c8s](/docs/c8s/install/installation)**.
+
+<Callout type="info">
+  New to c8s? Skim the [overview](/docs/c8s) and the [runtime model](/docs/c8s/runtime/pod-vs-node-cvm)
+  first — on Azure you run the **node-as-CVM** shape. This page assumes only basic Azure and
+  `kubectl` familiarity.
+</Callout>
+
+## Prerequisites
+
+On your **laptop**:
+
+- An **Azure subscription**, with the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
+  installed and logged in (`az login`).
+- **`kubectl`** — if you don't have it, `az aks install-cli` installs a compatible build.
+
+You'll also need **c8s source-repo access and a GitHub Personal Access Token** when you reach
+[Install c8s](/docs/c8s/install/installation) — the CLI is built from the private source repo and the
+component images ship from a private registry. Those are different private resources: cloning the
+source needs **`repo`** (classic) or **`contents: read`** (fine-grained), while pulling the images
+needs **`read:packages`**, so scope the token for both. Nothing in *this* guide needs them.
+
+## Confidential VM sizes
+
+AKS confidential node pools use the same AMD SEV-SNP **DCas_v5** family as standalone Azure
+confidential VMs. Pick a node size by workload:
+
+| SKU | vCPU | Typical use |
+| --- | --- | --- |
+| `Standard_DC2as_v5` | 2 | smallest — quota/cost-friendly smoke tests |
+| `Standard_DC4as_v5` | 4 | a comfortable single-node dev cluster |
+| `Standard_DC48as_v5` | 48 | a large single node |
+
+Confidential VM sizes exist only in some regions (for example `northeurope`); check with
+`az vm list-skus --location <region> --size Standard_DC` before you provision.
+
+<Callout type="info">
+  This guide uses **AMD SEV-SNP** (`DCas_v5`). Azure also offers **Intel TDX** confidential VMs
+  (the `DCes_v5` / `ECes_v5` family), and node-as-CVM targets both — but the vTPM attestation path
+  you'll select at install time (`--cvm-mode aks`) is **SEV-SNP today**, so treat the TDX route as
+  in progress for now.
+</Callout>
+
+## Step by step
+
+<Steps>
+
+<Step>
+
+### 1. Create the AKS cluster with a confidential node pool
+
+Choosing a `DCas_v5` node size makes the pool a **SEV-SNP confidential VM node pool** — each node
+boots as a CVM with a vTPM. `--node-count 1` keeps it single-node for a dev cluster.
+
+```bash
+az group create --name c8s-rg --location northeurope
+
+az aks create \
+  --resource-group c8s-rg \
+  --name c8s-aks \
+  --node-count 1 \
+  --node-vm-size Standard_DC4as_v5 \
+  --os-sku Ubuntu \
+  --generate-ssh-keys
+```
+
+<Callout type="warn">
+  **Verify the node-pool shape.** Some subscriptions/regions only allow the confidential VM size
+  on a **user** node pool, not the default system pool. If `az aks create` rejects the CVM size,
+  create a minimal regular system pool and add the confidential pool separately:
+
+  ```bash
+  az aks nodepool add \
+    --resource-group c8s-rg --cluster-name c8s-aks \
+    --name conf --mode User \
+    --node-count 1 --node-vm-size Standard_DC4as_v5 --os-sku Ubuntu
+  ```
+
+  With a separate system pool you no longer have a single node — drop `--single-node` at install
+  time and let the CDS schedule onto the confidential pool (label/taint it so only confidential
+  workloads land there).
+</Callout>
+
+</Step>
+
+<Step>
+
+### 2. Point kubectl at the cluster
+
+```bash
+az aks get-credentials --resource-group c8s-rg --name c8s-aks
+kubectl get nodes -o wide
+```
+
+Everything from here runs **from your laptop** — there's no node to SSH into. When the node
+reports `Ready`, you're ready to install c8s.
+
+</Step>
+
+</Steps>
+
+## Next: install c8s
+
+Your cluster is now a managed AKS cluster whose node is a confidential CVM, with `kubectl` wired up on
+your laptop. Continue to **[Install c8s](/docs/c8s/install/installation)**.
+
+One Azure-specific flag to know up front: SEV-SNP attestation here comes from the **vTPM at
+`/dev/tpm0`**, not a native `/dev/sev-guest` device, so you install with `--cvm-mode aks`.
+Despite the name it means "Azure vTPM" and applies to any Azure confidential VM. For the full
+provision-through-verify path on one page, follow
+[Deploy a confidential AKS cluster and run c8s](/docs/c8s/tutorials/azure-e2e).
+
+<Callout type="warn">
+  **Validate the host-side install on managed nodes.** c8s's node-as-CVM install runs privileged
+  DaemonSets that touch the node host: `nri-image-policy` patches the node's containerd config and
+  restarts it, `ratls-mesh` sets up `iptables`, and `attestation-api` mounts `/dev/tpm0`. This is
+  routine on self-managed nodes; on a **managed AKS node pool**, confirm these complete and
+  **survive node image upgrades / reconciliation** before relying on it in production — AKS may
+  reconcile host changes on upgrade.
+</Callout>
+
+## Why pod-as-CVM is not available on Azure
+
+This is the key limitation to plan around:
+
+<Callout type="warn">
+  Azure's hypervisor does **not** expose nested virtualization. A
+  [pod-as-CVM](/docs/c8s/runtime/pod-vs-node-cvm) design launches a *new* confidential VM **inside** the
+  node for every pod — that requires nesting, which Azure does not provide. So each AKS
+  confidential node is a single node-level CVM, and **all pods on it share that one confidential
+  boundary.** Don't add `--kata` on Azure.
+</Callout>
+
+Concretely, on AKS:
+
+- ✅ **Node-as-CVM works.** Each node runs as one confidential CVM; its memory is opaque to the Azure
+  operator. Attestation is at the node level — verify the node's launch state once and every pod
+  on it inherits that verified boundary.
+- ❌ **Pod-as-CVM (Kata per-pod VMs) does not work.** Launching a VM inside the node VM would be
+  nested virtualization, which the platform does not support.
+- ✅ **You still get strong guarantees.** Pod identities are issued by the CDS, the image
+  allowlist is enforced at the node, inter-node traffic (once you scale past one node) is
+  RA-TLS-protected, and secrets are released only to attested nodes.
+
+The tradeoff is attestation granularity: on Azure you cannot distinguish two pods on the same
+node at the attestation level — they are inside the same TEE.
+
+## Self-managed and bare-metal hosts
+
+If you need **pod-as-CVM** (per-pod isolation from the cluster operator), or you're running
+outside Azure, you need a **bare-metal-class confidential host that allows nested VMs**. Provisioning
+that host (and a self-managed Kubernetes on it) is out of scope for this AKS guide; once you have
+a cluster on it, [Install c8s](/docs/c8s/install/installation) is the same flow — use
+`--cvm-mode baremetal` (or `--cvm-mode gke` on GKE's native `/dev/sev-guest`), and add `--kata`
+for pod-as-CVM. See [pod-as-CVM vs node-as-CVM](/docs/c8s/runtime/pod-vs-node-cvm) for the full
+comparison.

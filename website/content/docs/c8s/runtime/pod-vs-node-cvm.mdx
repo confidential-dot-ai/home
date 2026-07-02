@@ -1,0 +1,91 @@
+---
+title: Pod-as-CVM vs Node-as-CVM
+description: The two confidential trust boundaries c8s supports — each pod as its own confidential VM, or the whole node as one — with the tradeoffs and an explicit guide to choosing.
+---
+
+<JourneyNav current={1} />
+
+This is the most consequential architectural decision in c8s: **what is the unit of trust and
+attestation?** There are two answers, and they correspond to two different ways of placing the
+TEE boundary. The layered picture (L0 = host/hypervisor, L1 = the node, L2 = the pods)
+makes the difference precise.
+
+## Node-as-CVM (node-as-guest)
+
+```text
+L1 (the node)  = confidential VM (SEV-SNP or TDX) of L0   ← the attestable unit
+L2 (the pods)  = ordinary containers in L1               ← protected by L1's encryption boundary
+```
+
+The **entire Kubernetes node is one confidential VM** — an AMD SEV-SNP or Intel TDX enclave.
+L0 (the cloud or bare-metal operator) sees only ciphertext of the node. Workloads run as
+ordinary containers inside that node; from a pod's point of view it is a normal node that
+happens to be a confidential VM. A verifier checks the **node's** launch digest — if it matches
+the published image, every container on the node is running in a verified state by definition.
+
+The control plane (kubelet, etcd, secrets) lives **inside** the verified node VM.
+
+## Pod-as-CVM (node-as-host)
+
+```text
+L1 (the node)  = not trusted (a plain launchpad)
+L2 (each pod)  = its own per-pod confidential VM    ← the attestable unit
+```
+
+Each **pod is its own confidential enclave** (via [Kata](/docs/c8s/runtime/kata-containers); the per-pod
+runtime is SEV-SNP today, with Intel TDX in progress). The node is just the launchpad that asks
+KVM to start each pod's VM. A verifier checks the **pod's**
+launch digest, not the node's. Even a malicious node cannot tamper with what a pod runs — it
+can break the pod, but the break is *detected by attestation*, not silently exploited.
+
+## Side-by-side
+
+| | Node-as-CVM | Pod-as-CVM |
+| --- | --- | --- |
+| Attestable unit | the whole node | each pod |
+| Trust required in the node operator | implicit (kubelet/runtime trusted) | **none** — host is adversarial |
+| Isolation between tenants on a node | container-level only | per-pod hardware memory encryption |
+| Per-pod attestation to an external verifier | no (all pods share the node digest) | **yes** |
+| Density / overhead | high density, one VM per node | one VM per pod; boot cost per pod |
+| Startup latency | normal pod start | includes VM boot |
+| Control plane in the boundary | yes (kubelet, etcd, secrets) | no — per-pod |
+| Image / build | one node image (e.g. `rke2`) | guest rootfs (`kata-guest-base`) + hypervisor node OS (`rke2-kata`) |
+| Works on Azure AKS | **yes** | **no** (needs nesting AKS lacks) |
+
+## When to choose which
+
+<Cards>
+  <Card title="Choose Node-as-CVM when…" description="The trust unit is 'this whole node and everything on it'; you don't need per-pod isolation from the cluster operator; you want the simplest model and maximum density; the control plane should be inside the boundary. Works on any L0 that exposes a confidential VM (AMD SEV-SNP or Intel TDX) — including Azure AKS." />
+  <Card title="Choose Pod-as-CVM when…" description="The trust unit is each individual pod; you need per-pod isolation from the cluster operator (multi-tenant, or the tenant doesn't trust the platform); each pod must prove its exact state to an external verifier independently. Requires a bare-metal-class confidential host." />
+</Cards>
+
+In short:
+
+- **Node-as-CVM** is the all-or-nothing model: verify the node once, and everything on it is
+  trusted. Simplest, densest, and the only option on managed services without nested
+  virtualization. The tradeoff is that you must trust the in-node control plane and you get
+  no per-pod attestation.
+- **Pod-as-CVM** is the mutual-distrust model: the platform operator and the tenant workloads
+  do not trust each other, and each pod carries its own attestable identity. The tradeoff is
+  one VM per pod (more overhead, slower starts) and a more complex install (Kata runtime,
+  per-pod measurement pinning, admission enforcement).
+
+<Callout type="warn">
+  **Pod-as-CVM is not available on Azure.** Azure's hypervisor does not expose nested
+  virtualization, so a per-pod VM cannot be launched inside an AKS node. On Azure you use
+  node-as-CVM, where the AKS node is a single confidential CVM and all its pods share that one
+  boundary. See [Provisioning on Azure](/docs/c8s/install/azure) for the details and what you
+  still get.
+</Callout>
+
+## Implementation note
+
+The two shapes are built from different base images: node-as-CVM uses a self-booting node
+image (hardened kernel + kubelet/containerd/CNI, dm-verity + IGVM/UKI), while pod-as-CVM uses
+a hypervisor-capable node OS (`rke2-kata`, full kernel with KVM/VFIO) that launches the
+sealed `kata-guest-base` per-pod VMs. The node-as-CVM node carries its own launch digest; in
+pod-as-CVM the per-pod Kata VM is the confidential unit and carries the digest that matters.
+
+Once you've chosen a shape, [Kata Containers](/docs/c8s/runtime/kata-containers) covers how the
+pod-as-CVM path is actually built — the measured boot, the sealed guest image, and the
+guest-pull model.

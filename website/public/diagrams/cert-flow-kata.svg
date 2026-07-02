@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 366" role="img" aria-label="Kata-mode certificate flow: the workload CVM connects to the CDS CVM over RA-TLS and attests; the CDS verifies evidence via the in-guest attestation-service and returns a leaf certificate — all inside the SEV-SNP boundary the host cannot read.">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L7.5,3 L0,6 z" fill="#8a8a8a" />
+    </marker>
+  </defs>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .card { fill: #121212; stroke: #2a2a2a; }
+    .tee { fill: rgba(254,220,81,0.04); stroke: #fedc51; stroke-width: 1.2; stroke-dasharray: 6 5; }
+    .teelbl { fill: #fedc51; font-size: 10.5px; letter-spacing: 0.05em; }
+    .actor { fill: #1c1c1c; stroke: #3c3c3c; }
+    .an { fill: #ededed; font-size: 13px; font-weight: 600; }
+    .as { fill: #8c8c8c; font-size: 10.5px; }
+    .life { stroke: #343434; stroke-width: 1; stroke-dasharray: 3 4; }
+    .req { stroke: #8a8a8a; stroke-width: 1.5; }
+    .res { stroke: #8a8a8a; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .lbl { fill: #c2c2c2; font-size: 11.5px; }
+  </style>
+
+  <rect class="card" x="0.5" y="0.5" width="719" height="365" rx="10" />
+
+  <!-- SEV-SNP boundary around the whole exchange -->
+  <rect class="tee" x="16" y="14" width="688" height="338" rx="10" />
+  <text class="teelbl" x="34" y="35">SEV-SNP BOUNDARY · HOST CANNOT READ</text>
+
+  <!-- lifelines -->
+  <line class="life" x1="128" y1="96" x2="128" y2="334" />
+  <line class="life" x1="380" y1="96" x2="380" y2="334" />
+  <line class="life" x1="616" y1="96" x2="616" y2="334" />
+
+  <!-- actors -->
+  <rect class="actor" x="44" y="50" width="168" height="44" rx="7" />
+  <text class="an" x="128" y="70" text-anchor="middle">Workload CVM</text>
+  <text class="as" x="128" y="85" text-anchor="middle">get-cert</text>
+
+  <rect class="actor" x="304" y="50" width="152" height="44" rx="7" />
+  <text class="an" x="380" y="70" text-anchor="middle">CDS CVM</text>
+  <text class="as" x="380" y="85" text-anchor="middle">mesh CA</text>
+
+  <rect class="actor" x="532" y="50" width="168" height="44" rx="7" />
+  <text class="an" x="616" y="70" text-anchor="middle">attestation-service</text>
+  <text class="as" x="616" y="85" text-anchor="middle">127.0.0.1:8400</text>
+
+  <!-- 1: RA-TLS connect -->
+  <text class="lbl" x="254" y="120" text-anchor="middle">RA-TLS connect · verify CDS measurement</text>
+  <line class="req" x1="128" y1="128" x2="380" y2="128" marker-end="url(#ah)" />
+
+  <!-- 2: attest -->
+  <text class="lbl" x="254" y="160" text-anchor="middle">POST /attest — challenge + evidence + CSR</text>
+  <line class="req" x1="128" y1="168" x2="380" y2="168" marker-end="url(#ah)" />
+
+  <!-- 3: verify in-process -->
+  <text class="lbl" x="498" y="200" text-anchor="middle">verify in-process</text>
+  <line class="req" x1="380" y1="208" x2="616" y2="208" marker-end="url(#ah)" />
+
+  <!-- 4: verdict -->
+  <text class="lbl" x="498" y="240" text-anchor="middle">verdict + launch_digest</text>
+  <line class="res" x1="616" y1="248" x2="380" y2="248" marker-end="url(#ah)" />
+
+  <!-- 5: leaf cert -->
+  <text class="lbl" x="254" y="300" text-anchor="middle">leaf cert from mesh CA</text>
+  <line class="res" x1="380" y1="308" x2="128" y2="308" marker-end="url(#ah)" />
+</svg>

@@ -1,0 +1,293 @@
+---
+title: Deploy a confidential AKS cluster and run c8s
+description: One sitting, start to finish — create a single-node AKS cluster on a confidential node pool, build the c8s CLI, install c8s in node-as-CVM mode, and verify the result.
+---
+
+This tutorial goes from an empty Azure subscription to an installed, verified confidential c8s
+cluster **in a single pass**, on a managed **AKS** cluster with a confidential node pool. It
+repeats the steps from the [provisioning guide](/docs/c8s/install/azure) and the
+[install guide](/docs/c8s/install/installation) so you can follow one page top to bottom — reach for
+those reference pages when you want a single piece (every install flag, the architecture
+rationale) on its own.
+
+The cluster you build runs the **node-as-CVM** shape: the node is one confidential VM and your
+pods are ordinary containers inside it. That's the only shape Azure supports — see
+[why](#why-pod-as-cvm-is-not-available-on-azure) at the end. If the node-as-CVM vs pod-as-CVM
+distinction is new, read [the runtime model](/docs/c8s/runtime/pod-vs-node-cvm) first.
+
+<Callout type="info">
+  You run everything **from your laptop** — `kubectl` and `c8s install` talk to the managed
+  cluster over `az aks get-credentials`. There's nothing to SSH into.
+</Callout>
+
+## Prerequisites
+
+On your **laptop**:
+
+- An **Azure subscription**, with the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
+  installed and logged in (`az login`).
+- **`kubectl`** (`az aks install-cli` if you don't have it).
+- Access to the **c8s source repo** and a **GitHub Personal Access Token**. The source repo and
+  the component images are *both* private but need *different* scopes, so give the token both:
+  **`repo`** (classic) or **`contents: read`** (fine-grained) to `git clone` the source, and
+  **`read:packages`** to pull the images. A `read:packages`-only token can pull the images but
+  **cannot clone the private repo**. Create one at GitHub → *Settings → Developer settings →
+  Personal access tokens*.
+
+## What you'll build
+
+- A single-node **AKS** cluster with a `Standard_DC*as_v5` **confidential node pool** — AMD
+  SEV-SNP, with a vTPM.
+- **c8s** installed — operator, CDS, attestation-api, RA-TLS mesh, and image policy — and
+  verified.
+
+AKS confidential node pools use the AMD SEV-SNP **DCas_v5** family; `Standard_DC4as_v5` is a
+comfortable single-node dev size. Confidential VM sizes exist only in some regions (for example
+`northeurope`) — check `az vm list-skus --location <region> --size Standard_DC` first. The
+[provisioning guide](/docs/c8s/install/azure#confidential-vm-sizes) has the full SKU table.
+
+## Step by step
+
+<Steps>
+
+<Step>
+
+### 1. Create the AKS cluster with a confidential node pool
+
+A `DCas_v5` node size makes the pool a SEV-SNP confidential VM node pool — each node boots as a
+CVM with a vTPM. `--node-count 1` keeps it single-node.
+
+```bash
+az group create --name c8s-rg --location northeurope
+
+az aks create \
+  --resource-group c8s-rg \
+  --name c8s-aks \
+  --node-count 1 \
+  --node-vm-size Standard_DC4as_v5 \
+  --os-sku Ubuntu \
+  --generate-ssh-keys
+```
+
+<Callout type="warn">
+  **Verify the node-pool shape.** If your subscription/region only allows the confidential size on
+  a **user** pool, create a regular system pool and add the confidential pool with
+  `az aks nodepool add --mode User --node-vm-size Standard_DC4as_v5 --os-sku Ubuntu …` — then drop
+  `--single-node` in step 5 and let the CDS schedule onto the confidential pool. See the
+  [provisioning guide](/docs/c8s/install/azure#step-by-step).
+</Callout>
+
+</Step>
+
+<Step>
+
+### 2. Point kubectl at the cluster
+
+```bash
+az aks get-credentials --resource-group c8s-rg --name c8s-aks
+
+# wait until the node reports Ready
+kubectl get nodes -o wide
+```
+
+`get-credentials` merges the cluster into your kubeconfig, so `kubectl` (and `c8s install`) talk
+to it directly from your laptop.
+
+</Step>
+
+<Step>
+
+### 3. Install the c8s CLI
+
+There's no prebuilt binary yet, so build the CLI from source on your laptop. It shells out to
+`helm`, `kubectl`, and `crane`.
+
+<details data-collapse>
+<summary>Install the build tools (make, Go, Helm, crane)</summary>
+
+On Linux:
+
+```bash
+# make + Go 1.26+ (the c8s go.mod floor)
+sudo apt-get update && sudo apt-get install -y make
+curl -sL https://go.dev/dl/go1.26.3.linux-amd64.tar.gz | sudo tar -C /usr/local -xz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc && export PATH=$PATH:/usr/local/go/bin
+
+# Helm
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# crane (only needed with the default --resolve-digests=true)
+CRANE_VER=$(curl -s https://api.github.com/repos/google/go-containerregistry/releases/latest | grep -oP '"tag_name": "\K[^"]+')
+curl -sL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VER}/go-containerregistry_Linux_x86_64.tar.gz" \
+  | sudo tar -xz -C /usr/local/bin crane
+```
+
+On macOS, `brew install make go helm crane` covers all four.
+
+</details>
+
+Clone the c8s repo — authenticate over HTTPS with that token (it needs the `repo` /
+`contents: read` scope, not `read:packages`), or with `gh` — and build the CLI. `make install`
+runs `go install`, which drops the binary in `$(go env GOPATH)/bin` (default `~/go/bin`) — add
+that directory to your `PATH`:
+
+```bash
+git clone https://github.com/confidential-dot-ai/c8s.git
+cd c8s
+make install     # builds and installs `c8s` to $(go env GOPATH)/bin (default ~/go/bin)
+
+export PATH=$PATH:$(go env GOPATH)/bin
+c8s --help
+```
+
+</Step>
+
+<Step>
+
+### 4. Provide registry credentials
+
+The c8s component images are currently private, so authenticate in **two separate places** — they
+are independent credentials and the install needs both:
+
+- **Locally**, so `crane` can resolve each image tag to a digest while `c8s install` runs (the
+  default `--resolve-digests=true` shells out to `crane` on your laptop, reading
+  `~/.docker/config.json`). Skipping it produces
+  `crane digest ...: UNAUTHORIZED: authentication required`.
+- **In the cluster**, via a pull Secret in the release namespace, so the kubelet can pull the
+  images at runtime. Create it **before** installing, in `c8s-system`.
+
+Both use the same `read:packages` token from the prerequisites:
+
+```bash
+GITHUB_USER=<your-github-username>
+GITHUB_PAT=<github-token-with-read:packages>
+
+# 1. Local login so `crane` can resolve digests during `c8s install`
+echo "$GITHUB_PAT" | crane auth login ghcr.io -u "$GITHUB_USER" --password-stdin
+
+# 2. Cluster-side pull Secret so the kubelet can pull the private images at runtime
+kubectl create namespace c8s-system
+kubectl create secret docker-registry ghcr-secret \
+  --namespace c8s-system \
+  --docker-server=ghcr.io \
+  --docker-username="$GITHUB_USER" \
+  --docker-password="$GITHUB_PAT"
+```
+
+<Callout type="info">
+  This step is only needed while the c8s images are private. After c8s's public launch you can
+  skip the Secret and drop `--image-pull-secret` — you'd only keep it for a **private or custom
+  registry**.
+</Callout>
+
+</Step>
+
+<Step>
+
+### 5. Install c8s
+
+On Azure, SEV-SNP attestation comes from the **vTPM at `/dev/tpm0`**, not a native
+`/dev/sev-guest` device. Select that path with `--cvm-mode aks` — despite the name it means
+"Azure vTPM". Note there's **no `--kata`**: per-pod CVMs need nesting Azure doesn't provide, so
+this is a node-as-CVM install.
+
+```bash
+c8s install \
+  --single-node \
+  --cvm-mode aks \
+  --image-pull-secret ghcr-secret
+```
+
+`--single-node` makes every node CDS-eligible (no dedicated CDS node).
+
+<Callout type="warn">
+  **Validate on managed nodes.** This install runs privileged DaemonSets that touch the node host
+  — `nri-image-policy` patches containerd and restarts it, `ratls-mesh` sets up `iptables`, and
+  `attestation-api` mounts `/dev/tpm0`. Confirm these complete on your AKS node pool (and survive
+  node image upgrades) before relying on it.
+</Callout>
+
+<Callout type="info">
+  `helm --wait` makes `c8s install` **block** until every component reports Ready, so the command
+  can sit for a few minutes — that's expected, not a hang. To watch progress, in another terminal:
+
+  ```bash
+  kubectl get pods -A -w
+  ```
+
+  A brief `ImageInspectError` or a single restart on `ratls-mesh` early in the rollout is normal:
+  `nri-image-policy` restarts containerd as it installs, and the mesh pod retries through that and
+  self-heals. The wait is **not** unbounded, though — `helm --wait` runs with a **5-minute
+  timeout**, so if a pod stays stuck in `ImagePullBackOff` or `CrashLoopBackOff` (a missing or
+  wrong pull secret is the usual culprit), `c8s install` **fails** once the timeout elapses. The
+  resources it already applied stay in place, so fix the cause and **re-run** `c8s install` — it's
+  idempotent (`helm upgrade --install`) and completes once every pod is Ready.
+</Callout>
+
+For production, pin launch measurements — see
+[Obtaining launch measurements](/docs/c8s/attestation/cds#obtaining-launch-measurements) — and read
+the [install guide](/docs/c8s/install/installation) for the rest of the flags.
+
+</Step>
+
+<Step>
+
+### 6. Verify the install
+
+Confirm the control plane came up. A node-as-CVM install runs seven components — `c8s-cds`,
+`c8s-operator`, `c8s-attestation-api`, `c8s-ratls-mesh`, `c8s-nri-image-policy`, `c8s-tee-proxy`,
+and `c8s-tls-lb` — and all should be `Running` with every container ready:
+
+```bash
+kubectl get pods -n c8s-system
+```
+
+Check the admission webhook is wired up — the operator patches its `caBundle` once at startup, so
+it should be non-empty:
+
+```bash
+# the config is named <release>-pod-injector (release defaults to c8s):
+kubectl get mutatingwebhookconfiguration c8s-pod-injector \
+  -o jsonpath='{.webhooks[*].clientConfig.caBundle}' | wc -c
+# any non-zero count means it's patched
+```
+
+Then prove confidentiality from **outside** the cluster — the real test — with
+[c8s-verify](/docs/c8s/verification/consumer), which checks the node's attestation evidence and
+launch measurement against what you expect.
+
+</Step>
+
+</Steps>
+
+## Why pod-as-CVM is not available on Azure
+
+<Callout type="warn">
+  Azure's hypervisor does **not** expose nested virtualization. A
+  [pod-as-CVM](/docs/c8s/runtime/pod-vs-node-cvm) design launches a *new* confidential VM inside the node
+  for every pod — that requires nesting, which Azure does not provide. So each AKS confidential
+  node is a single node-level CVM, and **all pods on it share that one confidential boundary.** Don't
+  add `--kata` on Azure.
+</Callout>
+
+You still get strong guarantees: pod identities are issued by the CDS, the image allowlist is
+enforced at the node, inter-node traffic (once you scale past one node) is RA-TLS-protected, and
+secrets are released only to attested nodes. The tradeoff is attestation *granularity* — you
+can't distinguish two pods on the same node, because they're inside the same TEE. If your threat
+model needs per-pod isolation from the operator, you need a bare-metal-class confidential host that
+allows nesting; GKE (native `/dev/sev-guest`, `--cvm-mode gke`) is the other platform where
+per-pod CVMs are an option. See [pod-as-CVM vs node-as-CVM](/docs/c8s/runtime/pod-vs-node-cvm) for the
+full comparison.
+
+## Where to go next
+
+**Continue the tutorial:** [Verified chat over confidential vLLM](/docs/c8s/tutorials/vllm-chat) —
+deploy a vLLM model server onto **this AKS cluster**, attest that it's running in a TEE, and chat
+with it over an encrypted channel from your laptop.
+
+Or branch off:
+
+- Run a confidential workload with the `confidential.ai/cw` annotation —
+  [Install c8s → Run a confidential workload](/docs/c8s/install/installation#run-a-confidential-workload).
+- Curate which images may run — [the allowlist](/docs/c8s/attestation/allowlist).
+- Understand the trust root you just deployed — [CDS bootstrapping](/docs/c8s/attestation/cds).

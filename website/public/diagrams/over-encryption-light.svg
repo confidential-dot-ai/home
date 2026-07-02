@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 418" role="img" aria-label="Browser verification over-encryption flow: the browser fetches the LB enclave's attestation through the untrusted TLS terminator, verifies the SEV-SNP evidence in WASM, runs a post-quantum handshake, and tunnels sealed requests end-to-end to the enclave.">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L7.5,3 L0,6 z" fill="#7c7a72" />
+    </marker>
+  </defs>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .card { fill: #ffffff; stroke: #e4e2dc; }
+    .actor { fill: #f6f5f1; stroke: #d9d7d0; }
+    .untrust { fill: #f6f5f1; stroke: #cfcdc5; stroke-dasharray: 4 4; }
+    .tee { fill: rgba(138,90,0,0.07); stroke: #8a5a00; stroke-width: 1.2; }
+    .an { fill: #1f1f1d; font-size: 13px; font-weight: 600; }
+    .as { fill: #6b6b66; font-size: 10.5px; }
+    .life { stroke: #dcdad3; stroke-width: 1; stroke-dasharray: 3 4; }
+    .req { stroke: #7c7a72; stroke-width: 1.5; }
+    .res { stroke: #7c7a72; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .lbl { fill: #4a4a46; font-size: 11.5px; }
+    .note { fill: #faf6e8; stroke: #8a5a00; }
+    .nt { fill: #8a5a00; font-size: 10.5px; }
+  </style>
+
+  <rect class="card" x="0.5" y="0.5" width="719" height="417" rx="10" />
+
+  <!-- lifelines -->
+  <line class="life" x1="116" y1="66" x2="116" y2="396" />
+  <line class="life" x1="380" y1="66" x2="380" y2="396" />
+  <line class="life" x1="620" y1="66" x2="620" y2="396" />
+
+  <!-- actors -->
+  <rect class="actor" x="36" y="18" width="160" height="44" rx="7" />
+  <text class="an" x="116" y="38" text-anchor="middle">Browser</text>
+  <text class="as" x="116" y="53" text-anchor="middle">c8s-verify-js</text>
+
+  <rect class="untrust" x="300" y="18" width="160" height="44" rx="7" />
+  <text class="an" x="380" y="38" text-anchor="middle">TLS terminator</text>
+  <text class="as" x="380" y="53" text-anchor="middle">untrusted</text>
+
+  <rect class="tee" x="540" y="18" width="160" height="44" rx="7" />
+  <text class="an" x="620" y="38" text-anchor="middle">LB enclave</text>
+  <text x="620" y="53" text-anchor="middle" fill="#8a5a00" font-size="10.5px">TEE</text>
+
+  <!-- 1: GET attestation -->
+  <text class="lbl" x="368" y="90" text-anchor="middle">GET /.well-known/c8s/attestation?nonce=N</text>
+  <line class="req" x1="116" y1="98" x2="620" y2="98" marker-end="url(#ah)" />
+
+  <!-- note over LB -->
+  <rect class="note" x="512" y="116" width="196" height="30" rx="5" />
+  <text class="nt" x="610" y="135" text-anchor="middle">HW report binds session key + nonce</text>
+
+  <!-- 2: evidence -->
+  <text class="lbl" x="368" y="170" text-anchor="middle">evidence + session pubkey + CDS cert</text>
+  <line class="res" x1="620" y1="178" x2="116" y2="178" marker-end="url(#ah)" />
+
+  <!-- note over Browser -->
+  <rect class="note" x="20" y="196" width="320" height="30" rx="5" />
+  <text class="nt" x="180" y="215" text-anchor="middle">verify SNP sig · measurement · report_data (WASM)</text>
+
+  <!-- 3: handshake -->
+  <text class="lbl" x="368" y="250" text-anchor="middle">handshake — X25519 + ML-KEM-768</text>
+  <line class="req" x1="116" y1="258" x2="620" y2="258" marker-end="url(#ah)" />
+
+  <!-- note over Browser..LB -->
+  <rect class="note" x="240" y="276" width="256" height="30" rx="5" />
+  <text class="nt" x="368" y="295" text-anchor="middle">derive AES-256-GCM over-encryption channel</text>
+
+  <!-- 4: tunnel -->
+  <text class="lbl" x="368" y="330" text-anchor="middle">POST /tunnel — sealed request</text>
+  <line class="req" x1="116" y1="338" x2="620" y2="338" marker-end="url(#ah)" />
+
+  <!-- 5: sealed response -->
+  <text class="lbl" x="368" y="368" text-anchor="middle">sealed response</text>
+  <line class="res" x1="620" y1="376" x2="116" y2="376" marker-end="url(#ah)" />
+</svg>

@@ -1,0 +1,69 @@
+---
+title: Limitations
+description: Known gaps and deliberate non-goals in the current c8s milestone — what is not yet enforced, and what to plan around.
+---
+
+c8s is built around a strong threat model, but not every gap is closed yet. This page is the
+honest list of what the current milestone does **not** do, so you can plan around it. Several
+items are deliberate non-goals for now; others are tracked work.
+
+## Trust & enforcement gaps
+
+- **Measurements are not pinned by default.** The chart ships with `cds.measurements` and
+  `ratls-mesh.measurements` empty, which means "accept any attested peer". This is fine for
+  demos but must be set for production — see the
+  [threat model](/docs/c8s/architecture/threat-model#measurement-pinning-is-mandatory-for-production).
+- **Mesh peer verification doesn't pin the peer measurement.** A mesh peer is accepted if its
+  certificate chains to the mesh CA; the peer's launch measurement is not additionally checked
+  on the handshake.
+- **Leaf certificates don't embed the verified TEE measurement.** The measurement is checked at
+  issuance time, but it is not carried inside the leaf for downstream re-verification.
+- **The image allowlist gates the digest only.** `nri-image-policy` / `policy-monitor` enforce
+  the container-image digest — not args, env, mounts, capabilities, or the rest of the pod spec.
+- **No per-workload peer allowlists in the mesh.** Any attested mesh peer can talk to any other;
+  there is no per-workload restriction on who may connect to whom.
+- **No SPIFFE-style URI SAN identities.** Workload identity is carried by the CDS-issued cert's
+  SANs/CN, not a SPIFFE URI scheme.
+
+## Availability & operations
+
+- **The CDS is a singleton by default.** The mesh CA key lives only in CDS process memory, so a
+  restart generates a new CA and invalidates existing leaves. HA via attested **CA handoff** is
+  opt-in (`cds.handoff.enabled=true`) — see [CDS handoff](/docs/c8s/attestation/cds#ca-handoff).
+- **Flipping `kata.enabled` on a live cluster is disruptive.** Node-as-CVM and pod-as-CVM move
+  components between host and guest; switching in place is not a seamless toggle.
+- **A small post-start kill window exists under Kata.** `policy-monitor` SIGKILLs a
+  non-allowlisted container's init PID, but the init fork happens a few milliseconds before the
+  kill lands.
+
+## Platform constraints
+
+- **Pod-as-CVM is unavailable on Azure.** Azure does not expose nested virtualization, so AKS
+  runs node-as-CVM only — all pods on a node share one confidential boundary. See
+  [Provisioning on Azure](/docs/c8s/install/azure#why-pod-as-cvm-is-not-available-on-azure).
+- **The per-pod Kata runtime is SEV-SNP today.** Node-as-CVM and the rest of the platform run on
+  both AMD SEV-SNP and Intel TDX, but the confidential *pod* runtime (`--kata`,
+  `kata-qemu-snp`) currently requires an AMD SEV-SNP host — TDX per-pod support is in progress.
+  On a non-SNP host you can still run `kata-qemu` (isolation without confidentiality).
+- **Browser verification is SEV-SNP only.** The [c8s-verify](/docs/c8s/verification/consumer)
+  WASM verifier ships AMD ARK/ASK roots and verifies SEV-SNP evidence; TDX is reserved in the
+  wire protocol but not yet implemented.
+- **No GPU confidential computing yet.** GPU CC (NVIDIA H100 CC-mode) is intentionally out of
+  scope for the initial pod runtime; integrating confidential GPUs is tracked separately.
+- **Don't run an external service mesh alongside c8s.** c8s installs its own pod-to-pod
+  **RA-TLS mesh** — transparent iptables redirection plus attestation-gated mTLS. A second
+  service mesh (Istio, Linkerd, or any sidecar / mTLS plumbing) double-intercepts the same
+  traffic, collides with the RA-TLS handshake, and injects **un-attested** proxies into the
+  confidential path — breaking the trust model rather than adding to it. Run c8s without one;
+  it already provides the mTLS layer, rooted in hardware attestation.
+
+## Out of scope for this milestone
+
+- Pod-spec integrity checking beyond the image-digest allowlist.
+- Attestation-gated release of application secrets (the CDS key-brokering path).
+- Multi-tenant isolation between workloads on the same cluster beyond the CVM boundary, and
+  federated multi-cluster control planes.
+
+For the verification client's roadmap (binding the LB leaf into attestation, removing the
+pinned mesh CA PEM), see
+[consumer verification](/docs/c8s/verification/consumer#why-the-mesh-ca-is-pinned-for-now).

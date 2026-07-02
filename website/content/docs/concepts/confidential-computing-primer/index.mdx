@@ -1,0 +1,54 @@
+---
+title: "Confidential Computing Primer"
+description: "A six-part deep dive into confidential computing — the technology behind TEEs, from threat model to measurement."
+---
+
+This is a six-part series explaining confidential computing, the technology behind Confidential. Confidential uses Trusted Execution Environments (TEEs) to provide secure, private, verifiable AI. This series explains how TEEs work under the hood.
+
+We will be using AMD SEV-SNP as the reference for CPU based confidential computing. The concepts here (threat models, attestation, measurement) apply broadly to TEE technologies, while the implementation details are AMD-specific.
+
+The series assumes you're comfortable with basic virtualization concepts (VMs, hypervisors, memory management) and public key cryptography. It doesn't assume prior knowledge of AMD architecture or confidential computing.
+
+This series is for people who want to understand what's happening beneath the surface in detail, verify our claims, or evaluate confidential computing for their use case.
+
+## What You'll Understand
+
+After reading this series, you'll be able to:
+
+- Explain what Confidential's TEE infrastructure protects against and what it doesn't
+- Trace how memory encryption and integrity protection work at the hardware level
+- Understand how workloads communicate safely with an untrusted hypervisor
+- Verify attestation reports and reason about what they prove
+- Understand how Confidential extends trust from hardware measurement to your application code
+
+## The Documents
+
+### [01. Threat Model & Security Boundaries](/docs/concepts/confidential-computing-primer/01-threat-model)
+
+Starts with the question: what does it mean to treat the hypervisor as adversarial? Defines the three guarantees (confidentiality, integrity, attestation), who you trust (AMD, the cryptographic primitives, your own code), and who you don't (cloud provider software stack, employees, other tenants). Explicitly covers what SEV-SNP does not protect against: denial of service, side channels, bugs in guest code, physical attacks.
+
+### [02. Hardware Foundations](/docs/concepts/confidential-computing-primer/02-hardware-foundations)
+
+Explains the hardware that makes SEV-SNP possible. Covers AMD-V virtualization (the VMCB, VMRUN/#VMEXIT cycle, nested paging), the Platform Security Processor (the ARM core that's the root of trust), how memory encryption actually works (AES in the memory controller, per-address tweak, ASID-based key selection), and the evolution from SME through SEV, SEV-ES, to SEV-SNP.
+
+### [03. Memory Integrity](/docs/concepts/confidential-computing-primer/03-memory-integrity)
+
+Addresses the gap that encryption alone leaves open. Explains the Reverse Map Table (RMP): its structure, how hardware performs RMP checks inline with every memory access, and how page validation works. Walks through specific attack scenarios (remapping, replay, aliasing) and shows exactly how the RMP catches them.
+
+### [04. Privilege & Communication](/docs/concepts/confidential-computing-primer/04-privilege-and-communication)
+
+Covers how guests operate with an untrusted hypervisor. Explains VMPLs (the four privilege levels within an encrypted guest), how CPU state is protected in the encrypted VMSA, and the GHCB protocol (how the guest explicitly shares information with the hypervisor and validates responses). Introduces SVSM and restricted/alternate injection modes.
+
+### [05. Attestation & Verification](/docs/concepts/confidential-computing-primer/05-attestation)
+
+Follows a measurement from launch through verification. Explains the SNP launch sequence (LAUNCH_START, LAUNCH_UPDATE, LAUNCH_FINISH), what gets measured and how, attestation report contents (measurement, policy, TCB, REPORT_DATA), the key hierarchy (ARK → ASK → VCEK), and practical verification steps.
+
+### [06. Measurement Strategies](/docs/concepts/confidential-computing-primer/06-measurement-strategies)
+
+Addresses the gap between what the PSP measures at launch and what you actually run. Compares two approaches: packing everything into initramfs (PSP measures it directly) versus using dm-verity (kernel verifies filesystem against a root hash embedded in the measured initramfs). Covers SVSM and vTPM for key sealing when you need secrets bound to specific system state.
+
+## Reading Order
+
+The documents build on each other. Document 1 (threat model) is conceptual and can be read standalone. Documents 2-5 should be read in order; each assumes concepts from the previous. Document 6 can be read after Document 5.
+
+If you're short on time: read Document 1 for the security model, skim Document 2 for hardware context, then jump to Document 5 for attestation.

@@ -1,0 +1,13 @@
+{
+  "title": "c8s platform",
+  "pages": [
+    "index",
+    "architecture",
+    "runtime",
+    "install",
+    "attestation",
+    "verification",
+    "tutorials",
+    "limitations"
+  ]
+}

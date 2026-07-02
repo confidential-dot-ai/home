@@ -1,0 +1,264 @@
+---
+title: Verified chat over confidential vLLM
+description: Build a small chat client that verifies a c8s Load Balancer's TEE attestation with c8s-verify, then talks to a downstream vLLM running confidentially in the cluster — over a post-quantum over-encrypted channel.
+---
+
+This tutorial builds a tiny chat client that talks to a **vLLM** model server running inside a c8s
+cluster — but only *after* cryptographically verifying it's a genuine TEE. Using
+[`c8s-verify`](/docs/c8s/verification/consumer), the client fetches the Load Balancer's
+attestation, checks it against a pinned measurement and your cluster's mesh CA, and only then opens
+a **post-quantum over-encrypted channel** to the LB enclave. Every prompt and completion is sealed
+end-to-end — a TLS-terminating proxy in front of the LB sees only ciphertext.
+
+If the design is new, skim [Consumer Verification](/docs/c8s/verification/consumer) first;
+this is the hands-on version.
+
+<Callout type="info">
+  What you verify here is the **LB**, plus that it belongs to *your* cluster (its CDS-issued cert
+  chains to your pinned mesh CA). By
+  [transitivity of trust](/docs/c8s/verification/consumer#transitivity-of-trust), an
+  attested LB only forwards to attested pods over the RA-TLS mesh — so verifying the LB transitively
+  covers the vLLM backend behind it.
+</Callout>
+
+## Prerequisites
+
+- A running c8s cluster (see [Deploy a confidential AKS cluster and run c8s](/docs/c8s/tutorials/azure-e2e)).
+- **Node ≥ 20** (or a browser) and [`c8s-verify`](/docs/c8s/verification/consumer) — see its
+  [installation](/docs/c8s/verification/consumer#installation).
+- The two **pinned values**, supplied out of band (Step 4): the LB **launch measurement** and your
+  cluster's **mesh CA** PEM.
+
+<Steps>
+
+<Step>
+
+### 1. Deploy a confidential vLLM backend
+
+Run vLLM as a confidential workload. The `confidential.ai/cw: vllm` annotation opts the pod in —
+the value `vllm` is the **workload id** — so the operator injects the get-cert identity (and, under
+`--kata`, the confidential RuntimeClass) and mints a headless Service `c8s-vllm.<namespace>.svc`.
+Headless DNS returns pod IPs, which the node mesh wraps in attested mTLS. We serve
+**`facebook/opt-125m`**, a tiny model that's quick to load on CPU.
+
+<Callout type="warn">
+  **Use a CPU build of vLLM.** c8s nodes are CPU-only today (confidential GPU is not yet
+  supported), and vLLM's published `vllm/vllm-openai` image is a **CUDA** build that won't start
+  without a GPU. vLLM ships no official prebuilt CPU image, so build one from
+  [vLLM's CPU Dockerfile](https://docs.vllm.ai/en/latest/getting_started/installation/cpu/), push
+  it to a registry your cluster can pull, and reference *that* image below (pinning its digest in
+  Step 2).
+</Callout>
+
+```yaml
+# vllm.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: vllm, namespace: workloads }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: vllm } }
+  template:
+    metadata:
+      labels: { app: vllm }
+      annotations: { confidential.ai/cw: vllm }   # workload id → headless Service c8s-vllm
+    spec:
+      containers:
+        - name: vllm
+          image: <your-registry>/vllm-cpu:v0.6.3   # your CPU build (see the callout above)
+          args: ["--model", "facebook/opt-125m"]   # tiny test model
+          ports: [{ containerPort: 8000 }]         # vLLM's OpenAI server port
+```
+
+```bash
+kubectl create namespace workloads
+kubectl apply -f vllm.yaml
+```
+
+You don't create a Service yourself — the operator mints the `c8s-vllm` headless Service from the
+annotation. (The pod won't actually start until its image is allowlisted, next.)
+
+</Step>
+
+<Step>
+
+### 2. Allow the vLLM image
+
+Nothing runs unless its image **digest** is on the [allowlist](/docs/c8s/attestation/allowlist) —
+otherwise `policy-monitor` kills the container at start. Resolve the digest of the exact image you
+deployed:
+
+```bash
+crane digest <your-registry>/vllm-cpu:v0.6.3
+# sha256:…
+```
+
+Pin it in the allowlist floor in a values file. The chart renders `bootstrapAllowlist.digests` into
+CDS's `--allowlist-seed` (and every enforcement plugin's boot config), so the CDS-served allowlist
+includes it from the next reconcile:
+
+```yaml
+# values.yaml — we'll apply this in Step 3, together with the LB routing
+nriImagePolicy:
+  bootstrapAllowlist:
+    digests:
+      "sha256:<vllm-image-digest>": "<your-registry>/vllm-cpu:v0.6.3"
+```
+
+<Callout type="info">
+  This is the **bootstrap** path — a chart value applied at install. To add an image to a *running*
+  cluster without re-applying, an attested writer can `POST /allowlist` with a short-lived
+  CDS-issued EAR — see [Authorizing mutations](/docs/c8s/attestation/allowlist#authorizing-mutations).
+  Either way the write goes through the CDS; there's no static token.
+</Callout>
+
+</Step>
+
+<Step>
+
+### 3. Point the Load Balancer at vLLM
+
+You don't hand-edit nginx. The chart wires the front door as a chain —
+**tls-lb (public TLS + over-encryption) → tee-proxy (attested) → your engine** — and you aim the
+last hop at your vLLM workload with the inference-engine preset. Add to the same values file:
+
+```yaml
+# values.yaml (continued)
+engine:
+  name: vllm          # preset for vLLM's default port (8000)
+  workloadId: vllm    # the confidential.ai/cw id from Step 1
+  namespace: workloads
+
+tlsLb:
+  attest:
+    enabled: true     # serve the c8s-verify/v1 attestation + over-encryption endpoints
+```
+
+Apply everything (the allowlist entry and the routing) with one upgrade — re-run your original
+`c8s install` with `-f values.yaml` added:
+
+```bash
+c8s install -f values.yaml   # plus the flags you first installed with (e.g. --single-node)
+```
+
+The preset derives `teeProxy.upstream = c8s-vllm.workloads.svc.cluster.local:8000`, so tee-proxy
+dials vLLM's headless Service and that hop rides the node mesh's attested mTLS; tls-lb already
+proxies to tee-proxy over attested mTLS by default — hence no nginx surgery. A request your client
+sends over the over-encryption tunnel (Step 6) is decrypted **inside the LB enclave** and forwarded
+down this chain to vLLM's OpenAI-compatible `/v1/chat/completions`.
+
+</Step>
+
+<Step>
+
+### 4. Gather the two pinned values
+
+Verification is meaningless without pinning *your* cluster's identity out of band:
+
+- **LB launch measurement** — the SHA-384 launch digest of the LB enclave. Use the published or
+  recomputed digest (see [Obtaining launch measurements](/docs/c8s/attestation/cds#obtaining-launch-measurements)).
+- **Mesh CA certificate** — your cluster's CDS mesh CA (PEM). Capture it from a trusted context at
+  install time (the CDS publishes its public CA bundle, e.g. `GET /ca`). This is the cluster-unique
+  anchor — [why](/docs/c8s/verification/consumer#why-the-mesh-ca-is-pinned-for-now).
+
+```bash
+export LB_MEASUREMENT=<sha384-launch-digest-of-the-lb>
+# plus mesh-ca.pem, captured out of band from your cluster operator / CDS bootstrap
+```
+
+</Step>
+
+<Step>
+
+### 5. Verify and connect
+
+Create a `C8sClient` with the LB origin and your pinned values, then `connect()`. That generates a
+nonce, fetches the LB attestation, verifies the attestation evidence in WASM, checks the measurement
+and the `report_data` binding, confirms the CDS cert chains to your mesh CA, and runs the
+X25519 + ML-KEM-768 handshake — all **fail-closed**:
+
+```js
+import { C8sClient } from "c8s-verify";
+import { readFileSync } from "node:fs";
+
+const client = new C8sClient({
+  baseUrl: "https://chat.example.com",            // your c8s LB
+  measurements: [process.env.LB_MEASUREMENT],     // pinned LB launch digest
+  meshCaPem: readFileSync("mesh-ca.pem", "utf8"), // pinned cluster anchor
+});
+
+const session = await client.connect();           // throws C8sVerifyError on any failure
+console.error(`✓ verified LB enclave — measurement ${session.attestation.measurement}`);
+```
+
+If anything is off — wrong measurement, tampered evidence, or a cert that doesn't chain to your
+mesh CA — `connect()` throws and **no channel is opened**. See
+[what it verifies](/docs/c8s/verification/consumer#what-it-verifies).
+
+</Step>
+
+<Step>
+
+### 6. Chat over the sealed channel
+
+`session.fetch` seals the **entire** request and sends it down the tunnel; the LB enclave decrypts
+it, forwards it to vLLM over the mesh, and seals the response back. Call vLLM's OpenAI-compatible
+endpoint — the `model` must match what you served in Step 1:
+
+```js
+async function ask(session, messages) {
+  const res = await session.fetch("/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "facebook/opt-125m", messages }),
+  });
+  if (res.status !== 200) throw new Error(`vLLM returned HTTP ${res.status}: ${res.text()}`);
+  return JSON.parse(res.text()).choices[0].message.content;
+}
+```
+
+Wrap it in a REPL for an actual chat loop (`chat.mjs`):
+
+```js
+import { createInterface } from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+
+const rl = createInterface({ input, output });
+const history = [];
+for (;;) {
+  const prompt = await rl.question("you> ");
+  if (!prompt || prompt === "/exit") break;
+  history.push({ role: "user", content: prompt });
+  const reply = await ask(session, history);       // session from Step 5
+  history.push({ role: "assistant", content: reply });
+  console.log(`bot> ${reply}\n`);
+}
+rl.close();
+```
+
+Run it:
+
+```bash
+LB_MEASUREMENT=$LB_MEASUREMENT node chat.mjs
+```
+
+</Step>
+
+</Steps>
+
+## What you've proven
+
+By the time the first reply comes back, you've established — from an untrusted client, over an
+untrusted network — that:
+
+1. the LB you reached is a **genuine TEE** running the **exact** measured image you pinned;
+2. it belongs to **your** cluster (its cert chains to your mesh CA), not an attacker's look-alike;
+3. the session key was minted **inside** that enclave (the `report_data` binding), so the
+   over-encrypted channel terminates there and nowhere else;
+4. by transitivity, the **vLLM** backend it forwards to is itself an attested pod on the c8s mesh.
+
+Your prompts and the model's completions are sealed end-to-end to the enclave — the TLS terminator,
+the host, and the infrastructure operator never see plaintext.
+
+For the bare-evidence path (verifying without opening the over-encryption channel) and the full
+API, see [c8s-verify](/docs/c8s/verification/consumer).

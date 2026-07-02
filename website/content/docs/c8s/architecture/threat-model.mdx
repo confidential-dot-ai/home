@@ -1,0 +1,77 @@
+---
+title: Threat Model
+description: The adversary c8s defends against, the trust boundary, what is enforced today, and why measurement pinning is mandatory for production.
+---
+
+c8s is designed around a single, demanding assumption: **the infrastructure operator (L0) is
+adversarial.** That includes the cloud provider, the bare-metal operator, and anything that
+can read raw host memory or inspect a QEMU command line. The trust boundary is the TEE — the
+node (a SEV-SNP or Intel TDX confidential VM) under node-as-CVM, or each pod's own confidential VM under pod-as-CVM (Kata).
+
+## What the adversary can and cannot do
+
+The left column is the non-confidential baseline — the default install on ordinary hardware.
+**Node-as-CVM** (the default install on a confidential node) gives the same protections as the
+right column, but at node granularity rather than per pod.
+
+| | Base mode (no confidential HW) | Pod-as-CVM (Kata) |
+| --- | --- | --- |
+| Read workload memory | **Yes** (host-trusted) | **No** — the TEE encrypts pod memory |
+| Tamper with the runtime undetected | n/a | **No** — tampering changes the launch measurement; attestation fails |
+| See unpacked workload rootfs | Yes | **No** — images are guest-pulled inside the VM |
+| Observe inter-node traffic | Mitigated by RA-TLS mesh | Mitigated by RA-TLS mesh |
+
+Under pod-as-CVM, if the host tampers with the kata runtime, QEMU, or the shim, it changes the
+pod's launch measurement, and attestation fails. The host can *break* a pod, but it
+cannot break it *silently* — detection is by attestation, not by trust.
+
+## What is enforced today
+
+| Gate | Enforced by | Source of truth |
+| --- | --- | --- |
+| TEE evidence is valid | attestation-api + CDS | hardware evidence verification |
+| A CSR can be signed | CDS | EAR JWT (+ `cds.measurements` when configured) |
+| Image digest is allowed | nri-image-policy (node-as-CVM) / policy-monitor (pod-as-CVM) | CDS-served allowlist |
+| Mesh peer chains to the mesh CA | ratls-mesh | mesh CA bundle |
+| Pod is an injection candidate | admission webhook | pod annotation `confidential.ai/cw` |
+
+## Measurement pinning is mandatory for production
+
+The default chart pins **no** launch measurements. Both `cds.measurements` and
+`ratls-mesh.measurements` default to *empty*, which means "accept any attested peer". That is
+fine for a demo or a dev loop, but it is **not the production trust model**:
+
+<Callout type="warn">
+  With empty measurements, an attacker on the Pod network can stand up their own genuine TEE
+  enclave (same open-source image, valid measurement, real silicon) and MITM the bootstrap —
+  every signature checks out, but you are talking to an attacker-operated enclave. Pin both
+  `cds.measurements` and `ratls-mesh.measurements` to your known-good launch digests in
+  production — see [Obtaining launch measurements](/docs/c8s/attestation/cds#obtaining-launch-measurements)
+  for how to get those values.
+</Callout>
+
+This is also why an end consumer must pin a **cluster-unique** anchor (today, the mesh CA
+certificate) in addition to the measurement allowlist — the open-source images are
+deliberately fungible across deployments, so a measurement alone proves "genuine audited
+code on real silicon," not "*my* cluster." See
+[consumer verification](/docs/c8s/verification/consumer) for the full argument.
+
+## The production direction
+
+The chart-managed default keeps the CA key in CDS process memory: any restart generates a
+new CA and invalidates old leaves, and there is a single CDS. The production direction holds
+the CA key only inside attested CVM memory and lets replicas join via **attested key
+handoff** (`cds.handoff.enabled=true`), so Kubernetes only ever sees ciphertext and public
+material. See [CDS bootstrapping](/docs/c8s/attestation/cds#ca-handoff).
+
+## Out of scope (today)
+
+These are known gaps, tracked but not yet enforced — see [Limitations](/docs/c8s/limitations)
+for the full list:
+
+- The NRI / policy-monitor gate covers the image **digest** only, not args, env, mounts, or
+  capabilities.
+- Mesh peer verification chains to the mesh CA but does **not** pin the peer's measurement.
+- Leaf certificates do not embed the verified TEE measurement.
+- No per-workload peer allowlists in the mesh; no multi-tenant isolation between workloads
+  on the same cluster beyond the CVM boundary.

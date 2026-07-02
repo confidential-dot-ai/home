@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Fumadocs generated source + node scripts (run via tsx, not part of the app).
+    ".source/**",
+    "scripts/**",
   ]),
 ]);
 
