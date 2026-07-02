@@ -1,0 +1,12 @@
+{
+  "title": "Confidential Computing Primer",
+  "pages": [
+    "index",
+    "01-threat-model",
+    "02-hardware-foundations",
+    "03-memory-integrity",
+    "04-privilege-and-communication",
+    "05-attestation",
+    "06-measurement-strategies"
+  ]
+}

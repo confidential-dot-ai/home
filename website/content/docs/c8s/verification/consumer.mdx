@@ -1,0 +1,248 @@
+---
+title: Consumer & browser verification
+description: How an end consumer — even a web browser — verifies that a workload runs in a genuine c8s TEE — the over-encryption design, the post-quantum channel, why cluster identity is pinned, and the c8s-verify library that implements it.
+---
+
+<JourneyNav current={6} />
+
+Attestation is only as good as your ability to check it — and whoever relies on a workload can.
+Often the verifier is the **operator** themselves (see
+[operator & service verification](/docs/c8s/verification/cli)). The strongest property, though, is
+when the **end consumer** can check it directly. For backend-to-backend traffic that is
+[RA-TLS](/docs/c8s/attestation/cds#verifying-the-cds-itself-ra-tls): the client pauses the TLS
+handshake, pulls the attestation evidence out of a custom X.509 extension, verifies the hardware
+signature, and only then completes the handshake. But **browsers do not expose any API to do
+that.** This page explains the design that works anyway, then documents
+[`c8s-verify`](#the-c8s-verify-library), the library that implements it.
+
+## The idea: over-encryption, not certificate extensions
+
+Instead of hiding attestation inside the TLS certificate, the c8s **Load Balancer (LB)** serves
+it over a normal HTTPS endpoint, via a challenge/response, and the client establishes a second,
+attested channel *inside* the existing connection:
+
+![Browser over-encryption flow: the browser fetches the LB enclave's attestation through the untrusted TLS terminator, verifies the hardware attestation evidence in WASM, runs a post-quantum handshake, and tunnels sealed requests end-to-end to the enclave.](/diagrams/over-encryption.svg)
+
+The plain HTTPS channel is **not trusted** — a malicious TLS-terminating proxy may sit in front
+of the real LB. Verification is performed entirely on the returned payload, and only then does
+the client derive an end-to-end encrypted channel to the attested per-session key. Everything
+after that is confidential to the LB's enclave regardless of the outer TLS terminator.
+
+## The post-quantum over-encryption channel
+
+The channel uses a hybrid KEM — **X25519** (classical, WebCrypto) **+ ML-KEM-768**
+(post-quantum, `mlkem-wasm`) — following the TLS `X25519MLKEM768` convention:
+
+1. Encapsulate against the attested ML-KEM key → `(mlkem_ct, mlkem_ss)`.
+2. ECDH an ephemeral X25519 key with the attested X25519 key → `x25519_ss`.
+3. `ikm = mlkem_ss ‖ x25519_ss`.
+4. `key = HKDF-SHA256(ikm, salt = nonce, info = "c8s-verify/over-encryption/v1", L = 32)` →
+   **AES-256-GCM**.
+
+Application traffic then rides a single `POST /.well-known/c8s/tunnel` endpoint as **CBOR**, one
+AES-256-GCM record per message with a fresh 12-byte IV. The **entire** request is sealed —
+method, path, headers, and body — so a proxy in front of the LB sees only ciphertext, not even
+the path or `Authorization` header. The LB enclave opens the record, forwards the plaintext
+request to the backend over the cluster's RA-TLS mesh, and seals the response back.
+
+## Why the mesh CA is pinned (for now)
+
+The client pins **two** things out of band: the LB **measurement** allowlist and the **mesh CA
+certificate**. Pinning a measurement alone is not enough, and the reason is **cluster identity**:
+
+<Callout type="info">
+  The CDS and LB images are open source and reproducible — which is what makes them auditable —
+  but it also means a valid measurement only proves *"a genuine instance of the audited code on
+  real AMD silicon,"* not *"my cluster."* An attacker could stand up their own genuine LB enclave
+  (same image, valid measurement, real VCEK chain, a correct `report_data` binding) and proxy you
+  to it; every check passes and you get a confidential channel to a genuine-but-attacker-operated
+  LB. The one value that is unique per cluster is the **mesh CA key**, generated inside the CDS
+  TEE. So the client must pin *something* cluster-unique, and today that is the mesh CA cert.
+</Callout>
+
+The planned direction removes the pinned PEM by binding the LB leaf into the attestation and
+moving the cluster-unique anchor into the CDS's measured `init_data`, so the only pinned values
+are hashes and certificates can rotate freely.
+
+## Transitivity of trust
+
+The consumer only verifies the **LB and CDS**. Because the LB and CDS are open-source c8s
+components whose code anyone can audit, and because the LB's certificate chains to the CDS mesh
+CA — as do all other pods in the cluster — relying on the LB (or CDS) as a single point of trust
+transitively vouches for the backend pods it talks to over RA-TLS. The c8s mesh carries the rest.
+
+## The c8s-verify library
+
+[`c8s-verify`](https://github.com/confidential-dot-ai/c8s-verify-js) is the client-side library
+that implements everything above: it verifies a c8s **Load Balancer's** attestation from a
+browser or Node, then opens the post-quantum **over-encrypted** channel that terminates inside the
+LB's enclave — so a malicious TLS-terminating proxy in front of the LB can neither read nor forge
+your traffic.
+
+`c8s-verify` is a **zero-build ES-module** library (browser + Node ≥ 20). The attestation evidence is
+verified **in your browser** by the [`attestation-rs`](https://github.com/confidential-dot-ai/attestation-rs)
+verifier compiled to WebAssembly (bundled AMD ARK/ASK roots — no network during verification). Its
+only runtime dependency is `mlkem-wasm` for ML-KEM-768.
+
+### Prerequisites
+
+- **Runtime:** Node ≥ 20, or a modern browser — the library uses WebCrypto and WebAssembly.
+- **Two values pinned out of band.** Without both you cannot prove you reached *your* cluster:
+  - the LB **measurement** allowlist — one or more SHA-384 launch digests
+    (see [Obtaining launch measurements](/docs/c8s/attestation/cds#obtaining-launch-measurements));
+  - the **mesh CA certificate** (PEM) your cluster's CDS issued — the cluster-unique anchor
+    (see [why the mesh CA is pinned](#why-the-mesh-ca-is-pinned-for-now)).
+- **A reachable LB** serving the `c8s-verify/v1` endpoints under `/.well-known/c8s/` (the
+  `tlsLb.attest.enabled` chart flag).
+
+<Callout type="info">
+  Browser verification is **AMD SEV-SNP only** today — the WASM verifier carries the AMD roots and
+  the protocol's `platform` field is `snp`. **Intel TDX** is reserved in the protocol but not yet
+  implemented; verify TDX workloads via the backend
+  [RA-TLS path](/docs/c8s/attestation/cds#verifying-the-cds-itself-ra-tls) instead.
+</Callout>
+
+### Installation
+
+`c8s-verify` is zero-build — there is no bundler step, and the prebuilt WASM verifier (with the AMD
+roots baked in) ships in the repo's `wasm/` directory, so verification makes **no network calls**.
+
+It is not on the public npm registry yet, so consume it from the
+[c8s-verify-js](https://github.com/confidential-dot-ai/c8s-verify-js) repo (package name
+`c8s-verify`) — vendor `src/` and `wasm/` into your app, or add the repo as a git submodule — and
+install its one runtime dependency:
+
+```bash
+npm install mlkem-wasm
+```
+
+Then import the module (map the `c8s-verify` specifier to the vendored `src/index.js`):
+
+```js
+import { C8sClient } from "c8s-verify";
+```
+
+### Usage
+
+The high-level `C8sClient` runs the entire flow — fetch the attestation, verify it, run the
+handshake, derive the channel — and returns a `Session` whose `fetch` is end-to-end encrypted to
+the enclave:
+
+```js
+import { C8sClient } from "c8s-verify";
+
+const client = new C8sClient({
+  baseUrl: "https://lb.example.com",
+  measurements: ["<expected hex SHA-384 launch digest>"], // pinned out of band
+  meshCaPem: pinnedMeshCaPem,                              // pinned CDS / mesh CA anchor
+});
+
+// Generates a nonce, fetches the LB attestation, verifies the attestation evidence,
+// the measurement, the report_data binding, and the CDS certificate chain, then
+// runs the X25519 + ML-KEM-768 handshake and derives the AES-256-GCM channel.
+const session = await client.connect();
+console.log(session.attestation.measurement, session.attestation.cert.sha256);
+
+// Every request on session.fetch is sealed end-to-end to the LB enclave —
+// method, path, headers and body — underneath whatever TLS terminator is in front.
+const res = await session.fetch("/v1/chat", { method: "POST", body: prompt });
+console.log(res.text());
+```
+
+If any check fails, `connect()` throws a typed `C8sVerifyError` and **no channel is established**
+(fail-closed) — see [Errors](#errors).
+
+### Configuration
+
+`new C8sClient(options)`:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `baseUrl` | string | — (**required**) | LB origin, e.g. `https://lb.example.com`. |
+| `measurements` | string[] | `[]` | Accepted launch digests (hex SHA-384). Empty = no pinning (**UNSAFE**). |
+| `meshCaPem` | string | — | Pinned mesh CA (PEM) the CDS leaf must chain to. If omitted, the bundle's `cds_cert_pem` is trusted as the anchor — no cluster-identity pin. |
+| `platform` | string | `"snp"` | Expected TEE platform. |
+| `requireFreshness` | bool | `true` | Require `report_data` to bind the session key + nonce. `false` accepts the hardware signature and measurement without the freshness / key binding (**UNSAFE** for a live channel). |
+| `cdsCertPath` | string \| null | `/.well-known/cds-cert.pem` | Where to fetch the CDS leaf when the attestation bundle omits it (nginx serves it statically). `null` disables the fetch. |
+| `fetch` | function | `globalThis.fetch` | Custom fetch implementation (e.g. for Node without a global fetch, or to inject headers). |
+| `wellKnownPrefix` | string | `/.well-known/c8s` | Base path for the protocol endpoints. |
+| `at` | Date | now | Validity reference time for certificate checks. |
+
+#### The Session
+
+`client.connect()` resolves to a `Session`:
+
+- **`session.attestation`** — the verification result: `measurement`, `platform`, `cert` info
+  (incl. `cert.sha256`), and any warnings.
+- **`session.fetch(path, init?)`** — an over-encrypted request. The **entire** request — method,
+  path, headers, and body — is sealed with AES-256-GCM and POSTed to the tunnel endpoint, so a
+  proxy in front of the LB sees only ciphertext. Resolves to `{ status, headers, bytes, text() }`.
+
+### What it verifies
+
+`connect()` (via `verifyAttestation`) performs these checks **in order**, failing closed on the
+first failure:
+
+1. **nonce echo** — the response carries back the exact nonce the client sent (freshness).
+2. **SEV-SNP signature + VCEK chain** — verified in WASM against the bundled AMD roots.
+3. **measurement ∈ allowlist** — `claims.launch_digest` matches a pinned measurement
+   (case-insensitive hex).
+4. **report_data binding** — `report_data == SHA-384(x25519_pub ‖ mlkem768_pub ‖ nonce)`, which
+   proves in one check that the evidence is fresh *and* that the session key was generated inside
+   the attested TEE.
+5. **CDS cert chains to the pinned mesh CA** — cluster identity.
+
+### Errors
+
+Every failure throws a typed `C8sVerifyError` carrying a `.code` (and `.details`). The codes mirror
+the c8s server error envelope where they overlap:
+
+| Code | Meaning |
+| --- | --- |
+| `invalid_request` | Bad client arguments (e.g. missing `baseUrl`). |
+| `nonce_mismatch` | The response did not echo the nonce that was sent. |
+| `verification_failed` | Hardware signature / VCEK chain or platform check failed. |
+| `report_data_mismatch` | `report_data` did not match the expected binding. |
+| `measurement_denied` | The launch digest is not in the allowlist. |
+| `invalid_cert` / `cert_chain` | The CDS cert is malformed, or did not chain to the mesh CA. |
+| `key_binding` | The session key is not bound to the attested report. |
+| `channel_error` | The handshake or an over-encrypted request failed. |
+| `unsupported` | Unsupported platform or protocol feature. |
+
+### Lower-level: verifying bare evidence
+
+If you obtain SNP evidence through your own transport (e.g. a [discovery document](/docs/c8s/attestation/cds))
+rather than the `c8s-verify/v1` challenge/response bundle, use `verifyEvidence`. It runs the same
+hardware verification and measurement / platform checks, plus the `report_data` binding when you
+pass `expectedReportData` — with no bundle, nonce, session key, or CDS certificate required (do any
+mesh-CA chaining yourself):
+
+```js
+import { verifyEvidence } from "c8s-verify";
+
+const r = await verifyEvidence(evidence /* { attestation_report, cert_chain:{ vcek } } */, {
+  generation: "genoa",          // "milan" | "genoa" | "turin" (required for bare snp)
+  measurements: ["<expected hex SHA-384 launch digest>"],
+  expectedReportData,           // optional Uint8Array; e.g. SHA-384(cert_spki ‖ challenge)
+});
+console.log(r.measurement, r.reportDataMatch, r.claims);
+```
+
+The raw WASM entrypoints `verifySnp` (and `verifyAzSnp`, for Azure Confidential VM vTPM evidence)
+are also exported for full control.
+
+### Try it offline
+
+The repo ships a self-contained mock LB so you can run the whole flow with no TEE:
+
+```bash
+npm install
+npm run gen-fixtures   # openssl mesh CA + leaf, copies recorded SNP evidence
+npm run demo           # serves the mock LB + browser demo on http://localhost:8799
+```
+
+Open the page and click **Run verification**; each step shows green or red, and a *Tamper with
+evidence* toggle flips a byte of the signed report to demonstrate failing closed. The recorded
+evidence is real hardware-signed SNP evidence, so the signature, measurement, certificate chain, and
+post-quantum channel are all genuine — only the live `report_data` key-binding is simulated (a fresh
+binding needs a real TEE LB to mint a report per session).

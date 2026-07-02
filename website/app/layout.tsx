@@ -2,10 +2,14 @@ import type { Metadata } from "next";
 import Script from "next/script";
 import { Source_Serif_4 } from "next/font/google";
 import "./globals.css";
+import { RootProvider } from "fumadocs-ui/provider/next";
 import { Sidebar } from "@/components/sidebar";
+import { getDocsNav } from "@/lib/docs-nav";
 
 // Resolve theme before paint: a saved toggle choice wins, otherwise default to light.
-const THEME_SCRIPT = `(function(){try{var t=localStorage.getItem('theme');if(t!=='light'&&t!=='dark'){t='light';}document.documentElement.dataset.theme=t;}catch(e){document.documentElement.dataset.theme='light';}})();`;
+// Mirror the choice onto both `data-theme` (home tokens) and the `dark` class
+// (Fumadocs' dark tokens + `dark:` utilities key off `.dark`).
+const THEME_SCRIPT = `(function(){try{var t=localStorage.getItem('theme');if(t!=='light'&&t!=='dark'){t='light';}var d=document.documentElement;d.dataset.theme=t;d.classList.toggle('dark',t==='dark');}catch(e){document.documentElement.dataset.theme='light';}})();`;
 
 const sourceSerif = Source_Serif_4({
   variable: "--font-source-serif",
@@ -25,6 +29,10 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // Built server-side and handed to the (client) sidebar so the docs tree can
+  // nest under the "Docs" nav item without a separate docs layout.
+  const docsNav = getDocsNav();
+
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
@@ -38,12 +46,12 @@ export default function RootLayout({
         </Script>
       </head>
       <body className={`${sourceSerif.variable} ${sourceSerif.className} antialiased`}>
-        <Sidebar />
-        <div className="md:pl-64 min-h-screen">
-          <main className="px-5 md:px-10 py-12">
-            <div className="max-w-[680px]">{children}</div>
-          </main>
-        </div>
+        {/* next-themes is disabled: the pre-paint script owns `data-theme` and the
+            `.dark` class, so nothing mutates <html> on the client. */}
+        <RootProvider theme={{ enabled: false }}>
+          <Sidebar docsNav={docsNav} />
+          <div className="md:pl-64 min-h-screen">{children}</div>
+        </RootProvider>
       </body>
     </html>
   );

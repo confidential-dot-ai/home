@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 188" role="img" aria-label="Three layers of attestation: the guest image (SNP launch digest), the container image (OCI digest checked against the allowlist), and the workload identity (RA-TLS certificate).">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L7.5,3 L0,6 z" fill="#8a8a8a" />
+    </marker>
+  </defs>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .card { fill: #121212; stroke: #2a2a2a; }
+    .box { fill: #1c1c1c; stroke: #3c3c3c; stroke-width: 1; }
+    .k { fill: #fedc51; font-size: 10.5px; letter-spacing: 0.08em; }
+    .t { fill: #ededed; font-size: 15px; font-weight: 600; }
+    .s { fill: #8c8c8c; font-size: 11.5px; }
+    .ln { stroke: #8a8a8a; stroke-width: 1.5; fill: none; }
+    .lbl { fill: #b6b6b6; font-size: 11px; }
+  </style>
+
+  <rect class="card" x="0.5" y="0.5" width="719" height="187" rx="10" />
+
+  <rect class="box" x="24" y="44" width="200" height="100" rx="8" />
+  <text class="k" x="44" y="72">LAYER 0</text>
+  <text class="t" x="44" y="98">Guest image</text>
+  <text class="s" x="44" y="120">SNP launch digest</text>
+
+  <rect class="box" x="260" y="44" width="200" height="100" rx="8" />
+  <text class="k" x="280" y="72">LAYER 1</text>
+  <text class="t" x="280" y="98">Container image</text>
+  <text class="s" x="280" y="120">OCI digest · allowlist</text>
+
+  <rect class="box" x="496" y="44" width="200" height="100" rx="8" />
+  <text class="k" x="516" y="72">LAYER 2</text>
+  <text class="t" x="516" y="98">Workload identity</text>
+  <text class="s" x="516" y="120">RA-TLS certificate</text>
+
+  <line class="ln" x1="224" y1="94" x2="260" y2="94" marker-end="url(#ah)" />
+  <line class="ln" x1="460" y1="94" x2="496" y2="94" marker-end="url(#ah)" />
+</svg>

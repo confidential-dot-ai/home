@@ -1,0 +1,472 @@
+---
+title: "Memory Integrity"
+description: "How SEV-SNP protects guest memory integrity via the Reverse Map Table and page validation."
+---
+
+This document explains how SEV-SNP protects the integrity of guest memory. After reading this, you'll understand how the Reverse Map Table (RMP) works, why guests must validate pages, and how these mechanisms together prevent memory manipulation attacks.
+
+This assumes you've read [02-hardware-foundations.md](/docs/concepts/confidential-computing-primer/02-hardware-foundations) and understand how memory encryption works.
+
+## The Problem Encryption Doesn't Solve
+
+Memory encryption (covered in the previous document) protects confidentiality: the hypervisor sees ciphertext, not plaintext. But encryption alone doesn't prevent the hypervisor from manipulating which ciphertext the guest sees.
+
+Consider this: the hypervisor controls the nested page tables that map guest physical addresses (GPAs) to system physical addresses (SPAs). Even with encryption, a malicious hypervisor could:
+
+**Remapping attack.** The guest writes sensitive data to GPA 0x1000, which backs to SPA X. Later, the hypervisor changes the nested page table so GPA 0x1000 maps to SPA Y instead. The guest reads GPA 0x1000 expecting its data, but gets whatever was at SPA Y. The hypervisor didn't need to decrypt anything; it just swapped the backing page.
+
+**Replay attack.** The hypervisor captures the ciphertext at SPA X at time T₁. Later, after the guest updates that memory, the hypervisor restores the old ciphertext. The guest now sees stale data without realizing it.
+
+**Aliasing attack.** The hypervisor maps two different guest addresses (GPA A and GPA B) to the same physical page (SPA X). Writes to GPA A appear at GPA B and vice versa. This can corrupt data structures or leak information between components that thought they had separate memory.
+
+**Corruption attack.** The hypervisor writes random bytes to a guest's physical memory. The ciphertext is garbage, which decrypts to garbage. The hypervisor can't control what the garbage says, but corrupting critical data structures can crash the guest or cause exploitable behavior.
+
+These are all integrity attacks. SEV and SEV-ES had no defense against them. SEV-SNP adds the RMP to close this gap.
+
+## The Reverse Map Table
+
+The RMP is a system-wide table in DRAM with one entry per 4KB physical page. It answers the question: who owns this physical page, and where should it appear in their address space?
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        RMP Structure in Memory                           │
+│                                                                          │
+│  System Physical Address Space                                           │
+│  ┌──────────────┬──────────────┬──────────────┬──────┬──────────────┐    │
+│  │ 0x0000_0000  │ 0x0000_1000  │ 0x0000_2000  │ ...  │ 0xFFFF_F000  │    │
+│  │    Page 0    │    Page 1    │    Page 2    │      │    Page N    │    │
+│  └──────┬───────┴──────┬───────┴──────┬───────┴──────┴──────┬───────┘    │
+│         │              │              │                     │            │
+│         ▼              ▼              ▼                     ▼            │
+│  RMP Table (indexed by SPA >> 12)                                        │
+│  ┌──────────────┬──────────────┬──────────────┬──────┬──────────────┐    │
+│  │   Entry 0    │   Entry 1    │   Entry 2    │ ...  │   Entry N    │    │
+│  │   16 bytes   │   16 bytes   │   16 bytes   │      │   16 bytes   │    │
+│  └──────────────┴──────────────┴──────────────┴──────┴──────────────┘    │
+│                                                                          │
+│  Each entry tracks: owner, expected GPA, validated?, permissions         │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+The RMP is configured via MSRs (RMP_BASE and RMP_END) and must be 1MB aligned. There's one RMP for the entire system, even with multiple sockets.
+
+### RMP Entry Fields
+
+Each 16-byte entry contains:
+
+| Field      | Purpose                                            |
+| ---------- | -------------------------------------------------- |
+| Assigned   | Is this page assigned to a guest (or firmware)?    |
+| ASID       | Which guest owns this page (0 = hypervisor/free)   |
+| GPA        | The guest physical address this page should map to |
+| Validated  | Has the guest explicitly accepted this page?       |
+| Immutable  | Is this page locked for firmware operations?       |
+| VMSA       | Is this a VM Save Area page?                       |
+| Page_Size  | 4KB or 2MB                                         |
+| VMPL perms | Read/write/execute permissions per VMPL (0-3)      |
+
+The combination of these fields determines the page state.
+
+### Page States
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          Page State Overview                             │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                         MUTABLE STATES                             │  │
+│  │  (can be modified by RMPUPDATE, PVALIDATE, or RMPADJUST)           │  │
+│  │                                                                    │  │
+│  │   Hypervisor        Guest-Invalid        Guest-Valid               │  │
+│  │   ┌────────────┐    ┌────────────────┐   ┌────────────────┐        │  │
+│  │   │ Assigned=0 │    │ Assigned=1     │   │ Assigned=1     │        │  │
+│  │   │ ASID=0     │    │ Validated=0    │   │ Validated=1    │        │  │
+│  │   │            │    │ ASID=guest     │   │ ASID=guest     │        │  │
+│  │   └────────────┘    └────────────────┘   └────────────────┘        │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                        IMMUTABLE STATES                            │  │
+│  │  (only AMD-SP firmware can modify)                                 │  │
+│  │                                                                    │  │
+│  │   Pre-Guest    Pre-Swap    Firmware    Metadata    Context         │  │
+│  │   ┌─────────┐  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐     │  │
+│  │   │ Launch  │  │ Swap-out│ │ AMD-SP  │ │ Swap    │ │ Guest   │     │  │
+│  │   │ prep    │  │ prep    │ │ working │ │ tags    │ │ context │     │  │
+│  │   └─────────┘  └─────────┘ └─────────┘ └─────────┘ └─────────┘     │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+The three mutable states are the ones you'll encounter most often:
+
+**Hypervisor.** The default state. The page belongs to the hypervisor. It can be used for hypervisor data, or as shared (C=0) memory that guests can access.
+
+**Guest-Invalid.** The page is assigned to a guest at a specific GPA, but the guest hasn't validated it yet. The hypervisor cannot write to it (the ciphertext would be garbage without the VEK). The guest cannot use it for private (C=1) memory because it's not validated.
+
+**Guest-Valid.** The page is assigned to the guest and validated. This is the normal state for guest private memory. The guest can read and write freely. The hypervisor sees only ciphertext.
+
+The immutable states exist for specific firmware operations (launch, swap, etc.) where neither hypervisor nor guest should interfere.
+
+## The RMP Check
+
+Hardware performs an RMP check at the end of address translation for accesses that require it. This happens inline with every relevant memory access.
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                      RMP Check Flow (Guest Access)                       │
+│                                                                          │
+│  1. Guest executes load/store at GVA                                     │
+│     └───────────────────────┐                                            │
+│                             ▼                                            │
+│  2. Guest page tables       ┌───────────────────────┐                    │
+│     translate GVA           │  GVA → GPA            │                    │
+│                             │  0x7fff1234 → 0x50000 │                    │
+│                             └───────────┬───────────┘                    │
+│                                         ▼                                │
+│  3. Nested page tables      ┌───────────────────────────┐                │
+│     translate GPA           │  GPA → SPA                │                │
+│     (hypervisor controls)   │  0x50000 → 0x1a500000     │                │
+│                             └───────────┬───────────────┘                │
+│                                         ▼                                │
+│  4. RMP lookup              ┌───────────────────────────────────────┐    │
+│     RMP[SPA >> 12]          │  RMP entry for SPA 0x1a500000:        │    │
+│                             │    ASID = 7                           │    │
+│                             │    GPA  = 0x50000                     │    │
+│                             │    Validated = 1                      │    │
+│                             └───────────┬───────────────────────────┘    │
+│                                         ▼                                │
+│  5. Hardware checks:        ┌───────────────────────────────────────┐    │
+│                             │  □ ASID matches current guest? (7==7) │    │
+│                             │  □ GPA matches translation? (0x50000) │    │
+│                             │  □ Validated bit set? (yes)           │    │
+│                             │  □ VMPL permissions allow access?     │    │
+│                             └───────────┬───────────────────────────┘    │
+│                                         ▼                                │
+│  6a. All checks pass        ┌───────────────────────┐                    │
+│      → access proceeds      │  Create TLB entry     │                    │
+│                             │  Complete access      │                    │
+│                             └───────────────────────┘                    │
+│                                                                          │
+│  6b. Any check fails        ┌───────────────────────┐                    │
+│      → exception            │  #NPF or #VC          │                    │
+│                             │  (guest sees error)   │                    │
+│                             └───────────────────────┘                    │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+The check that matters most for integrity is the GPA comparison. The RMP entry records what GPA this physical page should appear at. If the translation produces a different GPA (because the hypervisor modified the nested page table), the check fails.
+
+### When RMP Checks Occur
+
+| Access type                 | RMP check? | Why                                      |
+| --------------------------- | ---------- | ---------------------------------------- |
+| Guest private read (C=1)    | Yes        | Must verify ownership and validation     |
+| Guest private write (C=1)   | Yes        | Must verify ownership and validation     |
+| Guest shared access (C=0)   | No         | Shared pages don't need RMP protection   |
+| Hypervisor read guest page  | No         | Encryption protects confidentiality      |
+| Hypervisor write guest page | Yes        | Prevents corruption attacks              |
+| Page table A/D bit updates  | Yes        | Any write to guest pages needs RMP check |
+
+Shared pages (C=0) bypass RMP checks because they're explicitly meant to be accessible by both guest and hypervisor. The guest chooses to make certain pages shared for I/O and communication.
+
+## Page Validation
+
+The RMP tells hardware what the mapping should be. But how does it get populated correctly in the first place? This is where validation comes in.
+
+### The Two-Step Assignment
+
+Adding a page to a guest requires cooperation between hypervisor and guest:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    Page Assignment: Two-Step Process                     │
+│                                                                          │
+│  STEP 1: Hypervisor executes RMPUPDATE                                   │
+│  ─────────────────────────────────────────                               │
+│                                                                          │
+│  ┌─────────────────┐        ┌──────────────────────────────────────────┐ │
+│  │  Hypervisor     │        │  RMP Entry (before)    RMP Entry (after) │ │
+│  │                 │        │  ┌───────────────┐     ┌───────────────┐ │ │
+│  │  RMPUPDATE(     │───────►│  │ Assigned=0    │  →  │ Assigned=1    │ │ │
+│  │    SPA=X,       │        │  │ ASID=0        │     │ ASID=7        │ │ │
+│  │    ASID=7,      │        │  │ GPA=n/a       │     │ GPA=0x50000   │ │ │
+│  │    GPA=0x50000) │        │  │ Validated=0   │     │ Validated=0   │ │ │
+│  │                 │        │  └───────────────┘     └───────────────┘ │ │
+│  └─────────────────┘        │                                          │ │
+│                             │  Page state: Hypervisor → Guest-Invalid  │ │
+│                             └──────────────────────────────────────────┘ │
+│                                                                          │
+│  STEP 2: Guest executes PVALIDATE                                        │
+│  ─────────────────────────────────────                                   │
+│                                                                          │
+│  ┌─────────────────┐        ┌──────────────────────────────────────────┐ │
+│  │  Guest          │        │  RMP Entry (before)    RMP Entry (after) │ │
+│  │                 │        │  ┌───────────────┐     ┌───────────────┐ │ │
+│  │  PVALIDATE(     │───────►│  │ Assigned=1    │  →  │ Assigned=1    │ │ │
+│  │    GPA=0x50000) │        │  │ ASID=7        │     │ ASID=7        │ │ │
+│  │                 │        │  │ GPA=0x50000   │     │ GPA=0x50000   │ │ │
+│  │  Hardware:      │        │  │ Validated=0   │     │ Validated=1   │ │ │
+│  │  1. GPA→SPA     │        │  └───────────────┘     └───────────────┘ │ │
+│  │  2. Check ASID  │        │                                          │ │
+│  │  3. Check GPA   │        │  Page state: Guest-Invalid → Guest-Valid │ │
+│  │  4. Set Valid=1 │        └──────────────────────────────────────────┘ │
+│  └─────────────────┘                                                     │
+│                                                                          │
+│  Key insight: RMPUPDATE always clears Validated. Only PVALIDATE sets it. │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+The hypervisor can assign pages to guests, but it cannot validate them. The guest must explicitly accept each page. This separation is critical for security.
+
+### Why RMPUPDATE Always Clears Validated
+
+This is the crux of remapping protection. When the hypervisor executes RMPUPDATE, the Validated bit is always cleared, regardless of its previous value. This is enforced in hardware.
+
+Why? If RMPUPDATE could preserve the Validated bit, the hypervisor could:
+1. Wait for the guest to validate a page
+2. Use RMPUPDATE to reassign that page to a different GPA (keeping Validated=1)
+3. The guest would access the wrong physical page without knowing
+
+By forcing Validated=0 on every RMPUPDATE, any change to page assignment requires the guest to re-validate. And the guest should never re-validate a page it already validated.
+
+### The Validation Discipline
+
+For SEV-SNP's integrity guarantee to hold, the guest must follow one strict rule: **never validate the same GPA twice.**
+
+If the guest validates GPA A, and later validates GPA A again, the security model breaks. Here's why:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                   What Happens If Guest Re-validates                     │
+│                                                                          │
+│  Initial state:                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  GPA 0x50000 → SPA X                                               │  │
+│  │  RMP[X]: ASID=7, GPA=0x50000, Validated=1                          │  │
+│  │  Guest writes sensitive data to GPA 0x50000                        │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Attack setup (hypervisor):                                              │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  1. RMPUPDATE(SPA=Y, ASID=7, GPA=0x50000)                          │  │
+│  │     RMP[Y]: ASID=7, GPA=0x50000, Validated=0  ← new page, invalid  │  │
+│  │  2. Modify NPT: GPA 0x50000 → SPA Y (instead of X)                 │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Guest accesses GPA 0x50000:                                             │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  Translation: GPA 0x50000 → SPA Y                                  │  │
+│  │  RMP check: RMP[Y].Validated = 0                                   │  │
+│  │  Result: #VC exception (validation required)                       │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  CORRECT behavior: Guest recognizes attack, terminates                   │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  Guest: "I already validated 0x50000. Getting #VC means someone    │  │
+│  │         changed the backing page. This is a security violation."   │  │
+│  │  Action: Terminate or enter safe state                             │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  BROKEN behavior: Guest foolishly re-validates                           │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  Guest: PVALIDATE(GPA=0x50000)  ← WRONG!                           │  │
+│  │  RMP[Y]: Validated=1                                               │  │
+│  │  Now hypervisor can switch between X and Y at will!                │  │
+│  │  Guest sees either old data (X) or new/garbage data (Y)            │  │
+│  │  depending on hypervisor's whim                                    │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+
+## Attack Detection Walkthrough
+
+Let's trace through exactly how the RMP catches a remapping attack:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                      Remapping Attack Detection                          │
+│                                                                          │
+│  Timeline                                                                │
+│  ────────                                                                │
+│                                                                          │
+│  T₁: Initial setup (legitimate)                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  • NPT: GPA A → SPA X                                              │  │
+│  │  • RMP[X]: ASID=guest, GPA=A, Validated=1                          │  │
+│  │  • Guest writes secret to GPA A                                    │  │
+│  │  • Ciphertext stored at SPA X                                      │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  T₂: Hypervisor prepares attack                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  • RMPUPDATE(SPA=Y, ASID=guest, GPA=A)                             │  │
+│  │    → RMP[Y]: ASID=guest, GPA=A, Validated=0                        │  │
+│  │  • Hypervisor modifies NPT: GPA A → SPA Y                          │  │
+│  │  • (SPA X still has RMP[X].Validated=1, but NPT no longer points   │  │
+│  │     to it for GPA A)                                               │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  T₃: Guest accesses GPA A                                                │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  1. Guest: load from GPA A                                         │  │
+│  │  2. NPT translation: GPA A → SPA Y (hypervisor's malicious NPT)    │  │
+│  │  3. RMP lookup: RMP[Y]                                             │  │
+│  │  4. RMP check:                                                     │  │
+│  │     • ASID match? ✓ (guest matches)                                │  │
+│  │     • GPA match? ✓ (RMP[Y].GPA = A, translation gave A)            │  │
+│  │     • Validated? ✗ (RMP[Y].Validated = 0)                          │  │
+│  │  5. RMP check fails → #VC exception                                │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  T₄: Guest handles exception                                             │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  • Guest sees #VC for GPA A                                        │  │
+│  │  • Guest checks: "Did I validate GPA A before?" → Yes              │  │
+│  │  • Conclusion: Hypervisor changed the backing page                 │  │
+│  │  • Action: Terminate (attack detected)                             │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  The key: RMPUPDATE always clears Validated. The hypervisor cannot       │
+│  assign a new physical page to the same GPA without clearing Validated,  │
+│  which the guest detects.                                                │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+## The Bijective Mapping Guarantee
+
+When the RMP and validation discipline work together, they establish a one-to-one correspondence between guest physical addresses and system physical addresses:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                       Bijective Mapping Property                         │
+│                                                                          │
+│  Guest Physical Addresses                System Physical Addresses       │
+│         (GPAs)                                   (SPAs)                  │
+│                                                                          │
+│        ┌───┐                                    ┌───┐                    │
+│        │ A │ ───────────────────────────────────│ X │                    │
+│        └───┘                                    └───┘                    │
+│                                                                          │
+│        ┌───┐                                    ┌───┐                    │
+│        │ B │ ───────────────────────────────────│ Y │                    │
+│        └───┘                                    └───┘                    │
+│                                                                          │
+│        ┌───┐                                    ┌───┐                    │
+│        │ C │ ───────────────────────────────────│ Z │                    │
+│        └───┘                                    └───┘                    │
+│                                                                          │
+│  Guaranteed by:                                                          │
+│                                                                          │
+│  SPA → at most one GPA        Enforced by RMP's GPA field.               │
+│  (no aliasing)                If SPA X has RMP[X].GPA=A, mapping         │
+│                               GPA B to SPA X fails the RMP check         │
+│                               because B ≠ A.                             │
+│                                                                          │
+│  GPA → at most one SPA        Enforced by validation discipline.         │
+│  (no remapping)               Guest validates each GPA once. If          │
+│                               hypervisor changes SPA backing a GPA,      │
+│                               the new SPA is unvalidated and access      │
+│                               fails.                                     │
+│                                                                          │
+│  Together: GPA ↔ SPA is bijective (one-to-one and onto)                  │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+This is the fundamental integrity guarantee. The guest's view of memory is consistent: reading an address returns what was last written there, never stale data, never another page's data.
+
+## IOMMU Integration
+
+The RMP isn't only checked by CPUs. IOMMUs also perform RMP checks when devices attempt DMA.
+
+**Without IOMMU RMP checks:**
+
+1. Hypervisor programs device to DMA to SPA X
+2. SPA X is guest private memory
+3. Device reads/writes guest memory!
+
+This is a "confused deputy" attack that bypasses CPU-side protections.
+
+**With IOMMU RMP checks:**
+
+1. Device attempts DMA to SPA X
+2. IOMMU translates device address to SPA X
+3. IOMMU checks RMP[X]
+4. If page is guest-private, DMA is blocked
+
+The hypervisor cannot use devices to access guest memory.
+
+**Device DMA is allowed to:**
+- Hypervisor pages (Assigned=0)
+- Shared guest pages (C=0)
+
+**Device DMA is blocked for:**
+- Guest private pages (Assigned=1, belongs to a guest)
+
+This is why guests use bounce buffers for I/O: data moves through shared (C=0) pages that devices can access, then gets copied to/from private (C=1) pages.
+
+## TLB Caching
+
+For performance, RMP check results are cached in the TLB alongside translation results. This means:
+
+- Successful translations (including RMP checks) don't repeat the RMP lookup on every access
+- TLB entries include RMP state (ownership, permissions)
+- When RMP entries change, TLB entries must be invalidated
+
+Hardware automatically triggers TLB invalidation across all cores and IOMMUs when:
+- RMPUPDATE modifies an entry
+- PVALIDATE validates a page
+- RMPADJUST changes VMPL permissions
+- AMD-SP firmware commands change page states
+
+Stale TLB entries would be a security hole; the automatic invalidation prevents this.
+
+## The Instructions
+
+Three instructions modify RMP entries:
+
+**RMPUPDATE** (hypervisor instruction). Assigns pages to guests or reclaims them. Sets ASID, GPA, and VMPL permissions. Always clears the Validated bit. Cannot modify immutable pages.
+
+**PVALIDATE** (guest instruction, VMPL0 only). Validates or invalidates pages owned by the current guest. The hardware verifies that the RMP entry's ASID matches the current guest and that the RMP entry's GPA matches the address being validated.
+
+**RMPADJUST** (guest instruction, VMPL0 only). Modifies VMPL permissions for pages owned by the current guest. Does not affect the Validated bit.
+
+Only VMPL0 can execute PVALIDATE and RMPADJUST. If the guest runs an SVSM at VMPL0. the guest OS (at VMPL2/3) must call the SVSM to proxy these operations. This allows the SVSM to enforce additional security policies, like zeroing pages before handing them to the guest OS.
+
+## Launch-Time Validation
+
+During guest launch, pages are validated through a different path. The hypervisor provides each page to the AMD-SP via SNP_LAUNCH_UPDATE:
+
+1. Hypervisor calls SNP_LAUNCH_UPDATE(plaintext_page, GPA)
+
+2. AMD-SP:
+   - Encrypts page with guest's VEK
+   - Updates launch measurement (hash)
+   - Sets RMP entry:
+     - Assigned = 1
+     - ASID = guest
+     - GPA = specified address
+     - Validated = 1 (set directly by AMD-SP)
+
+3. Page goes directly to Guest-Valid state
+
+**Why this is safe:**
+- AMD-SP is trusted (part of the hardware root of trust)
+- The page is measured before being encrypted
+- Attestation reports include the launch measurement
+- Verifiers confirm the guest started with expected code
+
+Launch pages don't need explicit PVALIDATE because the AMD-SP is a trusted party that can set the Validated bit directly. The measurement ensures the verifier knows exactly what was loaded.
+
+## What RMP Protection Doesn't Cover
+
+The RMP provides strong integrity guarantees, but some attacks remain possible:
+
+**Denial of service.** The hypervisor can refuse to run the guest, refuse to provide memory, or provide memory that's intentionally slow to access. Availability is explicitly out of scope.
+
+**Side channels.** The hypervisor can observe which pages the guest accesses by watching page table access/dirty bits or nested page faults. This leaks information about the guest's memory access patterns, though not the data itself.
+
+**Shared page manipulation.** Pages marked as shared (C=0) are accessible to both guest and hypervisor. The guest must not put sensitive data in shared pages and must validate any data received through shared pages.
+
+**Guest bugs.** If the guest has a vulnerability (buffer overflow, etc.), attackers can exploit it through legitimate communication channels. The RMP protects the environment, not the code running in it.

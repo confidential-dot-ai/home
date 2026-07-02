@@ -1,0 +1,274 @@
+---
+title: Installing c8s
+description: Install c8s onto an existing Kubernetes cluster running on confidential hardware (AMD SEV-SNP or Intel TDX), with every relevant install flag explained, and verify the result.
+---
+
+<JourneyNav current={3} />
+
+This guide installs c8s onto an **existing** Kubernetes cluster that is already running on
+confidential hardware. If you do not have a cluster yet, start with
+[Provisioning a confidential cluster on Azure](/docs/c8s/install/azure), then come back here.
+
+For the exhaustive flag list of every subcommand, see the [CLI Reference](/docs/c8s/install/cli-reference).
+
+## Prerequisites
+
+- A Kubernetes cluster (k8s or RKE2) whose nodes run on confidential hardware — **AMD SEV-SNP**
+  (Genoa / Milan / Turin) or **Intel TDX**. For the confidential pod runtime you additionally
+  need a bare-metal-class host that allows nested VMs — see
+  [pod-as-CVM vs node-as-CVM](/docs/c8s/runtime/pod-vs-node-cvm).
+- `kubectl` configured for the target cluster.
+- `helm` on `PATH` (the chart is embedded in the binary and installed via Helm).
+- `crane` on `PATH` — needed for the default `--resolve-digests=true`, which pins each component
+  image to its registry digest. A **private registry** needs a local login first (see below).
+- The `c8s` CLI, built with `make install` (see below).
+
+<details data-collapse>
+<summary>crane — authenticating to a private registry</summary>
+
+For a **private registry**, `crane` runs **locally** during `c8s install` and authenticates from
+your `~/.docker/config.json`, so log in on the box first:
+
+```bash
+crane auth login ghcr.io -u <user> --password-stdin
+```
+
+This is **separate from the cluster pull Secret** (`--image-pull-secret`): that one is the
+kubelet's credential for pulling images at runtime, while this lets `crane` resolve digests
+locally during the install. Missing it surfaces as
+`crane digest ...: UNAUTHORIZED: authentication required`. (Or skip digest resolution entirely
+with `--resolve-digests=false` and supply digests via `-f`.)
+
+</details>
+
+<details data-collapse>
+<summary>Building the c8s CLI (make, GOPATH)</summary>
+
+`make install` runs `go install`, which drops the binary in `$(go env GOPATH)/bin` (default
+`~/go/bin`) — make sure that directory is on your `PATH`. You'll also need `make` itself; it's
+not preinstalled on stock Azure images (`sudo apt install make` on Debian/Ubuntu).
+
+</details>
+
+<Callout type="info">
+  **Which TEEs?** The platform — CDS, attestation verification, the RA-TLS mesh, the allowlist,
+  and the **node-as-CVM** shape — runs on both **AMD SEV-SNP** and **Intel TDX**. The per-pod
+  **Kata runtime** (`--kata`), `sev-snp-measure`, and the browser
+  [verification library](/docs/c8s/verification/consumer) are SEV-SNP today, with TDX
+  support in progress.
+</Callout>
+
+## Quickstart: a single-node cluster
+
+For a single-node cluster, pass `--single-node`. This clears the dedicated-CDS node selector and
+taint toleration so **every node is CDS-eligible** — there is no separate `role=cds` node to
+label or schedule. (It's about node count, not the number of pod CVMs: a multi-node cluster
+running a single Kata pod still wants a dedicated CDS node, so leave it off there.)
+
+<Steps>
+
+<Step>
+### Install the default shape (node-as-CVM)
+
+Start with the default install to confirm the control plane is healthy. This runs every
+component in ordinary node containers (node-as-CVM); there is no per-pod confidentiality until
+you add `--kata`.
+
+```bash
+c8s install --single-node
+```
+</Step>
+
+<Step>
+### Or install pod-as-CVM (`--kata`)
+
+To make each workload pod its own confidential VM, add `--kata`. This installs the Kata runtime
+stack, injects kata RuntimeClasses into workload pods, rejects non-kata pods, and moves the
+security services into the guest image.
+
+```bash
+c8s install --single-node --kata
+```
+
+On a managed service that exposes SEV-SNP through a vTPM (Azure AKS), select the device shape
+with `--cvm-mode`:
+
+```bash
+c8s install --single-node --cvm-mode aks
+```
+</Step>
+
+<Step>
+### Wait for readiness
+
+The installer passes `helm --wait` by default, so the command returns only once the release
+is ready. Confirm the components are running:
+
+```bash
+kubectl get pods -n c8s-system
+```
+
+<Callout type="info">
+  `helm --wait` makes `c8s install` **block** until every component reports Ready, so the
+  command can sit there for a few minutes — that's expected, not a hang. To watch progress while
+  it waits, open a **second shell** on the box and tail the pods across *all* namespaces
+  (`kata-deploy` and the CNI live outside `c8s-system`):
+
+  ```bash
+  kubectl get pods -A -w
+  ```
+
+  The wait is bounded: `helm --wait` runs with a **5-minute timeout**. If a pod stays wedged in
+  `ImagePullBackOff` or `CrashLoopBackOff` past it (a missing or wrong image pull secret is the
+  usual culprit), `c8s install` **fails** when the timeout elapses rather than waiting forever. The
+  resources it already applied remain, so fix the cause and **re-run** `c8s install` — it's
+  idempotent (`helm upgrade --install`) and completes once every pod is Ready.
+</Callout>
+</Step>
+
+</Steps>
+
+## The flags that change the install shape
+
+A handful of flags determine the trust model and topology. The rest tune webhook-injected
+certificate defaults — see the [CLI Reference](/docs/c8s/install/cli-reference#c8s-install).
+
+| Flag | Default | Why you'd change it |
+| --- | --- | --- |
+| `--single-node` | `false` | Single-node clusters: makes every node CDS-eligible (no dedicated CDS node). Node count only — not the number of pod CVMs. |
+| `--kata` | `false` | Turn on the confidential pod runtime: each pod becomes a confidential VM and enforcement is switched on. |
+| `--cvm-mode` | `baremetal` | Select the TEE device: `baremetal`/`gke` (native `/dev/sev-guest`) or `aks` (vTPM `/dev/tpm0`). |
+| `--debug` | `false` | Use the debug guest image so `kubectl logs`/`exec` work on kata pods. **Development only** — it changes the launch measurement and exposes container I/O to the host. Requires `--kata`. |
+| `--resolve-digests` | `true` | Resolve and pin component images to digests and add them to the NRI allowlist. Set `false` only when you supply digests yourself via `-f`. |
+| `--image-pull-secret` | `""` | Name of an existing `dockerconfigjson` Secret in the namespace so all components can pull private c8s images from first start. |
+
+<Callout type="info">
+  **`--image-pull-secret` is only needed while the images are private.** It exists because the
+  c8s component images currently ship from a private registry. After c8s's public launch those
+  images will be public, and you can drop the flag (and skip creating the Secret) entirely —
+  you'll only need it if you pull from a **private or custom registry**: an internal mirror, a
+  re-hosted copy, or your own workload images sitting behind auth.
+
+  This Secret is the **cluster-side (kubelet)** credential only. Digest resolution under
+  `--resolve-digests=true` runs `crane` **locally** during `c8s install` and uses your
+  `~/.docker/config.json` instead — so for a private registry you must *also* log in on the box
+  (see the `crane` prerequisite above), or pass `--resolve-digests=false` and supply digests via `-f`.
+</Callout>
+
+<Callout type="warn">
+  The default chart pins **no** launch measurements. For anything beyond a demo, set both
+  `cds.measurements` and `ratls-mesh.measurements` (via `-f values.yaml`) to your known-good
+  SHA-384 launch digests — otherwise the cluster accepts *any* attested peer.
+  [Obtaining launch measurements](/docs/c8s/attestation/cds#obtaining-launch-measurements) explains
+  how to get those values; the [threat model](/docs/c8s/architecture/threat-model#measurement-pinning-is-mandatory-for-production)
+  explains why it matters.
+</Callout>
+
+## Run a confidential workload
+
+Once installed, mark a workload for confidential treatment with the `confidential.ai/cw`
+annotation. Under pod-as-CVM (`--kata`) the webhook injects the `kata-qemu-snp` RuntimeClass and a
+`get-cert` init/sidecar that fetches a TEE-bound certificate from the CDS:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-inference
+spec:
+  template:
+    metadata:
+      annotations:
+        confidential.ai/cw: my-inference   # the workload identity (NOT a boolean)
+    spec:
+      containers:
+        - name: server
+          image: ghcr.io/example/inference@sha256:...   # must be on the allowlist
+```
+
+<Callout type="warn">
+  The annotation **value is the workload's identity**, not a `true`/`false` flag. The operator
+  derives a managed headless Service named `c8s-<value>` from it and the workload's certificate
+  SAN is `c8s-<value>.<namespace>.svc` (overridable with `confidential.ai/c8s-san`). So
+  `confidential.ai/cw: my-inference` yields the Service `c8s-my-inference` — which is what a
+  front-door proxy (e.g. tee-proxy's `--upstream`) dials to reach the workload over the RA-TLS
+  mesh. Use a stable, DNS-label-safe name; a value like `"true"` would only produce a Service
+  named `c8s-true`.
+</Callout>
+
+Make sure the image digest is on the [allowlist](/docs/c8s/attestation/allowlist), or
+`policy-monitor` will refuse to start the container.
+
+## Verify the install
+
+A few quick checks confirm everything came up.
+
+**Components are healthy** — CDS, the operator, and (under pod-as-CVM) `kata-deploy` should be
+`Running`:
+
+```bash
+kubectl get pods -n c8s-system
+```
+
+**The admission webhook is wired up** — the operator patches its `caBundle` once at startup, so
+it should be non-empty:
+
+```bash
+kubectl get mutatingwebhookconfiguration | grep c8s
+# caBundle populated? (any non-zero count means it's patched)
+# the config is named <release>-pod-injector (release defaults to c8s):
+kubectl get mutatingwebhookconfiguration c8s-pod-injector \
+  -o jsonpath='{.webhooks[*].clientConfig.caBundle}' | wc -c
+```
+
+**A workload got its confidential identity** — inspect a pod you annotated `confidential.ai/cw`.
+Under pod-as-CVM it should run under the `kata-qemu-snp` RuntimeClass and carry the injected
+`get-cert` init container:
+
+```bash
+# confidential RuntimeClass (pod-as-CVM) — describe shows it directly:
+kubectl describe pod <pod> | grep "Runtime Class"
+#   Runtime Class Name:  kata-qemu-snp
+
+# the webhook-injected get-cert init container is present:
+kubectl get pod <pod> -o jsonpath='{range .spec.initContainers[*]}{.name}{"\n"}{end}'
+#   c8s-init-cert
+```
+
+**End-to-end confidentiality** — verify it from *outside* the cluster with
+[c8s-verify](/docs/c8s/verification/consumer).
+
+## Uninstalling
+
+`c8s uninstall` reverses the install — same `--namespace` / `--release` defaults as `c8s install`:
+
+```bash
+c8s uninstall
+```
+
+It runs `helm uninstall` to remove the release (operator, CDS, attestation-api, ratls-mesh,
+tee-proxy, tls-lb, webhook configuration, RuntimeClasses, enforcement policy), and for a
+`--kata` install it then **sweeps the host-side kata artifacts** off every node — `/opt/kata`,
+the containerd runtime drop-in, the multi-GB `kata-guest-base` image, the RKE2 prep template,
+and the kata-runtime node labels — via a short-lived privileged DaemonSet. The sweep is read
+from the release's computed values before deletion, so install-time `-f` overrides are honored,
+and it's skipped automatically for a non-kata install.
+
+To remove kata leftovers from a cluster whose release is **already gone** (e.g. a previous bare
+`helm uninstall`), run just the sweep:
+
+```bash
+c8s uninstall --host-sweep-only
+```
+
+<Callout type="warn">
+  Uninstall **refuses to proceed while pods with a kata RuntimeClass are still running** —
+  pulling the runtime out from under a confidential workload kills it without cleanup. Delete
+  those workloads first, or pass `--force` (the VMs keep running unmanaged but cannot restart).
+
+  Two opt-ins are destructive and **off by default**: `--delete-crds` removes the
+  `ConfidentialWorkload` CRD **and every `ConfidentialWorkload` object in the cluster with it**,
+  and `--delete-namespace` deletes the release namespace and everything left in it.
+</Callout>
+
+See the [CLI Reference](/docs/c8s/install/cli-reference#c8s-uninstall) for every flag.

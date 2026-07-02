@@ -1,0 +1,77 @@
+name: CLI flag completeness
+
+# Keeps website/content/docs/c8s/install/cli-reference.mdx in sync with the c8s CLI source.
+#  - Deterministic gate: fails if any flag is undocumented or stale.
+#  - Advisory review: a lightweight model (Claude Haiku 4.5) flags wording/default
+#    drift as a PR comment (skipped cleanly when ANTHROPIC_API_KEY is absent).
+#
+# Requires repository secrets:
+#  - C8S_REPO_TOKEN : a read-only token with access to confidential-dot-ai/c8s
+#  - ANTHROPIC_API_KEY : (optional) enables the advisory AI review
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'website/content/docs/c8s/install/cli-reference.mdx'
+      - 'website/scripts/**'
+      - '.github/workflows/flag-completeness.yml'
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC — catch upstream drift
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check:
+    name: Compare docs against c8s source
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - name: Checkout site
+        uses: actions/checkout@v4
+
+      - name: Checkout c8s source
+        uses: actions/checkout@v4
+        with:
+          repository: confidential-dot-ai/c8s
+          token: ${{ secrets.C8S_REPO_TOKEN }}
+          path: _c8s
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - run: npm ci
+
+      - name: Deterministic flag check (gate)
+        env:
+          C8S_DIR: ${{ github.workspace }}/_c8s
+        run: npm run check:flags
+
+      - name: Advisory AI review
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          C8S_DIR: ${{ github.workspace }}/_c8s
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_REVIEW_OUT: ai-review.md
+        run: npm run ai:flags
+
+      - name: Post AI review comment
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -s website/ai-review.md ]; then
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file website/ai-review.md
+          fi

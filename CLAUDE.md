@@ -19,41 +19,66 @@ cd website && npm run lint      # ESLint
 
 ## Architecture
 
-### Content Layer (repo root)
+The site has **two content systems** in one Next.js app:
 
-Markdown files at the repo root are the source of truth for all page content. The website reads these files at build time.
+### Marketing content (repo root `.md`)
 
-- Top-level `.md` files: `README.md` (home), `cloud.md`, `pricing.md`, `team.md`
-- `docs/` — Technical documentation, nested directories use `README.md` as index pages
+Markdown files at the repo root are the source of truth for the marketing pages. The website reads them at build time.
+
+- Top-level `.md` files: `README.md` (home), `cloud.md`, `pricing.md`, `products.md`, `team.md`, `confidential-*.md`, `attestable-builds.md`
 - `blog/` — Blog posts
 - `careers/` — Careers page
 
+Rendered with `react-markdown`. **Docs are no longer here** — see below.
+
+### Docs (`website/content/docs/**`, Fumadocs MDX)
+
+All documentation lives inside the app as **MDX** with `meta.json` sidebar ordering, served by **Fumadocs** at `/docs`:
+
+- `content/docs/index.mdx` — the docs hub (the "From zero to verified, in four steps" `<FourSteps />` block + section cards)
+- `content/docs/c8s/**` — the c8s platform docs (migrated from the standalone c8s-docs site)
+- `content/docs/concepts/**`, `whitepapers/**`, `attestable-builds/**`, `api/**` — the rest, re-architected from the old repo-root `docs/`
+
+Authoring voice/terminology/formatting: `STYLE_GUIDE.md` at the repo root.
+
 ### Website (`website/`)
 
-Next.js 16 + React 19 + Tailwind 4 app that renders the markdown content.
+Next.js 16 + React 19 + Tailwind 4. Marketing pages use `react-markdown`; docs content uses Fumadocs (MDX), but **not** Fumadocs' `DocsLayout` — there's a single shared sidebar for the whole site.
 
-**Content pipeline:** `lib/markdown.ts` reads `.md` files from the repo root (`..` relative to `website/`), rewrites internal links (`.md` extensions to routes, relative to absolute), and fixes asset paths. The processed markdown string is passed to `components/markdown-page.tsx` which renders it with `react-markdown` (remark-gfm, rehype-raw, rehype-slug). Internal links become Next.js `<Link>` components.
+- **One shared sidebar.** `components/sidebar.tsx` is rendered once in the **root** `app/layout.tsx` (so it persists across navigation). The root layout builds the docs nav server-side via `lib/docs-nav.ts` (`source.getPageTree()` → serializable `DocsNavNode[]`) and passes it to the sidebar. On `/docs/**` routes the sidebar renders the docs tree (collapsible folders, marketing mono styling) **nested under the "Docs" item** — no separate docs sidebar, no back button.
+- **`app/(marketing)/layout.tsx`** — just the content column (`max-w-[680px]`). Pages call `getMarkdownContent("<name>.md")` → `components/markdown-page.tsx` (remark-gfm, rehype-raw, rehype-slug). Marketing prose is styled via `.prose` in `app/globals.css`.
+- **`app/docs/layout.tsx`** — just the content column (`max-w-[820px]`). `app/docs/[[...slug]]/page.tsx` renders the page with Fumadocs' `DocsTitle`/`DocsDescription`/`DocsBody` (content styling only) plus the site's own `components/table-of-contents.tsx` (mapped from `page.data.toc`). `source.config.ts` + `lib/source.ts` load the collection; `content/docs/**` generates into `.source/` (gitignored). Note: dropping `DocsLayout` also drops Fumadocs' built-in search UI — `app/api/search/route.ts` still exists if search is re-added.
 
-**Routing:** Each top-level page has a dedicated `app/<name>/page.tsx` that calls `getMarkdownContent("<name>.md")`. Docs use a catch-all route (`app/docs/[...slug]/page.tsx`) that walks `docs/` to resolve slugs to files or `README.md` indexes. Blog uses the same pattern.
+**Theme:** light-default with a dark toggle. `components/theme-toggle.tsx` and the pre-paint script in `app/layout.tsx` both set `data-theme` (home tokens) **and** the `.dark` class (Fumadocs' dark tokens + `dark:` utilities + Shiki dark theme all key off `.dark`). `app/globals.css` maps Fumadocs' `--color-fd-*` tokens onto the home palette so docs and marketing share one theme and one `ThemeToggle`. Fumadocs' own `next-themes` is disabled.
 
-**Navigation:** `components/navbar.tsx` defines `NAV_ITEMS` (top bar: cloud, pricing, docs) and `BOTTOM_NAV_ITEMS` (used in mobile menu). Footer links (blog, team, careers) live in `app/layout.tsx` alongside social icons.
+**Diagrams:** committed docs SVGs are dark-palette; a recolored `*-light.svg` sits beside each, and `components/diagram.tsx` (wired as the `img` MDX component) swaps them per theme via a no-JS `.dark` CSS rule. `source.config.ts` disables Fumadocs' image import so `/diagrams/*.svg` paths stay literal.
 
-**Redirects:** Removed pages with inbound link equity (e.g. `/components`, `/enterprise`) are 301-redirected to `/cloud` via `redirects()` in `next.config.ts`.
+**Redirects:** in `next.config.ts` — legacy marketing redirects (`/components`, `/enterprise`, `/agents-api`) plus 301s for docs URLs moved during the re-architecture (e.g. `/docs/intro-to-tees` → `/docs/concepts/intro-to-tees`).
 
-### Adding a New Page
+**CLI flag gate:** `scripts/check-flags.ts` (+ `lib.ts`, `ai-flag-review.ts`) keep `content/docs/c8s/install/cli-reference.mdx` in sync with the `c8s` Go source; enforced by `.github/workflows/flag-completeness.yml` (needs `C8S_REPO_TOKEN` to check out `../c8s` in CI). `.github/workflows/ci.yml` runs typecheck/lint/build. Both run from the `website/` subdir.
 
+**LLM text:** `lib/llms.ts` builds `/llms.txt` and `/llms-full.txt` from the marketing `.md`, the Fumadocs docs tree, and `blog/`/`careers/`.
+
+### Adding a page
+
+**Marketing page:**
 1. Create `<name>.md` at the repo root
-2. Create `website/app/<name>/page.tsx` following the pattern of existing pages (call `getMarkdownContent`, render `MarkdownPage`)
-3. Add to `NAV_ITEMS` or `BOTTOM_NAV_ITEMS` in `website/components/navbar.tsx`
+2. Create `website/app/(marketing)/<name>/page.tsx` following an existing page (call `getMarkdownContent`, render `MarkdownPage`)
+3. Add it to `SECTIONS` in `website/components/sidebar.tsx`
+
+**Docs page:**
+1. Create `website/content/docs/<section>/<name>.mdx` with `title` + `description` frontmatter (no `# H1` — the frontmatter title *is* the H1)
+2. Add its file stem to that folder's `meta.json` `pages` array, or it won't appear in the sidebar
+3. MDX components available: `Card(s)`, `Tab(s)`, `Step(s)`, `Accordion(s)`, `Callout`, `JourneyNav`, `FourSteps` (see `components/mdx.tsx`)
 
 ## TEE Content Reading Path
 
-Docs are structured as a progressive reading path for TEE knowledge:
-1. `docs/intro-to-tees.md` — Accessible high-level introduction
-2. `blog/secure-ai-needs-tees.md` — AI-specific argument (links to intro for general background)
-3. `docs/confidential-computing-primer/` — Deep technical series (assumes virtualization and cryptography knowledge)
+Docs are a progressive reading path for TEE knowledge:
+1. `/docs/concepts/intro-to-tees` — Accessible high-level introduction
+2. `blog/secure-ai-needs-tees.md` — AI-specific argument (links to the intro for general background)
+3. `/docs/concepts/confidential-computing-primer` — Deep technical series (assumes virtualization and cryptography knowledge)
 
-General TEE education lives in `docs/intro-to-tees.md`. AI-specific TEE content lives in the blog. Avoid duplicating TEE fundamentals across both — link instead.
+General TEE education lives under `/docs/concepts`. AI-specific TEE content lives in the blog. Avoid duplicating TEE fundamentals across both — link instead.
 
 ## Formatting Conventions
 

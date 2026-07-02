@@ -22,7 +22,11 @@ function getServerSnapshot(): Theme {
 }
 
 function setTheme(next: Theme) {
-  document.documentElement.dataset.theme = next;
+  const el = document.documentElement;
+  el.dataset.theme = next;
+  // Keep the `.dark` class in lockstep — Fumadocs' dark tokens, `dark:` utilities,
+  // and Shiki's dark code theme all key off `.dark`, not `data-theme`.
+  el.classList.toggle("dark", next === "dark");
   try {
     localStorage.setItem("theme", next);
   } catch {}

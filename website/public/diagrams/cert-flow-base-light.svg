@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 430" role="img" aria-label="Base-mode certificate flow: the workload requests a challenge from the CDS, generates evidence bound to its CSR, sends it to the CDS which verifies it via the attestation-api and returns a signed leaf certificate.">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L7.5,3 L0,6 z" fill="#7c7a72" />
+    </marker>
+  </defs>
+  <style>
+    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .card { fill: #ffffff; stroke: #e4e2dc; }
+    .actor { fill: #f6f5f1; stroke: #d9d7d0; }
+    .an { fill: #1f1f1d; font-size: 13px; font-weight: 600; }
+    .as { fill: #6b6b66; font-size: 10.5px; }
+    .life { stroke: #dcdad3; stroke-width: 1; stroke-dasharray: 3 4; }
+    .req { stroke: #7c7a72; stroke-width: 1.5; }
+    .res { stroke: #7c7a72; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .lbl { fill: #4a4a46; font-size: 11.5px; }
+    .note { fill: #faf6e8; stroke: #8a5a00; }
+    .nt { fill: #8a5a00; font-size: 11px; }
+  </style>
+
+  <rect class="card" x="0.5" y="0.5" width="719" height="429" rx="10" />
+
+  <!-- lifelines -->
+  <line class="life" x1="120" y1="66" x2="120" y2="406" />
+  <line class="life" x1="380" y1="66" x2="380" y2="406" />
+  <line class="life" x1="620" y1="66" x2="620" y2="406" />
+
+  <!-- actors -->
+  <rect class="actor" x="40" y="18" width="160" height="44" rx="7" />
+  <text class="an" x="120" y="38" text-anchor="middle">Workload</text>
+  <text class="as" x="120" y="53" text-anchor="middle">get-cert</text>
+
+  <rect class="actor" x="300" y="18" width="160" height="44" rx="7" />
+  <text class="an" x="380" y="38" text-anchor="middle">CDS</text>
+  <text class="as" x="380" y="53" text-anchor="middle">host</text>
+
+  <rect class="actor" x="540" y="18" width="160" height="44" rx="7" />
+  <text class="an" x="620" y="38" text-anchor="middle">attestation-api</text>
+  <text class="as" x="620" y="53" text-anchor="middle">host</text>
+
+  <!-- 1: authenticate -->
+  <text class="lbl" x="250" y="90" text-anchor="middle">POST /authenticate</text>
+  <line class="req" x1="120" y1="98" x2="380" y2="98" marker-end="url(#ah)" />
+
+  <!-- 2: nonce -->
+  <text class="lbl" x="250" y="124" text-anchor="middle">nonce — one-time challenge</text>
+  <line class="res" x1="380" y1="132" x2="120" y2="132" marker-end="url(#ah)" />
+
+  <!-- note: report_data -->
+  <rect class="note" x="106" y="152" width="288" height="32" rx="5" />
+  <text class="nt" x="250" y="172" text-anchor="middle">report_data = SHA-384(CSR pubkey ‖ nonce)</text>
+
+  <!-- 4: attest -->
+  <text class="lbl" x="250" y="214" text-anchor="middle">POST /attest — challenge + evidence + CSR</text>
+  <line class="req" x1="120" y1="222" x2="380" y2="222" marker-end="url(#ah)" />
+
+  <!-- 5: verify -->
+  <text class="lbl" x="500" y="248" text-anchor="middle">verify(evidence, report_data)</text>
+  <line class="req" x1="380" y1="256" x2="620" y2="256" marker-end="url(#ah)" />
+
+  <!-- 6: verdict -->
+  <text class="lbl" x="500" y="282" text-anchor="middle">valid · launch_digest</text>
+  <line class="res" x1="620" y1="290" x2="380" y2="290" marker-end="url(#ah)" />
+
+  <!-- note: sign -->
+  <rect class="note" x="232" y="310" width="296" height="32" rx="5" />
+  <text class="nt" x="380" y="330" text-anchor="middle">check measurement · validate CSR · sign (mesh CA)</text>
+
+  <!-- 8: leaf cert -->
+  <text class="lbl" x="250" y="376" text-anchor="middle">leaf certificate + CA chain</text>
+  <line class="res" x1="380" y1="384" x2="120" y2="384" marker-end="url(#ah)" />
+</svg>

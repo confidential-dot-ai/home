@@ -2,8 +2,10 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { ThemeToggle } from "./theme-toggle";
+import { Logo } from "./logo";
+import type { DocsNavNode } from "@/lib/docs-nav";
 
 type Item = { label: string; href: string; external?: boolean };
 type Section = { title?: string; items: Item[] };
@@ -36,22 +38,6 @@ const SECTIONS: Section[] = [
     ],
   },
 ];
-
-function Logo() {
-  return (
-    <svg
-      viewBox="0 0 459 130"
-      height={22}
-      style={{ height: 22, width: "auto" }}
-      fill="currentColor"
-      aria-hidden="true"
-    >
-      <path d="M1.49012e-06 0H42V21.9966H27V106.997L42 106.997V128.997H0L1.49012e-06 0Z" />
-      <path d="M459 0L416 0.00340271V21.838H431.944V106.695H416V129.522H459V0Z" />
-      <path d="M388 4H70V125H388V4Z" />
-    </svg>
-  );
-}
 
 const SOCIALS = [
   {
@@ -95,12 +81,132 @@ function SidebarFooter() {
   );
 }
 
-function NavContent({ onNavigate }: { onNavigate?: () => void }) {
+// ── Nested docs tree (rendered under the "Docs" item on /docs routes) ──────────
+
+function nodeContainsActive(node: DocsNavNode, pathname: string): boolean {
+  if (node.type === "page") return node.url === pathname;
+  return node.url === pathname || node.children.some((c) => nodeContainsActive(c, pathname));
+}
+
+const indent = (depth: number) => ({ paddingLeft: `${depth * 0.7 + 0.6}rem` });
+
+function DocsPageLink({
+  node,
+  pathname,
+  depth,
+  onNavigate,
+}: {
+  node: Extract<DocsNavNode, { type: "page" }>;
+  pathname: string;
+  depth: number;
+  onNavigate?: () => void;
+}) {
+  const active = pathname === node.url;
+  return (
+    <Link
+      href={node.url}
+      onClick={onNavigate}
+      aria-current={active ? "page" : undefined}
+      style={indent(depth)}
+      className={`font-mono text-[0.8rem] no-underline py-0.5 transition-colors hover:text-foreground ${
+        active ? "text-accent" : "text-foreground/70"
+      }`}
+    >
+      {node.title}
+    </Link>
+  );
+}
+
+function DocsFolder({
+  node,
+  pathname,
+  depth,
+  onNavigate,
+}: {
+  node: Extract<DocsNavNode, { type: "folder" }>;
+  pathname: string;
+  depth: number;
+  onNavigate?: () => void;
+}) {
+  const active = useMemo(() => nodeContainsActive(node, pathname), [node, pathname]);
+  // `null` follows the active state (auto-open the section for the current page);
+  // once the user toggles the folder, their choice sticks.
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const open = userOpen ?? active;
+
+  return (
+    <div className="flex flex-col">
+      <button
+        type="button"
+        onClick={() => setUserOpen(!open)}
+        style={indent(depth)}
+        aria-expanded={open}
+        className="flex items-center gap-1.5 font-mono text-[0.8rem] py-0.5 text-left text-foreground/85 hover:text-foreground transition-colors"
+      >
+        <svg
+          width="9"
+          height="9"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          aria-hidden="true"
+          className={`shrink-0 text-muted transition-transform ${open ? "rotate-90" : ""}`}
+        >
+          <path d="M9 6l6 6-6 6" />
+        </svg>
+        {node.title}
+      </button>
+      {open && (
+        <div className="flex flex-col">
+          {node.children.map((c, i) =>
+            c.type === "folder" ? (
+              <DocsFolder key={i} node={c} pathname={pathname} depth={depth + 1} onNavigate={onNavigate} />
+            ) : (
+              <DocsPageLink key={c.url} node={c} pathname={pathname} depth={depth + 1} onNavigate={onNavigate} />
+            )
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DocsTree({
+  nodes,
+  pathname,
+  onNavigate,
+}: {
+  nodes: DocsNavNode[];
+  pathname: string;
+  onNavigate?: () => void;
+}) {
+  return (
+    <div className="mt-1 mb-1 ml-1 flex flex-col border-l border-border pl-1">
+      {nodes.map((n, i) =>
+        n.type === "folder" ? (
+          <DocsFolder key={i} node={n} pathname={pathname} depth={0} onNavigate={onNavigate} />
+        ) : (
+          <DocsPageLink key={n.url} node={n} pathname={pathname} depth={0} onNavigate={onNavigate} />
+        )
+      )}
+    </div>
+  );
+}
+
+function NavContent({
+  docsNav,
+  onNavigate,
+}: {
+  docsNav: DocsNavNode[];
+  onNavigate?: () => void;
+}) {
   const pathname = usePathname();
   const isActive = (href: string) => {
     const base = href.split("#")[0];
     return pathname === base || (base !== "/" && pathname.startsWith(base + "/"));
   };
+  const onDocs = isActive("/docs");
 
   return (
     <nav aria-label="Primary" className="flex flex-col gap-6 text-sm">
@@ -124,16 +230,21 @@ function NavContent({ onNavigate }: { onNavigate?: () => void }) {
                 {item.label} ↗
               </a>
             ) : (
-              <Link
-                key={item.href}
-                href={item.href}
-                onClick={onNavigate}
-                className={`font-mono no-underline py-0.5 transition-colors hover:text-foreground ${
-                  isActive(item.href) ? "text-accent" : "text-foreground/85"
-                }`}
-              >
-                {item.label}
-              </Link>
+              <div key={item.href} className="flex flex-col">
+                <Link
+                  href={item.href}
+                  onClick={onNavigate}
+                  className={`font-mono no-underline py-0.5 transition-colors hover:text-foreground ${
+                    isActive(item.href) ? "text-accent" : "text-foreground/85"
+                  }`}
+                >
+                  {item.label}
+                </Link>
+                {/* Docs navigation nests here when you're in the docs section. */}
+                {item.href === "/docs" && onDocs && docsNav.length > 0 && (
+                  <DocsTree nodes={docsNav} pathname={pathname} onNavigate={onNavigate} />
+                )}
+              </div>
             )
           )}
         </div>
@@ -146,7 +257,7 @@ function NavContent({ onNavigate }: { onNavigate?: () => void }) {
   );
 }
 
-export function Sidebar() {
+export function Sidebar({ docsNav }: { docsNav: DocsNavNode[] }) {
   const [open, setOpen] = useState(false);
 
   return (
@@ -176,7 +287,7 @@ export function Sidebar() {
         <Link href="/" aria-label="Home" className="text-heading mb-8 block w-fit">
           <Logo />
         </Link>
-        <NavContent />
+        <NavContent docsNav={docsNav} />
         <div className="mt-auto pt-6 flex flex-col gap-4">
           <ThemeToggle />
           <SidebarFooter />
@@ -208,7 +319,7 @@ export function Sidebar() {
                 </svg>
               </button>
             </div>
-            <NavContent onNavigate={() => setOpen(false)} />
+            <NavContent docsNav={docsNav} onNavigate={() => setOpen(false)} />
             <div className="mt-auto pt-6">
               <SidebarFooter />
             </div>

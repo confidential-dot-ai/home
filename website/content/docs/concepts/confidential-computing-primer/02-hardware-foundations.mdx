@@ -1,0 +1,393 @@
+---
+title: "Hardware Foundations"
+description: "The AMD SEV-SNP hardware foundations: AMD-V, the Platform Security Processor, and memory encryption."
+---
+
+This document explains the hardware components that make SEV-SNP possible. After reading it, you'll understand how AMD-V virtualization works at the hardware level, what the Platform Security Processor does and why it's the root of trust, how memory encryption actually happens, and how SEV evolved through four generations to reach SNP. This assumes you're comfortable with basic operating system concepts (virtual memory, privilege levels) but doesn't require prior knowledge of AMD-specific architecture.
+
+## AMD-V Virtualization
+
+SEV-SNP builds on AMD-V, the hardware virtualization extension that AMD introduced in 2006. Understanding AMD-V is essential because SEV-SNP doesn't replace virtualization; it adds security properties on top of it.
+
+### The Problem Virtualization Solves
+
+You want to run multiple operating systems on one physical machine, each believing it has the entire computer to itself. The software that creates this illusion is the hypervisor. The challenge is that an operating system expects total control: it wants to manage memory, handle interrupts, and execute privileged instructions. If you ran two OSes side by side without mediation, they'd fight over resources and crash.
+
+Early hypervisors solved this through software trapping: intercept every privileged operation, simulate its effect, return control. This worked but was slow. AMD-V (and Intel's equivalent, VT-x) added explicit CPU modes for "running a guest" versus "running the hypervisor", letting hardware handle most isolation directly.
+
+### The VMCB
+
+The VMCB (Virtual Machine Control Block) is a data structure in memory that captures everything the hardware needs to run a guest VM. It has two parts.
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                            VMCB                               │
+├───────────────────────────────────────────────────────────────┤
+│  CONTROL AREA (hypervisor readable/writable)                  │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Intercepts: which operations cause exits               │  │
+│  │  ASID: which encryption key to use                      │  │
+│  │  nCR3: pointer to nested page tables                    │  │
+│  │  Exit code: why did we exit? (filled by hardware)       │  │
+│  │  Exit info: fault address, etc.                         │  │
+│  └─────────────────────────────────────────────────────────┘  │
+├───────────────────────────────────────────────────────────────┤
+│  SAVE AREA / VMSA (encrypted in SEV-ES/SNP)                   │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, R8-R15         │  │
+│  │  RIP (instruction pointer)                              │  │
+│  │  RFLAGS                                                 │  │
+│  │  CS, DS, SS, ES, FS, GS (segment registers)             │  │
+│  │  CR0, CR3, CR4 (control registers)                      │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────┘
+```
+
+The **Control Area** contains instructions for the hardware: which operations should cause exits to the hypervisor, which ASID to use (we'll explain this shortly), the pointer to nested page tables, and fields that hardware fills in when an exit occurs (exit code, fault address, etc.). The hypervisor reads and writes this area freely.
+
+The **Save Area** contains the guest's actual CPU state: all general-purpose registers (RAX through R15), the instruction pointer (RIP), flags, segment registers, and control registers. This is the complete "brain state" of the guest at any moment. In SEV-ES and SEV-SNP, this save area becomes the VMSA (VM Save Area) and gets encrypted.
+
+### The VMRUN / #VMEXIT Cycle
+
+Guest execution follows a simple loop:
+
+1. The hypervisor sets up a VMCB for the guest it wants to run and executes the VMRUN instruction.
+2. Hardware saves some hypervisor state, loads the guest's registers from the VMCB save area, switches to "guest mode," and jumps to the guest's instruction pointer.
+3. The guest executes at near-native speed until something triggers an exit: an intercepted instruction (like CPUID), an I/O access, a page fault, or an external interrupt.
+4. Hardware saves the guest's registers back to the VMCB save area, writes exit information to the control area, restores hypervisor state, and resumes hypervisor execution right after the VMRUN.
+5. The hypervisor reads the exit code, handles whatever caused the exit, and calls VMRUN again.
+
+This cycle repeats millions of times per second. Most guest execution happens at full speed; the hypervisor only gets involved when something interesting happens.
+
+```
+      Hypervisor                                Guest
+          │                                       │
+          │  VMRUN (load VMCB, switch to guest)   │
+          ├──────────────────────────────────────►│
+          │                                       │ executing...
+          │                                       │ executing...
+          │                                       │ CPUID instruction
+          │◄──────────────────────────────────────┤ #VMEXIT
+          │                                       │
+          │  read exit code from VMCB             │
+          │  handle the exit (emulate CPUID)      │
+          │  update VMCB if needed                │
+          │                                       │
+          │  VMRUN                                │
+          ├──────────────────────────────────────►│
+          │                                       │ continues executing...
+          │                                       │
+```
+
+### Why This Matters for Security
+
+On every #VMEXIT, the guest's complete register state is written to the VMCB save area. Without encryption, the hypervisor can see everything: what code the guest is executing (RIP), all data in registers (maybe passwords, keys, sensitive data), and what the guest is about to do. It can also modify any of it before calling VMRUN again.
+
+This is the gap that SEV-ES closes by encrypting the save area. But we're getting ahead of ourselves.
+
+### Nested Paging
+
+Before hardware nested paging, hypervisors maintained "shadow page tables": intercepting every guest page table modification and maintaining a parallel structure that mapped guest virtual addresses directly to physical addresses. This caused constant VM exits and was slow.
+
+AMD-V introduced nested paging (Intel calls it EPT, Extended Page Tables). The CPU now understands two levels of address translation natively:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                      Two-Level Address Translation                     │
+│                                                                        │
+│    Guest Process                                                       │
+│    ┌─────────────────┐                                                 │
+│    │ GVA: 0x7fff1234 │  Guest Virtual Address                          │
+│    └────────┬────────┘                                                 │
+│             │                                                          │
+│             ▼  Guest page tables (guest OS controls)                   │
+│    ┌─────────────────┐                                                 │
+│    │ GPA: 0x00050000 │  Guest Physical Address                         │
+│    └────────┬────────┘  (what guest thinks is "physical")              │
+│             │                                                          │
+│             ▼  Nested page tables (hypervisor controls)                │
+│    ┌─────────────────┐                                                 │
+│    │ SPA: 0x1a500000 │  System Physical Address                        │
+│    └────────┬────────┘  (actual DRAM location)                         │
+│             │                                                          │
+│             ▼                                                          │
+│         [ DRAM ]                                                       │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+Hardware walks both translations automatically on every memory access. The nested page table root is stored in the VMCB's nCR3 field. Guest page table modifications no longer cause exits; the hypervisor only gets involved when the GPA-to-SPA translation fails (a "nested page fault," indicating the guest needs more memory).
+
+The hypervisor controls the nested page tables. It decides which SPA backs each GPA. This is necessary for virtualization, but it's also where attacks become possible. A malicious hypervisor could remap GPAs to wrong SPAs, alias multiple GPAs to the same SPA, or replay old memory contents. Encryption alone doesn't prevent these integrity attacks. This is why SNP adds the RMP check at the end of every memory access.
+
+## The Platform Security Processor
+
+The AMD Secure Processor (also called AMD-SP or PSP) is a dedicated ARM Cortex-A5 microcontroller physically integrated onto the CPU die. This is not a separate chip that could be bypassed; it's part of the silicon.
+
+### What It Does
+
+The PSP runs its own firmware completely independently of the x86 cores. When you boot an AMD EPYC system, the PSP boots first and initializes before the x86 cores even start executing. This makes it the hardware root of trust for SEV.
+
+The PSP manages:
+
+**Key generation.** All VM encryption keys (VEKs) are generated by the PSP using an on-chip NIST SP 800-90 compliant hardware random number generator. The VEK is a 128-bit AES key, unique per guest instance. Even if you launch the same guest image twice, each gets a different VEK.
+
+**Guest context.** The PSP maintains an encrypted, integrity-protected data structure for each SNP guest called the GCTX (Guest Context). This contains the VEK, measurement digest, policy, VMPCKs (VM Platform Communication Keys), and other security state. The hypervisor can see the GCTX page exists but cannot read or modify its contents.
+
+**VM lifecycle.** Launch, activate, deactivate, and migration operations all go through the PSP. The hypervisor requests these operations; the PSP performs them and enforces security invariants.
+
+**Attestation.** The PSP generates and signs attestation reports. The signing key (VCEK or VLEK) is derived from keys fused into the silicon at manufacturing.
+
+### Communication with the PSP
+
+The x86 cores communicate with the PSP through MMIO mailbox registers in PCI space. The protocol is request/response:
+
+1. x86 software allocates a command buffer in DRAM.
+2. Writes the physical address to CmdBufAddr registers.
+3. Writes the command ID to the CmdResp register.
+4. PSP reads the command, executes it, writes results back, and signals completion.
+
+This is intentionally slow and course-grained. The PSP doesn't sit in the fast path of normal guest execution; it only handles security-critical operations.
+
+### Why This Architecture Matters
+
+The PSP being a separate processor with its own firmware means the x86 hypervisor cannot read PSP internal state. VEKs never leave the PSP in cleartext; they go directly to the memory controller's key slots through a hardware interface the hypervisor cannot access. Even if an attacker has full control of the hypervisor, they cannot extract VM encryption keys.
+
+## Memory Encryption
+
+The actual encryption happens in dedicated AES engines located in the on-die memory controllers, not in the CPU cores.
+
+### Location in the Data Path
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           CPU Die (trusted)                              │
+│                                                                          │
+│  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                 │
+│  │  CPU Core   │     │  CPU Core   │     │   AMD-SP    │                 │
+│  │             │     │             │     │   (PSP)     │                 │
+│  │  Registers  │     │  Registers  │     │             │                 │
+│  │ (plaintext) │     │ (plaintext) │     │  VEK store  │                 │
+│  └──────┬──────┘     └──────┬──────┘     └──────┬──────┘                 │
+│         │                   │                   │                        │
+│         └─────────┬─────────┘                   │ programs keys          │
+│                   ▼                             ▼                        │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                  L1 / L2 / L3 Cache (plaintext)                    │  │
+│  └───────────────────────────────┬────────────────────────────────────┘  │
+│                                  │                                       │
+│                                  ▼                                       │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                        Memory Controller                           │  │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │  │
+│  │  │  Key Slots:  ASID 1 → VEK_1,  ASID 2 → VEK_2,  ...           │  │  │
+│  │  └──────────────────────────────────────────────────────────────┘  │  │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │  │
+│  │  │                     AES-128 Engine                           │  │  │
+│  │  │          encrypt on write, decrypt on read                   │  │  │
+│  │  └──────────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────┬────────────────────────────────────┘  │
+│                                  │                                       │
+└──────────────────────────────────┼───────────────────────────────────────┘
+                                   │
+                   ════════════════╪════════════════  (SoC boundary)
+                                   │
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        DRAM (ciphertext only)                            │
+│                                                                          │
+│  Physical probing, cold boot attacks, stolen DIMMs → encrypted garbage   │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+Encryption and decryption occur at the boundary between the SoC and DRAM. Data inside the CPU caches is plaintext. This is a deliberate design choice: encrypting on every cache hit would be slow, and the threat model assumes the CPU package is trusted. An attacker who can probe inside the CPU die has capabilities beyond what memory encryption addresses.
+
+### How Encryption Works
+
+The memory controller maintains key slots, one per ASID. When a memory transaction arrives:
+
+1. The transaction is tagged with the originating ASID (set in the VMCB and carried through the entire memory pipeline).
+2. The memory controller looks up the VEK for that ASID.
+3. On writes, plaintext from cache is encrypted with the VEK before going to DRAM.
+4. On reads, ciphertext from DRAM is decrypted with the VEK before going to cache.
+
+The encryption uses AES-128 in XEX mode (a variant of XTS) with the physical address as a "tweak." The tweak ensures that the same plaintext at different physical addresses encrypts to different ciphertext. This prevents ciphertext block move attacks where an attacker copies encrypted data from one location to another.
+
+### The ASID
+
+The ASID (Address Space Identifier) is a 16-bit identifier that tags memory transactions. The hypervisor sets the ASID in the VMCB before VMRUN; hardware ensures all memory accesses from that guest carry the correct ASID.
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        ASID-Based Key Selection                          │
+│                                                                          │
+│   VMCB for VM #2:                       Memory Controller Key Slots:     │
+│   ┌──────────────────┐                  ┌───────────────────────────┐    │
+│   │  ASID = 2        │                  │ Slot 1: VEK for VM #1     │    │
+│   │  ...             │                  │ Slot 2: VEK for VM #2  ◄──┼─┐  │
+│   └──────────────────┘                  │ Slot 3: VEK for VM #3     │ │  │
+│                                         │ ...                       │ │  │
+│                                         └───────────────────────────┘ │  │
+│                                                                       │  │
+│   Guest memory access tagged with ASID=2 ─────────────────────────────┘  │
+│                                                                          │
+│   Memory controller uses ASID to select correct VEK automatically        │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+ASIDs are a limited resource. The exact count varies by processor (exposed via CPUID Fn8000_001F[ECX]), typically a few hundred. If you have more VMs than ASIDs, you need ASID overcommit: deactivate one guest, flush caches, activate another. The SNP_ACTIVATE command installs a guest's VEK into the key slot for a given ASID; SNP_DEACTIVATE removes it.
+
+### The C-bit
+
+The C-bit (bit 47 of guest physical addresses in page table entries, though the exact position is processor-dependent and reported by CPUID) controls whether a page is encrypted:
+
+| C-bit | Meaning | Encryption                     |
+| ----- | ------- | ------------------------------ |
+| 1     | Private | Encrypted with guest's VEK     |
+| 0     | Shared  | Not encrypted with guest's VEK |
+
+The guest sets the C-bit in its own page tables. The hypervisor cannot override this. Most pages are private (C=1). Shared pages (C=0) are used for communication with the hypervisor (the GHCB) and for DMA buffers (since devices doing DMA don't have a guest ASID).
+
+### DMA and Bounce Buffers
+
+Devices doing DMA don't execute in guest context, so they don't have a guest ASID. If a device DMAs to an encrypted page, it would read/write with the wrong key (or no key). The solution: guests must use shared (C=0) pages for any memory that devices will DMA to.
+
+For I/O operations, guests use "bounce buffers": allocate a shared buffer, copy data there, let the device DMA, copy the result back to private memory. This adds overhead but preserves confidentiality. Linux's SWIOTLB (Software I/O TLB) implements this transparently for SEV guests.
+
+## The Evolution: SME → SEV → SEV-ES → SEV-SNP
+
+Each generation addressed security gaps left by its predecessor. Understanding the progression clarifies what protections you actually get.
+
+### SME (Secure Memory Encryption)
+
+SME introduced the core encryption mechanism: the AES engine in the memory controller and the C-bit in page tables.
+
+**What it does:** Uses a single AES-128 key for all memory encryption. The OS or hypervisor controls which pages are encrypted via the C-bit.
+
+**What it protects against:** Physical attacks only. Cold boot attacks, memory bus probing, stolen DIMMs. If all memory is encrypted, physical access to DRAM gets you ciphertext.
+
+**What it doesn't protect against:** The hypervisor, other VMs, anything with software access to memory. There's only one key for the whole system; everyone who can access memory can decrypt.
+
+### SEV (Secure Encrypted Virtualization)
+
+SEV's breakthrough was per-VM encryption keys.
+
+**What it added:** Each VM gets its own VEK, selected via the ASID. The hypervisor reading VM memory sees encrypted garbage.
+
+**What it protects against:** Hypervisor reading guest memory contents. The hypervisor can see ciphertext but cannot decrypt.
+
+**What it doesn't protect against:** On #VMEXIT, guest registers are saved to the VMCB save area in plaintext. The hypervisor can read all register values, including sensitive data being computed, and can modify register state before the VM resumes.
+
+### SEV-ES (Encrypted State)
+
+SEV-ES closes the register exposure gap.
+
+**What it added:** The VMCB save area (now called VMSA) is encrypted with the guest's VEK on every #VMEXIT. The hypervisor sees ciphertext.
+
+**The #VC exception:** With encrypted registers, the hypervisor can't see what the guest needs when an exit occurs. SEV-ES introduces the #VC (VMM Communication) exception. When the guest hits an intercept, #VC fires inside the guest. The guest's handler decides what information to share, puts only the necessary data in the GHCB (a shared page), and executes VMGEXIT. The guest controls exactly what crosses the trust boundary.
+
+**What it doesn't protect against:** Memory integrity attacks. A malicious hypervisor can still:
+- **Replay:** Replace a memory page with an old copy.
+- **Corrupt:** Flip bits in encrypted memory (decrypts to garbage, potentially exploitable).
+- **Alias:** Map two different guest addresses to the same physical page.
+- **Remap:** Silently swap which physical page backs a guest address.
+
+These don't let the attacker read data, but they can cause the guest to operate on incorrect data.
+
+### SEV-SNP (Secure Nested Paging)
+
+SEV-SNP adds hardware-enforced integrity. The fundamental guarantee: if a guest reads a private page, it sees the value it last wrote, or gets an exception. Never stale data, never corrupted data, never another page's data.
+
+**The RMP (Reverse Map Table):** A single system-wide table with one entry per 4KB physical page, tracking: is this page assigned to a VM? Which VM (ASID)? What GPA should it map to? Is it validated? What are the VMPL permissions?
+
+Every memory access to a private guest page triggers an RMP check. If the access doesn't match what the RMP says (wrong ASID, wrong GPA, not validated), you get an exception.
+
+**Page validation:** Two-step process:
+1. Hypervisor uses RMPUPDATE to assign a page to a guest at a specific GPA. The page becomes Guest-Invalid.
+2. Guest uses PVALIDATE to validate the page. The page becomes Guest-Valid.
+
+The guest must explicitly accept each mapping. If the hypervisor swaps the backing page, the new page won't be validated, and the guest gets a #VC when accessing it.
+
+**VMPLs (VM Privilege Levels):** Four privilege levels (0-3) within the guest. Each RMP entry has separate permissions per VMPL. VMPL0 is highest privilege; it can run an SVSM (Secure VM Service Module) that provides services to the guest OS at VMPL2/3.
+
+**Additional protections:** Restricted interrupt injection (hypervisor can only inject a doorbell, not arbitrary interrupts), BTB protection (hardware flushes branch predictor entries from untrusted sources), TCB versioning (attestation reports include firmware versions, enabling verifiers to require minimum versions).
+
+### Summary: The Protection Matrix
+
+| Threat                        | SME | SEV | SEV-ES | SEV-SNP |
+| ----------------------------- | --- | --- | ------ | ------- |
+| Some Phyiscal DRAM attacks    | Yes | Yes | Yes    | Yes     |
+| Hypervisor reads VM memory    | No  | Yes | Yes    | Yes     |
+| Hypervisor reads VM registers | No  | No  | Yes    | Yes     |
+| Memory replay                 | No  | No  | No     | Yes     |
+| Memory corruption             | No  | No  | No     | Yes     |
+| Memory aliasing               | No  | No  | No     | Yes     |
+| Memory remapping              | No  | No  | No     | Yes     |
+
+## Key Hardware Structures Summary
+
+### ASID Key Slots
+
+Limited slots in the memory controller, each holding one VEK. The SNP_ACTIVATE command programs a VEK into a slot; SNP_DEACTIVATE clears it. If you need more guests than slots, you overcommit by deactivating idle guests.
+
+### The RMP
+
+One 16-byte entry per 4KB physical page. Indexed by system physical address. Modified only through specific privileged instructions (RMPUPDATE, PVALIDATE) or PSP commands. RMP checks are performed by CPU microarchitecture on every relevant memory access; this is hardware logic, not software the hypervisor could bypass.
+
+### The GCTX
+
+A 4KB page maintained by the PSP for each guest. Contains the VEK, measurement digest, VMPCKs, policy, and other state. Encrypted by the PSP (hypervisor sees ciphertext) and marked immutable in the RMP (hypervisor cannot modify the RMP entry). All guest secrets live here.
+
+### The VMSA
+
+The encrypted save area containing guest register state. Encrypted with the guest's VEK. The hypervisor specifies a pointer to the VMSA in the VMCB control area, but cannot read or write the VMSA contents.
+
+### The GHCB
+
+A shared (C=0) page for guest-hypervisor communication. The guest explicitly puts information here when it needs hypervisor services. The hypervisor can read and write the GHCB, but the guest controls what information is placed there.
+
+## The Trust Boundary
+
+Putting this together, here's where the security boundary lives:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        TRUSTED (inside CPU die)                          │
+│                                                                          │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────────┐       │
+│  │    CPU Cores     │  │   AMD-SP (PSP)   │  │ Memory Controller │       │
+│  │                  │  │                  │  │                   │       │
+│  │  • Registers     │  │  • VEK storage   │  │  • Key slots      │       │
+│  │  • RMP checks    │  │  • GCTX mgmt     │  │  • AES engine     │       │
+│  │  • Execution     │  │  • Attestation   │  │  • RMP table      │       │
+│  └──────────────────┘  └──────────────────┘  └───────────────────┘       │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                  L1 / L2 / L3 Cache (plaintext)                    │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+                                   │
+                   ════════════════╪════════════════
+                                   │
+┌──────────────────────────────────────────────────────────────────────────┐
+│                      UNTRUSTED (outside CPU die)                         │
+│                                                                          │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────────┐       │
+│  │      DRAM        │  │   Memory Bus     │  │   DMA Devices     │       │
+│  │  (ciphertext)    │  │  (ciphertext)    │  │  (shared pages    │       │
+│  │                  │  │                  │  │   only)           │       │
+│  └──────────────────┘  └──────────────────┘  └───────────────────┘       │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                          Hypervisor                                │  │
+│  │  • Sees ciphertext (cannot decrypt)                                │  │
+│  │  • Cannot modify guest memory without RMP detection                │  │
+│  │  • Cannot read encrypted VMSA registers                            │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+The PSP programs keys into the memory controller. The CPU performs RMP checks inline with memory access. The memory controller encrypts and decrypts. All of this is hardware that the hypervisor cannot modify.
