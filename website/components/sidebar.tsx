@@ -121,10 +121,13 @@ function DocsPageLink({
       href={node.url}
       onClick={onNavigate}
       aria-current={active ? "page" : undefined}
-      className={`block py-1 pl-[1.4rem] font-mono text-[0.8rem] no-underline transition-colors hover:text-foreground ${
+      className={`flex items-center gap-1 py-1 font-mono text-[0.8rem] no-underline transition-colors hover:text-foreground ${
         active ? "text-accent" : "text-foreground/60"
       }`}
     >
+      {/* Spacer the width of a folder chevron, so leaf text lines up with the
+          section titles above/below it. */}
+      <span className="size-4 shrink-0" aria-hidden="true" />
       {node.title}
     </Link>
   );
@@ -158,7 +161,7 @@ function DocsFolder({
           onClick={toggle}
           aria-expanded={open}
           aria-label={open ? "Collapse section" : "Expand section"}
-          className="flex size-4 items-center justify-center"
+          className="flex size-4 shrink-0 items-center justify-center"
         >
           <Chevron open={open} />
         </button>
