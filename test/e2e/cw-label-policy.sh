@@ -8,14 +8,13 @@
 #
 # Needs: kubectl pointed at a cluster with the c8s chart installed.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 
 ns="cw-label-policy-check-$$"
 pod=probe
 
 cleanup() { kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true; }
 trap cleanup EXIT
-
-fail() { echo "FAIL: $*" >&2; exit 1; }
 
 expect_deny() {
   local what=$1; shift

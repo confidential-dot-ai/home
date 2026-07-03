@@ -1,6 +1,6 @@
 .PHONY: build install build-c8s build-c8s-node build-get-cert build-ratls-mesh \
        build-nri-image-policy build-policy-monitor \
-       test test-integration test-e2e-cw-label-policy vet fmt lint clean \
+       test test-integration test-e2e-cw-label-policy test-e2e-mesh-cw-enforcement vet fmt lint clean \
        manifests generate check-crd-chart install-controller-gen require-controller-gen
 
 CONTROLLER_GEN         ?= controller-gen
@@ -100,6 +100,12 @@ test-integration:
 # kubectl pointed at a cluster with the c8s chart installed.
 test-e2e-cw-label-policy:
 	./test/e2e/cw-label-policy.sh
+
+# Live-cluster check that the workload path is mesh-wrapped and plaintext
+# bypasses to cw pods fail closed. Needs kubectl pointed at a cluster with
+# the c8s chart installed and a Running confidential workload.
+test-e2e-mesh-cw-enforcement:
+	./test/e2e/mesh-cw-enforcement.sh
 
 # --- Linting ---
 
