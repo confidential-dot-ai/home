@@ -54,6 +54,44 @@ direct connections to the host-network listener are rejected unless the original
 destination is a known pod IP. The inbound listener only forwards to local
 non-hostNetwork pod IPs.
 
+### Confidential-workload inbound guard
+
+The flows the mesh does not intercept would otherwise reach pods in
+plaintext, including confidential workloads: a ClusterIP Service selecting
+cw pods hands kube-proxy a VIP the mesh never matches, and sources in
+`--exclude-source-namespaces` dial pod IPs directly. With
+`--enforce-cw-inbound` (chart: `ratlsMesh.cwInboundEnforcement.enabled`,
+default on), `iptables-sync` maintains an extra ipset of pod IPs labeled
+`confidential.ai/cw` and a filter-table chain (`RATLS-MESH-CW`, jumped from
+`FORWARD` position 1) that drops any connection to those IPs, all protocols
+(the mesh carries only TCP, so non-TCP inbound is unmeshed by definition).
+Replies to cw-pod egress pass via a conntrack `ESTABLISHED,RELATED` rule.
+
+Every legitimate delivery path avoids `FORWARD` and is unaffected: mesh
+delivery is a host-originated `OUTPUT` dial from the proxy UID, kubelet
+probes and host daemons are `OUTPUT`, and meshed pod-to-pod egress is
+DNAT'd to the node's outbound listener (`INPUT`) in `PREROUTING` before
+`FORWARD`. Dropped packets are counted in
+`ratls_mesh_iptables_cw_inbound_drops_total`.
+
+The guard has two structural preconditions: kube-proxy must be in
+iptables mode (so a Service VIP is DNAT'd to the cw pod IP *before*
+`FORWARD`), and the packet must traverse the host `FORWARD` hook. Under
+kube-proxy **IPVS** (or **nftables**) mode the director rewrites VIP
+traffic in `LOCAL_IN`/`LOCAL_OUT` without a nat-table DNAT, so a same-node
+VIP-to-cw-pod flow skips `FORWARD` and is not dropped. Verify with the e2e
+check on any cluster not running iptables-mode kube-proxy.
+
+What this defends: in-cluster plaintext bypass of confidential-workload
+pods — Services selecting cw pods, direct pod-IP dials from excluded or
+non-meshed sources, hostNetwork agents on other nodes. What it does not
+defend: the hypervisor or cloud provider (the CVM boundary's job), host
+root on the node itself (inside the node trust boundary; it delivers via
+`OUTPUT`), kube-proxy IPVS/nftables mode and CNIs whose datapath bypasses
+the host `FORWARD` hook (verified on iptables-mode kube-proxy with Azure
+CNI and kubenet at `bridge-nf-call-iptables=1`; run the e2e check on
+anything else), and L7 attacks through the legitimate mesh path.
+
 Inbound delivery is still protected by RA-TLS on the node-to-node leg. The
 only plaintext segment is the final host-to-local-pod dial on the destination
 node. When the host exposes local pod-network CIDRs, `ValidateLocalDest`
@@ -108,6 +146,7 @@ it intercepts. The flags below tune that loop.
 | `--resync-period` | `30s` | Periodic full ipset reconciliation interval |
 | `--watchdog-period` | `2s` | Interval for re-asserting base-chain jumps at position 1 |
 | `--ipset-maxelem` | `262144` | Maximum members per managed ipset |
+| `--enforce-cw-inbound` | `false` | Drop `FORWARD`-path traffic to `confidential.ai/cw`-labeled pod IPs (see "Confidential-workload inbound guard"). The chart passes this explicitly; the binary default keeps an image bump from changing node behavior |
 | `--ready-file` | `""` | Path written after the first successful pod cache, ipset, and iptables sync |
 | `--iptables-metrics-file` | `/tmp/ratls-iptables-metrics.json` | Shared file where `iptables-sync` publishes iptables/ipset counters for the proxy `/metrics` endpoint |
 | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
@@ -209,6 +248,7 @@ are starting points; tune to your scrape interval and pod churn.
 | `rate(ratls_mesh_iptables_jump_position_violations_total[5m])` | Watchdog confirmed our PREROUTING/OUTPUT jump was demoted out of position 1 — typically kube-proxy reinserting `KUBE-SERVICES` ahead of us. Occasional events are normal; a steady positive rate indicates a fight with kube-proxy. | Warn when rate > 1/min sustained for 10 min; tune `--watchdog-period` (default 2s) downward if necessary. |
 | `rate(ratls_mesh_iptables_jump_position_check_errors_total[5m])` | `iptables -S` failed during a watchdog tick. Watchdog reinserts defensively, so this is environmental noise, not a kube-proxy race. | Warn at a sustained rate to flag a stuck or busy `xtables.lock`. |
 | `rate(ratls_mesh_outbound_dest_rejected_total{reason="host_addr"}[5m])` | The host-network listener was reached with the node IP or loopback as the original destination — only possible by dialing `:15001` outside the iptables REDIRECT path. This is the security signal; there is no legitimate cause. | Warn on any sustained rate. |
+| `rate(ratls_mesh_iptables_cw_inbound_drops_total[5m]) > 0` | The cw inbound guard dropped packets: something dialed a confidential-workload pod outside the mesh — a Service VIP selecting cw pods, an excluded-namespace source, or a direct cross-node pod-IP dial. The workload is protected; the signal identifies a misconfigured or hostile client. | Warn on a sustained rate; investigate the source. |
 | `rate(ratls_mesh_outbound_dest_rejected_total{reason="unknown_pod"}[5m])` | The outbound listener saw a destination that is not in the resolver's podMap — usually informer skew during pod churn, or a kube-proxy DNAT race after jump demotion. A small steady rate is normal. | Warn only on sustained spikes correlated with pod churn or `iptables_jump_position_violations_total`. |
 | `time() - ratls_mesh_iptables_metrics_file_updated_at_seconds` | Seconds since the proxy last read a fresh snapshot from the iptables-sync sidecar. The sidecar's own watchdog/violation counters cannot signal a wedge after they stop being published; this gauge does. Gauge stays at 0 until the first successful read so cold-start alerts can filter on `> 0`. | Warn when `gauge > 0 and time() - gauge > 3 * <resync-period>` (default `> 90s`). |
 

@@ -445,6 +445,16 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 	if err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
 	}
+	// A hostNetwork pod shares the node IP, so it cannot be a mesh endpoint
+	// and the cw inbound guard (which keys on distinct pod IPs) cannot cover
+	// it: the confidential workload would serve plaintext on the node IP with
+	// no interception and no drop. Reject the contradictory combination at
+	// admission rather than let it onboard silently unprotected.
+	if inj != nil && pod.Spec.HostNetwork {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf(
+			"%w: %s pods must not set hostNetwork — a hostNetwork pod shares the node IP and cannot be mesh-intercepted or protected by the cw inbound guard",
+			errInvalidInjectionAnnotation, AnnotationWorkload))
+	}
 	if inj != nil && inj.SAN == "" {
 		// req.Namespace, not pod.Namespace: template-created pods reach
 		// admission with an empty metadata.namespace.

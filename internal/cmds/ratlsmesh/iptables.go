@@ -15,12 +15,30 @@ import (
 const chainName = "RATLS-MESH"
 const preroutingChainName = "RATLS-MESH-PREROUTING"
 
+// cwChainName is the filter-table chain that fails closed on inbound traffic
+// to confidential-workload pods (see buildCWGuardRules).
+const cwChainName = "RATLS-MESH-CW"
+
 const (
 	podIPSetName4      = "RATLS-MESH-PODS"
 	podIPSetName6      = "RATLS-MESH-PODS6"
 	localPodIPSetName4 = "RATLS-MESH-LOCAL-PODS"
 	localPodIPSetName6 = "RATLS-MESH-LOCAL-PODS6"
+	cwPodIPSetName4    = "RATLS-MESH-CW-PODS"
+	cwPodIPSetName6    = "RATLS-MESH-CW-PODS6"
 )
+
+// ipSetTmpSuffix names the transient set used for the atomic swap-restore.
+const ipSetTmpSuffix = "-TMP"
+
+// managedIPSetNames is the single source of truth for the ipsets this process
+// owns. reconcileLiveSetMaxElem and cleanupPodIPSets derive their name lists
+// (and the -TMP swap variants) from it, so adding a set is one edit here.
+var managedIPSetNames = []string{
+	podIPSetName4, podIPSetName6,
+	localPodIPSetName4, localPodIPSetName6,
+	cwPodIPSetName4, cwPodIPSetName6,
+}
 
 // defaultProxyUID is the UID under which the ratls-mesh sidecar proxy runs.
 // Traffic from this UID is excluded from iptables redirect to avoid loops.
@@ -199,6 +217,70 @@ func makeDNATRule(spec dnatRuleSpec) iptablesRule {
 		label:  label,
 		family: spec.family,
 		args:   args,
+	}
+}
+
+// buildCWGuardRules computes the filter-table rules that fail closed on
+// inbound traffic to confidential-workload pods: any connection that reaches
+// a cw pod IP via the FORWARD hook is by definition not mesh-delivered, so
+// it is dropped instead of arriving as plaintext (Service-VIP DNAT,
+// excluded-source-namespace dials, cross-node direct-to-pod-IP).
+//
+// INVARIANT: every legitimate delivery path avoids FORWARD. Mesh delivery is
+// a host-originated OUTPUT dial from the proxy UID; kubelet probes and other
+// host daemons are OUTPUT; meshed pod-to-pod egress is DNAT'd to the node's
+// outbound listener (INPUT) in PREROUTING before FORWARD; replies to
+// cw-pod-originated egress match the conntrack RETURN below.
+//
+// The conntrack rule uses RETURN, not ACCEPT, so CNI or NetworkPolicy rules
+// later in FORWARD still run. The drop has no -p match: the mesh carries
+// only TCP, so non-TCP inbound to a cw pod is unmeshed by definition.
+func buildCWGuardRules() []iptablesRule {
+	var rules []iptablesRule
+	for _, spec := range []struct {
+		family  iptablesFamily
+		setName string
+	}{
+		{iptablesFamilyIPv4, cwPodIPSetName4},
+		{iptablesFamilyIPv6, cwPodIPSetName6},
+	} {
+		rules = append(rules,
+			iptablesRule{
+				table:  "filter",
+				chain:  cwChainName,
+				label:  "cw-established-return",
+				family: spec.family,
+				args: []string{
+					"-m", "set", "--match-set", spec.setName, "dst",
+					"-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+					"-j", "RETURN",
+				},
+			},
+			iptablesRule{
+				table:  "filter",
+				chain:  cwChainName,
+				label:  "cw-inbound-drop",
+				family: spec.family,
+				args: []string{
+					"-m", "set", "--match-set", spec.setName, "dst",
+					"-j", "DROP",
+				},
+			},
+		)
+	}
+	return rules
+}
+
+// cwJumpRule returns the filter FORWARD jump into the cw guard chain. It must
+// sit at position 1: KUBE-FORWARD's mark-based ACCEPT would otherwise admit
+// DNAT'd Service traffic before the drop runs. Args must stay exactly
+// {"-j", cwChainName} — see the isJumpAtHead literal-compare note.
+func cwJumpRule() iptablesRule {
+	return iptablesRule{
+		table: "filter",
+		chain: "FORWARD",
+		label: "jump-forward-to-" + cwChainName,
+		args:  []string{"-j", cwChainName},
 	}
 }
 

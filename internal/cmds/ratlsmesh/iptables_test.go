@@ -198,10 +198,56 @@ func TestJumpRules(t *testing.T) {
 // in isJumpAtHead, and turn the watchdog into a reinsert-every-tick loop. Catch
 // the regression here instead of in a noisy production race.
 func TestJumpRulesArgsShape(t *testing.T) {
-	for i, jump := range jumpRules() {
+	for i, jump := range append(jumpRules(), cwJumpRule()) {
 		if len(jump.args) != 2 || jump.args[0] != "-j" {
 			t.Fatalf("jump %d args = %v; isJumpAtHead requires {\"-j\", <chain>}", i, jump.args)
 		}
+	}
+}
+
+func TestCWJumpRule(t *testing.T) {
+	jump := cwJumpRule()
+	if jump.table != "filter" {
+		t.Errorf("cw jump: table=%q, want filter", jump.table)
+	}
+	if jump.chain != "FORWARD" {
+		t.Errorf("cw jump: chain=%q, want FORWARD", jump.chain)
+	}
+	assertContains(t, "cw jump", jump.args, "-j", cwChainName)
+}
+
+func TestBuildCWGuardRules(t *testing.T) {
+	rules := buildCWGuardRules()
+	if len(rules) != 4 {
+		t.Fatalf("expected 4 rules (RETURN + DROP per family), got %d", len(rules))
+	}
+	for _, spec := range []struct {
+		family  iptablesFamily
+		setName string
+		ret     iptablesRule
+		drop    iptablesRule
+	}{
+		{iptablesFamilyIPv4, cwPodIPSetName4, rules[0], rules[1]},
+		{iptablesFamilyIPv6, cwPodIPSetName6, rules[2], rules[3]},
+	} {
+		for _, r := range []iptablesRule{spec.ret, spec.drop} {
+			if r.table != "filter" || r.chain != cwChainName {
+				t.Errorf("%s: table=%q chain=%q, want filter/%s", spec.family, r.table, r.chain, cwChainName)
+			}
+			if r.family != spec.family {
+				t.Errorf("rule family=%q, want %q", r.family, spec.family)
+			}
+			assertContains(t, "cw guard", r.args, "--match-set", spec.setName)
+			// No -p match: non-TCP inbound to a cw pod is unmeshed by
+			// definition and must also be dropped.
+			assertArgNotContains(t, "cw guard", r.args, "-p")
+		}
+		// The conntrack RETURN must precede the DROP so replies to cw-pod
+		// egress pass.
+		assertContains(t, "cw return", spec.ret.args, "--ctstate", "ESTABLISHED,RELATED")
+		assertContains(t, "cw return", spec.ret.args, "-j", "RETURN")
+		assertContains(t, "cw drop", spec.drop.args, "-j", "DROP")
+		assertArgNotContains(t, "cw drop", spec.drop.args, "--ctstate")
 	}
 }
 

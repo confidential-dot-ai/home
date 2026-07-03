@@ -45,6 +45,7 @@ type metrics struct {
 	iptablesJumpViolations   prometheus.Gauge
 	iptablesJumpCheckErrors  prometheus.Gauge
 	iptablesIPSetOverflows   prometheus.Gauge
+	iptablesCWInboundDrops   prometheus.Gauge
 	iptablesMetricsTimestamp prometheus.Gauge
 	resolverCacheSize        prometheus.Gauge
 	resolverLocalCIDRs       prometheus.Gauge
@@ -133,6 +134,10 @@ func newMetrics() *metrics {
 		Name: "ratls_mesh_iptables_ipset_overflow_total",
 		Help: "Sidecar-reported reconcile cycles where pod count exceeded --ipset-maxelem.",
 	})
+	m.iptablesCWInboundDrops = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "ratls_mesh_iptables_cw_inbound_drops_total",
+		Help: "Sidecar-reported packets dropped by the cw guard chain: non-mesh traffic that tried to reach a confidential-workload pod (Service VIP bypass, excluded-namespace or direct-to-pod-IP dials).",
+	})
 	m.iptablesMetricsTimestamp = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "ratls_mesh_iptables_metrics_file_updated_at_seconds",
 		Help: "Unix-seconds timestamp of the last sidecar metrics snapshot the proxy successfully read; 0 = never read.",
@@ -204,6 +209,7 @@ func newMetrics() *metrics {
 		m.iptablesJumpViolations,
 		m.iptablesJumpCheckErrors,
 		m.iptablesIPSetOverflows,
+		m.iptablesCWInboundDrops,
 		m.iptablesMetricsTimestamp,
 		m.resolverCacheSize,
 		m.resolverLocalCIDRs,
@@ -334,6 +340,7 @@ func (m *metrics) refreshIptablesMetrics(path string) error {
 	m.iptablesJumpViolations.Set(float64(snap.JumpPositionViolations))
 	m.iptablesJumpCheckErrors.Set(float64(snap.JumpPositionCheckErrors))
 	m.iptablesIPSetOverflows.Set(float64(snap.IPSetOverflows))
+	m.iptablesCWInboundDrops.Set(float64(snap.CWInboundDrops))
 	if snap.UpdatedAtUnixNano > 0 {
 		m.iptablesMetricsTimestamp.Set(float64(snap.UpdatedAtUnixNano / int64(time.Second)))
 	}

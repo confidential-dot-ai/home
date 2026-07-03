@@ -33,6 +33,13 @@ fail mTLS against a peer with no ratls sidecar. In-cluster Service-VIP traffic
 to those namespaces is unaffected because kube-proxy DNATs the VIP before the
 mesh chain matches.
 
+Confidential-workload pods (label `confidential.ai/cw`) get a stricter
+inbound posture: with `ratlsMesh.cwInboundEnforcement.enabled` (default on),
+the mesh drops FORWARD-path traffic to their pod IPs, so Service-VIP dials
+and excluded-namespace sources are blocked instead of reaching the workload
+in plaintext. Only mesh-delivered traffic and node-local host processes
+(kubelet probes) reach cw pods.
+
 ## Ownership model
 
 Installing the c8s chart is a platform-admin operation, not a fully

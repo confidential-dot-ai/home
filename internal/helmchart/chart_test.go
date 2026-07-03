@@ -238,6 +238,11 @@ func TestChartRendersRATLSHostRoutingDefaults(t *testing.T) {
 	if slices.Contains(sync.Command, "--pod-cidrs") {
 		t.Errorf("iptables-sync must not require static --pod-cidrs; command=%q", sync.Command)
 	}
+	// Fail-closed inbound guard for cw pods defaults on; the binary default
+	// is off, so the chart must pass the flag explicitly.
+	if !slices.Contains(sync.Command, "--enforce-cw-inbound=true") {
+		t.Errorf("iptables-sync command missing --enforce-cw-inbound=true; command=%q", sync.Command)
+	}
 
 	mesh, ok := findContainer(ds.Spec.Template.Spec.Containers, "ratls-mesh")
 	if !ok {
@@ -276,6 +281,23 @@ func TestChartRendersRATLSHostRoutingDefaults(t *testing.T) {
 
 	if kinds := renderedKinds(t, out); kinds["NetworkPolicy"] > 0 {
 		t.Errorf("ratls host routing must not render NetworkPolicy for hostNetwork pods; got %d", kinds["NetworkPolicy"])
+	}
+}
+
+func TestChartCWInboundEnforcementToggle(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "ratlsMesh.cwInboundEnforcement.enabled=false")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	ds := findRATLSMeshDaemonSet(t, out)
+	sync, ok := findContainer(ds.Spec.Template.Spec.InitContainers, "iptables-sync")
+	if !ok {
+		t.Fatalf("iptables-sync init container missing; have %v", containerNames(ds.Spec.Template.Spec.InitContainers))
+	}
+	// Rendered explicitly even when off, so the manifest self-documents the
+	// enforcement posture.
+	if !slices.Contains(sync.Command, "--enforce-cw-inbound=false") {
+		t.Errorf("iptables-sync command missing --enforce-cw-inbound=false; command=%q", sync.Command)
 	}
 }
 

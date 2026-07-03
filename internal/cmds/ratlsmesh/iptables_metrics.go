@@ -24,6 +24,7 @@ type iptablesMetricsSnapshot struct {
 	JumpPositionViolations  int64 `json:"jump_position_violations"`
 	JumpPositionCheckErrors int64 `json:"jump_position_check_errors"`
 	IPSetOverflows          int64 `json:"ipset_overflows"`
+	CWInboundDrops          int64 `json:"cw_inbound_drops"`
 	// UpdatedAtUnixNano is the wall-clock time the sidecar wrote this
 	// snapshot, used by the proxy to expose a freshness gauge so a wedged
 	// iptables-sync (file not advancing) shows up as a stale-timestamp
@@ -49,6 +50,7 @@ func currentIptablesMetricsSnapshot() iptablesMetricsSnapshot {
 		JumpPositionViolations:  iptablesJumpPositionViolations(),
 		JumpPositionCheckErrors: iptablesJumpPositionCheckErrors(),
 		IPSetOverflows:          iptablesIPSetOverflows(),
+		CWInboundDrops:          iptablesCWInboundDrops(),
 		UpdatedAtUnixNano:       time.Now().UnixNano(),
 	}
 }

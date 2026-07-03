@@ -73,6 +73,10 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 	}
 	rules := buildPodIPSetRules(cfg.outboundPort, cfg.uid, excludeUIDs, nodeIPsByFamily)
 	jumps := jumpRules()
+	if cfg.enforceCWInbound {
+		rules = append(rules, buildCWGuardRules()...)
+		jumps = append(jumps, cwJumpRule())
+	}
 
 	logger, err := certutil.NewJSONLogger(cfg.logLevel)
 	if err != nil {
@@ -121,11 +125,27 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 	if err := reconcileLiveSetMaxElem(logger, cfg.ipsetMaxElem); err != nil {
 		return err
 	}
-	if err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, excludedSourceNamespaces, cfg.ipsetMaxElem, logger); err != nil {
+	cwIPs, err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, excludedSourceNamespaces, cfg.ipsetMaxElem, cfg.enforceCWInbound, logger)
+	if err != nil {
 		return err
 	}
 	if err := installIptablesRules(logger, rules, jumps); err != nil {
 		return err
+	}
+	if cfg.enforceCWInbound {
+		// The guard now fails closed only for NEW flows; tear down conntrack
+		// for existing connections to cw pods so pre-enforcement plaintext
+		// flows (and any that raced the chain-flush-then-append window in
+		// installIptablesRules) must re-establish through the DROP instead of
+		// being grandfathered by the ESTABLISHED,RELATED RETURN rule.
+		flushCWConntrack(logger, cwIPs)
+	} else {
+		// Converge on->off without a manual uninstall: the guard chain was
+		// flushed by the install above (it is a managed chain), but a stale
+		// FORWARD jump from a prior enforcing run must go too.
+		for _, ipt := range iptablesClients() {
+			deleteAllIptablesRules(logger, ipt, cwJumpRule())
+		}
 	}
 	publishIptablesMetrics(logger)
 	if cfg.readyFile != "" {
@@ -143,9 +163,15 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 	// VIP traffic could be DNAT'd before our chain runs.
 	go runJumpWatchdog(ctx, logger, jumps, cfg.watchdogPeriod)
 
+	// prevCWIPs lets each reconcile flush conntrack only for cw pod IPs that
+	// newly entered the set, keeping the guard fail-closed as workloads are
+	// (re)labeled without re-flushing the whole set every tick.
+	prevCWIPs := stringSet(cwIPs)
+
 	ticker := time.NewTicker(cfg.resyncPeriod)
 	defer ticker.Stop()
 	for {
+		resync := false
 		select {
 		case <-ctx.Done():
 			// Deliberately no teardown here. Graceful shutdown is owned by the
@@ -158,14 +184,49 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 			// flushes the managed chains before reinstalling.
 			return nil
 		case <-ticker.C:
+			resync = true
 		case <-syncCh:
 		}
-		if err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, excludedSourceNamespaces, cfg.ipsetMaxElem, logger); err != nil {
+		cwIPs, err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, excludedSourceNamespaces, cfg.ipsetMaxElem, cfg.enforceCWInbound, logger)
+		if err != nil {
 			logger.Warn("pod ipset sync failed", "error", err)
 			continue
 		}
+		if cfg.enforceCWInbound {
+			curr := stringSet(cwIPs)
+			flushCWConntrack(logger, newMembers(prevCWIPs, curr))
+			prevCWIPs = curr
+			// Drop counters change only on packet hits, not pod events, so
+			// refresh on the resync tick rather than every event-driven sync
+			// (which would fork iptables and take the xtables lock during
+			// churn, contending with kube-proxy and the jump watchdog).
+			if resync {
+				if err := refreshCWInboundDrops(); err != nil {
+					logger.Warn("cw drop counter read failed", "error", err)
+				}
+			}
+		}
 		publishIptablesMetrics(logger)
 	}
+}
+
+func stringSet(ss []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(ss))
+	for _, s := range ss {
+		m[s] = struct{}{}
+	}
+	return m
+}
+
+// newMembers returns the elements of curr not present in prev.
+func newMembers(prev, curr map[string]struct{}) []string {
+	var out []string
+	for s := range curr {
+		if _, ok := prev[s]; !ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func resetReadyFile(path string) error {
@@ -193,29 +254,47 @@ func runJumpWatchdog(ctx context.Context, logger *slog.Logger, jumps []iptablesR
 	}
 }
 
-func reconcilePodIPSets(store cache.Store, nodeIPs []string, excludedSourceNamespaces map[string]struct{}, ipsetMaxElem int, logger *slog.Logger) error {
-	sets := collectPodIPSetMembers(store.List(), nodeIPs, excludedSourceNamespaces)
+type ipSetSpec struct {
+	name    string
+	family  string
+	members []string
+	label   string
+}
+
+// reconcilePodIPSets rewrites the managed ipsets from the pod cache. The cw
+// sets are only computed and written when enforceCWInbound is set: nothing
+// references them otherwise, so an unenforcing node does no cw ipset work.
+// reconcilePodIPSets returns the cw pod IPs it wrote (empty when enforcement
+// is off) so the caller can flush their conntrack entries and keep the guard
+// fail-closed across membership changes.
+func reconcilePodIPSets(store cache.Store, nodeIPs []string, excludedSourceNamespaces map[string]struct{}, ipsetMaxElem int, enforceCWInbound bool, logger *slog.Logger) ([]string, error) {
+	sets := collectPodIPSetMembers(store.List(), nodeIPs, excludedSourceNamespaces, enforceCWInbound)
 	if sets.exceeds(ipsetMaxElem) {
 		ipsetOverflows.Add(1)
 		publishIptablesMetrics(logger)
 	}
-	for _, spec := range []struct {
-		name    string
-		family  string
-		members []string
-		label   string
-	}{
+	specs := []ipSetSpec{
 		{podIPSetName4, "inet", sets.allIPv4, "IPv4 pod ipset"},
 		{podIPSetName6, "inet6", sets.allIPv6, "IPv6 pod ipset"},
 		{localPodIPSetName4, "inet", sets.localIPv4, "local IPv4 pod ipset"},
 		{localPodIPSetName6, "inet6", sets.localIPv6, "local IPv6 pod ipset"},
-	} {
+	}
+	if enforceCWInbound {
+		specs = append(specs,
+			ipSetSpec{cwPodIPSetName4, "inet", sets.cwIPv4, "IPv4 cw pod ipset"},
+			ipSetSpec{cwPodIPSetName6, "inet6", sets.cwIPv6, "IPv6 cw pod ipset"},
+		)
+	}
+	for _, spec := range specs {
 		if err := replaceIPSetMembers(logger, spec.name, spec.family, spec.members, ipsetMaxElem); err != nil {
-			return fmt.Errorf("sync %s: %w", spec.label, err)
+			return nil, fmt.Errorf("sync %s: %w", spec.label, err)
 		}
 	}
-	logger.Debug("pod ipsets reconciled", "ipv4", len(sets.allIPv4), "ipv6", len(sets.allIPv6), "local_ipv4", len(sets.localIPv4), "local_ipv6", len(sets.localIPv6))
-	return nil
+	logger.Debug("pod ipsets reconciled", "ipv4", len(sets.allIPv4), "ipv6", len(sets.allIPv6), "local_ipv4", len(sets.localIPv4), "local_ipv6", len(sets.localIPv6), "cw_ipv4", len(sets.cwIPv4), "cw_ipv6", len(sets.cwIPv6))
+	if !enforceCWInbound {
+		return nil, nil
+	}
+	return append(append([]string{}, sets.cwIPv4...), sets.cwIPv6...), nil
 }
 
 type podIPSetMembers struct {
@@ -223,16 +302,20 @@ type podIPSetMembers struct {
 	allIPv6   []string
 	localIPv4 []string
 	localIPv6 []string
+	cwIPv4    []string
+	cwIPv6    []string
 }
 
 func (m podIPSetMembers) exceeds(maxElem int) bool {
 	return len(m.allIPv4) > maxElem ||
 		len(m.allIPv6) > maxElem ||
 		len(m.localIPv4) > maxElem ||
-		len(m.localIPv6) > maxElem
+		len(m.localIPv6) > maxElem ||
+		len(m.cwIPv4) > maxElem ||
+		len(m.cwIPv6) > maxElem
 }
 
-func collectPodIPSetMembers(objs []interface{}, nodeIPs []string, excludedSourceNamespaces map[string]struct{}) podIPSetMembers {
+func collectPodIPSetMembers(objs []interface{}, nodeIPs []string, excludedSourceNamespaces map[string]struct{}, collectCW bool) podIPSetMembers {
 	ourNodeIPs := make(map[string]struct{}, len(nodeIPs))
 	for _, ip := range nodeIPs {
 		if canon := normalizeIP(ip); canon != "" {
@@ -243,6 +326,8 @@ func collectPodIPSetMembers(objs []interface{}, nodeIPs []string, excludedSource
 	v6Set := make(map[string]struct{})
 	localV4Set := make(map[string]struct{})
 	localV6Set := make(map[string]struct{})
+	cwV4Set := make(map[string]struct{})
+	cwV6Set := make(map[string]struct{})
 	add := func(value string, v4Target, v6Target map[string]struct{}) {
 		ip := net.ParseIP(value)
 		if ip == nil {
@@ -261,10 +346,18 @@ func collectPodIPSetMembers(objs []interface{}, nodeIPs []string, excludedSource
 			continue
 		}
 		localSource := podIsLocal(pod, ourNodeIPs) && podEligibleForMeshSource(pod, excludedSourceNamespaces)
+		// cw membership is cluster-wide, mirroring the all-pods sets: the
+		// FORWARD guard then also drops at the source node when a Service
+		// VIP is DNAT'd toward a cw pod on another node. Only computed when
+		// enforcement is on; the sets are unreferenced otherwise.
+		cw := collectCW && podIsConfidentialWorkload(pod)
 		for _, ip := range podStatusIPs(pod) {
 			add(ip, v4Set, v6Set)
 			if localSource {
 				add(ip, localV4Set, localV6Set)
+			}
+			if cw {
+				add(ip, cwV4Set, cwV6Set)
 			}
 		}
 	}
@@ -274,6 +367,8 @@ func collectPodIPSetMembers(objs []interface{}, nodeIPs []string, excludedSource
 		allIPv6:   sortedKeys(v6Set),
 		localIPv4: sortedKeys(localV4Set),
 		localIPv6: sortedKeys(localV6Set),
+		cwIPv4:    sortedKeys(cwV4Set),
+		cwIPv6:    sortedKeys(cwV6Set),
 	}
 }
 
@@ -430,7 +525,7 @@ func sortedKeys(values map[string]struct{}) []string {
 // returns early when no maxelem changed; installIptablesRules handles
 // chain flushing on every other path.
 func reconcileLiveSetMaxElem(logger *slog.Logger, desiredMaxElem int) error {
-	names := []string{podIPSetName4, podIPSetName6, localPodIPSetName4, localPodIPSetName6}
+	names := managedIPSetNames
 	mismatched := make([]string, 0, len(names))
 	priorMaxElem := make(map[string]int, len(names))
 	for _, name := range names {
@@ -505,7 +600,7 @@ func parseIPSetMaxElemHeader(out string) (int, error) {
 }
 
 func replaceIPSetMembers(logger *slog.Logger, name, family string, ips []string, maxElem int) error {
-	tmpName := name + "-TMP"
+	tmpName := name + ipSetTmpSuffix
 	restoreScript, err := buildIPSetRestoreScript(name, family, ips, maxElem)
 	if err != nil {
 		return err
@@ -535,7 +630,7 @@ func buildIPSetRestoreScript(name, family string, ips []string, maxElem int) (st
 	if len(ips) > maxElem {
 		return "", fmt.Errorf("ipset %s has %d members, exceeds maxelem %d", name, len(ips), maxElem)
 	}
-	tmpName := name + "-TMP"
+	tmpName := name + ipSetTmpSuffix
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "create %s hash:ip family %s maxelem %d -exist\n", name, family, maxElem)
 	fmt.Fprintf(&buf, "create %s hash:ip family %s maxelem %d\n", tmpName, family, maxElem)
@@ -549,12 +644,11 @@ func buildIPSetRestoreScript(name, family string, ips []string, maxElem int) (st
 }
 
 func cleanupPodIPSets(logger *slog.Logger) {
-	for _, name := range []string{
-		podIPSetName4, podIPSetName6,
-		localPodIPSetName4, localPodIPSetName6,
-		podIPSetName4 + "-TMP", podIPSetName6 + "-TMP",
-		localPodIPSetName4 + "-TMP", localPodIPSetName6 + "-TMP",
-	} {
+	names := make([]string, 0, len(managedIPSetNames)*2)
+	for _, name := range managedIPSetNames {
+		names = append(names, name, name+ipSetTmpSuffix)
+	}
+	for _, name := range names {
 		if err := runIPSetCmd([]string{"destroy", name}); err != nil {
 			logger.Warn("delete ipset failed (may not exist)", "set", name, "error", err)
 		} else {

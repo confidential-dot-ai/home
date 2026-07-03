@@ -31,11 +31,20 @@ func parseExcludeUIDs(excludeUIDsStr string) ([]uint32, error) {
 	return excludeUIDs, nil
 }
 
-var managedChainNames = []string{chainName, preroutingChainName}
+type managedChain struct {
+	table string
+	chain string
+}
+
+var managedChains = []managedChain{
+	{"nat", chainName},
+	{"nat", preroutingChainName},
+	{"filter", cwChainName},
+}
 
 // iptablesV4 and iptablesV6 are the per-protocol netfilter clients used for
-// every NAT-table mutation. Set once at the top of runIptablesSync /
-// runIptablesCleanup and treated as immutable thereafter.
+// every nat- and filter-table mutation. Set once at the top of
+// runIptablesSync / runIptablesCleanup and treated as immutable thereafter.
 var (
 	iptablesV4 *iptables.IPTables
 	iptablesV6 *iptables.IPTables
@@ -105,16 +114,16 @@ func installIptablesRules(logger *slog.Logger, rules []iptablesRule, jumps []ipt
 func flushManagedIptablesChains(logger *slog.Logger) error {
 	for _, ipt := range iptablesClients() {
 		bin := iptablesLabel(ipt)
-		for _, chain := range managedChainNames {
-			if err := ipt.NewChain("nat", chain); err != nil {
-				logger.Debug("chain already exists (expected on restart)", "bin", bin, "chain", chain)
+		for _, mc := range managedChains {
+			if err := ipt.NewChain(mc.table, mc.chain); err != nil {
+				logger.Debug("chain already exists (expected on restart)", "bin", bin, "chain", mc.chain)
 			} else {
-				logger.Info("chain created", "bin", bin, "chain", chain)
+				logger.Info("chain created", "bin", bin, "chain", mc.chain)
 			}
-			if err := ipt.ClearChain("nat", chain); err != nil {
-				return fmt.Errorf("flush chain %s on %s: %w", chain, bin, err)
+			if err := ipt.ClearChain(mc.table, mc.chain); err != nil {
+				return fmt.Errorf("flush chain %s on %s: %w", mc.chain, bin, err)
 			}
-			logger.Info("chain flushed", "bin", bin, "chain", chain)
+			logger.Info("chain flushed", "bin", bin, "chain", mc.chain)
 		}
 	}
 	return nil
@@ -225,6 +234,33 @@ func iptablesJumpPositionCheckErrors() int64 {
 	return jumpPositionCheckErrors.Load()
 }
 
+// cwInboundDrops mirrors the kernel packet counters of the cw guard chain's
+// DROP rules. Absolute values, reset when the chain is flushed on restart —
+// same reset semantics as the other sidecar counters, which the proxy
+// exposes as gauges for that reason.
+var cwInboundDrops atomic.Int64
+
+func iptablesCWInboundDrops() int64 {
+	return cwInboundDrops.Load()
+}
+
+func refreshCWInboundDrops() error {
+	var total uint64
+	for _, ipt := range iptablesClients() {
+		stats, err := ipt.StructuredStats("filter", cwChainName)
+		if err != nil {
+			return fmt.Errorf("read %s stats on %s: %w", cwChainName, iptablesLabel(ipt), err)
+		}
+		for _, s := range stats {
+			if s.Target == "DROP" {
+				total += s.Packets
+			}
+		}
+	}
+	cwInboundDrops.Store(int64(total))
+	return nil
+}
+
 func runIptablesCleanup() error {
 	logger, err := certutil.NewJSONLogger("info")
 	if err != nil {
@@ -234,7 +270,9 @@ func runIptablesCleanup() error {
 	if err := initIptablesClients(); err != nil {
 		return err
 	}
-	jumps := jumpRules()
+	// Cleanup always covers the cw guard jump regardless of the enforcement
+	// flag, so an on->off config change converges on the next rollout.
+	jumps := append(jumpRules(), cwJumpRule())
 
 	for _, ipt := range iptablesClients() {
 		bin := iptablesLabel(ipt)
@@ -242,14 +280,14 @@ func runIptablesCleanup() error {
 			deleteAllIptablesRules(logger, ipt, jump)
 		}
 
-		for _, chain := range managedChainNames {
-			if err := ipt.ClearChain("nat", chain); err != nil {
-				logger.Warn("flush chain failed (may not exist)", "bin", bin, "chain", chain)
+		for _, mc := range managedChains {
+			if err := ipt.ClearChain(mc.table, mc.chain); err != nil {
+				logger.Warn("flush chain failed (may not exist)", "bin", bin, "chain", mc.chain)
 			}
-			if err := ipt.DeleteChain("nat", chain); err != nil {
-				logger.Warn("delete chain failed (may not exist)", "bin", bin, "chain", chain)
+			if err := ipt.DeleteChain(mc.table, mc.chain); err != nil {
+				logger.Warn("delete chain failed (may not exist)", "bin", bin, "chain", mc.chain)
 			} else {
-				logger.Info("chain removed", "bin", bin, "chain", chain)
+				logger.Info("chain removed", "bin", bin, "chain", mc.chain)
 			}
 		}
 	}

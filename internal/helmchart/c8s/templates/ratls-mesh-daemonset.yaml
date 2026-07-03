@@ -169,6 +169,7 @@ spec:
             - {{ .Values.ratlsMesh.iptablesSync.watchdogPeriod | quote }}
             - --ipset-maxelem
             - {{ .Values.ratlsMesh.iptablesSync.ipsetMaxElem | quote }}
+            - --enforce-cw-inbound={{ .Values.ratlsMesh.cwInboundEnforcement.enabled }}
             - --ready-file
             - /tmp/ratls-iptables-ready
             - --iptables-metrics-file

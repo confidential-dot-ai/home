@@ -556,6 +556,16 @@ ratlsMesh:
   # UIDs excluded from iptables redirect (comma-separated)
   excludeUids: "0"
 
+  # Fail-closed inbound guard for confidential workloads: drop FORWARD-path
+  # traffic to pods labeled confidential.ai/cw. The mesh cannot intercept
+  # Service-VIP traffic, so without this guard a ClusterIP Service selecting
+  # cw pods (or a dial from an excluded source namespace) reaches the
+  # workload in plaintext. With it, those flows are dropped; mesh delivery,
+  # kubelet probes, and replies to pod egress are unaffected because none of
+  # them traverse the FORWARD hook.
+  cwInboundEnforcement:
+    enabled: true
+
   # Certificate settings
   certMode: cds  # self-signed | cds
   certTtl: "4h"
@@ -608,6 +618,8 @@ ratlsMesh:
     # The release namespace is intentionally NOT excluded: tee-proxy's egress
     # to workload pod IPs must be intercepted to get attested mTLS, and
     # control-plane traffic dials Service VIPs the mesh never intercepts.
+    # With cwInboundEnforcement, excluded sources are blocked from reaching
+    # confidential-workload pods entirely, not left plaintext.
     excludeSourceNamespaces:
       - kube-system
     resyncPeriod: 30s

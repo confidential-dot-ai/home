@@ -57,7 +57,7 @@ func TestCollectPodIPSetMembersSkipsHostNetworkAndDeduplicates(t *testing.T) {
 				PodIP:  "10.244.0.8",
 			},
 		},
-	}, []string{"10.0.0.1"}, parseExcludedNamespaces("kube-system"))
+	}, []string{"10.0.0.1"}, parseExcludedNamespaces("kube-system"), true)
 
 	if want := []string{"10.244.0.5", "10.244.0.6", "10.244.0.7"}; !reflect.DeepEqual(sets.allIPv4, want) {
 		t.Fatalf("IPv4 pod IPs = %#v, want %#v", sets.allIPv4, want)
@@ -70,6 +70,69 @@ func TestCollectPodIPSetMembersSkipsHostNetworkAndDeduplicates(t *testing.T) {
 	}
 	if want := []string{"fd00::5"}; !reflect.DeepEqual(sets.localIPv6, want) {
 		t.Fatalf("local IPv6 pod IPs = %#v, want %#v", sets.localIPv6, want)
+	}
+}
+
+func TestCollectPodIPSetMembersCWPods(t *testing.T) {
+	cwLabels := map[string]string{labelConfidentialWorkload: "vllm"}
+	sets := collectPodIPSetMembers([]interface{}{
+		// Local cw pod: in the cw sets and the regular sets.
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Labels: cwLabels},
+			Status: corev1.PodStatus{
+				HostIP: "10.0.0.1",
+				PodIPs: []corev1.PodIP{{IP: "10.244.0.5"}, {IP: "fd00::5"}},
+			},
+		},
+		// Remote cw pod: membership is cluster-wide.
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Labels: cwLabels},
+			Status: corev1.PodStatus{
+				HostIP: "10.0.0.2",
+				PodIP:  "10.244.1.9",
+			},
+		},
+		// Unlabeled pod: regular sets only.
+		&corev1.Pod{
+			Status: corev1.PodStatus{
+				HostIP: "10.0.0.1",
+				PodIP:  "10.244.0.6",
+			},
+		},
+		// Empty label value: not a cw pod (managed Service selectors never
+		// match an empty cw id).
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelConfidentialWorkload: ""}},
+			Status: corev1.PodStatus{
+				HostIP: "10.0.0.1",
+				PodIP:  "10.244.0.7",
+			},
+		},
+		// hostNetwork and completed cw pods: excluded like everywhere else.
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Labels: cwLabels},
+			Spec:       corev1.PodSpec{HostNetwork: true},
+			Status: corev1.PodStatus{
+				PodIP: "10.0.0.10",
+			},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Labels: cwLabels},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodSucceeded,
+				PodIP: "10.244.0.8",
+			},
+		},
+	}, []string{"10.0.0.1"}, parseExcludedNamespaces("kube-system"), true)
+
+	if want := []string{"10.244.0.5", "10.244.1.9"}; !reflect.DeepEqual(sets.cwIPv4, want) {
+		t.Fatalf("cw IPv4 pod IPs = %#v, want %#v", sets.cwIPv4, want)
+	}
+	if want := []string{"fd00::5"}; !reflect.DeepEqual(sets.cwIPv6, want) {
+		t.Fatalf("cw IPv6 pod IPs = %#v, want %#v", sets.cwIPv6, want)
+	}
+	if want := []string{"10.244.0.5", "10.244.0.6", "10.244.0.7", "10.244.1.9"}; !reflect.DeepEqual(sets.allIPv4, want) {
+		t.Fatalf("IPv4 pod IPs = %#v, want %#v", sets.allIPv4, want)
 	}
 }
 

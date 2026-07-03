@@ -176,6 +176,20 @@ spec:
               ratls_mesh_iptables_jump_position_check_errors_total
               which signals environmental noise (xtables.lock).
 
+        - alert: RATLSMeshCWInboundDrops
+          expr: rate(ratls_mesh_iptables_cw_inbound_drops_total[5m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "RA-TLS mesh dropping non-mesh traffic to cw pods on {{`{{ $labels.instance }}`}}"
+            description: >-
+              The cw guard chain is dropping packets: something is dialing
+              confidential-workload pods outside the mesh — a Service VIP
+              selecting cw pods, a dial from an excluded source namespace,
+              or a direct cross-node pod-IP dial. The workload is protected;
+              investigate the client.
+
         - alert: RATLSMeshHighMemory
           expr: |
             container_memory_working_set_bytes{namespace="{{ .Release.Namespace }}", container="ratls-mesh"}

@@ -527,6 +527,65 @@ func TestHandleDerivesServiceSAN(t *testing.T) {
 	}
 }
 
+// TestHandleRejectsCWHostNetwork proves a cw-annotated hostNetwork pod is
+// denied: it shares the node IP so it cannot be mesh-intercepted or covered by
+// the cw inbound guard, and must not onboard silently unprotected.
+func TestHandleRejectsCWHostNetwork(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	m := &podMutator{
+		decoder: admission.NewDecoder(scheme),
+		cfg: Config{
+			GetCertImage: "ghcr.io/confidential-dot-ai/c8s-operator:test",
+			CDSURL:       "http://cds.c8s-system.svc:8443",
+			CertDir:      "/etc/c8s/certs",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+		Spec:       corev1.PodSpec{HostNetwork: true, Containers: []corev1.Container{{Name: "app"}}},
+	}
+	raw, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := m.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Namespace: "default",
+			Object:    runtime.RawExtension{Raw: raw},
+		},
+	})
+	if resp.Allowed {
+		t.Fatal("Handle admitted a cw hostNetwork pod; want denial")
+	}
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "hostNetwork") {
+		t.Fatalf("denial message = %+v, want it to mention hostNetwork", resp.Result)
+	}
+}
+
+// A hostNetwork pod WITHOUT the cw annotation is untouched: the guardrail is
+// scoped to opted-in workloads, not every hostNetwork pod on the cluster.
+func TestHandleAllowsPlainHostNetwork(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	m := &podMutator{decoder: admission.NewDecoder(scheme), cfg: Config{}.withDefaults()}
+	pod := &corev1.Pod{Spec: corev1.PodSpec{HostNetwork: true, Containers: []corev1.Container{{Name: "app"}}}}
+	raw, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := m.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{Namespace: "default", Object: runtime.RawExtension{Raw: raw}},
+	})
+	if !resp.Allowed {
+		t.Fatalf("Handle denied a plain hostNetwork pod: %v", resp.Result)
+	}
+}
+
 // initContainersPatch decodes the /spec/initContainers patch op from an
 // admission response into typed containers.
 func initContainersPatch(t *testing.T, resp admission.Response) []corev1.Container {

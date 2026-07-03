@@ -28,6 +28,16 @@ func parseExcludedNamespaces(raw string) map[string]struct{} {
 	return out
 }
 
+// labelConfidentialWorkload is the pod label the injection webhook mirrors
+// from the confidential.ai/cw annotation. Must equal webhook.LabelWorkload;
+// a unit test asserts the two stay in sync so this package needs no runtime
+// dependency on the webhook package.
+const labelConfidentialWorkload = "confidential.ai/cw"
+
+func podIsConfidentialWorkload(pod *corev1.Pod) bool {
+	return pod.Labels[labelConfidentialWorkload] != ""
+}
+
 func podEligibleForMeshEndpoint(pod *corev1.Pod) bool {
 	if pod.Spec.HostNetwork {
 		return false
