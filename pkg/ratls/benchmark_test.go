@@ -47,18 +47,6 @@ func BenchmarkCreateAttestedCert(b *testing.B) {
 	}
 }
 
-func BenchmarkCheckKeyBinding(b *testing.B) {
-	key, reportData, _ := GenerateKeyPair()
-	att := &Attestation{
-		TEEType: TEETypeSEVSNP,
-		Report:  fakeSNPReport(reportData),
-	}
-	b.ResetTimer()
-	for b.Loop() {
-		_ = CheckKeyBinding(&key.PublicKey, att, nil)
-	}
-}
-
 func BenchmarkMarshalExtension(b *testing.B) {
 	reportData := [64]byte{1, 2, 3, 4}
 	att := &Attestation{

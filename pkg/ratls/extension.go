@@ -81,15 +81,17 @@ type Attestation struct {
 	// For SEV-SNP: 1184 bytes (AMD ATTESTATION_REPORT structure).
 	// For TDX: variable-length TDREPORT/Quote.
 	Report []byte
-	// CertChain is the DER-encoded certificate chain for offline verification.
+	// CertChain is the DER-encoded certificate chain.
 	// For SEV-SNP: VCEK || ASK || ARK (concatenated DER certificates).
-	// If empty, the verifier must fetch certificates from AMD KDS online.
+	// Not read by [VerifyAttestation], which delegates to the attestation-api;
+	// the c8s verify CLI forwards an inline VCEK to its in-process verifier
+	// instead of fetching it from AMD KDS when present.
 	CertChain []byte
 
-	// embedded is the parsed attestation-api envelope when Report was
-	// produced by a verifier-requires-online path (e.g. az-snp). Populated
-	// by UnmarshalExtension; nil means the Report holds a raw hardware
-	// report that can be verified offline.
+	// embedded is the parsed attestation-api envelope when Report carries a
+	// full evidence envelope (e.g. az-snp, tdx). Populated by
+	// UnmarshalExtension; nil means Report holds a raw bare-metal SNP report,
+	// which verifyReport wraps in the "snp" envelope for /verify.
 	embedded *types.AttestationEvidence
 }
 
@@ -148,12 +150,13 @@ func UnmarshalExtension(der []byte) (*Attestation, error) {
 		CertChain: raw.CertChain,
 	}
 
-	// Auto-detect JSON envelope for the online-verification path. SEV-SNP
-	// covers both offline (bare-metal, raw report bytes) and online (az-snp,
-	// JSON envelope) — so we probe first and only normalize the raw SNP
-	// report shape when no envelope is present. TDX always takes the online
-	// path (the in-process Go parser is intentionally not carried; see
-	// verifyTDXOnline in verify.go), so an envelope is required.
+	// Auto-detect the JSON evidence envelope. SEV-SNP may carry either a
+	// full envelope (az-snp) or raw report bytes (bare-metal), so probe
+	// first and only normalize the raw SNP report shape when no envelope is
+	// present; verification wraps the raw report in the "snp" envelope for
+	// attestation-api /verify. TDX has no raw-bytes shape (no in-process Go
+	// parser is carried; see verifyTDXOnline in verify.go), so an envelope
+	// is required.
 	embedded, err := parseEmbeddedEvidence(raw.Report)
 	if err != nil {
 		return nil, err
@@ -178,7 +181,8 @@ func UnmarshalExtension(der []byte) (*Attestation, error) {
 // platform-specific evidence) embedded in the certificate, and true, when the
 // Report carries a JSON envelope rather than a raw hardware report (e.g. az-snp,
 // where verification forwards the envelope to the attestation-api). It returns
-// false when the Report holds a raw offline-verifiable report.
+// false when the Report holds a raw hardware report, which verification wraps
+// in the "snp" envelope before forwarding.
 func (a *Attestation) EmbeddedEvidence() (types.AttestationEvidence, bool) {
 	if a.embedded == nil {
 		return types.AttestationEvidence{}, false

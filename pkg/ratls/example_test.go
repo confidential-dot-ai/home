@@ -100,29 +100,3 @@ func ExampleGenerateKeyPair() {
 	// key curve: P-256
 	// reportData length: 64 bytes
 }
-
-func ExampleCheckKeyBinding() {
-	key, reportData, err := ratls.GenerateKeyPair()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	att := &ratls.Attestation{
-		TEEType: ratls.TEETypeSEVSNP,
-		Report:  makeFakeReport(reportData),
-	}
-
-	err = ratls.CheckKeyBinding(&key.PublicKey, att, nil)
-	fmt.Printf("binding valid: %v\n", err == nil)
-	// Output: binding valid: true
-}
-
-// makeFakeReport creates a minimal fake SNP report with the given reportData
-// at the correct offset. For example purposes only.
-func makeFakeReport(reportData [64]byte) []byte {
-	report := make([]byte, ratls.SNPReportSize)
-	report[0] = 0x02    // version
-	report[0x0A] = 0x03 // SMT policy bit
-	copy(report[0x50:], reportData[:])
-	return report
-}

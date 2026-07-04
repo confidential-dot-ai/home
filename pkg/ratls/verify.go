@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/sha512"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -14,16 +13,13 @@ import (
 
 	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
-	sabi "github.com/google/go-sev-guest/abi"
-	spb "github.com/google/go-sev-guest/proto/sevsnp"
-	"github.com/google/go-sev-guest/validate"
-	"github.com/google/go-sev-guest/verify"
 )
 
 // VerifyPolicy defines what attestation claims are acceptable.
 type VerifyPolicy struct {
 	// Measurements is the set of acceptable launch measurements (48 bytes each).
 	// If empty, any measurement is accepted (UNSAFE — use only for development).
+	// Enforced on the SNP path only; ignored for TDX (see verifyTDXOnline).
 	Measurements [][]byte
 
 	// MinTCBVersion is the minimum acceptable platform TCB version.
@@ -31,17 +27,12 @@ type VerifyPolicy struct {
 	// (bootloader, TEE, reserved, snp, microcode, etc.) — each component
 	// of the current TCB must be >= the corresponding minimum.
 	// If zero, any TCB version is accepted.
+	// Enforced on the SNP path only; ignored for TDX (see verifyTDXOnline).
 	MinTCBVersion uint64
 
 	// AllowDebug controls whether debug-mode guests are accepted.
 	// Default: false (reject debug guests).
 	AllowDebug bool
-
-	// RequireSMT requires the SNP guest policy to allow SMT
-	// (Simultaneous Multi-Threading).
-	// SMT is otherwise allowed by default, matching the upstream SEV-SNP
-	// verifier's guest-policy model and common CVM cloud behavior.
-	RequireSMT bool
 
 	// Nonce, when set, is verified against the attestation report's REPORTDATA.
 	// REPORTDATA must equal hash(pubkey || nonce). Use when both sides agree on
@@ -49,10 +40,10 @@ type VerifyPolicy struct {
 	// check is performed (TLS 1.3 already provides replay protection).
 	Nonce []byte
 
-	// AttestationApiURL enables online verification for evidence formats
-	// that cannot be verified from the SNP report alone. AKS az-snp binds the
-	// caller nonce through the TPM quote, so verifiers must call the local
-	// attestation-api /verify endpoint for those RA-TLS extensions.
+	// AttestationApiURL is the attestation-api whose /verify endpoint performs
+	// all evidence verification: hardware signature chain, REPORTDATA key
+	// binding, debug policy, and minimum TCB. Required: there is no
+	// in-process verification path; verification without it fails closed.
 	//
 	// SECURITY: the /verify response is currently not signed; the verifier
 	// trusts whatever this URL returns. Operators MUST point this at an
@@ -70,58 +61,34 @@ type VerifyPolicy struct {
 type VerifyResult struct {
 	// TEEType is the platform type.
 	TEEType TEEType
-	// ReportData is the 64-byte REPORTDATA field from the attestation report.
+	// ReportData is the 64-byte expected REPORTDATA that the attestation-api
+	// confirmed the report is bound to (the api returns only a match verdict,
+	// not the report bytes, so this echoes the verified expectation). Only set
+	// on the SNP path; left zero for TDX.
 	ReportData [64]byte
-	// Measurement is the 48-byte launch measurement.
+	// Measurement is the 48-byte launch measurement reported by the
+	// attestation-api. Only set on the SNP path; left zero for TDX.
 	Measurement [48]byte
-	// GuestPolicy is the SNP guest policy flags.
-	GuestPolicy uint64
-	// CurrentTCB is the platform's current TCB version (packed uint64).
-	CurrentTCB uint64
-	// PlatformInfo contains platform-specific metadata.
+	// PlatformInfo contains platform-specific metadata from the
+	// attestation-api response. Only set on the SNP path.
 	PlatformInfo []byte
 }
 
-// CheckKeyBinding verifies that the attestation report's REPORTDATA matches
-// hash(pub || nonce), proving the key was generated inside this TEE.
-// Unlike [VerifyAttestation], this does NOT verify the hardware signature
-// chain — it only checks the cryptographic binding between key and report.
-func CheckKeyBinding(pub crypto.PublicKey, att *Attestation, nonce []byte) error {
-	expected, err := ReportDataForKey(pub, nonce)
-	if err != nil {
-		return fmt.Errorf("ratls: compute expected REPORTDATA: %w", err)
-	}
-
-	switch att.TEEType {
-	case TEETypeSEVSNP:
-		_, err := checkSEVSNPBinding(att.Report, expected)
-		return err
-	case TEETypeTDX:
-		// TDX key-binding verification is not implemented here: the
-		// authoritative parser is attestation-rs (crates/attestation/
-		// src/platforms/tdx). Wiring a second, in-process Go parser for
-		// the Intel TDX quote layout would be fragile duplication —
-		// offset drift between the two would silently accept a bad
-		// quote. Production callers go through VerifyAttestation ->
-		// verifyTDXOnline, which forwards the raw quote to a local
-		// attestation-api /verify and reads ReportDataMatch off the
-		// signed response.
-		return fmt.Errorf("%w: TDX key-binding check delegates to attestation-api; call VerifyAttestation with a Policy.AttestationApiURL set", ErrUnsupportedTEE)
-	default:
-		return fmt.Errorf("%w: TEE type %d", ErrUnsupportedTEE, att.TEEType)
-	}
-}
-
-// VerifyAttestation verifies a raw attestation report against a public key:
-//  1. Parses the attestation report (once).
-//  2. Checks that REPORTDATA == hash(pub || nonce), proving the key was
-//     generated inside the TEE (and the report is fresh if nonce is set).
-//  3. Verifies the attestation report signature against the AMD VCEK chain
-//     (or Intel equivalent for TDX).
-//  4. Validates measurements and policy against the provided VerifyPolicy.
+// VerifyAttestation verifies a raw attestation report against a public key by
+// forwarding the evidence to the attestation-api /verify endpoint
+// (policy.AttestationApiURL, required):
+//  1. The attestation-api verifies the hardware signature chain and that
+//     REPORTDATA == hash(pub || nonce), proving the key was generated inside
+//     the TEE (and the report is fresh if nonce is set), plus the debug and
+//     minimum-TCB policy.
+//  2. The launch measurement it returns is checked against
+//     policy.Measurements here.
 func VerifyAttestation(pub crypto.PublicKey, att *Attestation, policy *VerifyPolicy, nonce []byte) (*VerifyResult, error) {
 	if policy == nil {
 		policy = &VerifyPolicy{}
+	}
+	if policy.AttestationApiURL == "" {
+		return nil, fmt.Errorf("%w: attestation-api URL is required", ErrInvalidReport)
 	}
 
 	expectedReportData, err := ReportDataForKey(pub, nonce)
@@ -132,16 +99,12 @@ func VerifyAttestation(pub crypto.PublicKey, att *Attestation, policy *VerifyPol
 	return verifyReport(att, policy, expectedReportData)
 }
 
-// VerifyCert verifies an RA-TLS certificate:
-//  1. Extracts the TEE attestation extension from the cert.
-//  2. Checks that REPORTDATA == hash(cert.PublicKey || nonce), proving the key
-//     was generated inside the TEE (and the report is fresh if nonce is set).
-//  3. Verifies the attestation report signature against the AMD VCEK chain
-//     (or Intel equivalent for TDX).
-//  4. Validates measurements and policy against the provided VerifyPolicy.
+// VerifyCert verifies an RA-TLS certificate: it extracts the TEE attestation
+// extension and hands it to [VerifyAttestation] with the cert's public key.
 //
-// Trust comes from the hardware attestation chain (AMD ARK → ASK → VCEK),
-// not from any certificate authority signature.
+// Trust comes from the hardware attestation chain (AMD ARK → ASK → VCEK, or
+// Intel equivalent for TDX) as verified by the same-TCB attestation-api, not
+// from any certificate authority signature.
 func VerifyCert(cert *x509.Certificate, policy *VerifyPolicy, nonce []byte) (*VerifyResult, error) {
 	att, err := ExtractAttestation(cert)
 	if err != nil {
@@ -166,12 +129,22 @@ func ExtractAttestation(cert *x509.Certificate) (*Attestation, error) {
 	return nil, fmt.Errorf("%w (OID %s)", ErrNotAttested, OIDRATLSAttestation)
 }
 
-// verifyReport parses the attestation report once, checks key binding,
-// verifies the hardware signature, and validates policy.
+// verifyReport dispatches the attestation to the per-platform verifier. All
+// verification is delegated to the attestation-api /verify endpoint.
 func verifyReport(att *Attestation, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
 	switch att.TEEType {
 	case TEETypeSEVSNP:
-		return verifySEVSNP(att, policy, expectedReportData)
+		// Envelope platforms (az-snp) embed their evidence in the
+		// extension directly; bare-metal SNP carries the raw report,
+		// which is wrapped in the "snp" evidence envelope here.
+		evidence := att.embedded
+		if evidence == nil {
+			var err error
+			if evidence, err = snpEvidence(att.Report); err != nil {
+				return nil, err
+			}
+		}
+		return verifySEVSNPOnline(evidence, policy, expectedReportData)
 	case TEETypeTDX:
 		// TDX always carries a JSON envelope in the RA-TLS extension
 		// (see extension.go's UnmarshalExtension), so att.embedded is
@@ -185,26 +158,6 @@ func verifyReport(att *Attestation, policy *VerifyPolicy, expectedReportData [64
 	default:
 		return nil, fmt.Errorf("%w: TEE type %d", ErrUnsupportedTEE, att.TEEType)
 	}
-}
-
-// checkSEVSNPBinding parses the raw SNP report and verifies that REPORTDATA
-// matches the expected value. Returns the parsed report proto for reuse.
-func checkSEVSNPBinding(rawReport []byte, expected [64]byte) (*spb.Report, error) {
-	rawReport, err := NormalizeSEVSNPReport(rawReport)
-	if err != nil {
-		return nil, err
-	}
-	report, err := sabi.ReportToProto(rawReport)
-	if err != nil {
-		return nil, fmt.Errorf("ratls: parse SNP report: %w", err)
-	}
-	if len(report.ReportData) != 64 {
-		return nil, fmt.Errorf("ratls: SNP report has %d-byte REPORTDATA, expected 64", len(report.ReportData))
-	}
-	if !bytes.Equal(report.ReportData, expected[:]) {
-		return nil, fmt.Errorf("%w — key was not generated in this TEE", ErrKeyBinding)
-	}
-	return report, nil
 }
 
 const defaultAttestationVerifyTimeout = 10 * time.Second
@@ -222,6 +175,38 @@ func unpackSNPMinTcb(packed uint64) types.MinTcb {
 	}
 }
 
+// callAttestationVerify posts evidence to the attestation-api /verify endpoint
+// and enforces the verdicts common to every platform: the hardware signature
+// must be valid and REPORTDATA must match the expected binding.
+func callAttestationVerify(evidence *types.AttestationEvidence, policy *VerifyPolicy, expectedReportData []byte, minTcb *types.MinTcb) (types.VerifyResponse, error) {
+	timeout := policy.AttestationVerifyTimeout
+	if timeout <= 0 {
+		timeout = defaultAttestationVerifyTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	expected := types.NewBase64Bytes(expectedReportData)
+	allowDebug := policy.AllowDebug
+	issueToken := false
+	params := &types.VerifyParams{
+		ExpectedReportData: &expected,
+		AllowDebug:         &allowDebug,
+		MinTcb:             minTcb,
+	}
+	resp, err := attestationclient.NewClient(policy.AttestationApiURL).Verify(ctx, types.NewVerifyRequest(*evidence, params, issueToken))
+	if err != nil {
+		return types.VerifyResponse{}, fmt.Errorf("ratls: online %s attestation verify: %w", evidence.Platform, err)
+	}
+	if !resp.Result.SignatureValid {
+		return types.VerifyResponse{}, ErrSignatureInvalid
+	}
+	if resp.Result.ReportDataMatch == nil || !*resp.Result.ReportDataMatch {
+		return types.VerifyResponse{}, fmt.Errorf("%w — key was not generated in this TEE", ErrKeyBinding)
+	}
+	return resp, nil
+}
+
 // verifyTDXOnline forwards a TDX evidence envelope to the local
 // attestation-api /verify endpoint. Analogous to verifySEVSNPOnline for
 // the SNP path — the attestation-api has all the Intel PCS collateral
@@ -230,40 +215,21 @@ func unpackSNPMinTcb(packed uint64) types.MinTcb {
 // TDX quote verifier here; delegating to attestation-api keeps the
 // heavy Intel dependencies out of every c8s Go binary and makes the
 // verifier upgradeable independently of the mesh binary.
+//
+// LIMITATION: unlike the SNP path, this does not enforce policy.MinTCBVersion
+// or policy.Measurements. The attestation-api's TDX verifier has no minimum-TCB
+// parameter (only the SNP verifier does), and the TDX launch measurement is not
+// pulled off the response for allowlist matching. A TDX peer therefore verifies
+// on signature + REPORTDATA binding + debug policy only; MinTCBVersion and
+// Measurements set on the policy are silently ignored for TDX. Wire both through
+// before relying on TDX in a measurement- or TCB-pinned deployment.
 func verifyTDXOnline(evidence *types.AttestationEvidence, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
 	if evidence.Platform != string(types.PlatformTdx) {
 		return nil, fmt.Errorf("%w: online verification not implemented for platform %q", ErrUnsupportedTEE, evidence.Platform)
 	}
-	if policy == nil || policy.AttestationApiURL == "" {
-		return nil, fmt.Errorf("%w: attestation-api URL is required for %s evidence", ErrInvalidReport, evidence.Platform)
-	}
 
-	timeout := policy.AttestationVerifyTimeout
-	if timeout <= 0 {
-		timeout = defaultAttestationVerifyTimeout
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	// TDX REPORTDATA is 64 bytes; unlike SNP's 48-byte truncation we pass
-	// the full 64-byte expected value. attestation-api's /verify accepts
-	// either length and matches on prefix.
-	expected := types.NewBase64Bytes(expectedReportData[:])
-	allowDebug := policy.AllowDebug
-	issueToken := false
-	params := &types.VerifyParams{
-		ExpectedReportData: &expected,
-		AllowDebug:         &allowDebug,
-	}
-	resp, err := attestationclient.NewClient(policy.AttestationApiURL).Verify(ctx, types.NewVerifyRequest(*evidence, params, issueToken))
-	if err != nil {
-		return nil, fmt.Errorf("ratls: online tdx attestation verify: %w", err)
-	}
-	if !resp.Result.SignatureValid {
-		return nil, ErrSignatureInvalid
-	}
-	if resp.Result.ReportDataMatch == nil || !*resp.Result.ReportDataMatch {
-		return nil, fmt.Errorf("%w — key was not generated in this TEE", ErrKeyBinding)
+	if _, err := callAttestationVerify(evidence, policy, expectedReportData[:], nil); err != nil {
+		return nil, err
 	}
 	return &VerifyResult{TEEType: TEETypeTDX}, nil
 }
@@ -275,43 +241,19 @@ func verifySEVSNPOnline(evidence *types.AttestationEvidence, policy *VerifyPolic
 	if evidence.Platform != string(types.PlatformAzSnp) && evidence.Platform != string(types.PlatformSnp) {
 		return nil, fmt.Errorf("%w: online verification not implemented for platform %q", ErrUnsupportedTEE, evidence.Platform)
 	}
-	if policy == nil || policy.AttestationApiURL == "" {
-		return nil, fmt.Errorf("%w: attestation-api URL is required for %s evidence", ErrInvalidReport, evidence.Platform)
-	}
-	if policy.RequireSMT {
-		// The attestation-api /verify API has no SMT parameter, so we
-		// cannot enforce this constraint online without extending the wire
-		// protocol. Fail closed so the policy is never silently ignored.
-		return nil, fmt.Errorf("%w: RequireSMT is not enforceable for online (%s) verification", ErrPolicyViolation, evidence.Platform)
-	}
 
-	timeout := policy.AttestationVerifyTimeout
-	if timeout <= 0 {
-		timeout = defaultAttestationVerifyTimeout
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	expected := types.NewBase64Bytes(expectedReportData[:sha512.Size384])
-	allowDebug := policy.AllowDebug
-	issueToken := false
-	params := &types.VerifyParams{
-		ExpectedReportData: &expected,
-		AllowDebug:         &allowDebug,
-	}
+	var minTcb *types.MinTcb
 	if policy.MinTCBVersion != 0 {
-		minTcb := unpackSNPMinTcb(policy.MinTCBVersion)
-		params.MinTcb = &minTcb
+		m := unpackSNPMinTcb(policy.MinTCBVersion)
+		minTcb = &m
 	}
-	resp, err := attestationclient.NewClient(policy.AttestationApiURL).Verify(ctx, types.NewVerifyRequest(*evidence, params, issueToken))
+	// Send all 64 REPORTDATA bytes. ReportDataForKey puts SHA-384 in bytes
+	// 0-47 and zero-pads 48-63; passing the full value makes the binding a
+	// full-length compare at the call site rather than relying on the
+	// attestation-api to zero-pad a 48-byte prefix.
+	resp, err := callAttestationVerify(evidence, policy, expectedReportData[:], minTcb)
 	if err != nil {
-		return nil, fmt.Errorf("ratls: online attestation verify: %w", err)
-	}
-	if !resp.Result.SignatureValid {
-		return nil, ErrSignatureInvalid
-	}
-	if resp.Result.ReportDataMatch == nil || !*resp.Result.ReportDataMatch {
-		return nil, fmt.Errorf("%w — key was not generated in this TEE", ErrKeyBinding)
+		return nil, err
 	}
 
 	result := &VerifyResult{TEEType: TEETypeSEVSNP}
@@ -357,135 +299,6 @@ func snpEvidence(rawReport []byte) (*types.AttestationEvidence, error) {
 	}, nil
 }
 
-// verifySEVSNP performs full verification: key binding, AMD signature chain,
-// and policy validation. The report is parsed once and reused.
-func verifySEVSNP(att *Attestation, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
-	if att.embedded != nil {
-		return verifySEVSNPOnline(att.embedded, policy, expectedReportData)
-	}
-
-	// Prefer the in-guest attestation-api /verify when available: its verifier
-	// classifies CPUs that go-sev-guest's bundled tables don't (e.g. Zen4c
-	// Bergamo/Siena, which offline verification rejects as an unknown product).
-	// RequireSMT can't be enforced over the /verify wire, so fall back to the
-	// offline path when it's set.
-	if policy != nil && policy.AttestationApiURL != "" && !policy.RequireSMT {
-		evidence, err := snpEvidence(att.Report)
-		if err != nil {
-			return nil, err
-		}
-		return verifySEVSNPOnline(evidence, policy, expectedReportData)
-	}
-
-	report, err := checkSEVSNPBinding(att.Report, expectedReportData)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build the attestation protobuf with certificate chain.
-	snpAttestation := &spb.Attestation{Report: report}
-	if len(att.CertChain) > 0 {
-		certs, err := parseSEVCertChain(att.CertChain)
-		if err != nil {
-			return nil, fmt.Errorf("ratls: parse VCEK cert chain: %w", err)
-		}
-		snpAttestation.CertificateChain = certs
-	}
-
-	// Verify the report signature against the AMD VCEK chain.
-	if err := verify.SnpAttestation(snpAttestation, &verify.Options{}); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrSignatureInvalid, err)
-	}
-
-	// Validate report fields against policy. go-sev-guest treats each true
-	// GuestPolicy field as an allowed capability, not as a required property.
-	// SMT-enabled CVMs are common, so allow SMT by default and enforce
-	// RequireSMT explicitly below when callers ask for it.
-	validateOpts := snpValidateOptions(policy)
-	if err := validate.SnpAttestation(snpAttestation, validateOpts); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrPolicyViolation, err)
-	}
-	if err := enforceSNPRequiredPolicy(report, policy); err != nil {
-		return nil, err
-	}
-
-	// Validate measurement length before comparison.
-	if len(report.Measurement) != SNPMeasurementSize {
-		return nil, fmt.Errorf("%w: measurement is %d bytes, expected %d", ErrInvalidReport, len(report.Measurement), SNPMeasurementSize)
-	}
-
-	// Check measurement against allowed list.
-	if len(policy.Measurements) > 0 {
-		if !MeasurementAllowed(report.Measurement, policy.Measurements) {
-			return nil, fmt.Errorf("%w: launch measurement not in allowed set", ErrPolicyViolation)
-		}
-	}
-
-	// Check TCB version against minimum.
-	if policy.MinTCBVersion != 0 {
-		if !tcbAtLeast(report.CurrentTcb, policy.MinTCBVersion) {
-			return nil, fmt.Errorf("%w: platform TCB 0x%016x is below minimum 0x%016x", ErrPolicyViolation, report.CurrentTcb, policy.MinTCBVersion)
-		}
-	}
-
-	result := &VerifyResult{
-		TEEType:     TEETypeSEVSNP,
-		GuestPolicy: report.Policy,
-		CurrentTCB:  report.CurrentTcb,
-	}
-	copy(result.ReportData[:], report.ReportData)
-	copy(result.Measurement[:], report.Measurement)
-	return result, nil
-}
-
-func snpValidateOptions(policy *VerifyPolicy) *validate.Options {
-	if policy == nil {
-		policy = &VerifyPolicy{}
-	}
-	return &validate.Options{
-		GuestPolicy: sabi.SnpPolicy{
-			SMT:   true,
-			Debug: policy.AllowDebug,
-		},
-	}
-}
-
-func enforceSNPRequiredPolicy(report *spb.Report, policy *VerifyPolicy) error {
-	if policy == nil || !policy.RequireSMT {
-		return nil
-	}
-	guestPolicy, err := sabi.ParseSnpPolicy(report.Policy)
-	if err != nil {
-		return fmt.Errorf("%w: parse SNP guest policy: %w", ErrInvalidReport, err)
-	}
-	if !guestPolicy.SMT {
-		return fmt.Errorf("%w: SMT is required but not enabled", ErrPolicyViolation)
-	}
-	return nil
-}
-
-// parseSEVCertChain parses concatenated DER-encoded certificates into the
-// protobuf CertificateChain format expected by go-sev-guest.
-func parseSEVCertChain(chainDER []byte) (*spb.CertificateChain, error) {
-	certs, err := x509.ParseCertificates(chainDER)
-	if err != nil {
-		return nil, fmt.Errorf("parse DER certificates: %w", err)
-	}
-
-	chain := &spb.CertificateChain{}
-	for i, cert := range certs {
-		switch i {
-		case 0:
-			chain.VcekCert = cert.Raw
-		case 1:
-			chain.AskCert = cert.Raw
-		case 2:
-			chain.ArkCert = cert.Raw
-		}
-	}
-	return chain, nil
-}
-
 // MeasurementAllowed reports whether measurement byte-equals one of the allowed
 // launch digests (an empty allowed set means "no pin" and is handled by callers).
 func MeasurementAllowed(measurement []byte, allowed [][]byte) bool {
@@ -495,20 +308,4 @@ func MeasurementAllowed(measurement []byte, allowed [][]byte) bool {
 		}
 	}
 	return false
-}
-
-// tcbAtLeast returns true if every byte component of current is >= the
-// corresponding byte in minimum. The TCB version is a packed uint64 where
-// each byte represents a versioned component (bootloader, TEE, SNP,
-// microcode, etc.) — all must individually meet the minimum.
-func tcbAtLeast(current, minimum uint64) bool {
-	for i := 0; i < 8; i++ {
-		shift := uint(i * 8)
-		cur := byte(current >> shift)
-		min := byte(minimum >> shift)
-		if cur < min {
-			return false
-		}
-	}
-	return true
 }

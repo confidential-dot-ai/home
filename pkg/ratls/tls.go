@@ -463,6 +463,12 @@ func NewServerTLSConfig(cfg *ServerConfig) (*tls.Config, *CertManager, error) {
 //
 // The returned CertManager is non-nil only when mTLS is configured. Use it
 // for eager provisioning and readiness checks.
+//
+// Policy.AttestationApiURL is not validated here: all verification is
+// delegated to the attestation-api, so a Policy with an empty URL builds a
+// config successfully but fails closed at the first handshake with
+// [ErrInvalidReport]. Callers wanting a construction-time error should
+// validate the URL before calling (see [NewVerifyingHTTPClient]).
 func NewClientTLSConfig(cfg *ClientConfig) (*tls.Config, *CertManager, error) {
 	if cfg == nil {
 		cfg = &ClientConfig{}

@@ -1,6 +1,7 @@
 package ratls
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -722,45 +723,23 @@ func TestDualVerifyPeerCallback_CASigned(t *testing.T) {
 }
 
 func TestDualVerifyPeerCallback_RATLSSelfSigned(t *testing.T) {
-	// This test verifies the RA-TLS fallback path of dualVerifyPeerCallback.
-	//
-	// Full end-to-end RA-TLS verification requires real AMD TEE hardware
-	// (verify.SnpAttestation contacts AMD KDS to download VCEK certificates).
-	// Instead, we verify the components that dualVerifyPeerCallback exercises:
-	//
-	// 1. The cert has a valid RA-TLS extension with correct REPORTDATA binding.
-	// 2. CA chain verification correctly rejects the cert (triggering fallback).
-	// 3. The attestation can be extracted and parsed from the cert.
+	// The RA-TLS fallback path: a self-signed attested cert fails CA-chain
+	// verification, so the callback falls back to attestation verification,
+	// which is delegated to a (mocked) attestation-api.
+	_, _, ratlsCert := testAttestedCert(t, &CertOptions{TTL: 1 * time.Hour})
 
-	// Create an RA-TLS cert with correctly bound REPORTDATA.
-	key, att, ratlsCert := testAttestedCert(t, &CertOptions{TTL: 1 * time.Hour})
+	measurement := bytes.Repeat([]byte{0x42}, SNPMeasurementSize)
+	srv := newMockedVerifySrv(t, verifyResponse(measurement))
+	defer srv.Close()
 
-	// (1) Verify the cert has correct RA-TLS attestation and key binding.
-	requireRATLSExtension(t, ratlsCert)
-	if err := CheckKeyBinding(&key.PublicKey, att, nil); err != nil {
-		t.Fatalf("RA-TLS cert has incorrect key binding: %v", err)
-	}
-
-	// (2) CA chain verification rejects the cert (not signed by our CA).
 	_, caCert := generateCACert(t)
-	caPool := x509.NewCertPool()
-	caPool.AddCert(caCert)
-	_, chainErr := ratlsCert.Verify(x509.VerifyOptions{
-		Roots:     caPool,
-		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
-	})
-	if chainErr == nil {
-		t.Fatal("expected CA chain verification to fail for self-signed RA-TLS cert")
-	}
+	verifyFunc := dualVerifyPeerCallback(
+		&VerifyPolicy{AttestationApiURL: srv.URL, Measurements: [][]byte{measurement}},
+		newSharedCACerts([]*x509.Certificate{caCert}),
+	)
 
-	// (3) The attestation extension can be extracted from the cert —
-	// this is the first step dualVerifyPeerCallback takes in the RA-TLS fallback.
-	extractedAtt, err := ExtractAttestation(ratlsCert)
-	if err != nil {
-		t.Fatalf("failed to extract attestation from RA-TLS cert: %v", err)
-	}
-	if extractedAtt.TEEType != TEETypeSEVSNP {
-		t.Errorf("extracted TEE type = %v, want SEV-SNP", extractedAtt.TEEType)
+	if err := verifyFunc([][]byte{ratlsCert.Raw}, nil); err != nil {
+		t.Fatalf("RA-TLS fallback failed: %v", err)
 	}
 }
 
