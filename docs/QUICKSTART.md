@@ -124,7 +124,7 @@ CVM trust boundary; the supported chart path no longer has external CDS
 URL values.
 
 The chart's RA-TLS handshakes accept any TEE-attested peer unless the
-operator pins `cds.measurements` and `ratls-mesh.measurements` to the
+operator pins `cds.measurements` and `ratlsMesh.measurements` to the
 expected launch digests. Leave these empty only on a trusted Pod network;
 see docs/THREAT_MODEL.md for the threat surface.
 

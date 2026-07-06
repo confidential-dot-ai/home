@@ -67,7 +67,7 @@ test/
 
 ## Build
 
-Requires Go 1.26.3+.
+Requires Go 1.26+.
 
 ```bash
 # Build the c8s binary for the container images (linux/amd64)

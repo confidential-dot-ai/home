@@ -66,8 +66,10 @@ pinning and both ship empty:
 - `cds.measurements`: the flat allowlist of SHA-384 hex launch digests
   permitted to call `/attest` and (when handoff is enabled) `/handoff`.
   Empty = no pinning, accept any TEE-attested caller.
-- `ratls-mesh.measurements`: ratls-mesh pins CDS's RA-TLS peer cert during the
-  initial cert provisioning handshake. Empty = accept any TEE-attested CDS.
+- `ratlsMesh.measurements`: the launch digests mesh peers must present on
+  RA-TLS handshakes (wired to ratls-mesh `--measurements`). Empty = accept any
+  TEE-attested peer. CDS's RA-TLS peer cert is pinned separately, from
+  `cds.measurements` (wired to `--cds-measurements`).
 
 With both empty, the chart's RA-TLS handshakes accept any peer that
 produces a syntactically valid TEE attestation. An attacker who can serve

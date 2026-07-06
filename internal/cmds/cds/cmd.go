@@ -76,7 +76,7 @@ func NewCmd() *cobra.Command {
 	flags.DurationVar(&cfg.rotationOverlap, "token-signer-overlap", 25*time.Hour, "how long a retired EAR key stays in JWKS")
 	flags.Float64Var(&cfg.rotationJitter, "token-signer-rotation-jitter", 0.1, "")
 
-	flags.StringVar(&cfg.ratlsPlatform, "ratls-platform", "sev-snp", "TEE platform for the RA-TLS serving cert (sev-snp; snp, az-snp, and gcp-snp aliases are normalized). Empty disables TLS — UNSAFE outside tests.")
+	flags.StringVar(&cfg.ratlsPlatform, "ratls-platform", "sev-snp", "TEE platform for the RA-TLS serving cert: sev-snp or tdx (snp/az-snp/gcp-snp and az-tdx/gcp-tdx aliases are normalized). Empty disables TLS — UNSAFE outside tests.")
 	flags.DurationVar(&cfg.ratlsCertTTL, "ratls-cert-ttl", 24*time.Hour, "")
 
 	_ = cmd.MarkFlagRequired("attestation-api-url")

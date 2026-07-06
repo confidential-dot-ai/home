@@ -113,8 +113,8 @@ operator skips that controller rather than failing startup.
 `c8s install --kata` additionally installs the Kata Containers runtime onto
 the cluster: the embedded chart renders the upstream `kata-deploy` DaemonSet
 (which installs QEMU, the kata runtime, and the `containerd-shim-kata-v2`
-shim onto every node) and the `kata-qemu` / `kata-clh` / `kata-qemu-snp`
-RuntimeClass objects. The host containerd config path (`k8s` vs `rke2`
+shim onto every node) and the `kata-qemu` / `kata-clh` / `kata-qemu-snp` /
+`kata-qemu-tdx` RuntimeClass objects. The host containerd config path (`k8s` vs `rke2`
 layout) is detected from the cluster's kubelet versions.
 
 `--kata` is **enforcing** — there is no kata-without-enforcement shape:
@@ -219,10 +219,13 @@ new key, no workload trusts them, and the mesh degrades as old leaves
 expire. Recovery is to restart every workload so its get-cert init container
 re-runs the CDS provisioning flow.
 
-Scheduled in-process CA rotation (`--ca-rotation-interval`) is **not** a
-re-bootstrap: the rotator signs the new CA with the still-live current
-CA's key, the continuity check accepts it, and workloads pick it up on
-their next `/ca` refresh. Only restart loses the signing key.
+There is **no scheduled in-process CA rotation today** — no cds flag or
+loop drives it, so every CA fingerprint change is a restart-shaped
+re-bootstrap. (An unwired rotator exists at `internal/issuer.CARotator`:
+it signs a successor CA with the still-live current CA's key, so the
+continuity check would accept it and workloads would pick it up on their
+next `/ca` refresh, without re-bootstrap. Wiring it into `c8s cds` is
+future work.)
 
 To remove this restriction, enable in-process handoff by setting
 `cds.handoff.enabled=true` in values and pinning `cds.measurements` to CDS's
@@ -242,9 +245,8 @@ Until handoff is enabled:
   voluntary disruptions;
 - treat any CDS restart as a planned maintenance event with workload
   churn;
-- watch CDS startup logs for the active CA fingerprint — a fingerprint
-  change without a planned rotation means a restart happened and workload
-  re-provisioning is needed.
+- watch CDS startup logs for the active CA fingerprint — any fingerprint
+  change means a restart happened and workload re-provisioning is needed.
 
 After enabling handoff, verify the bootstrap succeeded by checking
 CDS logs for `attested CA handoff enabled` and

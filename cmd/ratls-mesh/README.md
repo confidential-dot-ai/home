@@ -104,7 +104,7 @@ destinations whose `Pod.Status.HostIP` matches this node's `NODE_IP`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--platform` | `sev-snp` | TEE platform: `sev-snp` or `tdx` |
+| `--platform` | `auto` | TEE platform: `sev-snp`, `tdx`, or `auto` (probes `/dev/{tdx_guest,sev-guest}`) |
 | `--attestation-api-url` | (required) | URL of the local attestation-api (e.g. `http://localhost:8400`) |
 | `--outbound-port` | `15001` | Outbound listener port (iptables redirect target) |
 | `--inbound-port` | `15006` | Inbound listener port (RA-TLS from peer nodes) |
@@ -191,7 +191,7 @@ a DaemonSet and uses Kubernetes 1.29+ native sidecar init containers for iptable
 synchronization and cleanup.
 
 **Kubernetes version requirement.** The chart's `Chart.yaml` declares
-`kubeVersion: ">=1.29.0-0"`. `iptables-cleanup` runs as a native sidecar
+`kubeVersion: ">=1.30.0-0"`. `iptables-cleanup` runs as a native sidecar
 (`restartPolicy: Always` on an `initContainer`) so its `preStop` hook fires
 last during shutdown and reliably tears down the managed chains/ipsets.
 Kubernetes 1.28 exposed this behind the `SidecarContainers` feature gate, but
@@ -209,7 +209,7 @@ Reviewer-relevant defaults:
 | `iptablesSync.resyncPeriod` | `30s` | Periodic reconciliation of pod ipsets and iptables rules. |
 | `iptablesSync.ipsetMaxElem` | `262144` | Maximum size for each managed ipset. |
 | `excludeUids` | `"0"` | Excludes root-owned host daemon traffic from `OUTPUT` redirect in addition to the mesh UID. |
-| `ratls-mesh.measurements` | `[]` | SHA-384 hex launch digests that CDS's RA-TLS peer cert must match; empty accepts any (UNSAFE outside dev). |
+| `ratlsMesh.measurements` | `[]` | SHA-384 hex launch digests mesh peers must present (wired to `--measurements`); empty accepts any (UNSAFE outside dev). CDS's peer cert is pinned from the parent `cds.measurements` (wired to `--cds-measurements`). |
 
 ## Observability
 
