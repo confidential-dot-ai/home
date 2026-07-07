@@ -2,9 +2,6 @@
 {{- $nri := .Values.nriImagePolicy -}}
 {{- $nriCDSURL := tpl (default "" $nri.cds.url) . -}}
 {{- $attestationNodePort := int .Values.attestationApi.service.nodePort -}}
-{{- /* Must track values.yaml tlsLb.upstream.address
-       (TestChartEngineConflictDefaultMatchesValues pins the two together). */ -}}
-{{- $defaultUpstream := "vllm-router-service.vllm.svc.cluster.local" -}}
 {{- /*
   Helm silently ignores values keys the chart no longer reads, so a values
   file carried over from a release that still had tee-proxy would drop its
@@ -83,7 +80,7 @@
   the helper is reached, with stable kind= markers for the tests.
 */ -}}
 {{- $engine := .Values.engine -}}
-{{- if $engine.name -}}
+{{- if and $engine.name $tlsLB.enabled -}}
 {{- if not (hasKey $engine.presets $engine.name) -}}
 {{- fail (printf "VALIDATION_ERROR kind=unknown_engine: engine.name=%q is not in engine.presets (%s)" $engine.name (join ", " (keys $engine.presets))) -}}
 {{- end -}}
@@ -100,8 +97,12 @@
 {{- if or (gt (len $svc) 63) (not (regexMatch "^[a-z]([-a-z0-9]*[a-z0-9])?$" $svc)) -}}
 {{- fail (printf "VALIDATION_ERROR kind=engine_invalid_workload_id: engine.workloadId=%q makes Service name %q, not a DNS-1035 label (start with a letter, then [a-z0-9-], end alphanumeric, <=63 chars)" $engine.workloadId $svc) -}}
 {{- end -}}
-{{- if and $tlsLB.upstream.address (ne $tlsLB.upstream.address $defaultUpstream) -}}
-{{- fail (printf "VALIDATION_ERROR kind=engine_upstream_conflict: engine.name=%q derives tlsLb.upstream.address, but tlsLb.upstream.address is also set to %q; set one, not both" $engine.name $tlsLB.upstream.address) -}}
+{{- $engineNamespace := $engine.namespace | default .Release.Namespace -}}
+{{- if or (gt (len $engineNamespace) 63) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $engineNamespace)) -}}
+{{- fail (printf "VALIDATION_ERROR kind=engine_invalid_namespace: engine namespace %q is not a DNS-1123 label (lowercase alphanumeric or '-', start/end alphanumeric, <=63 chars)" $engineNamespace) -}}
+{{- end -}}
+{{- if $tlsLB.upstream.address -}}
+{{- fail (printf "VALIDATION_ERROR kind=engine_upstream_conflict: engine.name=%q derives tlsLb.upstream.address, but tlsLb.upstream.address is also set to %q; set one, not both. If upgrading from a chart that shipped a default tlsLb.upstream.address, clear it (it is no longer defaulted)" $engine.name $tlsLB.upstream.address) -}}
 {{- end -}}
 {{- /*
   The derived headless-Service hop is plaintext at the app layer; the node
@@ -113,11 +114,15 @@
 {{- end -}}
 {{- end -}}
 {{- /*
-  Same class of misconfig without the engine preset: the default upstream is
-  the plaintext vllm router, so protocol=https against it can only fail at
-  runtime (a TLS handshake to a plaintext port). A custom address is the
-  operator's contract; only the known-plaintext default is guarded.
+  No upstream is a legal state: tls-lb installs and serves with no catch-all
+  until an inference backend is wired (install-then-attach). But when an
+  upstream IS set without the engine preset, it must be secured: the engine
+  preset (the mesh-wrapped headless path, how a confidential workload like vllm
+  is reached) or a manual address that terminates and verifies TLS itself
+  (app-TLS). A silently-defaulted Service VIP would leave the inference hop
+  plaintext. The secured-only check is the shared tls-lb.requireSecuredBackend,
+  also applied per route. There is no plaintext-to-unattested escape hatch.
 */ -}}
-{{- if and $tlsLB.enabled (not $engine.name) (eq $tlsLB.upstream.protocol "https") (eq $tlsLB.upstream.address $defaultUpstream) -}}
-{{- fail "VALIDATION_ERROR kind=https_plaintext_default: tlsLb.upstream.protocol=https with the default plaintext upstream (vllm-router-service.vllm.svc.cluster.local); point tlsLb.upstream.address at a backend that terminates TLS, or keep protocol http" -}}
+{{- if and $tlsLB.enabled (not $engine.name) $tlsLB.upstream.address -}}
+{{- include "tls-lb.requireSecuredBackend" (dict "protocol" $tlsLB.upstream.protocol "tls" $tlsLB.upstream.tls "address" $tlsLB.upstream.address "label" "tlsLb.upstream" "kind" "tlslb_unsecured_upstream" "suggest" "To reach a confidential workload like vllm set engine.name + engine.workloadId instead (the mesh wraps that plaintext hop in attested mTLS); ") -}}
 {{- end -}}

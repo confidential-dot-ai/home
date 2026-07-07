@@ -938,18 +938,20 @@ tlsLb:
   # only server_name and need no dnsSanPatterns entry.
   san: []
 
-  # -- Upstream backend the front door proxies to. Defaults to the workload
-  # over plain HTTP at the app layer: point address at the operator-managed
-  # headless Service (or use the engine preset, which derives it) so the
-  # pod-IP hop is wrapped in the node mesh's attested mTLS. The tls sub-block
-  # applies only when protocol is https (an upstream that terminates TLS
-  # itself).
+  # -- Upstream backend the front door proxies to. No default, and exactly two
+  # safe shapes: prefer the engine preset (engine.name + engine.workloadId),
+  # which derives the operator-managed headless Service so the pod-IP hop is
+  # wrapped in the node mesh's attested mTLS (this is how a confidential
+  # workload like vllm is reached, over plaintext http the mesh secures);
+  # otherwise a manual address must be https with tls.verify=true, an upstream
+  # that terminates and authenticates TLS itself (app-TLS). A plaintext http or
+  # unverified-https manual address fails the render (kind=tlslb_unsecured_upstream):
+  # the chart cannot confirm it resolves to pod IPs the mesh intercepts and
+  # there is no acknowledgment to override that.
   upstream:
     # -- Host and port of the upstream service. The engine preset (engine.name)
-    # derives this; set one, not both. This default is also hardcoded in
-    # validations.yaml ($defaultUpstream); keep the two in sync
-    # (TestChartEngineConflictDefaultMatchesValues enforces it).
-    address: vllm-router-service.vllm.svc.cluster.local
+    # derives this; set one, not both.
+    address: ""
     # -- Protocol for the upstream connection (http or https).
     protocol: http
     tls:
@@ -978,11 +980,16 @@ tlsLb:
     # - path: /allowlist
     #   match: exact  # exact | prefix (default)
     #   backend:
-    #     address: cds.default.svc.cluster.local:8080
-    #     protocol: http
+    #     # A route backend must be https with tls.verify: true (app-TLS): the
+    #     # chart cannot confirm a plaintext http or unverified-https address
+    #     # resolves to pod IPs the node mesh wraps, so it fails the render
+    #     # (kind=tlslb_unsecured_route). A confidential workload is reached via
+    #     # the engine preset, not a route.
+    #     address: cds.default.svc.cluster.local:8443
+    #     protocol: https
     #     tls:
-    #       useCDSClientCert: false
-    #       verify: false
+    #       useCDSClientCert: true
+    #       verify: true
     #       verifyDepth: 2
     #       serverName: cds.default.svc.cluster.local
     #       trustedCAPath: ""

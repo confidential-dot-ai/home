@@ -106,6 +106,25 @@ serverName, trustedCAPath, label.
 {{- end -}}
 
 {{/*
+tls-lb.requireSecuredBackend fails the render on a proxied backend hop that is
+not authenticated: plaintext http, or https without tls.verify. A confidential
+platform has exactly two safe paths to a backend and this helper admits only
+them: the engine preset (a mesh-wrapped headless Service, validated separately),
+or an https backend that terminates and verifies TLS itself (app-TLS). There is
+no plaintext-to-unattested escape hatch. Shared by the catch-all upstream and
+every route backend so the invariant lives in one place.
+Args: protocol, tls (dict), address, label, kind, suggest (leading hint prose,
+may be "").
+*/}}
+{{- define "tls-lb.requireSecuredBackend" -}}
+{{- $tls := default dict .tls -}}
+{{- $secured := and (eq .protocol "https") (default false $tls.verify) -}}
+{{- if not $secured -}}
+{{- fail (printf "VALIDATION_ERROR kind=%s: %s.address=%q is a plaintext http or unverified-https hop the chart cannot confirm the node mesh wraps. %sUse https with tls.verify=true so the backend authenticates itself (app-TLS)" .kind .label .address .suggest) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Render nginx proxy TLS directives for an HTTPS backend.
 */}}
 {{- define "tls-lb.proxySSLDirectives" -}}

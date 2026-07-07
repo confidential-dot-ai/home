@@ -320,18 +320,21 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 	}
 
 	prev := struct {
-		crds, singleNode, kata, resolveDigests bool
-		secret, cvm, operatorKeys              string
-	}{installCRDs, installSingleNode, installKata, installResolveDigests, installImagePullSecret, installCvmMode, installOperatorKeys}
+		crds, singleNode, kata, resolveDigests                 bool
+		secret, cvm, engine, engineWID, engineNS, operatorKeys string
+	}{installCRDs, installSingleNode, installKata, installResolveDigests, installImagePullSecret, installCvmMode, installEngine, installEngineWorkloadID, installEngineNamespace, installOperatorKeys}
 	defer func() {
 		installCRDs, installSingleNode, installKata, installResolveDigests = prev.crds, prev.singleNode, prev.kata, prev.resolveDigests
-		installImagePullSecret, installCvmMode, installOperatorKeys = prev.secret, prev.cvm, prev.operatorKeys
+		installImagePullSecret, installCvmMode = prev.secret, prev.cvm
+		installEngine, installEngineWorkloadID, installEngineNamespace = prev.engine, prev.engineWID, prev.engineNS
+		installOperatorKeys = prev.operatorKeys
 	}()
 	// Drive every value-producing toggle. --install-crds=false exercises the
 	// non-default CRD path; --resolve-digests=false keeps crane off PATH (the
 	// digest-arg shape is covered separately via buildDigestArgs below).
 	installCRDs, installSingleNode, installKata, installResolveDigests = false, true, true, false
 	installImagePullSecret, installCvmMode = "regcred", "aks"
+	installEngine, installEngineWorkloadID, installEngineNamespace = "vllm", "infer", "workloads"
 	installOperatorKeys = writeTestOperatorKeys(t)
 
 	args, err := buildValueArgs(context.Background(), cmd, nil, "main", "rke2", appendResolvedDigestArgs)

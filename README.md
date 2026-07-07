@@ -106,7 +106,8 @@ kubectl create namespace c8s-system
 IMAGE_PULL_SECRET=<ghcr-token> NAMESPACE=c8s-system ./scripts/deploy-image-pull-secret.sh
 
 # 3. THEN install, referencing the Secret by name.
-c8s install --namespace c8s-system --image-pull-secret ghcr-pull-secret
+c8s install --namespace c8s-system --image-pull-secret ghcr-pull-secret \
+  --engine vllm --engine-workload-id <cw-id>
 ```
 
 The chart wires the Secret into every component's `imagePullSecrets`

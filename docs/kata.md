@@ -51,11 +51,13 @@ enforcing it are one shape, not two (see [Enforcement](#enforcement)).
 ```bash
 # Install the Kata stack and enforce it (see Enforcement below).
 # Works on RKE2 too: the host distro is detected from the cluster.
-c8s install --kata
+# tls-lb runs as a kata CVM; --engine derives the mesh-wrapped upstream
+# (see operator.md, "Engine upstream preset").
+c8s install --kata --engine vllm --engine-workload-id <cw-id>
 
 # Dev only: use the -debug guest image so `kubectl logs` and `kubectl exec`
 # work against kata pods (host log/exec RPCs allowed in the guest policy).
-c8s install --kata --debug
+c8s install --kata --debug --engine vllm --engine-workload-id <cw-id>
 ```
 
 `--debug` switches the guest image to the `<tag>-debug` variant published in

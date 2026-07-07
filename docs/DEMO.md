@@ -6,8 +6,16 @@ production trust boundary.
 
 ## 1. Install c8s
 
+This demo shows confidential-workload injection, not the public front door, so
+it installs with tls-lb disabled. To also expose a workload through tls-lb, give
+it an upstream instead (see the
+[engine upstream preset](operator.md#engine-upstream-preset)).
+
 ```sh
-c8s install --namespace c8s-system
+c8s install --namespace c8s-system -f - <<'EOF'
+tlsLb:
+  enabled: false
+EOF
 ```
 
 ## 2. Apply optional CRD object

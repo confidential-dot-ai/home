@@ -5,12 +5,21 @@
 {{- include "tls-lb.validateProtocol" (required "protocol must be http or https" .Values.tlsLb.upstream.protocol) -}}
 {{- $defaultMeshCAPath := printf "%s/ca.pem" .Values.tlsLb.tlsMountPath -}}
 {{- $upstreamTrustedCAPath := default $defaultMeshCAPath .Values.tlsLb.upstream.tls.trustedCAPath -}}
-{{- $upstreamAddress := include "c8s.tlsLb.resolvedUpstreamAddress" . -}}
+{{- $upstreamAddress := include "c8s.tlsLb.resolvedUpstreamAddress" . | trim -}}
+{{- /*
+  No upstream is a legal state: tls-lb serves its cert and explicit routes with
+  no catch-all until one is wired (an install-then-attach-inference flow). The
+  address-format check, the secured-backend guard (validations.yaml), and the
+  location / block all render only when an upstream is set.
+*/ -}}
+{{- $upstreamServerName := "" -}}
+{{- if $upstreamAddress -}}
 {{- if not (regexMatch `^[^[:space:]{};/#]+$` $upstreamAddress) -}}
 {{- fail (printf "tlsLb.upstream.address must be a host:port address without scheme, whitespace, semicolons, braces, slashes, or '#', got: %s" $upstreamAddress) -}}
 {{- end -}}
-{{- $upstreamServerName := default (include "tls-lb.serverNameFromAddress" $upstreamAddress) .Values.tlsLb.upstream.tls.serverName -}}
+{{- $upstreamServerName = default (include "tls-lb.serverNameFromAddress" $upstreamAddress) .Values.tlsLb.upstream.tls.serverName -}}
 {{- include "tls-lb.validateProxyTLS" (dict "protocol" .Values.tlsLb.upstream.protocol "tls" .Values.tlsLb.upstream.tls "serverName" $upstreamServerName "trustedCAPath" $upstreamTrustedCAPath "label" "tlsLb.upstream") -}}
+{{- end -}}
 {{- include "tls-lb.validateCORS" .Values.tlsLb.cors -}}
 {{- range $i, $route := .Values.tlsLb.routes -}}
 {{- include "tls-lb.validateRouteCORS" (dict "cors" $route.cors "label" (printf "tlsLb.routes[%d]" $i)) -}}
@@ -109,6 +118,7 @@ data:
             {{- if and (ne $backendProtocol "https") (or (default false $backendTLS.verify) (default false $backendTLS.useCDSClientCert)) }}
             {{- fail (printf "tlsLb.routes[%d].backend.tls.verify and useCDSClientCert require backend.protocol: https" $i) }}
             {{- end }}
+            {{- include "tls-lb.requireSecuredBackend" (dict "protocol" $backendProtocol "tls" $backendTLS "address" $backendAddress "label" (printf "tlsLb.routes[%d].backend" $i) "kind" "tlslb_unsecured_route" "suggest" "") }}
             {{- /* Route inherits the global CORS block; route.cors.enabled (if set) toggles it on/off for this route only. */}}
             {{- $routeCors := deepCopy $.Values.tlsLb.cors }}
             {{- if and (hasKey $route "cors") (hasKey (default dict $route.cors) "enabled") }}
@@ -185,6 +195,7 @@ data:
             }
 
             {{- end }}
+            {{- if $upstreamAddress }}
             location / {
                 {{- if default false .Values.tlsLb.cors.enabled }}
                 {{- include "tls-lb.corsLocationDirectives" .Values.tlsLb.cors | nindent 16 }}
@@ -199,6 +210,7 @@ data:
                 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                 proxy_set_header X-Forwarded-Proto $scheme;
             }
+            {{- end }}
 
             location /healthz {
                 access_log off;

@@ -2,14 +2,16 @@
   Inference-engine presets. The chart treats the engine as an opaque HTTP
   upstream; the only engine-specific fact it needs is the default server port,
   read from engine.presets (the single source of truth, shared with
-  validations.yaml). This helper turns engine.name into tls-lb's upstream
-  address, defaulting to the operator-managed headless Service so the hop is
-  mesh-intercepted (attested mTLS) rather than dialing a Service VIP the mesh
-  cannot see.
+  validations.yaml). When engine.name is set this helper derives the
+  operator-managed headless Service so the hop is mesh-intercepted (attested
+  mTLS) rather than dialing a Service VIP the mesh cannot see; otherwise it
+  returns tlsLb.upstream.address verbatim.
 
 c8s.tlsLb.resolvedUpstreamAddress is tls-lb's upstream host[:port].
 
-  engine.name == ""  -> tlsLb.upstream.address verbatim.
+  engine.name == ""  -> tlsLb.upstream.address verbatim (may be empty: an
+                        unset upstream renders no catch-all, a legal
+                        install-then-attach state).
   engine.name set    -> c8s-<workloadId>.<namespace>.svc.cluster.local:<port>,
                         mirroring webhook.WorkloadServiceName / workloadSAN so
                         the dialed name is exactly the headless Service the

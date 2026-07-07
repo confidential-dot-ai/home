@@ -141,6 +141,12 @@ type digestResolver func(ctx context.Context, setArgs []string, imageTag string,
 // <release> <chart>` verb and appends -f / wait flags, render-values converts
 // these to a values tree.
 func buildValueArgs(ctx context.Context, cmd *cobra.Command, components []c8sComponent, imageTag, distro string, resolveDigests digestResolver) ([]string, error) {
+	// --engine-workload-id / --engine-namespace are inert without --engine (the
+	// chart only reads them when engine.name is set), so a lone one is a silent
+	// no-op; fail fast instead of plumbing a value the chart ignores.
+	if installEngine == "" && (installEngineWorkloadID != "" || installEngineNamespace != "") {
+		return nil, fmt.Errorf("--engine-workload-id and --engine-namespace require --engine")
+	}
 	var setArgs []string
 	// Chart has no default image tags. When digests are resolved (below) they
 	// pin the image and the chart prefers digest over tag, so emitting both is
@@ -173,6 +179,7 @@ func buildValueArgs(ctx context.Context, cmd *cobra.Command, components []c8sCom
 	}
 	setArgs = appendKataInstallArgs(setArgs, installKata, installKataDebug)
 	setArgs = appendSingleNodeInstallArgs(setArgs, installSingleNode)
+	setArgs = appendEngineInstallArgs(setArgs, installEngine, installEngineWorkloadID, installEngineNamespace)
 	if installImagePullSecret != "" {
 		setArgs = append(setArgs, "--set-string", "imagePullSecret="+installImagePullSecret)
 	}
@@ -326,6 +333,9 @@ func init() {
 	renderValuesCmd.Flags().StringVar(&installHardwarePlatform, flagHardwarePlatform, "sev-snp", "CPU-level TEE hardware (orthogonal to --cvm-mode): sev-snp (default, /dev/sev-guest) or tdx (Intel TDX, /dev/tdx-guest). Ignored when --cvm-mode=aks")
 	renderValuesCmd.Flags().BoolVar(&installKata, "kata", false, "emit the Kata Containers runtime values (kata.enabled=true; disables host-side ratls-mesh/attestation-api/nri-image-policy)")
 	renderValuesCmd.Flags().BoolVar(&installKataDebug, "debug", false, "use the kata-guest-base DEBUG image variant (requires --kata)")
+	renderValuesCmd.Flags().StringVar(&installEngine, "engine", "", "inference engine preset deriving tls-lb's upstream (chart engine.name): vllm or sglang. Requires --engine-workload-id. Without this or a verified-https tlsLb.upstream, tls-lb renders no catch-all route until one is attached")
+	renderValuesCmd.Flags().StringVar(&installEngineWorkloadID, "engine-workload-id", "", "confidential.ai/cw id of the engine workload (chart engine.workloadId); with --engine, derives the mesh-wrapped upstream c8s-<id>.<ns>.svc.cluster.local:<port>")
+	renderValuesCmd.Flags().StringVar(&installEngineNamespace, "engine-namespace", "", "namespace the engine workload runs in (chart engine.namespace); empty = release namespace")
 	renderValuesCmd.Flags().BoolVar(&installResolveDigests, "resolve-digests", true, "resolve each component image tag to its registry digest (via crane), pin it, and enable the NRI allowlist derivation")
 	renderValuesCmd.Flags().StringVar(&installImagePullSecret, "image-pull-secret", "", "name of an existing dockerconfigjson Secret the chart wires into every component's imagePullSecrets")
 	renderValuesCmd.Flags().StringVar(&installImageTag, "image-tag", "", "component image tag to resolve digests at (default: the CLI build version, or 'main'). Override to pin a specific branch/tag/release")

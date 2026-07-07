@@ -18,8 +18,14 @@ This installs the supported chart-managed CVM shape: operator, RBAC, CRDs,
 webhook, attestation-api, and CDS.
 
 ```sh
-c8s install --namespace c8s-system
+c8s install --namespace c8s-system --engine vllm --engine-workload-id <cw-id>
 ```
+
+tls-lb ships no default upstream: `--engine` + `--engine-workload-id` derive
+the mesh-wrapped one from the inference workload's `confidential.ai/cw` id.
+Without an upstream choice, tls-lb renders no catch-all route until one is
+attached rather than shipping an unencrypted inference hop. Alternatives and details: the
+[engine upstream preset](operator.md#engine-upstream-preset).
 
 By default `c8s install` resolves each component image tag to its registry
 digest (via `crane`) and pins it. The image policy admits c8s components by
@@ -52,7 +58,8 @@ default image tag of its own, so the image tag above is supplied by
 To install without the advisory CRDs:
 
 ```sh
-c8s install --namespace c8s-system --install-crds=false
+c8s install --namespace c8s-system --install-crds=false \
+  --engine vllm --engine-workload-id <cw-id>
 ```
 
 The cluster still runs without CRDs. CRDs only provide demo/status UX such as
@@ -73,7 +80,8 @@ kubectl create secret docker-registry ghcr-secret \
   --docker-username=<user-or-x-access-token> \
   --docker-password="$GITHUB_TOKEN"
 
-c8s install --namespace c8s-system --image-pull-secret ghcr-secret
+c8s install --namespace c8s-system --image-pull-secret ghcr-secret \
+  --engine vllm --engine-workload-id <cw-id>
 ```
 
 `scripts/deploy-image-pull-secret.sh` wraps the secret-creation step
@@ -81,7 +89,8 @@ idempotently (re-run it to rotate the credential in place):
 
 ```sh
 IMAGE_PULL_SECRET=<ghcr-token> NAMESPACE=c8s-system ./scripts/deploy-image-pull-secret.sh
-c8s install --namespace c8s-system --image-pull-secret ghcr-pull-secret
+c8s install --namespace c8s-system --image-pull-secret ghcr-pull-secret \
+  --engine vllm --engine-workload-id <cw-id>
 ```
 
 Pass `NAMESPACE=c8s-system` explicitly — the script defaults to `default`,

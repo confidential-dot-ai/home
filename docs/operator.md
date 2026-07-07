@@ -97,10 +97,11 @@ webhook, attestation-api, and CDS. It does not mutate
 application workloads until those workloads opt in with
 `confidential.ai/cw`.
 
-Install with the CLI:
+Install with the CLI. `--engine` derives tls-lb's mesh-wrapped upstream from
+the inference workload's `confidential.ai/cw` id:
 
 ```bash
-c8s install
+c8s install --engine vllm --engine-workload-id <cw-id>
 ```
 
 `c8s install --install-crds=false` passes Helm's `--skip-crds`; CRDs are
@@ -423,10 +424,22 @@ engine:
 
 With `engine.name=sglang` and `engine.workloadId=infer` in namespace
 `c8s-system`, tls-lb's upstream resolves to
-`c8s-infer.c8s-system.svc.cluster.local:30000`. Leaving `engine.name` empty
-preserves `tlsLb.upstream.address` verbatim, so an upstream that is not a
-c8s-managed workload (an existing Service, an external address) is set
-directly:
+`c8s-infer.c8s-system.svc.cluster.local:30000` (`c8s install` plumbs these as
+`--engine sglang --engine-workload-id infer`, plus `--engine-namespace` when
+the workload runs elsewhere). Leaving `engine.name` empty preserves
+`tlsLb.upstream.address` verbatim, so an upstream that is not a c8s-managed
+workload (an existing Service, an external address) is set directly, but the
+chart cannot verify such an upstream resolves to pod IPs the mesh intercepts,
+so a manual address must be `protocol: https` with `tls.verify: true`: an
+upstream that terminates and authenticates TLS itself (app-TLS). There is no
+plaintext-to-unattested escape hatch and no default upstream.
+
+Leaving both unset is legal: tls-lb installs and serves its cert, discovery,
+and any explicit routes with **no catch-all** `location /` until an upstream is
+wired. This is the install-then-attach flow: `c8s install` stands up the front
+door, and the operator attaches inference later by setting the engine preset
+(or a verified-https address). An unmatched request gets nginx's default 404
+until then.
 
 ```bash
 helm template c8s internal/helmchart/c8s \
@@ -438,6 +451,13 @@ helm template c8s internal/helmchart/c8s \
 The chart rejects, at render time, with stable `kind=` markers (the same the
 chart tests assert on):
 
+- `tlslb_unsecured_upstream`: `tlsLb.upstream.address` is set to a plaintext
+  http backend, or https without `tls.verify=true`. Only a verified-https
+  (app-TLS) manual address is admitted; there is no acknowledgment to override
+  this. To reach a confidential workload, use `engine.name` +
+  `engine.workloadId` instead: pointing the address at a Service VIP fronting
+  cw pods is unmeshed, and with `ratlsMesh.cwInboundEnforcement` (on by default)
+  the mesh drops it, so the hop fails closed rather than running plaintext.
 - `engine_upstream_conflict`: both `engine.name` and a custom
   `tlsLb.upstream.address` are set. They are two ways to say the same thing;
   set one.
@@ -445,10 +465,6 @@ chart tests assert on):
   `tlsLb.upstream.protocol=https`. The derived headless-Service hop is
   plaintext at the app layer (the mesh wraps it in attested mTLS), so an https
   protocol could only fail at runtime.
-- `https_plaintext_default`: `engine.name` is empty and
-  `tlsLb.upstream.protocol=https` while `tlsLb.upstream.address` is still the
-  default plaintext vllm router; same runtime-only failure class as above.
-  A custom address with https is accepted as the operator's contract.
 - `engine_missing_workload_id`: `engine.name` is set but `engine.workloadId` is
   empty.
 - `engine_invalid_workload_id`: `c8s-<workloadId>` is not a DNS-1035 label
@@ -457,6 +473,21 @@ chart tests assert on):
   Service and tls-lb would dial a name that resolves to nothing. The rule
   mirrors `webhook.WorkloadServiceName`.
 - `unknown_engine`: `engine.name` is not a key of `engine.presets`.
+
+The same secured-backend rule applies to every `tlsLb.routes[].backend`: it
+must use `protocol: https` with `tls.verify: true` (app-TLS). A plaintext http
+or unverified-https route backend fails the render (`tlslb_unsecured_route`);
+there is no acknowledgment to override it. Routes have no default backend, so
+this only affects routes you configure. A confidential workload is reached via
+the engine preset, not a route.
+
+The engine path's mesh guarantee holds only when `engine.workloadId` names a
+real cw workload: the chart validates the id is a DNS-1035 label but cannot
+confirm, at render time, that `c8s-<workloadId>` fronts attested cw pods. A
+wrong id derives a headless Service that resolves to nothing (tls-lb has no
+backend) rather than a plaintext leak; the runtime boundary that a peer is a
+genuine cw pod is the mesh's inbound enforcement (`ratlsMesh.cwInboundEnforcement`),
+not this render guard.
 
 ## Certificate file permissions
 

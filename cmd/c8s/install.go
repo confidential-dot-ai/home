@@ -49,6 +49,10 @@ var (
 	installOperatorKeys     string
 	installForce            bool
 
+	installEngine           string
+	installEngineWorkloadID string
+	installEngineNamespace  string
+
 	installResolveDigests bool
 )
 
@@ -825,6 +829,24 @@ func appendSingleNodeInstallArgs(helmArgs []string, singleNode bool) []string {
 	)
 }
 
+// appendEngineInstallArgs emits the engine-preset values that derive tls-lb's
+// mesh-wrapped upstream. Empty values are not plumbed so an operator's -f (or
+// the chart's no-catch-all install-then-attach state) stands. The chart
+// validates the combinations (engine_missing_workload_id, unknown_engine, ...),
+// so no CLI-side checks here.
+func appendEngineInstallArgs(setArgs []string, engine, workloadID, namespace string) []string {
+	if engine != "" {
+		setArgs = append(setArgs, "--set-string", "engine.name="+engine)
+	}
+	if workloadID != "" {
+		setArgs = append(setArgs, "--set-string", "engine.workloadId="+workloadID)
+	}
+	if namespace != "" {
+		setArgs = append(setArgs, "--set-string", "engine.namespace="+namespace)
+	}
+	return setArgs
+}
+
 // craneDigest resolves an image reference to its registry digest by shelling
 // out to `crane digest <ref>`. crane handles registry auth (docker config),
 // manifest lists, and the v2 protocol — reimplementing that in-process would
@@ -906,6 +928,9 @@ func init() {
 	installCmd.Flags().Int64Var(&installGetCertRunAsGroup, "webhook-get-cert-run-as-group", 65532, "runAsGroup for injected get-cert containers")
 	installCmd.Flags().BoolVar(&installGetCertRunAsNonRoot, "webhook-get-cert-run-as-non-root", true, "set runAsNonRoot for injected get-cert containers")
 	installCmd.Flags().BoolVar(&installSingleNode, "single-node", false, "single-node / single-CVM cluster: clear the dedicated-CDS-node selector and taint toleration so every node is CDS-eligible (no role=cds label or dedicated node needed). Sets cds.node.selector={} and cds.node.tolerations=[]")
+	installCmd.Flags().StringVar(&installEngine, "engine", "", "inference engine preset deriving tls-lb's upstream (chart engine.name): vllm or sglang. Requires --engine-workload-id. Without this or a verified-https tlsLb.upstream, tls-lb renders no catch-all route until one is attached")
+	installCmd.Flags().StringVar(&installEngineWorkloadID, "engine-workload-id", "", "confidential.ai/cw id of the engine workload (chart engine.workloadId); with --engine, derives the mesh-wrapped upstream c8s-<id>.<ns>.svc.cluster.local:<port>")
+	installCmd.Flags().StringVar(&installEngineNamespace, "engine-namespace", "", "namespace the engine workload runs in (chart engine.namespace); empty = release namespace")
 	installCmd.Flags().StringVar(&installCvmMode, flagCvmMode, "baremetal", "CVM deployment shape (orthogonal to --hardware-platform): baremetal, or node (generalized node-as-CVM: our own TDX/SNP nodes are themselves confidential VMs, pods run as ordinary processes), or gke (GKE managed confidential VMs), or aks (vTPM /dev/tpm0). All modes render a privileged attestation-api (a hostPath device mount alone does not grant device-cgroup access)")
 	installCmd.Flags().StringVar(&installHardwarePlatform, flagHardwarePlatform, "sev-snp", "CPU-level TEE hardware (orthogonal to --cvm-mode): sev-snp (default, /dev/sev-guest) or tdx (Intel TDX, /dev/tdx-guest). Ignored when --cvm-mode=aks (Azure vTPM path); combining --cvm-mode=aks with --hardware-platform=tdx is refused")
 	installCmd.Flags().BoolVar(&installKata, "kata", false, "install the Kata Containers runtime stack (kata-deploy DaemonSet + RuntimeClasses) and enforce it: workload pods are injected with kata RuntimeClasses and non-kata classes are rejected. Also disables the host-side ratls-mesh, attestation-api, and nri-image-policy — under kata their function runs inside the kata-guest-base VM image")

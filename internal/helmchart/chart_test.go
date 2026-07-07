@@ -1575,7 +1575,7 @@ func hasPullSecret(refs []corev1.LocalObjectReference, name string) bool {
 }
 
 func TestChartRendersTLSLBPublicTLSAndDiscovery(t *testing.T) {
-	out, err := helmTemplate(t,
+	out, err := helmTemplate(t, noEngineArgs(
 		"--set-string", "tlsLb.publicTLS.secretName=tls-lb-public-tls",
 		"--set-string", "tlsLb.publicTLS.mountPath=/edge-tls",
 		"--set-string", "tlsLb.publicTLS.certKey=public.crt",
@@ -1585,7 +1585,7 @@ func TestChartRendersTLSLBPublicTLSAndDiscovery(t *testing.T) {
 		"--set", "tlsLb.upstream.protocol=https",
 		"--set", "tlsLb.upstream.tls.verify=true",
 		"--set-string", "tlsLb.upstream.tls.serverName=my-backend.other-ns.svc.cluster.local",
-	)
+	)...)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
@@ -1680,9 +1680,9 @@ func TestChartRendersTLSLBAttestSidecar(t *testing.T) {
 		"--port=8800",
 		"--generation=milan",
 		"--attestation-api-url=http://",
-		// The default upstream is the workload over plain HTTP at the app
-		// layer; the mTLS args render only for an https upstream.
-		"--upstream=http://vllm-router-service.vllm.svc.cluster.local",
+		// The baseline engine preset derives a plain-HTTP workload upstream;
+		// the mTLS args render only for an https upstream.
+		"--upstream=http://c8s-infer.c8s-system.svc.cluster.local:8000",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("cds-attest args missing %q: %v", want, sidecar.Args)
@@ -1719,11 +1719,11 @@ func TestChartRendersTLSLBAttestSidecar(t *testing.T) {
 	// An https upstream: the sidecar presents the CDS client cert and
 	// verifies the upstream against the CA chain get-cert writes to
 	// /tls/cert.pem, mirroring the nginx proxy_ssl_* config.
-	httpsOut, err := helmTemplate(t,
+	httpsOut, err := helmTemplate(t, noEngineArgs(
 		"--set", "tlsLb.attest.enabled=true",
 		"--set-string", "tlsLb.upstream.address=my-backend.other-ns.svc:8443",
 		"--set", "tlsLb.upstream.protocol=https",
-	)
+	)...)
 	if err != nil {
 		t.Fatalf("helm template (https upstream): %v\n%s", err, httpsOut)
 	}
@@ -1853,7 +1853,7 @@ func TestTLSLBProbesAvoidMTLSHandshakeUnderKata(t *testing.T) {
 // Service (the engine preset) returns pod IPs that change on pod churn, and
 // a static upstream block would pin the startup-time IPs and 502 until the
 // next config reload.
-func TestChartDefaultTLSLBUpstreamIsWorkloadDirect(t *testing.T) {
+func TestChartTLSLBEnginePresetUpstreamIsWorkloadDirect(t *testing.T) {
 	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
@@ -1861,7 +1861,9 @@ func TestChartDefaultTLSLBUpstreamIsWorkloadDirect(t *testing.T) {
 	cfg := renderedTLSLBNginxConf(t, out)
 	for _, want := range []string{
 		"resolver kube-dns.kube-system.svc.cluster.local;",
-		"set $backend_addr vllm-router-service.vllm.svc.cluster.local;",
+		// The baseline engine preset derives the operator-managed headless
+		// Service, so the pod-IP hop is mesh-wrapped.
+		"set $backend_addr c8s-infer.c8s-system.svc.cluster.local:8000;",
 		"proxy_pass http://$backend_addr;",
 	} {
 		if !strings.Contains(cfg, want) {
@@ -1891,12 +1893,18 @@ func TestTLSLBVerifyDerivesProxySSLNameFromUpstream(t *testing.T) {
 }
 
 func TestTLSLBAdditionalRoutesConfigureNginxLocations(t *testing.T) {
+	// Route backends must be secured (https + verify); the location/upstream
+	// wiring under test is protocol-independent.
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "routes[0].path=/allowlist",
 		"--set-string", "routes[0].match=exact",
 		"--set-string", "routes[0].backend.address=cds.c8s-system.svc:8080",
+		"--set-string", "routes[0].backend.protocol=https",
+		"--set", "routes[0].backend.tls.verify=true",
 		"--set-string", "routes[1].path=/tenant/",
 		"--set-string", "routes[1].backend.address=tenant-router.c8s-system.svc:8080",
+		"--set-string", "routes[1].backend.protocol=https",
+		"--set", "routes[1].backend.tls.verify=true",
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
@@ -1913,13 +1921,13 @@ func TestTLSLBAdditionalRoutesConfigureNginxLocations(t *testing.T) {
 			name:     "exact",
 			match:    "exact",
 			path:     "/allowlist",
-			proxyURL: "http://route_0",
+			proxyURL: "https://route_0",
 		},
 		{
 			name:     "default-prefix",
 			match:    "prefix",
 			path:     "/tenant/",
-			proxyURL: "http://route_1",
+			proxyURL: "https://route_1",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1930,15 +1938,20 @@ func TestTLSLBAdditionalRoutesConfigureNginxLocations(t *testing.T) {
 
 	defaultRoute := cfg.location(t, "prefix", "/")
 	defaultRoute.assertDirective(t, "set", "$backend_addr", "vllm:8000")
-	defaultRoute.assertDirective(t, "proxy_pass", "http://$backend_addr")
+	defaultRoute.assertDirective(t, "proxy_pass", "https://$backend_addr")
 	cfg.upstream(t, "route_0").assertServer(t, "cds.c8s-system.svc:8080")
 	cfg.upstream(t, "route_1").assertServer(t, "tenant-router.c8s-system.svc:8080")
 }
 
-func TestTLSLBTypedHTTPRouteConfiguresNginxLocation(t *testing.T) {
+// A route backend forwards X-Forwarded-Proto to the origin regardless of the
+// backend protocol; the backend must be secured (https + verify), so a client
+// cert is presented but no proxy_ssl client cert is required for that header.
+func TestTLSLBRouteForwardsProto(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "routes[0].path=/tenant/",
 		"--set-string", "routes[0].backend.address=tenant-router.c8s-system.svc:8080",
+		"--set-string", "routes[0].backend.protocol=https",
+		"--set", "routes[0].backend.tls.verify=true",
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
@@ -1946,12 +1959,8 @@ func TestTLSLBTypedHTTPRouteConfiguresNginxLocation(t *testing.T) {
 	cfg := renderedTLSLBNginxConfig(t, out)
 	cfg.upstream(t, "route_0").assertServer(t, "tenant-router.c8s-system.svc:8080")
 	route := cfg.location(t, "prefix", "/tenant/")
-	route.assertDirective(t, "proxy_pass", "http://route_0")
+	route.assertDirective(t, "proxy_pass", "https://route_0")
 	route.assertDirective(t, "proxy_set_header", "X-Forwarded-Proto", "$scheme")
-	route.assertNoDirective(t, "proxy_ssl_certificate")
-	route.assertNoDirective(t, "proxy_ssl_certificate_key")
-	route.assertNoDirective(t, "proxy_ssl_name")
-	route.assertNoDirective(t, "proxy_ssl_verify")
 }
 
 func TestTLSLBTypedHTTPSRouteConfiguresProxyTLS(t *testing.T) {
@@ -1985,6 +1994,7 @@ func TestTLSLBTypedHTTPSRouteCanUseCDSClientCert(t *testing.T) {
 		"--set-string", "routes[0].backend.address=cds.c8s-system.svc.cluster.local:8080",
 		"--set-string", "routes[0].backend.protocol=https",
 		"--set", "routes[0].backend.tls.useCDSClientCert=true",
+		"--set", "routes[0].backend.tls.verify=true",
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
@@ -2242,6 +2252,9 @@ func TestTLSLBMultiRouteVerifiedRouteUsesMeshCABundle(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "routes[0].path=/a",
 		"--set-string", "routes[0].backend.address=svc-a:8080",
+		"--set-string", "routes[0].backend.protocol=https",
+		"--set", "routes[0].backend.tls.verify=true",
+		"--set-string", "routes[0].backend.tls.trustedCAPath=/tls/other.pem",
 		"--set-string", "routes[1].path=/b",
 		"--set-string", "routes[1].backend.address=svc-b:8080",
 		"--set-string", "routes[1].backend.protocol=https",
@@ -2254,6 +2267,46 @@ func TestTLSLBMultiRouteVerifiedRouteUsesMeshCABundle(t *testing.T) {
 	route := cfg.location(t, "prefix", "/b")
 	route.assertDirective(t, "proxy_ssl_verify", "on")
 	route.assertDirective(t, "proxy_ssl_trusted_certificate", "/tls/ca.pem")
+}
+
+// TestTLSLBRejectsUnsecuredRoute pins the per-route secured-backend guard,
+// mirroring the catch-all upstream: a route backend must be https with
+// tls.verify=true (app-TLS). A plaintext http backend, or https without verify,
+// fails the render; there is no plaintext-to-unattested acknowledgment.
+func TestTLSLBRejectsUnsecuredRoute(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+		kind string
+	}{
+		{
+			name: "http-route",
+			args: []string{
+				"--set-string", "routes[0].path=/x",
+				"--set-string", "routes[0].backend.address=svc:8080",
+			},
+			kind: "tlslb_unsecured_route",
+		},
+		{
+			name: "unverified-https-route",
+			args: []string{
+				"--set-string", "routes[0].path=/x",
+				"--set-string", "routes[0].backend.address=svc:8080",
+				"--set-string", "routes[0].backend.protocol=https",
+			},
+			kind: "tlslb_unsecured_route",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := helmTemplateTLSLB(t, tt.args...)
+			if err == nil {
+				t.Fatalf("helm template succeeded, want %s failure\n%s", tt.kind, out)
+			}
+			if got := parseValidationErrorKind(out); got != tt.kind {
+				t.Fatalf("validation kind = %q, want %q\n%s", got, tt.kind, out)
+			}
+		})
+	}
 }
 
 func TestTLSLBRejectsInvalidRouteMatch(t *testing.T) {
@@ -2981,6 +3034,12 @@ func helmTemplate(t *testing.T, args ...string) (string, error) {
 		"--set", "cds.image.tag=dev",
 		"--set", "ratlsMesh.image.tag=dev",
 		"--set", "nriImagePolicy.image.tag=dev",
+		// tls-lb has no default upstream (a silently-plaintext VIP was
+		// removed); the engine preset is the representative mesh-wrapped
+		// baseline. Tests for the manual-upstream paths clear it via
+		// noEngineArgs.
+		"--set-string", "engine.name=vllm",
+		"--set-string", "engine.workloadId=infer",
 		"--set", "nriImagePolicy.image.digest=" + baseNRIDigest,
 		// The fail-closed default (this PR) activates the
 		// uncovered_component_digest guard: every digest-pinned component must be
@@ -2996,6 +3055,12 @@ func helmTemplate(t *testing.T, args ...string) (string, error) {
 	cmd.Dir = "."
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// noEngineArgs clears the engine preset that helmTemplate pins by default,
+// for tests exercising the manual tlsLb.upstream paths.
+func noEngineArgs(args ...string) []string {
+	return append([]string{"--set-string", "engine.name=", "--set-string", "engine.workloadId="}, args...)
 }
 
 func renderedValue(t *testing.T, manifest, key string) string {
@@ -3425,7 +3490,13 @@ func TestChartNoTeeProxyRemnants(t *testing.T) {
 // same charset guard every routes[].backend.address gets: an address with
 // nginx metacharacters must fail the render, not corrupt the config.
 func TestChartRejectsMalformedUpstreamAddress(t *testing.T) {
-	out, err := helmTemplate(t, "--set-string", "tlsLb.upstream.address=bad addr;{}")
+	// Clear the engine baseline and secure the manual upstream (https + verify)
+	// so the render reaches the address-format check rather than tripping the
+	// engine-conflict / unsecured-upstream guards first.
+	out, err := helmTemplate(t, noEngineArgs(
+		"--set-string", "tlsLb.upstream.address=bad addr;{}",
+		"--set-string", "tlsLb.upstream.protocol=https",
+		"--set", "tlsLb.upstream.tls.verify=true")...)
 	if err == nil {
 		t.Fatalf("helm template succeeded, want upstream address rejection\n%s", out)
 	}
@@ -3650,9 +3721,12 @@ func helmTemplateTLSLB(t *testing.T, args ...string) (string, error) {
 		"--set", "ratlsMesh.enabled=false",
 		"--set", "nriImagePolicy.enabled=false",
 		"--set-string", "tlsLb.upstream.address=vllm:8000",
-		// Plain-HTTP upstream baseline for the tls-lb subchart tests, on a
-		// bare vllm address. Tests that exercise https set it.
-		"--set", "tlsLb.upstream.protocol=http",
+		// Secured (https + verify) upstream baseline for the tls-lb subchart
+		// tests, on a bare vllm address. A manual address must be app-TLS now
+		// that no default ships and there is no unmeshed acknowledgment; tests
+		// that exercise a specific upstream protocol override it.
+		"--set", "tlsLb.upstream.protocol=https",
+		"--set", "tlsLb.upstream.tls.verify=true",
 		"--set", "tlsLb.nginx.image.tag=dev",
 		"--show-only", "templates/tls-lb-configmap.yaml",
 		"--show-only", "templates/tls-lb-deployment.yaml",
@@ -3736,9 +3810,15 @@ func Example_tlsLBConfig() {
 	//         # Headroom for upstream responses with large headers.
 	//         proxy_buffer_size 16k;
 	//         proxy_buffers 4 16k;
-	//         # Route: /allowlist -> http://c8s-cds.c8s-system.svc:8443
+	//         # Route: /allowlist -> https://c8s-cds.c8s-system.svc:8443
 	//         location = /allowlist {
-	//             proxy_pass http://route_0;
+	//
+	//             proxy_ssl_server_name on;
+	//             proxy_ssl_name c8s-cds.c8s-system.svc;
+	//             proxy_ssl_verify on;
+	//             proxy_ssl_verify_depth 2;
+	//             proxy_ssl_trusted_certificate /tls/ca.pem;
+	//             proxy_pass https://route_0;
 	//             proxy_set_header Host $host;
 	//             proxy_set_header X-Real-IP $remote_addr;
 	//             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -3759,8 +3839,16 @@ func Example_tlsLBConfig() {
 	//             proxy_set_header X-Forwarded-Proto $scheme;
 	//         }
 	//         location / {
+	//
+	//             proxy_ssl_certificate /tls/cert.pem;
+	//             proxy_ssl_certificate_key /tls/key.pem;
+	//             proxy_ssl_server_name on;
+	//             proxy_ssl_name vllm;
+	//             proxy_ssl_verify on;
+	//             proxy_ssl_verify_depth 2;
+	//             proxy_ssl_trusted_certificate /tls/cert.pem;
 	//             set $backend_addr vllm:8000;
-	//             proxy_pass http://$backend_addr;
+	//             proxy_pass https://$backend_addr;
 	//             proxy_set_header Host $host;
 	//             proxy_set_header X-Real-IP $remote_addr;
 	//             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -3774,7 +3862,6 @@ func Example_tlsLBConfig() {
 	//         }
 	//     }
 	// }
-	//
 }
 
 // containerVolumeMount returns the named volume mount from a container
@@ -4185,11 +4272,14 @@ func renderExampleTLSLBNginxConf() string {
 		// (discovery's own locations are covered by a dedicated test above).
 		"--set", "tlsLb.discovery.enabled=false",
 		"--set-string", "tlsLb.upstream.address=vllm:8000",
-		"--set", "tlsLb.upstream.protocol=http",
+		"--set", "tlsLb.upstream.protocol=https",
+		"--set", "tlsLb.upstream.tls.verify=true",
 		"--set", "tlsLb.nginx.image.tag=dev",
 		"--set-string", "tlsLb.routes[0].path=/allowlist",
 		"--set-string", "tlsLb.routes[0].match=exact",
 		"--set-string", "tlsLb.routes[0].backend.address=c8s-cds.c8s-system.svc:8443",
+		"--set-string", "tlsLb.routes[0].backend.protocol=https",
+		"--set", "tlsLb.routes[0].backend.tls.verify=true",
 		"--set-string", "tlsLb.routes[1].path=/tenant/",
 		"--set-string", "tlsLb.routes[1].backend.address=tenant-router.c8s-system.svc:8080",
 		"--set-string", "tlsLb.routes[1].backend.protocol=https",
@@ -4488,14 +4578,67 @@ func tlsLbUpstreamAddress(t *testing.T, manifest string) string {
 	return ""
 }
 
-func TestChartEngineUpstreamDefault(t *testing.T) {
-	out, err := helmTemplate(t)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	// No engine preset: tlsLb.upstream.address passes through verbatim.
-	if got, want := tlsLbUpstreamAddress(t, out), "vllm-router-service.vllm.svc.cluster.local"; got != want {
-		t.Fatalf("default upstream = %q, want %q", got, want)
+// TestChartTLSLBUpstreamChoice: there is no default upstream. An unset upstream
+// is a legal install-then-attach state (tls-lb serves with no catch-all); when
+// an upstream IS set without the engine preset it must be https with
+// tls.verify=true (app-TLS) — a plaintext http address or unverified https
+// fails instead of shipping a silently-plaintext hop.
+func TestChartTLSLBUpstreamChoice(t *testing.T) {
+	// No engine and no upstream renders a healthy front door with NO catch-all:
+	// the operator attaches inference later by setting the engine preset. The
+	// cert, discovery, and /healthz still render; only location / is withheld.
+	t.Run("no-upstream-renders-without-catch-all", func(t *testing.T) {
+		out, err := helmTemplate(t, noEngineArgs()...)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		cfg := renderedTLSLBNginxConfig(t, out)
+		if _, ok := cfg.locations[nginxLocationKey{match: "prefix", path: "/"}]; ok {
+			t.Fatalf("no upstream should render no catch-all location /, but one is present\n%s", out)
+		}
+		// The front door is still healthy and serving.
+		cfg.location(t, "prefix", "/healthz")
+	})
+
+	// An https upstream with tls.verify (verify defaults to true) terminates and
+	// authenticates TLS itself: that hop is app-TLS, the only manual-address
+	// shape the guard admits, and the address passes through verbatim.
+	t.Run("verified-https-upstream-passes-verbatim", func(t *testing.T) {
+		out, err := helmTemplate(t, noEngineArgs(
+			"--set-string", "tlsLb.upstream.address=my-backend.other-ns.svc:8443",
+			"--set", "tlsLb.upstream.protocol=https")...)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		if got, want := tlsLbUpstreamAddress(t, out), "my-backend.other-ns.svc:8443"; got != want {
+			t.Fatalf("upstream = %q, want %q", got, want)
+		}
+	})
+
+	// A disabled tls-lb needs no upstream, and a leftover upstream (e.g. a
+	// migration that flips tlsLb.enabled=false without clearing the value)
+	// must not trip the secured-backend check: the unmeshed-hop risk cannot
+	// occur when tls-lb renders nothing.
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"tlslb-disabled-needs-no-upstream", noEngineArgs("--set", "tlsLb.enabled=false")},
+		{"tlslb-disabled-ignores-leftover-upstream", noEngineArgs(
+			"--set", "tlsLb.enabled=false",
+			"--set-string", "tlsLb.upstream.address=my-router.ns.svc:9000")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := helmTemplate(t, tc.args...)
+			if err != nil {
+				t.Fatalf("helm template: %v\n%s", err, out)
+			}
+			// The render must not just succeed: a disabled tls-lb must emit no
+			// Deployment, so no upstream (leftover or otherwise) can ship.
+			if renderedManifestHasNamedKind(t, out, "Deployment", "c8s-tls-lb") {
+				t.Fatalf("tlsLb.enabled=false still rendered a c8s-tls-lb Deployment\n%s", out)
+			}
+		})
 	}
 }
 
@@ -4552,13 +4695,22 @@ func TestChartEnginePresetValidation(t *testing.T) {
 		},
 		{
 			name: "missing-workload-id",
-			args: []string{"--set-string", "engine.name=sglang"},
+			args: []string{"--set-string", "engine.name=sglang", "--set-string", "engine.workloadId="},
 			kind: "engine_missing_workload_id",
 		},
 		{
 			name: "invalid-workload-id",
 			args: []string{"--set-string", "engine.name=sglang", "--set-string", "engine.workloadId=Bad_ID"},
 			kind: "engine_invalid_workload_id",
+		},
+		{
+			name: "invalid-namespace",
+			args: []string{
+				"--set-string", "engine.name=sglang",
+				"--set-string", "engine.workloadId=infer",
+				"--set-string", "engine.namespace=bad_ns",
+			},
+			kind: "engine_invalid_namespace",
 		},
 		{
 			name: "upstream-conflict",
@@ -4578,6 +4730,23 @@ func TestChartEnginePresetValidation(t *testing.T) {
 			},
 			kind: "engine_https_upstream",
 		},
+		{
+			// A plaintext http manual upstream cannot render: there is no
+			// acknowledgment, only https + verify is admitted.
+			name: "http-upstream",
+			args: noEngineArgs("--set-string", "tlsLb.upstream.address=my-router.ns.svc:9000"),
+			kind: "tlslb_unsecured_upstream",
+		},
+		{
+			// https alone does not secure the hop: verify=false is an
+			// encrypted-but-unauthenticated backend, rejected like http.
+			name: "unverified-https-upstream",
+			args: noEngineArgs(
+				"--set-string", "tlsLb.upstream.address=my-router.ns.svc:8443",
+				"--set", "tlsLb.upstream.protocol=https",
+				"--set", "tlsLb.upstream.tls.verify=false"),
+			kind: "tlslb_unsecured_upstream",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			out, err := helmTemplate(t, tt.args...)
@@ -4591,26 +4760,11 @@ func TestChartEnginePresetValidation(t *testing.T) {
 	}
 }
 
-// TestChartRejectsHTTPSAgainstPlaintextDefault: without the engine preset the
-// same misconfig class engine_https_upstream catches is guarded for the
-// known-plaintext default upstream; https against it can only fail at runtime.
-func TestChartRejectsHTTPSAgainstPlaintextDefault(t *testing.T) {
-	out, err := helmTemplate(t, "--set", "tlsLb.upstream.protocol=https")
-	if err == nil {
-		t.Fatalf("helm template succeeded, want https_plaintext_default failure\n%s", out)
-	}
-	if got := parseValidationErrorKind(out); got != "https_plaintext_default" {
-		t.Fatalf("validation kind = %q, want https_plaintext_default\n%s", got, out)
-	}
-}
-
-// TestChartEngineConflictDefaultMatchesValues guards the engine_upstream_conflict
-// check in validations.yaml: it hardcodes the default tlsLb.upstream.address so
-// it can tell "user left the default" from "user set a custom upstream". If
-// values.yaml drifts, the conflict check would either fire on the default or
-// miss a real conflict — pin the two together.
-func TestChartEngineConflictDefaultMatchesValues(t *testing.T) {
-	const defaultInValidations = "vllm-router-service.vllm.svc.cluster.local"
+// TestChartTLSLBUpstreamDefaultEmpty guards the no-default-upstream invariant:
+// a shipped default would silently render a catch-all and could put the
+// inference hop back on an unmeshed Service VIP. Empty keeps the front door
+// catch-all-free until an upstream is deliberately wired.
+func TestChartTLSLBUpstreamDefaultEmpty(t *testing.T) {
 	data, err := os.ReadFile("c8s/values.yaml")
 	if err != nil {
 		t.Fatalf("read values.yaml: %v", err)
@@ -4625,9 +4779,8 @@ func TestChartEngineConflictDefaultMatchesValues(t *testing.T) {
 	if err := yaml.Unmarshal(data, &values); err != nil {
 		t.Fatalf("unmarshal values.yaml: %v", err)
 	}
-	if values.TLSLB.Upstream.Address != defaultInValidations {
-		t.Fatalf("tlsLb.upstream.address default = %q, but validations.yaml engine_upstream_conflict pins %q; keep them in sync",
-			values.TLSLB.Upstream.Address, defaultInValidations)
+	if values.TLSLB.Upstream.Address != "" {
+		t.Fatalf("tlsLb.upstream.address default = %q, want empty: a shipped default silently renders a catch-all and can leave the hop unmeshed", values.TLSLB.Upstream.Address)
 	}
 }
 
