@@ -66,11 +66,11 @@ CPU VMs (per core-hour + per GB-hour RAM):
 
 {{cpu_vms_table}}
 
-### [Attestable Builds (Kettle)](https://confidential.ai/attestable-builds)
+### [Attested Builds (Kettle)](https://confidential.ai/attested-builds)
 
 Attested CI/CD inside TEEs with cryptographic provenance. SLSA Build L3. GitHub integration. Base rate $0.008 per vCPU-minute; runners scale linearly.
 
-{{attestable_builds_table}}
+{{attested_builds_table}}
 
 ### [Confidential Agents](https://confidential.ai/confidential-agents)
 
@@ -82,7 +82,7 @@ Confidential is a set of independent, composable components. Use them all or int
 
 - **Attestation Service** — Generates and verifies TEE attestation reports. Trust anchor for the platform. Supports AMD SEV-SNP (VCEK/VLEK), Intel TDX, and NVIDIA CC. Continuous re-attestation with automatic certificate revocation. Public verification API and CLI.
 - **Certificate Distribution Service (CDS)** — Gates secret and certificate distribution on attestation. Workloads prove what they're running before receiving secrets. Optional certificate authority and TEE registry. Integrates with existing secret stores (e.g. HashiCorp Vault).
-- **Build Pipeline (Kettle)** — Produces attestable builds: runs builds inside a TEE with cryptographic proof of inputs, environment, and outputs. Verifiable chain from git commit to running code without needing deterministic compilers. Achieves SLSA Build L3 through hardware enforcement.
+- **Build Pipeline (Kettle)** — Produces attested builds: runs builds inside a TEE with cryptographic proof of inputs, environment, and outputs. Verifiable chain from git commit to running code without needing deterministic compilers. Achieves SLSA Build L3 through hardware enforcement.
 - **Networking & Application Services** — All networking runs inside TEEs. API gateway, multi-recipient hybrid encryption (payloads encrypted to multiple attested TEEs for reliability), firewalls, DDoS protection, load balancing. Internal mTLS with attestation-rooted certificates.
 - **Oblivious HTTP Gateway** — OHTTP-compatible gateway in a TEE paired with a third-party relay. Separates client identity from request content. No single party learns both who is asking and what they're asking.
 - **Control Plane** — Orchestration, scheduling, and autoscaling inside a TEE. Telemetry extracted from within the encrypted boundary. Optional ZK proofs verify scaling decisions without exposing per-process data. Supports on-prem, bare metal, and cloud (CPU and GPU).

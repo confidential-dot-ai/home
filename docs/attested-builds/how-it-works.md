@@ -1,22 +1,22 @@
-# How Attestable Builds Work
+# How Attested Builds Work
 
-This document explains the architecture and mechanics of attestable builds. After reading it, you'll understand each phase of the build process, how cryptographic binding works at every step, and how verification closes the loop from source to running code.
+This document explains the architecture and mechanics of attested builds. After reading it, you'll understand each phase of the build process, how cryptographic binding works at every step, and how verification closes the loop from source to running code.
 
-We assume you've read [What Are Attestable Builds?](what-are-attestable-builds.md) and understand the core concept: attestable builds prove that specific inputs were used to produce specific outputs in a verified environment. This document shows exactly how that works.
+We assume you've read [What Are Attested Builds?](what-are-attested-builds.md) and understand the core concept: attested builds prove that specific inputs were used to produce specific outputs in a verified environment. This document shows exactly how that works.
 
 ## Kettle: Confidential's Implementation
 
-Kettle is Confidential's implementation of attestable builds. It handles the entire pipeline: input verification, manifest generation, TEE orchestration, build execution, and provenance signing. When we describe "how attestable builds work" in this document, we're describing how Kettle works.
+Kettle is Confidential's implementation of attested builds. It handles the entire pipeline: input verification, manifest generation, TEE orchestration, build execution, and provenance signing. When we describe "how attested builds work" in this document, we're describing how Kettle works.
 
 Kettle will be open source and audited.
 
 ## The Build Flow
 
-An attestable build has three phases, split across two environments. The first phase happens locally on the developer's machine. The second and third phases happen inside a TEE.
+An attested build has three phases, split across two environments. The first phase happens locally on the developer's machine. The second and third phases happen inside a TEE.
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────────┐
-│                          Attestable Build Flow                                │
+│                          Attested Build Flow                                  │
 │                                                                               │
 │  DEVELOPER MACHINE                                                            │
 │  ─────────────────                                                            │
@@ -116,7 +116,7 @@ The measurement chain includes:
 | --------- | --------------------------------------- |
 | Firmware  | UEFI/boot code that initializes the TEE |
 | VM Image  | The hardened operating system image     |
-| Kettle    | The attestable build orchestrator       |
+| Kettle    | The attested build orchestrator       |
 
 Kettle is measured as part of the TEE's initial state. This is critical: the attestation report proves not just "this is a TEE" but "this is a TEE running Kettle with measurement X." A verifier can confirm they're talking to a genuine Kettle instance, not arbitrary code claiming to be Kettle.
 

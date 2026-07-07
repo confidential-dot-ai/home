@@ -10,5 +10,5 @@ For detailed rates, see [Pricing](/pricing.md).
 
 - [Confidential Inference](/confidential-inference)
 - [Confidential VMs](/confidential-vms)
-- [Attestable Builds](/attestable-builds)
+- [Attested Builds](/attested-builds)
 - [Confidential Agents](/confidential-agents)

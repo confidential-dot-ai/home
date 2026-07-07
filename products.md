@@ -21,7 +21,7 @@ The stack is built in layers. Confidential Metal and Confidential Kubernetes are
 
 ## Confidential Metal
 
-The foundation for bare metal. Confidential Metal turns on confidential computing on CC-capable hardware: software that sets the BIOS and a hardened host image carrying the right TEE firmware and kernel parameters. On top of that it provides the machinery to launch CVMs you can fully measure and verify, a hardened guest image measured from firmware all the way to user space, with that measurement bound to an attestable build and the attestation library baked in.
+The foundation for bare metal. Confidential Metal turns on confidential computing on CC-capable hardware: software that sets the BIOS and a hardened host image carrying the right TEE firmware and kernel parameters. On top of that it provides the machinery to launch CVMs you can fully measure and verify, a hardened guest image measured from firmware all the way to user space, with that measurement bound to an attested build and the attestation library baked in.
 
 Managed clouds like GCP and Azure already hand you measurable CVMs; Confidential Metal brings the same guarantees to your own bare metal.
 

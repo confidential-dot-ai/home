@@ -1,6 +1,6 @@
-# What Are Attestable Builds?
+# What Are Attested Builds?
 
-This document explains what attestable builds are, why they matter, and how they solve the software verification problem. After reading it, you'll understand the core insight behind attestable builds and why Trusted Execution Environments make them possible now.
+This document explains what attested builds are, why they matter, and how they solve the software verification problem. After reading it, you'll understand the core insight behind attested builds and why Trusted Execution Environments make them possible now.
 
 We assume familiarity with git, package managers, and the concept of cryptographic hashes.
 
@@ -38,7 +38,7 @@ But reproducible inputs don't guarantee reproducible outputs. The same source bu
 
 There's also an issue of how do you trust Nix itself? A compromised Nix installation can produce bogus derivations. A malicious actor with access to your build machine can modify the Nix toolchain to inject code regardless of what your flake.lock specifies. The derivation hashes prove consistency with a particular Nix evaluation, but they don't prove that evaluation was honest.
 
-## Attestable Builds: A Different Approach
+## Attested Builds: A Different Approach
 
 Here is the core insight: if you can cryptographically verify how something was built, and what went into that build, then bind it to the outcome, then that gives you a lot of the guarantees you'd want out of reproducible builds.
 
@@ -46,17 +46,17 @@ It is a shift from asking "does this binary have hash X?" to asking "was this bi
 
 With **reproducible builds**, you build the same source twice and check whether both outputs are bit-for-bit identical. If they are, you know the artifact matches the source. The problem is that this fails whenever timestamps, file ordering, or compiler optimizations introduce non-determinism. They almost always do.
 
-With **attestable builds**, you take a different approach. You feed your source, dependencies, and toolchain into a hardware-isolated build environment, and you get back both the binary and a provenance record. Verification then becomes three questions: was the build environment tamper-proof? Were the inputs the expected ones? And is the output cryptographically bound to that environment and those inputs? This is a mouthful to state, but it turns out these verifications are much easier to achieve than bit-for-bit reproducible builds. You don't need to eliminate non-determinism from every compiler, linker, and archive tool in your dependency tree. You need to verify the process and bind the result to it.
+With **attested builds**, you take a different approach. You feed your source, dependencies, and toolchain into a hardware-isolated build environment, and you get back both the binary and a provenance record. Verification then becomes three questions: was the build environment tamper-proof? Were the inputs the expected ones? And is the output cryptographically bound to that environment and those inputs? This is a mouthful to state, but it turns out these verifications are much easier to achieve than bit-for-bit reproducible builds. You don't need to eliminate non-determinism from every compiler, linker, and archive tool in your dependency tree. You need to verify the process and bind the result to it.
 
 This reframes the problem entirely. You're not trying to achieve deterministic compilation. You're trying to create a cryptographic chain of evidence that binds your output to auditable inputs through a process that can be independently verified. A verifier checks cryptographic signatures and attestation reports. The verification is independent: anyone can verify without trusting the builder's claims.
 
 ## Why Now: TEEs as Root of Trust
 
-Why is the attestable builds approach possible now? How do we actually verify the statement "was this binary with hash X produced by process Y from sources Z in environment W?"
+Why is the attested builds approach possible now? How do we actually verify the statement "was this binary with hash X produced by process Y from sources Z in environment W?"
 
 One answer is Trusted Execution Environments. TEEs provide a root of trust that is cryptographically attestable. Let's unpack what that means.
 
-A TEE is a hardware-isolated execution environment where the CPU itself enforces protections that software cannot override. You can think of it as a hardened and encrypted version of a VM. Even the operating system, hypervisor, and cloud operators cannot read or tamper with code running inside a TEE. Three primitives matter for attestable builds.
+A TEE is a hardware-isolated execution environment where the CPU itself enforces protections that software cannot override. You can think of it as a hardened and encrypted version of a VM. Even the operating system, hypervisor, and cloud operators cannot read or tamper with code running inside a TEE. Three primitives matter for attested builds.
 
 **Isolation.** Code runs in a hardware-protected environment. The host system (hypervisor, cloud provider, operators) cannot access memory or tamper with execution. Memory is encrypted with a per-VM key that only the CPU's security processor knows. When the hypervisor reads a guest's memory region, it gets ciphertext. The encryption key is generated by hardware, stored in hardware, and never exposed to any software.
 
@@ -68,11 +68,11 @@ This does not guarantee zero trust. You trust the CPU vendor's silicon and firmw
 
 You don't trust the cloud provider's software stack. The hypervisor, host OS, management plane, orchestration systems, and monitoring agents are all outside the trust boundary. They can be compromised, malicious, or buggy without affecting the confidentiality or integrity of your workload. You also don't trust the cloud provider's employees. Administrators with root access to the hypervisor, and anyone in the operational chain cannot read your memory or tamper with it undetected.
 
-This is a much smaller trust surface than trusting the entire infrastructure. The TEE provides a hardware root of trust that allows you to verify that a specific process ran in a specific environment with specific inputs, and that the output is cryptographically bound to that process. This is the foundation that makes attestable builds possible now. This creates the root of trust needed to make process verification meaningful. Without TEEs, "we verified the inputs" is just a claim. With TEEs, it's a hardware-signed assertion. Yes it is not zero trust, but it is still a huge upgrade security wise.
+This is a much smaller trust surface than trusting the entire infrastructure. The TEE provides a hardware root of trust that allows you to verify that a specific process ran in a specific environment with specific inputs, and that the output is cryptographically bound to that process. This is the foundation that makes attested builds possible now. This creates the root of trust needed to make process verification meaningful. Without TEEs, "we verified the inputs" is just a claim. With TEEs, it's a hardware-signed assertion. Yes it is not zero trust, but it is still a huge upgrade security wise.
 
-## What Attestable Builds Give You
+## What Attested Builds Give You
 
-Attestable builds provide three properties that together close the verification gap.
+Attested builds provide three properties that together close the verification gap.
 
 **Supply chain verification.** The artifact was built from a specific source commit, with specific dependency versions, using a specific toolchain. Each input is cryptographically identified, not just named. The source is pinned to a git commit hash and tree hash. Dependencies are pinned via lockfiles with each package identified by cryptographic checksum. The toolchain (compiler, linker, build tools) is hashed. All of these become leaves in a Merkle tree, producing a single root hash that uniquely identifies the complete set of build inputs. If any input changes by a single byte, the root changes.
 

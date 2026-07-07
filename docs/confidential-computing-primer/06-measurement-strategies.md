@@ -38,7 +38,7 @@ Consider a typical deployment: you have a Python service with dependencies. At l
 
 This isn't a flaw in SEV-SNP. The hardware can only measure what's in memory at launch. It has no way to measure a disk image that will be mounted later. The question is: how do you extend trust from the PSP measurement to your runtime code?
 
-This is the measurement gap we bridge. When you deploy on Confidential, your application code becomes part of an attestable measurement chain—you don't need to manage IGVM files, initramfs builds, or dm-verity setup yourself.
+This is the measurement gap we bridge. When you deploy on Confidential, your application code becomes part of an attested measurement chain—you don't need to manage IGVM files, initramfs builds, or dm-verity setup yourself.
 
 ## Background: Key Concepts
 
@@ -80,7 +80,7 @@ When you build your VM image, you produce an IGVM file. A measurement tool can p
 
 This matters because the PSP's measurement depends not just on file contents, but on where each page is placed in guest physical memory. Without a standardized format, different hypervisors might lay out memory differently, producing different measurements for the same logical content. IGVM eliminates this problem.
 
-We use IGVM to ensure attestable measurements. When you push code, we build an IGVM file that captures the complete memory layout, making the resulting measurement deterministic and verifiable.
+We use IGVM to ensure attested measurements. When you push code, we build an IGVM file that captures the complete memory layout, making the resulting measurement deterministic and verifiable.
 
 ## Two Common Approaches
 
@@ -445,7 +445,7 @@ If there's no SVSM and the guest kernel runs at VMPL0, it has VMPCK0 and can use
 
 We abstract the measurement workflow so you don't need to manage IGVM files, initramfs builds, or dm-verity setup yourself.
 
-**Attestable builds:** When you push code to your connected GitHub repo, we build an attestable image. The build process is recorded, and the resulting measurement is tied to your git commit hash.
+**Attested builds:** When you push code to your connected GitHub repo, we build an attested image. The build process is recorded, and the resulting measurement is tied to your git commit hash.
 
 **The measurement chain:**
 ```
@@ -472,7 +472,7 @@ Attestation report (signed by hardware)
 
 We provide SDKs that handle this verification, but the underlying data is standard—you can verify independently with AMD's tools or your own implementation.
 
-**What this means in practice:** You push code. We build it into an attestable image. Every request to that deployment can include cryptographic proof that your code (identified by git commit) is running on genuine TEE hardware. The measurement gap is bridged automatically.
+**What this means in practice:** You push code. We build it into an attested image. Every request to that deployment can include cryptographic proof that your code (identified by git commit) is running on genuine TEE hardware. The measurement gap is bridged automatically.
 
 ## Further Reading
 

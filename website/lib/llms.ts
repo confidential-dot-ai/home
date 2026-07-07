@@ -18,7 +18,10 @@ export interface ContentFile {
 
 function readRepoFile(relPath: string): string {
   const resolved = path.resolve(CONTENT_ROOT, relPath);
-  if (!resolved.startsWith(CONTENT_ROOT + path.sep) && resolved !== CONTENT_ROOT) {
+  if (
+    !resolved.startsWith(CONTENT_ROOT + path.sep) &&
+    resolved !== CONTENT_ROOT
+  ) {
     throw new Error(`Path traversal: ${relPath}`);
   }
   return fs.readFileSync(resolved, "utf-8");
@@ -153,7 +156,9 @@ function buildPagesIndex(files: ContentFile[]): string {
 
 function buildBlogIndex(files: ContentFile[]): string {
   return files
-    .filter((f) => f.relPath.startsWith("blog/") && f.relPath !== "blog/README.md")
+    .filter(
+      (f) => f.relPath.startsWith("blog/") && f.relPath !== "blog/README.md",
+    )
     .map((f) => `- [${f.title}](${f.fullUrl})`)
     .join("\n");
 }
@@ -177,8 +182,14 @@ export function buildLlmsText(): string {
   const substitutions: Record<string, string> = {
     "{{gpu_vms_table}}": extractTableAfter("pricing.md", "**GPU VMs**"),
     "{{cpu_vms_table}}": extractTableAfter("pricing.md", "**CPU VMs**"),
-    "{{inference_pricing_table}}": extractTableAfter("pricing.md", "## Confidential Inference"),
-    "{{attestable_builds_table}}": extractTableAfter("pricing.md", "## Attestable Builds"),
+    "{{inference_pricing_table}}": extractTableAfter(
+      "pricing.md",
+      "## Confidential Inference",
+    ),
+    "{{attested_builds_table}}": extractTableAfter(
+      "pricing.md",
+      "## Attested Builds",
+    ),
     "{{pages_index}}": buildPagesIndex(files),
     "{{blog_index}}": buildBlogIndex(files),
     "{{docs_index}}": buildDocsIndex(files),
@@ -187,7 +198,9 @@ export function buildLlmsText(): string {
   let result = template;
   for (const [key, value] of Object.entries(substitutions)) {
     if (!result.includes(key)) {
-      throw new Error(`Template placeholder ${key} not found in llms-template.md`);
+      throw new Error(
+        `Template placeholder ${key} not found in llms-template.md`,
+      );
     }
     result = result.split(key).join(value);
   }
