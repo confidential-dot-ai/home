@@ -4,10 +4,17 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -109,6 +116,36 @@ func TestValueArgsToTreeRejectsMalformedArg(t *testing.T) {
 	}
 	if _, err := valueArgsToTree([]string{"--set"}); err == nil {
 		t.Fatal("expected error for dangling flag with no key=value")
+	}
+}
+
+// TestValueArgsToTreeSetFileReadsContent pins helm's --set-file semantics: the
+// token's value names a file and the tree gets that file's content verbatim.
+// Regression test for the operator-keys ConfigMap that shipped a filesystem
+// path as its content instead of the PEM bundle.
+func TestValueArgsToTreeSetFileReadsContent(t *testing.T) {
+	pemText := "-----BEGIN PUBLIC KEY-----\nMFkwfakefakefake\n-----END PUBLIC KEY-----\n"
+	path := filepath.Join(t.TempDir(), "keys.pem")
+	if err := os.WriteFile(path, []byte(pemText), 0o600); err != nil {
+		t.Fatalf("write temp key file: %v", err)
+	}
+
+	got, err := valueArgsToTree([]string{"--set-file", "cds.operatorKeys=" + path})
+	if err != nil {
+		t.Fatalf("valueArgsToTree: %v", err)
+	}
+	if v := got["cds"].(map[string]any)["operatorKeys"]; v != pemText {
+		t.Errorf("operatorKeys: got %#v, want the file's content (not the path)", v)
+	}
+
+	if _, err := valueArgsToTree([]string{"--set-file", "cds.operatorKeys=" + filepath.Join(t.TempDir(), "missing.pem")}); err == nil {
+		t.Fatal("expected error for --set-file naming a missing file")
+	}
+}
+
+func TestValueArgsToTreeRejectsUnknownFlag(t *testing.T) {
+	if _, err := valueArgsToTree([]string{"--set-json", `a={"b":1}`}); err == nil {
+		t.Fatal("expected error for a value flag the parser does not implement")
 	}
 }
 
@@ -284,17 +321,18 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 
 	prev := struct {
 		crds, singleNode, kata, resolveDigests bool
-		secret, cvm                            string
-	}{installCRDs, installSingleNode, installKata, installResolveDigests, installImagePullSecret, installCvmMode}
+		secret, cvm, operatorKeys              string
+	}{installCRDs, installSingleNode, installKata, installResolveDigests, installImagePullSecret, installCvmMode, installOperatorKeys}
 	defer func() {
 		installCRDs, installSingleNode, installKata, installResolveDigests = prev.crds, prev.singleNode, prev.kata, prev.resolveDigests
-		installImagePullSecret, installCvmMode = prev.secret, prev.cvm
+		installImagePullSecret, installCvmMode, installOperatorKeys = prev.secret, prev.cvm, prev.operatorKeys
 	}()
 	// Drive every value-producing toggle. --install-crds=false exercises the
 	// non-default CRD path; --resolve-digests=false keeps crane off PATH (the
 	// digest-arg shape is covered separately via buildDigestArgs below).
 	installCRDs, installSingleNode, installKata, installResolveDigests = false, true, true, false
 	installImagePullSecret, installCvmMode = "regcred", "aks"
+	installOperatorKeys = writeTestOperatorKeys(t)
 
 	args, err := buildValueArgs(context.Background(), cmd, nil, "main", "rke2", appendResolvedDigestArgs)
 	if err != nil {
@@ -309,8 +347,8 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 	}
 
 	for i := 0; i < len(args); i += 2 {
-		if flag := args[i]; flag != "--set" && flag != "--set-string" {
-			t.Fatalf("arg %d: expected --set/--set-string, got %q (slice: %v)", i, flag, args)
+		if flag := args[i]; flag != "--set" && flag != "--set-string" && flag != "--set-file" {
+			t.Fatalf("arg %d: expected --set/--set-string/--set-file, got %q (slice: %v)", i, flag, args)
 		}
 		if i+1 >= len(args) {
 			t.Fatalf("dangling %s with no key=value", args[i])
@@ -323,10 +361,36 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 	}
 
 	// The whole point of the grammar guard is that these args round-trip
-	// through the parser cleanly, so prove it.
-	if _, err := valueArgsToTree(args); err != nil {
+	// through the parser cleanly, so prove it — including that the --set-file
+	// pair lands as the key file's CONTENT, not its path (the operator-keys
+	// ConfigMap regression).
+	tree, err := valueArgsToTree(args)
+	if err != nil {
 		t.Fatalf("builder output failed to parse: %v", err)
 	}
+	keys, _ := tree["cds"].(map[string]any)["operatorKeys"].(string)
+	if keys == installOperatorKeys || !strings.Contains(keys, "BEGIN PUBLIC KEY") {
+		t.Fatalf("cds.operatorKeys = %q, want the PEM content of %s", keys, installOperatorKeys)
+	}
+}
+
+// writeTestOperatorKeys writes a real EC public-key PEM to a temp file (the
+// builder validates it parses) and returns its path.
+func writeTestOperatorKeys(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("marshal pub: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "operator.pub")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	return path
 }
 
 func TestCoerceTypedVsString(t *testing.T) {

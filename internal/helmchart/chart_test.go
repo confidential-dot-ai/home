@@ -774,6 +774,33 @@ func TestChartRejectsNegativePreStopSleep(t *testing.T) {
 	}
 }
 
+// TestChartRejectsOperatorKeysPath pins the path-vs-content guard: a
+// cds.operatorKeys value that is a filesystem path (or any non-PEM string)
+// must fail the render with an instructive message, not ship a ConfigMap CDS
+// will refuse at startup.
+func TestChartRejectsOperatorKeysPath(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "cds.operatorKeys=/home/user/public.pem")
+	if err == nil {
+		t.Fatalf("helm template succeeded, want operatorKeys content-guard failure\n%s", out)
+	}
+	assertHelmFailMessage(t, out, "cds.operatorKeys must be the PEM content of the operator public-key bundle, not a file path — use `c8s install --operator-keys <file>`, `c8s render-values --operator-keys <file>`, or helm --set-file cds.operatorKeys=<file>")
+}
+
+func TestChartRendersOperatorKeysPEM(t *testing.T) {
+	pemText := "-----BEGIN PUBLIC KEY-----\nMFkwfakefakefake\n-----END PUBLIC KEY-----\n"
+	path := filepath.Join(t.TempDir(), "operator.pub")
+	if err := os.WriteFile(path, []byte(pemText), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	out, err := helmTemplate(t, "--set-file", "cds.operatorKeys="+path)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "operator-keys") || !strings.Contains(out, "BEGIN PUBLIC KEY") {
+		t.Fatalf("rendered output missing the operator-keys ConfigMap with PEM content")
+	}
+}
+
 func TestChartAcceptsPreStopSleepAtBoundary(t *testing.T) {
 	out, err := helmTemplate(t, "--set", "ratlsMesh.iptablesCleanup.preStopSleepSeconds=15")
 	if err != nil {

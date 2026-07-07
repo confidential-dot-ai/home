@@ -37,6 +37,9 @@ data:
 ---
 {{- end }}
 {{- if .Values.cds.operatorKeys }}
+{{- if not (contains "BEGIN PUBLIC KEY" .Values.cds.operatorKeys) }}
+{{- fail "cds.operatorKeys must be the PEM content of the operator public-key bundle, not a file path — use `c8s install --operator-keys <file>`, `c8s render-values --operator-keys <file>`, or helm --set-file cds.operatorKeys=<file>" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

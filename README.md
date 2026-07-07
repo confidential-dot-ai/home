@@ -206,6 +206,11 @@ Installing **without** `--operator-keys` leaves allowlist writes disabled (nobod
 can use `c8s allowlist` add/remove/upload), so `c8s install` refuses it on the
 default path unless you pass `--force` to acknowledge.
 
+If you set `cds.operatorKeys` yourself (a values file, a Flux HelmRelease, or
+helm `--set-file`), the value is the PEM **content**, never a file path — the
+chart fails the render otherwise. `c8s render-values --operator-keys
+operator.pub` embeds the content for GitOps consumers.
+
 Supply the operator key to the CLI by flag (`--operator-key`) or environment
 (`C8S_OPERATOR_KEY`); the flag wins.
 

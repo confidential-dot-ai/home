@@ -69,7 +69,8 @@ Use it to feed a GitOps consumer: a Flux HelmRelease can valuesFrom the bundle
 this produces rather than recomputing digests and device mappings. Unlike
 install, the host distro is not autodetected — pass --distro to pin it, or leave
 it unset to keep the chart default. No preflight checks run and no namespace is
-applied.
+applied. --operator-keys embeds the key file's PEM content as cds.operatorKeys
+(the chart value is the content itself, never a file path).
 
 "No cluster" does not mean no network: by default each component tag is resolved
 to its registry digest via crane, which needs the registry reachable and local
@@ -219,14 +220,16 @@ func appendWebhookInstallArgs(setArgs []string, cmd *cobra.Command) []string {
 	return setArgs
 }
 
-// valueArgsToTree turns the flat helm --set / --set-string pairs the builder
-// emits into the nested map a values.yaml needs. It handles exactly the arg
-// shapes the builder produces — alternating `--set`/`--set-string` followed by
-// a single `key.path=value` token. --set values are typed (true/false/null/int
-// coerced; everything else stays a string); --set-string values stay strings.
-// Dotted keys nest. This deliberately does not implement helm's full --set
-// grammar (no list indexing, no escaped dots) because the builder never emits
-// those.
+// valueArgsToTree turns the flat helm value-flag pairs the builder emits into
+// the nested map a values.yaml needs. It handles exactly the arg shapes the
+// builder produces — alternating `--set`/`--set-string`/`--set-file` followed
+// by a single `key.path=value` token. --set values are typed (true/false/null/
+// int coerced; everything else stays a string); --set-string values stay
+// strings; --set-file values name a file whose content becomes the value
+// verbatim, mirroring helm. Any other flag is an error rather than a silently
+// mis-parsed value. Dotted keys nest. This deliberately does not implement
+// helm's full --set grammar (no list indexing, no escaped dots) because the
+// builder never emits those.
 func valueArgsToTree(setArgs []string) (map[string]any, error) {
 	root := map[string]any{}
 	for i := 0; i < len(setArgs); i += 2 {
@@ -234,14 +237,28 @@ func valueArgsToTree(setArgs []string) (map[string]any, error) {
 		if i+1 >= len(setArgs) {
 			return nil, fmt.Errorf("dangling %s with no key=value", flag)
 		}
-		typed := flag == "--set"
 		kv := setArgs[i+1]
 		eq := strings.IndexByte(kv, '=')
 		if eq < 0 {
 			return nil, fmt.Errorf("malformed value arg %q (no '=')", kv)
 		}
 		path, raw := kv[:eq], kv[eq+1:]
-		if err := setNested(root, strings.Split(path, "."), coerce(raw, typed)); err != nil {
+		var value any
+		switch flag {
+		case "--set":
+			value = coerce(raw, true)
+		case "--set-string":
+			value = raw
+		case "--set-file":
+			content, err := os.ReadFile(raw)
+			if err != nil {
+				return nil, fmt.Errorf("%s %s: %w", flag, path, err)
+			}
+			value = string(content)
+		default:
+			return nil, fmt.Errorf("unsupported value flag %q (want --set, --set-string, or --set-file)", flag)
+		}
+		if err := setNested(root, strings.Split(path, "."), value); err != nil {
 			return nil, err
 		}
 	}
@@ -312,5 +329,6 @@ func init() {
 	renderValuesCmd.Flags().BoolVar(&installResolveDigests, "resolve-digests", true, "resolve each component image tag to its registry digest (via crane), pin it, and enable the NRI allowlist derivation")
 	renderValuesCmd.Flags().StringVar(&installImagePullSecret, "image-pull-secret", "", "name of an existing dockerconfigjson Secret the chart wires into every component's imagePullSecrets")
 	renderValuesCmd.Flags().StringVar(&installImageTag, "image-tag", "", "component image tag to resolve digests at (default: the CLI build version, or 'main'). Override to pin a specific branch/tag/release")
+	renderValuesCmd.Flags().StringVar(&installOperatorKeys, "operator-keys", "", "path to a PEM bundle of operator EC public keys that authorize `c8s allowlist` writes; the file's content is embedded as cds.operatorKeys in the emitted values (the chart value is PEM content, never a path)")
 	rootCmd.AddCommand(renderValuesCmd)
 }

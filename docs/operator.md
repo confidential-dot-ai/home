@@ -206,7 +206,12 @@ cds:
 ```
 
 Prefer `c8s install --operator-keys operator.pub`, which reads the file and
-sets this value for you.
+sets this value for you. In a GitOps flow, `c8s render-values --operator-keys
+operator.pub` embeds the content into the emitted values.
+
+The value is the PEM **content**, never a file path — a path from the machine
+that rendered the values is meaningless in-cluster, and the chart fails the
+render when the value doesn't look like PEM.
 
 ### Operational warning: CDS is a singleton until handoff is enabled
 
