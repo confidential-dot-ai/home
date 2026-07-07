@@ -5,7 +5,9 @@ description: Run KServe on a c8s cluster in Standard deployment mode — every i
 
 This tutorial puts **KServe** — the standard Kubernetes model-serving layer — on top of a
 **c8s** cluster, so a deployed model and every request to it stay inside the Trusted Execution
-Environment (TEE). You'll install the KServe control plane with every image on the
+Environment (TEE).
+
+You'll install the KServe control plane with every image on the
 [allowlist](/docs/c8s/attestation/allowlist), deploy a scikit-learn `InferenceService` as a
 confidential workload, and call it from your laptop only after cryptographically verifying the
 enclave — the host, the cloud operator, and any TLS-terminating proxy in between see only
@@ -27,16 +29,21 @@ root) bound to the predictor, and an attested front door.
 
 ## Prerequisites
 
-- A running c8s cluster in **node-as-CVM** mode — one command-for-command path is
-  [Deploy a confidential AKS cluster and run c8s](/docs/c8s/tutorials/azure-e2e).
+This tutorial **continues from
+[Deploy a confidential AKS cluster and run c8s](/docs/c8s/tutorials/azure-e2e)** and assumes
+that cluster: single-node AKS in **node-as-CVM** mode, with `operator.pub` pinned at install.
+On a different c8s cluster everything here transfers — adjust the install flags in Step 4 and
+how you expose the front door.
+
+You'll also need:
+
 - The `c8s` CLI, `kubectl`, `helm`, and `crane` on your laptop (all already there if you
   followed that tutorial).
-- The **operator private key** (`operator.key`) whose public half you pinned at install with
-  `--operator-keys` — [allowlist writes](/docs/c8s/attestation/allowlist#authorizing-mutations)
-  are signed with it.
-- For the final step: **Node ≥ 20**, plus the two pinned values from
-  [Consumer verification](/docs/c8s/verification/consumer) — the LB **launch measurement** and
-  your cluster's **mesh CA** PEM.
+- The **operator private key** (`operator.key`) — [allowlist
+  writes](/docs/c8s/attestation/allowlist#authorizing-mutations) are signed with it.
+- For the final step: **Node ≥ 20**, plus the LB **launch measurement** and your cluster's
+  **mesh CA** PEM, supplied out of band — see
+  [Consumer verification](/docs/c8s/verification/consumer).
 
 ## Step by step
 
@@ -122,7 +129,7 @@ Confirm both control planes are up before moving on:
 
 ```bash
 kubectl get pods -n cert-manager
-# three pods Running — their images were on the allowlist before the kubelet ever asked
+# three pods Running — allowlisted before the kubelet ever asked
 
 kubectl get pods -n kserve
 # kserve-controller-manager-…   2/2   Running
@@ -178,8 +185,11 @@ kubectl get pod -n workloads -l serving.kserve.io/inferenceservice=iris \
 
 kubectl get svc -n workloads c8s-iris
 # NAME       TYPE        CLUSTER-IP   …
-# c8s-iris   ClusterIP   None         ← headless: DNS returns pod IPs, which the mesh wraps
+# c8s-iris   ClusterIP   None         ← headless: resolves to pod IPs
 ```
+
+Headless matters: DNS returns pod IPs, which the RA-TLS mesh intercepts and wraps in attested
+mTLS — a Service VIP it cannot.
 
 Optionally, mirror attestation status into a `ConfidentialWorkload` CR so `kubectl` can show
 it (a status view — injection works with or without it):
@@ -231,19 +241,44 @@ teeProxy:
 
 tlsLb:
   attest:
-    enabled: true    # serve the c8s-verify/v1 attestation + over-encryption endpoints
+    enabled: true    # serve the c8s-verify/v1 attestation endpoints
+  service:
+    type: LoadBalancer
 ```
 
-Apply it by re-running your original `c8s install` with `-f values.yaml` added (the front door
-has one catch-all upstream — this repoints it if another tutorial's workload was wired first):
+`service.type: LoadBalancer` gives the front door a public IP on AKS. Apply it all by
+re-running the `c8s install` from the Azure tutorial with `-f values.yaml` added (the front
+door has one catch-all upstream — this repoints it if another tutorial's workload was wired
+first):
 
 ```bash
-c8s install -f values.yaml   # plus the flags you first installed with (e.g. --single-node --cvm-mode aks --operator-keys operator.pub)
+c8s install \
+  --single-node \
+  --cvm-mode aks \
+  --image-pull-secret ghcr-secret \
+  --operator-keys operator.pub \
+  -f values.yaml
 ```
 
 tee-proxy now dials the predictor over the node mesh's attested mTLS, and tls-lb fronts it
 with public TLS. A request from outside is decrypted **inside the LB enclave** and forwarded
 down this chain to KServe's v1 REST endpoint.
+
+Grab the public address Azure assigns — it's `<pending>` for a minute or so:
+
+```bash
+kubectl get svc -n c8s-system c8s-tls-lb -w
+# NAME         TYPE           CLUSTER-IP   EXTERNAL-IP   PORT(S)
+# c8s-tls-lb   LoadBalancer   10.0.…       20.…          443:…/TCP
+
+LB_ADDRESS=<EXTERNAL-IP>
+```
+
+<Callout type="info">
+  **Not on the Azure tutorial's cluster?** Use the flags you originally installed with, and
+  expose `c8s-tls-lb` however your environment does it — a cloud `LoadBalancer`, a `NodePort`,
+  or your own edge — then set `LB_ADDRESS` to whatever address terminates at it.
+</Callout>
 
 </Step>
 
@@ -255,7 +290,7 @@ First, prove the front door is a genuine TEE running the image you expect — fr
 before any feature vector leaves it. The CLI check pins the LB launch measurement:
 
 ```bash
-c8s verify "https://<LB_ADDRESS>" --kind lb --measurements <LB_LAUNCH_DIGEST>
+c8s verify "https://$LB_ADDRESS" --kind lb --measurements <LB_LAUNCH_DIGEST>
 # exit code 0: evidence verified against the pinned measurement
 ```
 
@@ -270,12 +305,12 @@ import { C8sClient } from "c8s-verify";
 import { readFileSync } from "node:fs";
 
 const client = new C8sClient({
-  baseUrl: "https://<LB_ADDRESS>",                // your c8s front door (tls-lb)
+  baseUrl: `https://${process.env.LB_ADDRESS}`,
   measurements: [process.env.LB_MEASUREMENT],     // pinned LB launch digest
   meshCaPem: readFileSync("mesh-ca.pem", "utf8"), // pinned cluster anchor
 });
 
-const session = await client.connect();           // throws C8sVerifyError on any failure
+const session = await client.connect(); // throws C8sVerifyError on any failure
 
 const res = await session.fetch("/v1/models/iris:predict", {
   method: "POST",
@@ -291,9 +326,18 @@ console.log(res.text());
 ```
 
 ```bash
-LB_MEASUREMENT=<sha384-launch-digest-of-the-lb> node predict.mjs
+LB_ADDRESS=$LB_ADDRESS \
+LB_MEASUREMENT=<sha384-launch-digest-of-the-lb> \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node predict.mjs
 # {"predictions":[1,1]}
 ```
+
+`NODE_TLS_REJECT_UNAUTHORIZED=0` is fine *here*: you dialed a bare IP whose outer TLS cert is
+the LB's CDS-issued one, which web PKI doesn't know — and in this design the outer TLS layer
+is untrusted transport by definition. Trust comes from the attestation checks and the sealed
+channel, so the env var relaxes only the outer web-PKI check. For a real deployment you'd put
+a public certificate on the LB via `tlsLb.publicTLS` and drop it.
 
 Both flowers classify as class `1` (versicolor). The feature vectors traveled sealed to the LB
 enclave, crossed the cluster only over attested mTLS, and were scored by a model the host

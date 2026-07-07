@@ -356,6 +356,12 @@ body {
   font-family: var(--font-mono);
 }
 
+/* Fumadocs caps code blocks at 600px with an inner scrollbar; long manifests in
+   the docs should read top to bottom, so let the block take its full height. */
+figure.shiki .fd-scroll-container {
+  max-height: none;
+}
+
 .code-block .prose pre,
 .prose .code-block pre {
   margin-bottom: 0;

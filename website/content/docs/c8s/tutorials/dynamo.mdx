@@ -4,37 +4,47 @@ description: Run NVIDIA Dynamo's serving stack — frontend, router, worker, and
 ---
 
 This tutorial deploys **NVIDIA Dynamo** — the distributed LLM inference framework — onto a
-**c8s** cluster as a set of confidential workloads. Dynamo splits serving into components: an
-OpenAI-compatible **frontend** that routes requests, **workers** that run the engine, and a
-discovery plane that connects them. That makes it a realistic test of running a *multi-component*
-serving system inside the Trusted Execution Environment (TEE): you'll allowlist every image,
-give the frontend and worker identities issued by the **CDS** (Certificate Distribution
-Service, the cluster's attested trust root), and chat with the deployment from your laptop
-over a verified, sealed channel.
+**c8s** cluster as a set of confidential workloads.
+
+Dynamo splits serving into components: an OpenAI-compatible **frontend** that routes requests,
+**workers** that run the engine, and a discovery plane that connects them. That makes it a
+realistic test of running a *multi-component* serving system inside the Trusted Execution
+Environment (TEE).
+
+You'll allowlist every image, give the frontend and worker identities issued by the **CDS**
+(Certificate Distribution Service, the cluster's attested trust root), and chat with the
+deployment from your laptop over a verified, sealed channel. Every image is public — there is
+nothing to build or push.
 
 <Callout type="info">
   **CPU cluster, mock engine.** Dynamo's real engine backends (vLLM, SGLang, TensorRT-LLM) ship
   as CUDA images and need GPUs, and GPU confidential computing is not yet part of c8s — see
   [Limitations](/docs/c8s/limitations). So this tutorial runs Dynamo's own GPU-free **mocker**
   engine (`dynamo.mocker`, the upstream-supported way to exercise the frontend, router, and
-  discovery without GPUs). Every c8s property you set up — digest enforcement, workload
-  identity, the attested front door — transfers unchanged to a GPU-backed deployment: swap the
-  worker's image and command, keep the annotations.
+  discovery without GPUs). The mocker downloads only the model's *tokenizer* — a few MB — and
+  never loads weights, so it runs comfortably on the smallest confidential node sizes. Every
+  c8s property you set up — digest enforcement, workload identity, the attested front door —
+  transfers unchanged to a GPU-backed deployment: swap the worker's image and command, keep the
+  annotations.
 </Callout>
 
 ## Prerequisites
 
-- A running c8s cluster in **node-as-CVM** mode — one command-for-command path is
-  [Deploy a confidential AKS cluster and run c8s](/docs/c8s/tutorials/azure-e2e). This tutorial
-  assumes that single-node shape; see the callout in Step 2 before scaling out.
-- The `c8s` CLI, `kubectl`, and `crane` on your laptop, plus **Docker** (or another builder) and
-  a registry you can push to.
-- The **operator private key** (`operator.key`) whose public half you pinned at install with
-  `--operator-keys` — [allowlist writes](/docs/c8s/attestation/allowlist#authorizing-mutations)
-  are signed with it.
-- For the final step: **Node ≥ 20**, plus the two pinned values from
-  [Consumer verification](/docs/c8s/verification/consumer) — the LB **launch measurement** and
-  your cluster's **mesh CA** PEM.
+This tutorial **continues from
+[Deploy a confidential AKS cluster and run c8s](/docs/c8s/tutorials/azure-e2e)** and assumes
+that cluster: single-node AKS in **node-as-CVM** mode, with `operator.pub` pinned at install.
+On a different c8s cluster everything here transfers — adjust the install flags in Step 5 and
+how you expose the front door.
+
+You'll also need:
+
+- The `c8s` CLI, `kubectl`, and `crane` on your laptop (all already there if you followed
+  that tutorial).
+- The **operator private key** (`operator.key`) — [allowlist
+  writes](/docs/c8s/attestation/allowlist#authorizing-mutations) are signed with it.
+- For the final step: **Node ≥ 20**, plus the LB **launch measurement** and your cluster's
+  **mesh CA** PEM, supplied out of band — see
+  [Consumer verification](/docs/c8s/verification/consumer).
 
 ## Step by step
 
@@ -42,39 +52,13 @@ over a verified, sealed channel.
 
 <Step>
 
-### 1. Build the Dynamo CPU image
-
-Dynamo's published runtime images are CUDA builds, so build a small CPU image instead. The
-`ai-dynamo` wheel is pure Python (no CUDA dependency) and ships both entrypoints this tutorial
-runs — `dynamo.frontend` and `dynamo.mocker`:
-
-```dockerfile
-# Dockerfile
-FROM python:3.12-slim
-RUN pip install --no-cache-dir ai-dynamo==1.2.1
-ENV HF_HOME=/tmp/hf
-USER 65532:65532
-```
-
-`HF_HOME` gives the non-root user a writable cache — the mocker downloads its tokenizer from
-Hugging Face at startup. Build for the cluster's architecture and push to a registry your
-cluster can pull (add an image pull Secret to the pod specs below if it's private):
-
-```bash
-docker build --platform linux/amd64 -t <your-registry>/dynamo-cpu:1.2.1 .
-docker push <your-registry>/dynamo-cpu:1.2.1
-```
-
-One image serves both roles: the frontend and the worker differ only in command.
-
-</Step>
-
-<Step>
-
-### 2. Deploy the discovery and event planes
+### 1. Deploy the discovery and event planes
 
 Plain-Deployment Dynamo (no Dynamo operator) uses **etcd** for endpoint discovery, and its
 KV-event plane defaults to **NATS** under etcd discovery — so deploy both, single-replica.
+This etcd is Dynamo's own registry, deployed like any app — it is **not** the Kubernetes
+control plane's etcd, which stays untouched (and on AKS isn't even reachable).
+
 These are infrastructure, not confidential workloads: they carry routing metadata, and under
 node-as-CVM they already run inside the node's confidential boundary. Don't annotate them —
 c8s identities belong on the components that terminate model traffic.
@@ -83,13 +67,18 @@ c8s identities belong on the components that terminate model traffic.
 # dynamo-infra.yaml
 apiVersion: apps/v1
 kind: Deployment
-metadata: { name: etcd, namespace: workloads }
+metadata:
+  name: etcd
+  namespace: workloads
 spec:
   replicas: 1
-  selector: { matchLabels: { app: etcd } }
+  selector:
+    matchLabels:
+      app: etcd
   template:
     metadata:
-      labels: { app: etcd }
+      labels:
+        app: etcd
     spec:
       containers:
         - name: etcd
@@ -97,37 +86,52 @@ spec:
           command:
             - /usr/local/bin/etcd
             - --listen-client-urls=http://0.0.0.0:2379
-            - --advertise-client-urls=http://etcd.workloads.svc.cluster.local:2379
-          ports: [{ containerPort: 2379 }]
+            - --advertise-client-urls=http://etcd.workloads.svc:2379
+          ports:
+            - containerPort: 2379
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: etcd, namespace: workloads }
+metadata:
+  name: etcd
+  namespace: workloads
 spec:
-  selector: { app: etcd }
-  ports: [{ port: 2379 }]
+  selector:
+    app: etcd
+  ports:
+    - port: 2379
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: { name: nats, namespace: workloads }
+metadata:
+  name: nats
+  namespace: workloads
 spec:
   replicas: 1
-  selector: { matchLabels: { app: nats } }
+  selector:
+    matchLabels:
+      app: nats
   template:
     metadata:
-      labels: { app: nats }
+      labels:
+        app: nats
     spec:
       containers:
         - name: nats
           image: nats:2.14.3-alpine
-          ports: [{ containerPort: 4222 }]
+          ports:
+            - containerPort: 4222
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: nats, namespace: workloads }
+metadata:
+  name: nats
+  namespace: workloads
 spec:
-  selector: { app: nats }
-  ports: [{ port: 4222 }]
+  selector:
+    app: nats
+  ports:
+    - port: 4222
 ```
 
 ```bash
@@ -136,7 +140,7 @@ kubectl apply -f dynamo-infra.yaml
 ```
 
 The pods won't start yet — their images aren't on the allowlist. That's enforcement working;
-Step 4 fixes it.
+Step 3 fixes it.
 
 <Callout type="warn">
   **Scaling past one node changes the picture.** The RA-TLS mesh wraps **pod-IP** traffic —
@@ -151,70 +155,104 @@ Step 4 fixes it.
 
 <Step>
 
-### 3. Deploy the frontend and worker as confidential workloads
+### 2. Deploy the frontend and worker as confidential workloads
 
-Two more Deployments, both from your image. The `confidential.ai/cw` annotation opts each into
-c8s: the webhook injects the `c8s-cert` identity sidecar (a CDS-issued, TEE-bound certificate),
-and the operator mints a headless Service per workload id — `c8s-dynamo` is what the front door
-will dial in Step 6. The worker finds etcd and NATS via the env vars Dynamo reads
-(`ETCD_ENDPOINTS`, `NATS_SERVER`); requests then flow frontend → worker over Dynamo's TCP
-request plane:
+Both components run from one **public** image: `dynamo-frontend` is NVIDIA's non-CUDA Dynamo
+image, and it carries the whole `ai-dynamo` Python package — `dynamo.frontend` *and*
+`dynamo.mocker` — so the two Deployments differ only in `command:` (which overrides the
+image's entrypoint). It pulls anonymously from `nvcr.io`.
+
+The `confidential.ai/cw` annotation opts each Deployment into c8s: the webhook injects the
+`c8s-cert` identity sidecar (a CDS-issued, TEE-bound certificate), and the operator mints a
+headless Service per workload id — `c8s-dynamo` is what the front door will dial in Step 5.
+The components find etcd and NATS via the env vars Dynamo reads (`ETCD_ENDPOINTS`,
+`NATS_SERVER`); requests then flow frontend → worker over Dynamo's TCP request plane. The
+`--model-path` names the tokenizer the mocker fetches — no weights are loaded.
 
 ```yaml
 # dynamo.yaml
 apiVersion: apps/v1
 kind: Deployment
-metadata: { name: dynamo-frontend, namespace: workloads }
+metadata:
+  name: dynamo-frontend
+  namespace: workloads
 spec:
   replicas: 1
-  selector: { matchLabels: { app: dynamo-frontend } }
+  selector:
+    matchLabels:
+      app: dynamo-frontend
   template:
     metadata:
-      labels: { app: dynamo-frontend }
-      annotations: { confidential.ai/cw: dynamo }   # workload id → headless Service c8s-dynamo
+      labels:
+        app: dynamo-frontend
+      annotations:
+        # workload id → headless Service c8s-dynamo
+        confidential.ai/cw: dynamo
     spec:
       containers:
         - name: frontend
-          image: <your-registry>/dynamo-cpu:1.2.1
-          command: ["python3", "-m", "dynamo.frontend", "--http-port", "8000"]
-          ports: [{ containerPort: 8000 }]
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.2.1
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+            - --http-port
+            - "8000"
+          ports:
+            - containerPort: 8000
           env:
-            - { name: ETCD_ENDPOINTS, value: "http://etcd.workloads.svc.cluster.local:2379" }
-            - { name: NATS_SERVER, value: "nats://nats.workloads.svc.cluster.local:4222" }
+            - name: ETCD_ENDPOINTS
+              value: http://etcd.workloads.svc:2379
+            - name: NATS_SERVER
+              value: nats://nats.workloads.svc:4222
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: { name: dynamo-worker, namespace: workloads }
+metadata:
+  name: dynamo-worker
+  namespace: workloads
 spec:
   replicas: 1
-  selector: { matchLabels: { app: dynamo-worker } }
+  selector:
+    matchLabels:
+      app: dynamo-worker
   template:
     metadata:
-      labels: { app: dynamo-worker }
-      annotations: { confidential.ai/cw: dynamo-worker }
+      labels:
+        app: dynamo-worker
+      annotations:
+        confidential.ai/cw: dynamo-worker
     spec:
       containers:
         - name: worker
-          image: <your-registry>/dynamo-cpu:1.2.1
-          command: ["python3", "-m", "dynamo.mocker", "--model-path", "Qwen/Qwen3-0.6B"]
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.2.1
+          command:
+            - python3
+            - -m
+            - dynamo.mocker
+            - --model-path
+            - Qwen/Qwen3-0.6B
           env:
-            - { name: ETCD_ENDPOINTS, value: "http://etcd.workloads.svc.cluster.local:2379" }
-            - { name: NATS_SERVER, value: "nats://nats.workloads.svc.cluster.local:4222" }
+            - name: ETCD_ENDPOINTS
+              value: http://etcd.workloads.svc:2379
+            - name: NATS_SERVER
+              value: nats://nats.workloads.svc:4222
 ```
 
 ```bash
 kubectl apply -f dynamo.yaml
 ```
 
-On a GPU cluster the worker line would read
-`["python3", "-m", "dynamo.vllm", "--model", "Qwen/Qwen3-0.6B"]` on a CUDA runtime image —
-the c8s wiring around it stays identical.
+On a GPU cluster the worker's command would run `dynamo.vllm --model Qwen/Qwen3-0.6B` on a
+CUDA runtime image — the c8s wiring around it stays identical. (And if you'd rather serve
+from a minimal image you control, `pip install ai-dynamo==1.2.1` on `python:3.12-slim`
+provides the same entrypoints — build it, push it, and allowlist *that* digest instead.)
 
 </Step>
 
 <Step>
 
-### 4. Allow the images
+### 3. Allow the images
 
 Everything is deployed and nothing runs — check the events and you'll see c8s enforcement
 denying container creation at the node:
@@ -225,34 +263,42 @@ kubectl get events -n workloads | grep allowlist
 ```
 
 Add the three digests, signed with your operator key. The CDS has no public ingress, so
-port-forward it first — along with the attestation-api, which the CLI uses to verify the CDS's
-own attestation before talking to it:
+port-forward it first — along with the attestation-api, which the CLI uses to verify the
+CDS's own attestation before talking to it:
 
 ```bash
 kubectl port-forward -n c8s-system svc/c8s-cds 8443:8443 &
 kubectl port-forward -n c8s-system svc/c8s-attestation-api 8400:8400 &
 
-for IMAGE in \
-  "<your-registry>/dynamo-cpu:1.2.1" \
-  "quay.io/coreos/etcd:v3.6.13" \
-  "nats:2.14.3-alpine"; do
-  c8s allowlist add "$(crane digest "$IMAGE")" "$IMAGE" \
-    --url https://localhost:8443 \
-    --attestation-api-url http://localhost:8400 \
-    --operator-key operator.key
-done
+DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.2.1
+c8s allowlist add "$(crane digest "$DYNAMO_IMAGE")" "$DYNAMO_IMAGE" \
+  --url https://localhost:8443 \
+  --attestation-api-url http://localhost:8400 \
+  --operator-key operator.key
+
+ETCD_IMAGE=quay.io/coreos/etcd:v3.6.13
+c8s allowlist add "$(crane digest "$ETCD_IMAGE")" "$ETCD_IMAGE" \
+  --url https://localhost:8443 \
+  --attestation-api-url http://localhost:8400 \
+  --operator-key operator.key
+
+NATS_IMAGE=nats:2.14.3-alpine
+c8s allowlist add "$(crane digest "$NATS_IMAGE")" "$NATS_IMAGE" \
+  --url https://localhost:8443 \
+  --attestation-api-url http://localhost:8400 \
+  --operator-key operator.key
 ```
 
 The CLI warns that no `--measurements` are pinned — it's accepting *any* attested CDS, fine
 for a tutorial cluster; in production pin your CDS launch digest so a write can never land on
 a rogue CDS. The enforcement plugins poll the CDS-served list, so the kubelet's next retry
-succeeds:
+succeeds — the Dynamo image is large, so its first pull takes a few minutes:
 
 ```bash
 kubectl get pods -n workloads -w
 # etcd-…             1/1   Running
 # nats-…             1/1   Running
-# dynamo-frontend-…  2/2   Running   ← 2/2: the app container plus the injected c8s-cert sidecar
+# dynamo-frontend-…  2/2   Running   ← app + injected c8s-cert sidecar
 # dynamo-worker-…    2/2   Running
 ```
 
@@ -263,15 +309,23 @@ optional `ConfidentialWorkload` CRs (a status view — injection works without t
 # dynamo-cwl.yaml
 apiVersion: confidential.ai/v1alpha2
 kind: ConfidentialWorkload
-metadata: { name: dynamo, namespace: workloads }
+metadata:
+  name: dynamo
+  namespace: workloads
 spec:
-  workloadRef: { kind: Deployment, name: dynamo-frontend }
+  workloadRef:
+    kind: Deployment
+    name: dynamo-frontend
 ---
 apiVersion: confidential.ai/v1alpha2
 kind: ConfidentialWorkload
-metadata: { name: dynamo-worker, namespace: workloads }
+metadata:
+  name: dynamo-worker
+  namespace: workloads
 spec:
-  workloadRef: { kind: Deployment, name: dynamo-worker }
+  workloadRef:
+    kind: Deployment
+    name: dynamo-worker
 ```
 
 ```bash
@@ -286,7 +340,7 @@ kubectl get cwl -n workloads
 
 <Step>
 
-### 5. Smoke-test the serving graph
+### 4. Smoke-test the serving graph
 
 Before wiring the front door, confirm discovery worked end to end: the worker registered in
 etcd, and the frontend found it. `kubectl port-forward` reaches the pod over the kubelet's
@@ -300,8 +354,10 @@ curl -s localhost:8000/v1/models
 
 curl -s localhost:8000/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 32}'
-# {"id":"...","choices":[{"message":{"role":"assistant","content":"..."}}], ...}
+  -d '{"model": "Qwen/Qwen3-0.6B",
+       "messages": [{"role": "user", "content": "hello"}],
+       "max_tokens": 32}'
+# {"id":"...","choices":[{"message":{"role":"assistant", ...
 
 kill %%   # stop this port-forward (the most recent background job)
 ```
@@ -314,13 +370,14 @@ frontend → router → worker across attested, identity-bearing components.
 
 <Step>
 
-### 6. Point the front door at the frontend
+### 5. Point the front door at the frontend
 
 External clients come in through the chart's front-door chain — **tls-lb (public TLS +
 over-encryption) → tee-proxy (attested) → your frontend**. The engine presets cover vLLM and
 SGLang; for Dynamo, set the upstream directly to the minted headless Service and the
-frontend's container port. Headless DNS returns pod IPs, which the node mesh wraps in attested
-mTLS — a Service VIP it cannot:
+frontend's container port. Headless DNS returns pod IPs, which the node mesh wraps in
+attested mTLS — a Service VIP it cannot. `service.type: LoadBalancer` gives the front door a
+public IP on AKS:
 
 ```yaml
 # values.yaml
@@ -329,27 +386,51 @@ teeProxy:
 
 tlsLb:
   attest:
-    enabled: true    # serve the c8s-verify/v1 attestation + over-encryption endpoints
+    enabled: true    # serve the c8s-verify/v1 attestation endpoints
+  service:
+    type: LoadBalancer
 ```
 
-Apply it by re-running your original `c8s install` with `-f values.yaml` added (the front door
-has one catch-all upstream — this repoints it if another tutorial's workload was wired first):
+Apply it by re-running the `c8s install` from the Azure tutorial with `-f values.yaml` added
+(the front door has one catch-all upstream — this repoints it if another tutorial's workload
+was wired first):
 
 ```bash
-c8s install -f values.yaml   # plus the flags you first installed with (e.g. --single-node --cvm-mode aks --operator-keys operator.pub)
+c8s install \
+  --single-node \
+  --cvm-mode aks \
+  --image-pull-secret ghcr-secret \
+  --operator-keys operator.pub \
+  -f values.yaml
 ```
+
+Then grab the public address Azure assigns — it's `<pending>` for a minute or so:
+
+```bash
+kubectl get svc -n c8s-system c8s-tls-lb -w
+# NAME         TYPE           CLUSTER-IP   EXTERNAL-IP   PORT(S)
+# c8s-tls-lb   LoadBalancer   10.0.…       20.…          443:…/TCP
+
+LB_ADDRESS=<EXTERNAL-IP>
+```
+
+<Callout type="info">
+  **Not on the Azure tutorial's cluster?** Use the flags you originally installed with, and
+  expose `c8s-tls-lb` however your environment does it — a cloud `LoadBalancer`, a `NodePort`,
+  or your own edge — then set `LB_ADDRESS` to whatever address terminates at it.
+</Callout>
 
 </Step>
 
 <Step>
 
-### 7. Verify the enclave and chat
+### 6. Verify the enclave and chat
 
 From your laptop, prove the front door is a genuine TEE in *your* cluster before the first
 prompt leaves your machine. The CLI check pins the LB launch measurement:
 
 ```bash
-c8s verify "https://<LB_ADDRESS>" --kind lb --measurements <LB_LAUNCH_DIGEST>
+c8s verify "https://$LB_ADDRESS" --kind lb --measurements <LB_LAUNCH_DIGEST>
 # exit code 0: evidence verified against the pinned measurement
 ```
 
@@ -364,12 +445,12 @@ import { C8sClient } from "c8s-verify";
 import { readFileSync } from "node:fs";
 
 const client = new C8sClient({
-  baseUrl: "https://<LB_ADDRESS>",                // your c8s front door (tls-lb)
+  baseUrl: `https://${process.env.LB_ADDRESS}`,
   measurements: [process.env.LB_MEASUREMENT],     // pinned LB launch digest
   meshCaPem: readFileSync("mesh-ca.pem", "utf8"), // pinned cluster anchor
 });
 
-const session = await client.connect();           // throws C8sVerifyError on any failure
+const session = await client.connect(); // throws C8sVerifyError on any failure
 
 const res = await session.fetch("/v1/chat/completions", {
   method: "POST",
@@ -384,8 +465,20 @@ console.log(JSON.parse(res.text()).choices[0].message.content);
 ```
 
 ```bash
-LB_MEASUREMENT=<sha384-launch-digest-of-the-lb> node chat.mjs
+LB_ADDRESS=$LB_ADDRESS \
+LB_MEASUREMENT=<sha384-launch-digest-of-the-lb> \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
+node chat.mjs
 ```
+
+Why `NODE_TLS_REJECT_UNAUTHORIZED=0` is fine *here*: you dialed a bare IP, and the LB's outer
+TLS cert is its CDS-issued one, which web PKI doesn't know. In this design the outer TLS layer
+is **untrusted transport by definition** — trust comes from the attestation evidence, the
+pinned measurement, and the pinned mesh CA, and every request is sealed inside the
+over-encrypted channel, so a hostile TLS terminator sees only ciphertext. The env var relaxes
+only the outer web-PKI check, for this process. (`c8s verify` above does the equivalent
+internally.) For a real deployment you'd put a public certificate on the LB via
+`tlsLb.publicTLS` and drop the env var.
 
 For a full interactive client — REPL loop, failure drills, what each check means — see
 [Verified chat over confidential vLLM](/docs/c8s/tutorials/vllm-chat); the session API is
