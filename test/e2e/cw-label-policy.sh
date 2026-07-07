@@ -16,15 +16,23 @@ pod=probe
 cleanup() { kubectl delete namespace "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+# expect_deny <description> <expected-substring> -- <command...>
+# Runs the command, requires it to be denied, and requires the denial message
+# to contain <expected-substring> so the check proves which invariant fired,
+# not merely that some admission plugin objected.
 expect_deny() {
-  local what=$1; shift
+  local what=$1 want=$2
+  # ${3-} so a miscall with too few args hits this fail, not set -u's raw
+  # "unbound variable" at the [[ ]].
+  [[ ${3-} == -- ]] || fail "expect_deny: expected '--' before the command, got '${3-}'"
+  shift 3
   local out
   if out=$("$@" 2>&1); then
-    fail "$what was admitted; want denial by cw-label-integrity. output: $out"
+    fail "$what was admitted; want denial matching '$want'. output: $out"
   fi
-  grep -q "cw-label-integrity" <<<"$out" \
-    || fail "$what was denied, but not by cw-label-integrity: $out"
-  echo "ok: $what denied by the policy"
+  grep -q "$want" <<<"$out" \
+    || fail "$what was denied, but not by the expected guard (want '$want'): $out"
+  echo "ok: $what denied"
 }
 
 kubectl create namespace "$ns" >/dev/null
@@ -37,15 +45,21 @@ kubectl run "$pod" --namespace "$ns" --image=registry.k8s.io/pause:3.9 \
 echo "ok: plain pod admitted"
 
 # Out-of-band writes on a running pod: the post-create mutation the
-# CREATE-only injection webhook cannot see.
-expect_deny "post-create cw label" \
+# CREATE-only injection webhook cannot see, so the VAP is necessarily the
+# denier here (assert its name).
+expect_deny "post-create cw label" "cw-label-integrity" -- \
   kubectl label pod "$pod" --namespace "$ns" confidential.ai/cw=spoof
-expect_deny "post-create cw annotation" \
+expect_deny "post-create cw annotation" "cw-label-integrity" -- \
   kubectl annotate pod "$pod" --namespace "$ns" confidential.ai/cw=spoof
 
-# CREATE with the label but no matching annotation. --dry-run=server still
-# runs admission, and holds even when the injection webhook is down.
+# CREATE with the label but no matching annotation. Either guard is a correct
+# denial and both default on: the mutating webhook's CREATE-time
+# validateWorkloadLabel runs first (admission webhooks precede validating
+# admission policies), and the cw-label-integrity VAP covers the same CREATE
+# case when the webhook is down. Accept either. --dry-run=server still runs
+# admission.
 expect_deny "pod created with cw label but no annotation" \
+  "cw-label-integrity\|must match the confidential.ai/cw annotation" -- \
   kubectl run spoof --namespace "$ns" --image=registry.k8s.io/pause:3.9 \
     --restart=Never --labels=confidential.ai/cw=spoof --dry-run=server
 
