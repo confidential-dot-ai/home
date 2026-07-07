@@ -1,4 +1,4 @@
 {
   "title": "Tutorials",
-  "pages": ["azure-e2e", "vllm-chat"]
+  "pages": ["azure-e2e", "vllm-chat", "dynamo", "kserve"]
 }

@@ -127,7 +127,7 @@ pod from Step 1 starts on its next retry:
 
 ```bash
 kubectl get pods -n workloads -w
-# vllm-…   1/1   Running
+# vllm-…   2/2   Running   ← the vLLM container plus the injected c8s-cert sidecar
 ```
 
 <Callout type="info">

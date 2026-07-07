@@ -299,6 +299,13 @@ full comparison.
 deploy a vLLM model server onto **this AKS cluster**, attest that it's running in a TEE, and chat
 with it over an encrypted channel from your laptop.
 
+Or bring your serving stack of choice onto this cluster:
+
+- [NVIDIA Dynamo](/docs/c8s/tutorials/dynamo) — a multi-component serving graph (frontend,
+  router, worker, discovery) as confidential workloads.
+- [KServe](/docs/c8s/tutorials/kserve) — `InferenceService` model serving in Standard mode,
+  every image digest-allowlisted.
+
 Or branch off:
 
 - Run a confidential workload with the `confidential.ai/cw` annotation —

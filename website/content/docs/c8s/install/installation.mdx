@@ -277,7 +277,7 @@ kubectl describe pod <pod> | grep "Runtime Class"
 
 # the webhook-injected get-cert init container is present:
 kubectl get pod <pod> -o jsonpath='{range .spec.initContainers[*]}{.name}{"\n"}{end}'
-#   c8s-init-cert
+#   c8s-cert
 ```
 
 **End-to-end confidentiality** — verify it from *outside* the cluster with
