@@ -38,14 +38,14 @@ cannot break it *silently* — detection is by attestation, not by trust.
 ## Measurement pinning is mandatory for production
 
 The default chart pins **no** launch measurements. Both `cds.measurements` and
-`ratls-mesh.measurements` default to *empty*, which means "accept any attested peer". That is
+`ratlsMesh.measurements` default to *empty*, which means "accept any attested peer". That is
 fine for a demo or a dev loop, but it is **not the production trust model**:
 
 <Callout type="warn">
   With empty measurements, an attacker on the Pod network can stand up their own genuine TEE
   enclave (same open-source image, valid measurement, real silicon) and MITM the bootstrap —
   every signature checks out, but you are talking to an attacker-operated enclave. Pin both
-  `cds.measurements` and `ratls-mesh.measurements` to your known-good launch digests in
+  `cds.measurements` and `ratlsMesh.measurements` to your known-good launch digests in
   production — see [Obtaining launch measurements](/docs/c8s/attestation/cds#obtaining-launch-measurements)
   for how to get those values.
 </Callout>

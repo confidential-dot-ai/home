@@ -304,10 +304,10 @@ Each flag wants the digest of a different party:
 | Flag | Pin the launch digest of… |
 | --- | --- |
 | `cds.measurements` (`--measurements`) | the workloads/peers allowed to attest to the CDS |
-| `ratls-mesh.measurements` | the mesh peers allowed to connect |
+| `ratlsMesh.measurements` | the mesh peers allowed to connect |
 | `--cds-measurements` (get-cert, ratls-mesh `cds` mode) | the CDS itself |
 | `--measurements` (`c8s allowlist`) | the CDS itself, before reading or writing the allowlist |
-| `cds.handoff-measurements` | peer CDS replicas allowed to receive the CA |
+| `--handoff-measurements` (the chart reuses `cds.measurements` when `cds.handoff.enabled`) | peer CDS replicas allowed to receive the CA |
 | `measurements` in [c8s-verify](/docs/c8s/verification/consumer) | the user-facing LB enclave |
 
 <Callout type="info">

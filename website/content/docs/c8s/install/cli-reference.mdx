@@ -160,7 +160,7 @@ Run the Certificate Distribution Service (CDS). Requires `--attestation-api-url`
 | `--token-signer-rotation-interval` | duration | `720h` | No | EAR signing key rotation interval (0 disables) |
 | `--token-signer-overlap` | duration | `25h` | No | how long a retired EAR key stays in JWKS |
 | `--token-signer-rotation-jitter` | float64 | `0.1` | No | EAR key rotation jitter |
-| `--ratls-platform` | string | `sev-snp` | No | TEE platform for the RA-TLS serving cert (sev-snp; snp, az-snp, gcp-snp aliases normalized). Empty disables TLS — UNSAFE outside tests |
+| `--ratls-platform` | string | `sev-snp` | No | TEE platform for the RA-TLS serving cert: `sev-snp` or `tdx` (snp/az-snp/gcp-snp and az-tdx/gcp-tdx aliases normalized). Empty disables TLS — UNSAFE outside tests |
 | `--ratls-cert-ttl` | duration | `24h` | No | RA-TLS certificate TTL |
 
 {/* flags:allowlist */}
@@ -300,7 +300,7 @@ Run the RA-TLS L4 mesh proxy or its iptables side commands.
 
 | Flag | Type | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--platform` | string | `sev-snp` | No | TEE platform: sev-snp, tdx |
+| `--platform` | string | `auto` | No | TEE platform: `sev-snp`, `tdx`, or `auto` (probes `/dev/{tdx_guest,sev-guest}`) |
 | `--attestation-api-url` | string | `""` | No | URL of the local attestation-api (e.g. http://localhost:8400) |
 | `--outbound-port` | int | `15001` | No | outbound listener port (intercepted app traffic) |
 | `--inbound-port` | int | `15006` | No | inbound listener port (RA-TLS from peer nodes) |

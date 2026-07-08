@@ -206,7 +206,7 @@ kubectl label node <NODE> intel-tdx.node.kubernetes.io/enabled=true
 
 <Callout type="warn">
   The default chart pins **no** launch measurements. For anything beyond a demo, set both
-  `cds.measurements` and `ratls-mesh.measurements` (via `-f values.yaml`) to your known-good
+  `cds.measurements` and `ratlsMesh.measurements` (via `-f values.yaml`) to your known-good
   SHA-384 launch digests — otherwise the cluster accepts *any* attested peer.
   [Obtaining launch measurements](/docs/c8s/attestation/cds#obtaining-launch-measurements) explains
   how to get those values; the [threat model](/docs/c8s/architecture/threat-model#measurement-pinning-is-mandatory-for-production)

@@ -10,7 +10,7 @@ items are deliberate non-goals for now; others are tracked work.
 ## Trust & enforcement gaps
 
 - **Measurements are not pinned by default.** The chart ships with `cds.measurements` and
-  `ratls-mesh.measurements` empty, which means "accept any attested peer". This is fine for
+  `ratlsMesh.measurements` empty, which means "accept any attested peer". This is fine for
   demos but must be set for production — see the
   [threat model](/docs/c8s/architecture/threat-model#measurement-pinning-is-mandatory-for-production).
 - **Mesh peer verification doesn't pin the peer measurement.** A mesh peer is accepted if its
