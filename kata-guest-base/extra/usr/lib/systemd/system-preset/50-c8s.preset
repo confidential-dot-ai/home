@@ -38,7 +38,7 @@ enable policy-monitor.service
 # (measurement-only; independent of policy-monitor's allowlist enforcement).
 enable rtmr3-measurer.service
 
-# scratch-setup backs the CoCo image store with an ephemeral dm-crypt disk so
+# scratch-setup backs the guest-pull image store with an ephemeral dm-crypt disk so
 # large workload images unpack to encrypted disk instead of RAM (needs the VM
 # launched with a confai-scratch disk; no-op otherwise).
 enable scratch-setup.service

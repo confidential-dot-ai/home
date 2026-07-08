@@ -356,7 +356,7 @@ mkdir -p "${ROOTFS_BUILD_DEST}" "${IMAGES_BUILD_DEST}" "${GO_PATH_DIR}"
 # modalias — nvidia-uvm has no modalias). Without it the unit exits 127,
 # kata-agent never starts, and every GPU pod hangs in ContainerCreating.
 KATA_EXTRA_PKGS="libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-sys1t64 libtss2-tctildr0t64 ca-certificates kmod cryptsetup-bin"
-# --- Step 1b/5: stage the CoCo guest-components ------------------------
+# --- Step 1b/5: stage the confidential guest-components ------------------------
 # confidential-data-hub (CDH), attestation-agent (AA), api-server-rest. The
 # kata-agent SPAWNS these at boot (its guest_components_procs default is
 # ApiServerRest, which implies CDH + AA) and performs in-guest image guest-pull
@@ -376,8 +376,8 @@ need_gc=0
 for gc in "${GUEST_COMPONENTS[@]}"; do [[ -x "${GC_BIN_DIR}/${gc}" ]] || need_gc=1; done
 if [[ "${need_gc}" == "1" ]]; then
     KATA_CONFIDENTIAL_IMG="${KATA_CONFIDENTIAL_IMG:-/opt/kata/share/kata-containers/kata-ubuntu-noble-confidential.image}"
-    [[ -f "${KATA_CONFIDENTIAL_IMG}" ]] || die "CoCo guest-components missing from ${GC_BIN_DIR} and KATA_CONFIDENTIAL_IMG=${KATA_CONFIDENTIAL_IMG} not found. Stage confidential-data-hub/attestation-agent/api-server-rest there, or point KATA_CONFIDENTIAL_IMG at a kata confidential rootfs image, or set COCO_GUEST_COMPONENTS_TARBALL."
-    log "Step 1b/5: staging CoCo guest-components from ${KATA_CONFIDENTIAL_IMG}"
+    [[ -f "${KATA_CONFIDENTIAL_IMG}" ]] || die "confidential guest-components missing from ${GC_BIN_DIR} and KATA_CONFIDENTIAL_IMG=${KATA_CONFIDENTIAL_IMG} not found. Stage confidential-data-hub/attestation-agent/api-server-rest there, or point KATA_CONFIDENTIAL_IMG at a kata confidential rootfs image, or set COCO_GUEST_COMPONENTS_TARBALL."
+    log "Step 1b/5: staging confidential guest-components from ${KATA_CONFIDENTIAL_IMG}"
     gc_loop="$(sudo losetup -fP --show "${KATA_CONFIDENTIAL_IMG}")"
     gc_mnt="$(mktemp -d)"
     sudo mount -o ro "${gc_loop}p1" "${gc_mnt}"
@@ -387,7 +387,7 @@ if [[ "${need_gc}" == "1" ]]; then
     done
     sudo umount "${gc_mnt}"; sudo losetup -d "${gc_loop}"; rmdir "${gc_mnt}"
 else
-    log "Step 1b/5: CoCo guest-components already staged in ${GC_BIN_DIR}"
+    log "Step 1b/5: confidential guest-components already staged in ${GC_BIN_DIR}"
 fi
 for gc in "${GUEST_COMPONENTS[@]}"; do log "  guest-component: ${gc} ($(stat -c%s "${GC_BIN_DIR}/${gc}") bytes)"; done
 

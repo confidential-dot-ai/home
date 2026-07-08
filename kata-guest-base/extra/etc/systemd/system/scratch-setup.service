@@ -1,5 +1,5 @@
 [Unit]
-# Backs /run/kata-containers/image (the CoCo guest-pull image store) with a
+# Backs /run/kata-containers/image (the guest-pull image store) with a
 # dm-crypt-encrypted scratch disk, so large workload images unpack to disk
 # instead of the RAM tmpfs (which caps image size at guest memory). Runs BEFORE
 # kata-agent so the mount is in place before any CreateContainer/guest-pull.

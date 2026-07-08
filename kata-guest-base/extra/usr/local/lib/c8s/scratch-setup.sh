@@ -3,7 +3,7 @@
 #
 # When the VM is launched with an ephemeral scratch disk tagged
 # serial=confai-scratch (see scripts/kata-qemu-scratch-wrapper.sh), back the
-# CoCo guest-pull image store with a dm-crypt-encrypted filesystem on it, so
+# guest-pull image store with a dm-crypt-encrypted filesystem on it, so
 # large workload images unpack to encrypted DISK instead of the RAM tmpfs that
 # otherwise caps image size at guest memory. No such disk => no-op (guest-pull
 # keeps using the default tmpfs). Matches Steep's ephemeral-encrypted-overlay
