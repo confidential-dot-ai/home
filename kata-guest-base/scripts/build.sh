@@ -175,8 +175,8 @@ command -v jq     >/dev/null 2>&1 || die "jq not found — needed to emit manife
 # compute the rootfs-builder Docker build-args; without it RUST_TOOLCHAIN
 # comes back empty and the rustup install fails with a cryptic
 # '--default-toolchain <...> required' error.
-command -v yq >/dev/null 2>&1 || die "yq not found — osbuilder needs it to read kata's versions.yaml. Install mikefarah yq:
-       sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq"
+command -v yq >/dev/null 2>&1 || die "yq not found — osbuilder needs it to read kata's versions.yaml. Install mikefarah yq (pinned + checksummed; it shapes the measured guest rootfs build-args):
+       sudo curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64 && echo '0c2b24e645b57d8e7c0566d18643a6d4f5580feeea3878127354a46f2a1e4598  /usr/local/bin/yq' | sha256sum -c - && sudo chmod +x /usr/local/bin/yq"
 
 # Guest-pull sandboxes need a pause image baked into the rootfs at
 # /pause_bundle — the kata-agent unpacks it for the sandbox (pause) container

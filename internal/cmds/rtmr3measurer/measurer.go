@@ -20,6 +20,16 @@
 // rtmr3-hook): event = SHA384("sha256:"+hex); RTMR[3] = extend(RTMR3, event).
 // RTMR[3] is hardware-append-only and the measurer is part of the dm-verity
 // root, so a workload can neither forge nor suppress its own measurement.
+//
+// Determinism: in the common one-workload-per-sandbox case (agent-sandbox runs
+// a single workload container plus the pause container), RTMR[3] is a single
+// deterministic extend. Each DISTINCT image is measured exactly once — restarts
+// and replicas (same image, different container id) are collapsed, since a
+// double-extend of an append-only register yields a value that matches no
+// golden and makes the pod unverifiable. A pod with multiple distinct workload
+// images extends them in first-seen (scan) order, which is not guaranteed
+// stable across runs; a verifier for such pods must account for ordering (or the
+// deployment should keep one workload image per sandbox).
 package rtmr3measurer
 
 import (
@@ -47,9 +57,19 @@ var (
 	hex64Re = regexp.MustCompile(`^[a-f0-9]{64}$`)
 )
 
-// seen records cids already acted on so each extends RTMR[3] exactly once.
-// Accessed only from the single Run() scan loop, so no lock is needed.
-var seen = map[string]struct{}{}
+// Dedup state, both touched only from the single Run() scan loop (no lock):
+//
+//	seenCids        — cids we've already decided on, so we don't re-read
+//	                  config.json on every scan.
+//	measuredDigests — image digests already extended into RTMR[3]. THIS is the
+//	                  correctness-critical dedup: keyed on the digest (not the
+//	                  cid) so a container restart (same image, new cid) or a
+//	                  second replica of the same image does not double-extend
+//	                  the append-only register.
+var (
+	seenCids        = map[string]struct{}{}
+	measuredDigests = map[string]struct{}{}
+)
 
 type ociSpec struct {
 	Annotations map[string]string `json:"annotations"`
@@ -63,9 +83,10 @@ func Run(_ []string) error {
 	// Poll, don't inotify. kata-agent sets up /run/kata-containers as its own
 	// mount after this daemon starts at boot; an inotify watch added early binds
 	// the pre-mount inode and never sees the <cid> dirs created on the mounted
-	// fs. A 1s scan is immune to that (and to dropped events); `seen` makes each
-	// cid extend RTMR[3] exactly once — mandatory, since the register is
-	// append-only and a double-extend would corrupt it.
+	// fs. A 1s scan is immune to that (and to dropped events); the dedup in
+	// handle() (measuredDigests) makes each distinct image extend RTMR[3]
+	// exactly once — mandatory, since the register is append-only and a
+	// double-extend would corrupt it.
 	for {
 		if entries, err := os.ReadDir(watchDir); err == nil {
 			for _, e := range entries {
@@ -83,14 +104,14 @@ func handle(logger *slog.Logger, dir string) {
 	if !cidRe.MatchString(cid) {
 		return // "shared"/"sandbox"/"image" and other non-container entries
 	}
-	if _, done := seen[cid]; done {
+	if _, done := seenCids[cid]; done {
 		return
 	}
 	spec, err := readConfig(filepath.Join(dir, "config.json"))
 	if err != nil {
 		return // config.json not written yet; retry next scan (do NOT mark seen)
 	}
-	seen[cid] = struct{}{} // definitive outcome from here — act once
+	seenCids[cid] = struct{}{} // decided this cid — don't re-read it every scan
 
 	// Skip the pause/sandbox container — it's the measured rootfs, not a
 	// workload, and carries no image-name annotation.
@@ -105,10 +126,20 @@ func handle(logger *slog.Logger, dir string) {
 		logger.Warn("no image digest annotation; not measurable (pin the image by digest)", "cid", cid)
 		return
 	}
+	// Correctness dedup: extend each distinct image exactly once. A restart of
+	// this container (new cid, same digest) or a second replica of the same
+	// image must NOT extend again — RTMR[3] is append-only and a double-extend
+	// corrupts the attested value.
+	if _, done := measuredDigests[digest]; done {
+		logger.Info("image already measured into RTMR[3]; skipping duplicate (restart or replica)", "cid", cid, "digest", digest)
+		return
+	}
 	if err := extendRTMR3(digest); err != nil {
+		// Not marked measured, so a later cid with this digest can retry.
 		logger.Error("extend RTMR[3] failed", "cid", cid, "digest", digest, "error", err)
 		return
 	}
+	measuredDigests[digest] = struct{}{}
 	logger.Info("measured workload into RTMR[3]", "cid", cid, "digest", digest)
 }
 
