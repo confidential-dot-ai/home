@@ -184,7 +184,7 @@ sudo modprobe loop 2>/dev/null || true
 
 # The overlay binaries must be staged before we build the rootfs image,
 # because they end up in the dm-verity root (and thus the measurement).
-for bin in ratls-mesh policy-monitor attestation-service; do
+for bin in ratls-mesh policy-monitor attestation-service rtmr3-measurer; do
     [[ -x "${EXTRA_DIR}/usr/local/bin/${bin}" ]] || die "${EXTRA_DIR}/usr/local/bin/${bin} missing — run scripts/fetch.sh first."
 done
 [[ -f "${EXTRA_DIR}/etc/c8s/bootstrap-allowlist.json" ]] || die "bootstrap-allowlist.json not staged — run scripts/fetch.sh (with IMAGE_TAG or *_DIGEST env vars) first."
@@ -421,6 +421,7 @@ C8S_UNITS=(
     attestation-service.service
     ratls-mesh.service
     policy-monitor.service
+    rtmr3-measurer.service
     c8s-cloudinit-env.service
 )
 # kata boots the guest with `systemd.unit=kata-containers.target` on the kernel

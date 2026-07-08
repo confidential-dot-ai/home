@@ -1,0 +1,29 @@
+[Unit]
+# In-guest per-workload measurement. rtmr3-measurer scans kata-agent's
+# container bundles under /run/kata-containers and extends TDX RTMR[3] with
+# each deployed workload's image digest (SHA384("sha256:"+hex)), so the guest's
+# attestation quote binds *which* container ran — dynamically, for any image,
+# with no baked allowlist. It is the measurement-only counterpart to
+# policy-monitor (allowlist enforcement); the two are independent and either or
+# both may run. Requires a guest kernel that exposes the TDX RTMR-extend sysfs
+# (/sys/devices/virtual/misc/tdx_guest/measurements/, mainline >= 6.16).
+Description=c8s rtmr3-measurer (in-guest per-workload RTMR[3] measurement)
+Documentation=https://github.com/confidential-dot-ai/c8s/tree/main/cmd/rtmr3-measurer
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rtmr3-measurer
+Restart=always
+RestartSec=2s
+# NOTE: do NOT add ProtectKernelTunables=/ProtectSystem=strict — the measurer
+# must write /sys/devices/virtual/misc/tdx_guest/measurements to extend RTMR[3].
+NoNewPrivileges=yes
+ProtectHome=yes
+
+[Install]
+# Mirrors the other c8s units: WantedBy=multi-user.target for a normal/debug
+# boot; build.sh additionally links it into kata-containers.target.wants (the
+# target kata actually boots), see C8S_UNITS in scripts/build.sh.
+WantedBy=multi-user.target

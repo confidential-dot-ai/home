@@ -97,6 +97,20 @@ fi
 install -m 0755 "${POLICY_MONITOR_BIN}" "${BIN_DIR}/policy-monitor"
 echo "==> policy-monitor: ${BIN_DIR}/policy-monitor ($(stat -c '%s' "${BIN_DIR}/policy-monitor") bytes)"
 
+# rtmr3-measurer: in-VM per-workload RTMR[3] measurer. Scans
+# /run/kata-containers and extends TDX RTMR[3] with each workload's image
+# digest. Source at /workspace/c8s/cmd/rtmr3-measurer. Built by
+# `make build-rtmr3-measurer` -> ${C8S_DIR}/build/rtmr3-measurer.
+RTMR3_MEASURER_BIN="${RTMR3_MEASURER_BIN:-${C8S_DIR}/build/rtmr3-measurer}"
+if [[ ! -x "${RTMR3_MEASURER_BIN}" ]]; then
+    echo "FATAL: ${RTMR3_MEASURER_BIN} missing" >&2
+    echo "       Build first:" >&2
+    echo "         cd ${C8S_DIR} && make build-rtmr3-measurer" >&2
+    exit 1
+fi
+install -m 0755 "${RTMR3_MEASURER_BIN}" "${BIN_DIR}/rtmr3-measurer"
+echo "==> rtmr3-measurer: ${BIN_DIR}/rtmr3-measurer ($(stat -c '%s' "${BIN_DIR}/rtmr3-measurer") bytes)"
+
 # In-guest attester: the `attestation-api` bin from attestation-rs, built for
 # the default (glibc) target. Staged under the attestation-service role name
 # (the in-guest unit, the C8S_ATTESTATION_SERVICE_URL contract, and the

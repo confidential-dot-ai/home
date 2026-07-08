@@ -1,5 +1,5 @@
 .PHONY: build install build-c8s build-c8s-node build-get-cert build-ratls-mesh \
-       build-nri-image-policy build-policy-monitor \
+       build-nri-image-policy build-policy-monitor build-rtmr3-measurer \
        test test-integration test-e2e-cw-label-policy test-e2e-mesh-cw-enforcement vet fmt lint clean \
        manifests generate check-crd-chart install-controller-gen require-controller-gen
 
@@ -60,6 +60,20 @@ build-policy-monitor:
 		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
 		-o $(BUILD_DIR)/policy-monitor ./cmd/policy-monitor
 	@echo "Built $(BUILD_DIR)/policy-monitor"
+
+# --- RTMR3-measurer (in-kata-guest per-workload RTMR[3] measurer) ---
+# Standalone daemon baked into kata-guest-base. Scans kata-agent's container
+# bundles and extends TDX RTMR[3] with each deployed workload's image digest,
+# binding the workload into the guest's attestation quote (measurement-only;
+# independent of policy-monitor's allowlist). Requires a guest kernel with the
+# TDX RTMR-extend sysfs (mainline >= 6.16). Static build like the other in-guest
+# binaries so osbuilder can copy it into the rootfs.
+build-rtmr3-measurer:
+	@mkdir -p $(BUILD_DIR)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+		go build -ldflags="-s -w -X $(MODULE)/internal/version.Version=$(VERSION)" \
+		-o $(BUILD_DIR)/rtmr3-measurer ./cmd/rtmr3-measurer
+	@echo "Built $(BUILD_DIR)/rtmr3-measurer"
 
 # --- Get-Cert ---
 
