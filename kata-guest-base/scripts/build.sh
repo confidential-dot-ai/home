@@ -346,6 +346,8 @@ mkdir -p "${ROOTFS_BUILD_DEST}" "${IMAGES_BUILD_DEST}" "${GO_PATH_DIR}"
 # bundle to validate those TLS connections (osbuilder's `required`-variant
 # rootfs ships none). The boot path (/attest) is network-free, so a missing
 # bundle would only degrade verification — but it is cheap and in `main`.
+# cryptsetup-bin: scratch-setup.service opens the ephemeral image-store scratch
+# disk under dm-crypt (see extra/usr/local/lib/c8s/scratch-setup.sh). In noble main.
 # Only `main`-component packages are installable (osbuilder sets
 # REPO_COMPONENTS=main); universe packages (e.g. traceroute, mtr-tiny) fail the
 # rootfs build with "no installation candidate".
@@ -353,7 +355,7 @@ mkdir -p "${ROOTFS_BUILD_DEST}" "${IMAGES_BUILD_DEST}" "${GO_PATH_DIR}"
 # nvidia-uvm load; udev's builtin libkmod only auto-loads nvidia via PCI
 # modalias — nvidia-uvm has no modalias). Without it the unit exits 127,
 # kata-agent never starts, and every GPU pod hangs in ContainerCreating.
-KATA_EXTRA_PKGS="libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-sys1t64 libtss2-tctildr0t64 ca-certificates kmod"
+KATA_EXTRA_PKGS="libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-sys1t64 libtss2-tctildr0t64 ca-certificates kmod cryptsetup-bin"
 # --- Step 1b/5: stage the CoCo guest-components ------------------------
 # confidential-data-hub (CDH), attestation-agent (AA), api-server-rest. The
 # kata-agent SPAWNS these at boot (its guest_components_procs default is
@@ -450,6 +452,7 @@ C8S_UNITS=(
     ratls-mesh.service
     policy-monitor.service
     rtmr3-measurer.service
+    scratch-setup.service
     c8s-cloudinit-env.service
 )
 # kata boots the guest with `systemd.unit=kata-containers.target` on the kernel

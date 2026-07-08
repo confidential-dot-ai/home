@@ -38,6 +38,11 @@ enable policy-monitor.service
 # (measurement-only; independent of policy-monitor's allowlist enforcement).
 enable rtmr3-measurer.service
 
+# scratch-setup backs the CoCo image store with an ephemeral dm-crypt disk so
+# large workload images unpack to encrypted disk instead of RAM (needs the VM
+# launched with a confai-scratch disk; no-op otherwise).
+enable scratch-setup.service
+
 # Make sure cloud-init's units are on — without these, our env
 # materialisation never sees the user-data. Ubuntu's default preset
 # already enables them, but be explicit so a base-image refactor
