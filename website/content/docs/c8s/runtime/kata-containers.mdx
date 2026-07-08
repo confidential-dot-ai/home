@@ -11,24 +11,26 @@ and verifiable.
 
 ## What gets installed
 
-`c8s install --kata` deploys the Kata runtime stack and registers four RuntimeClasses:
+`c8s install --kata` deploys the Kata runtime stack and registers four RuntimeClasses — the two
+non-confidential classes plus the declared platform's confidential (CPU, GPU) pair:
 
 - **`kata-deploy`** (DaemonSet, digest-pinned) installs the Kata runtime and
-  `containerd-shim-kata-v2` on every node — including the SEV-SNP- and TDX-capable QEMU builds,
-  the guest kernel, guest image, and OVMF firmware. It restarts containerd/RKE2 after install;
-  running pods survive via shim persistence.
+  `containerd-shim-kata-v2` on every node — including the declared platform's confidential QEMU
+  build, the guest kernel, guest image, and OVMF firmware. It restarts containerd/RKE2 after
+  install; running pods survive via shim persistence.
 - **RuntimeClasses:**
 
   | RuntimeClass | Hypervisor | Confidential? |
   | --- | --- | --- |
   | `kata-qemu` | QEMU micro-VM | No — VM isolation from the host only |
   | `kata-clh` | Cloud Hypervisor | No — VM isolation only |
-  | `kata-qemu-snp` | QEMU + SEV-SNP | **Yes** — pod memory is encrypted against the host |
-  | `kata-qemu-tdx` | QEMU + Intel TDX | **Yes** — pod memory is encrypted against the host; schedules only on nodes labeled `intel-tdx.node.kubernetes.io/enabled=true` |
+  | `kata-qemu-snp` / `kata-qemu-tdx` | QEMU + SEV-SNP / Intel TDX | **Yes** — pod memory is encrypted against the host; schedules only on platform-labeled nodes |
+  | `kata-qemu-snp-nvidia` / `kata-qemu-tdx-nvidia` | as above + VFIO GPU passthrough | **Yes** — a confidential VM with a dedicated NVIDIA GPU |
 
-  A cluster runs **one** confidential class: the webhook promotes `confidential.ai/cw` pods to
-  `kata-qemu-snp` or `kata-qemu-tdx` per the install's `--hardware-platform` — mixed-TEE
-  clusters are not supported. The rest of this page describes the SEV-SNP path.
+  A cluster runs **one** platform's confidential classes: only the pair matching the install's
+  `--hardware-platform` is rendered, and the webhook promotes `confidential.ai/cw` pods to its
+  CPU class (and pods requesting `nvidia.com/*` to its GPU class) — mixed-TEE clusters are not
+  supported. The rest of this page describes the SEV-SNP path.
 
 Installing `--kata` also **disables** the host-side `ratls-mesh`, `attestation-api`, and
 `nri-image-policy`: under Kata their function moves *inside* the guest image, where the host
@@ -107,12 +109,17 @@ the confidential-data-hub's pull).
 
 ## Constraints
 
-- **x86-64 + SEV-SNP today.** The confidential *pod* path currently requires an AMD SEV-SNP host
-  (Genoa / Milan / Turin class) — Intel TDX runs the rest of the c8s stack and node-as-CVM, but
-  the per-pod Kata runtime is SEV-SNP for now, with TDX in progress. On a non-SNP host you can
-  still run `kata-qemu` (isolation, not confidentiality) but not `kata-qemu-snp`.
-- **No GPU confidential computing yet.** GPU CC (NVIDIA H100 CC-mode) is intentionally out of
-  scope for the initial pod runtime — see [Limitations](/docs/c8s/limitations).
+- **x86-64, SEV-SNP or Intel TDX.** The confidential *pod* path needs an AMD SEV-SNP host
+  (Genoa / Milan / Turin class) or an Intel TDX host, declared at install time via
+  `--hardware-platform`. On a host with neither TEE you can still run `kata-qemu` (isolation,
+  not confidentiality) but no confidential class.
+- **Confidential GPU is passthrough-based and comes with constraints.** GPU pods run as
+  confidential VMs with the NVIDIA GPU passed through over VFIO (request an `nvidia.com/*`
+  resource; the webhook injects the GPU RuntimeClass). The GPU host setup (vfio-pci binding,
+  GPU CC mode, BAR resize) is provisioning's job, **not** the NVIDIA GPU Operator's — the
+  operator assumes host-visible GPUs with a host driver and must not be installed on these
+  clusters. GPU attestation (SPDM) is not yet surfaced to the relying party — see
+  [Limitations](/docs/c8s/limitations).
 - **Per-pod, not per-node.** Pod-as-CVM attests each pod; it does not by itself attest the
   node. If you need a single confidential node instead, see
   [pod-as-CVM vs node-as-CVM](/docs/c8s/runtime/pod-vs-node-cvm).

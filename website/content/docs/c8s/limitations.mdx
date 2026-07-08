@@ -58,8 +58,15 @@ items are deliberate non-goals for now; others are tracked work.
 - **Browser verification is SEV-SNP only.** The [c8s-verify](/docs/c8s/verification/consumer)
   WASM verifier ships AMD ARK/ASK roots and verifies SEV-SNP evidence; TDX is reserved in the
   wire protocol but not yet implemented.
-- **No GPU confidential computing yet.** GPU CC (NVIDIA H100 CC-mode) is intentionally out of
-  scope for the initial pod runtime; integrating confidential GPUs is tracked separately.
+- **Confidential GPU ships, with gaps.** Kata clusters run GPU pods as confidential VMs with
+  the NVIDIA GPU passed through over VFIO (Blackwell-class, CC mode) — request an
+  `nvidia.com/*` resource and the webhook injects the confidential GPU RuntimeClass. Current
+  gaps: the GPU's own attestation (SPDM) is not yet surfaced to the relying party (a non-CC
+  GPU fails closed at guest boot, but there is no positive GPU evidence in the attestation
+  result); the GPU guest boots kata's GPU kernel (measured, but not the steep-hardened build);
+  and on SEV-SNP each GPU pod is pinned to a single vCPU to keep the launch measurement
+  stable. Host GPU provisioning (vfio-pci binding, GPU CC mode, BAR resize) is assumed done
+  before install; the NVIDIA GPU Operator is **not** used on this path.
 - **Don't run an external service mesh alongside c8s.** c8s installs its own pod-to-pod
   **RA-TLS mesh** — transparent iptables redirection plus attestation-gated mTLS. A second
   service mesh (Istio, Linkerd, or any sidecar / mTLS plumbing) double-intercepts the same

@@ -42,12 +42,23 @@ Headless DNS returns pod IPs, which the node mesh wraps in attested mTLS. We ser
 **`facebook/opt-125m`**, a tiny model that's quick to load on CPU.
 
 <Callout type="warn">
-  **Use a CPU build of vLLM.** c8s nodes are CPU-only today (confidential GPU is not yet
-  supported), and vLLM's published `vllm/vllm-openai` image is a **CUDA** build that won't start
-  without a GPU. vLLM ships no official prebuilt CPU image, so build one from
+  **This tutorial uses a CPU build of vLLM.** vLLM's published `vllm/vllm-openai` image is a
+  **CUDA** build that won't start without a GPU, and vLLM ships no official prebuilt CPU image —
+  so build one from
   [vLLM's CPU Dockerfile](https://docs.vllm.ai/en/latest/getting_started/installation/cpu/), push
   it to a registry your cluster can pull, and reference *that* image below (pinning its digest in
   Step 2).
+
+  **Running the GPU build instead?** Your cluster must be GPU-provisioned for confidential
+  passthrough *before* c8s installs — GPUs bound to vfio-pci, GPU CC mode on, BAR resize done
+  (this is host provisioning's job; do **not** install the NVIDIA GPU Operator — it assumes
+  host-visible GPUs with a host driver and conflicts with the passthrough model). Then use the
+  CUDA image and add a GPU resource limit with the per-model name your node advertises
+  (`kubectl describe node <gpu-node> | grep nvidia.com`), e.g.
+  `nvidia.com/GB202GL_RTX_PRO_6000_BLACKWELL_SERVER_EDITION: 1` — the webhook injects the
+  confidential GPU RuntimeClass from the GPU request alone. Don't set a `memory` limit on GPU
+  pods, and expect one vCPU per GPU pod on SEV-SNP — see
+  [Kata containers](/docs/c8s/runtime/kata-containers).
 </Callout>
 
 ```yaml
