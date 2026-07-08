@@ -19,15 +19,14 @@ nothing to build or push.
 <Callout type="info">
   **CPU cluster, mock engine.**
 
-  Dynamo's real engine backends (vLLM, SGLang, TensorRT-LLM) ship
-  as CUDA images and need GPUs, and GPU confidential computing is not yet part of c8s — see
-  [Limitations](/docs/c8s/limitations). So this tutorial runs Dynamo's own GPU-free **mocker**
-  engine (`dynamo.mocker`, the upstream-supported way to exercise the frontend, router, and
-  discovery without GPUs). The mocker downloads only the model's *tokenizer* — a few MB — and
-  never loads weights, so it runs comfortably on the smallest confidential node sizes. Every
-  c8s property you set up — digest enforcement, workload identity, the attested front door —
-  transfers unchanged to a GPU-backed deployment: swap the worker's image and command, keep the
-  annotations.
+  Dynamo's real engine backends (vLLM, SGLang, TensorRT-LLM) ship as CUDA images and need
+  GPUs — and this tutorial's AKS cluster is CPU-only. So it runs Dynamo's own GPU-free
+  **mocker** engine (`dynamo.mocker`, the upstream-supported way to exercise the frontend,
+  router, and discovery without GPUs). The mocker downloads only the model's *tokenizer* — a
+  few MB — and never loads weights, so it runs comfortably on the smallest confidential node
+  sizes. Every c8s property you set up — digest enforcement, workload identity, the attested
+  front door — transfers unchanged to a GPU-backed deployment: swap the worker's image and
+  command, keep the annotations.
 </Callout>
 
 ## Prerequisites
@@ -529,9 +528,12 @@ intact:
   `confidential.ai/cw` on the pods via `spec.services.<Name>.extraPodMetadata.annotations`
   (`v1alpha1`) or `spec.components[].podTemplate.metadata.annotations` (`v1beta1`) in a
   `DynamoGraphDeployment`.
-- **Real engines need confidential GPUs** — GPU CC is on the roadmap, not in the current
-  milestone: [Limitations](/docs/c8s/limitations). The swap when it lands is the worker's
-  image and command, not the c8s wiring.
+- **Real engines need GPUs** — on a GPU-equipped c8s cluster they just run: node-as-CVM
+  nodes schedule GPUs as normal Kubernetes resources, and under Kata, GPU pods become
+  confidential VMs with the GPU passed through — see
+  [Kata containers](/docs/c8s/runtime/kata-containers) and
+  [Limitations](/docs/c8s/limitations) for the current gaps. The swap is the worker's image,
+  command, and a GPU resource limit — not the c8s wiring.
 - **Classical model serving** — [Serving a confidential model with KServe](/docs/c8s/tutorials/kserve)
   runs the same pattern with KServe's `InferenceService`.
 - **Automate the digests** — wire `c8s allowlist add` into CI:

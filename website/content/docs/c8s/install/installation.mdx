@@ -239,10 +239,10 @@ spec:
   The annotation **value is the workload's identity**, not a `true`/`false` flag. The operator
   derives a managed headless Service named `c8s-<value>` from it and the workload's certificate
   SAN is `c8s-<value>.<namespace>.svc` (overridable with `confidential.ai/c8s-san`). So
-  `confidential.ai/cw: my-inference` yields the Service `c8s-my-inference` — which is what a
-  front-door proxy (e.g. tee-proxy's `--upstream`) dials to reach the workload over the RA-TLS
-  mesh. Use a stable, DNS-label-safe name; a value like `"true"` would only produce a Service
-  named `c8s-true`.
+  `confidential.ai/cw: my-inference` yields the Service `c8s-my-inference` — which is what the
+  front door (tls-lb's upstream, derived via `engine.name`/`engine.port` + `engine.workloadId`)
+  dials to reach the workload over the RA-TLS mesh. Use a stable, DNS-label-safe name; a value
+  like `"true"` would only produce a Service named `c8s-true`.
 </Callout>
 
 Make sure the image digest is on the [allowlist](/docs/c8s/attestation/allowlist), or
@@ -296,7 +296,7 @@ c8s uninstall
 ```
 
 It runs `helm uninstall` to remove the release (operator, CDS, attestation-api, ratls-mesh,
-tee-proxy, tls-lb, webhook configuration, RuntimeClasses, enforcement policy), and for a
+tls-lb, webhook configuration, RuntimeClasses, enforcement policy), and for a
 `--kata` install it then **sweeps the host-side kata artifacts** off every node — `/opt/kata`,
 the containerd runtime drop-in, the multi-GB `kata-guest-base` image, the RKE2 prep template,
 and the kata-runtime node labels — via a short-lived privileged DaemonSet. The sweep is read
