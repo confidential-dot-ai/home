@@ -71,7 +71,9 @@ In short:
   per-pod measurement pinning, admission enforcement).
 
 <Callout type="warn">
-  **Pod-as-CVM is not available on Azure.** Azure's hypervisor does not expose nested
+  **Pod-as-CVM is not available on Azure.**
+
+  Azure's hypervisor does not expose nested
   virtualization, so a per-pod VM cannot be launched inside an AKS node. On Azure you use
   node-as-CVM, where the AKS node is a single confidential CVM and all its pods share that one
   boundary. See [Provisioning on Azure](/docs/c8s/install/azure) for the details and what you

@@ -1,5 +1,5 @@
 ---
-title: Confidential model serving with KServe
+title: Serving a confidential model with KServe
 description: Run KServe on a c8s cluster in Standard deployment mode — every image digest-allowlisted, the predictor carrying a CDS-issued TEE identity — and serve verified predictions through the attested front door.
 ---
 
@@ -19,7 +19,9 @@ identity issued by the **CDS** (Certificate Distribution Service, the cluster's 
 root) bound to the predictor, and an attested front door.
 
 <Callout type="info">
-  **Why Standard mode?** KServe's Knative (serverless) mode requires Knative and Istio. c8s
+  **Why Standard mode?**
+
+  KServe's Knative (serverless) mode requires Knative and Istio. c8s
   already runs its own pod-to-pod mesh — **RA-TLS** (Remote-Attestation TLS) rooted in hardware
   attestation — and a second service mesh double-intercepts the same traffic and injects
   un-attested proxies into the confidential path (see [Limitations](/docs/c8s/limitations)).
@@ -222,7 +224,9 @@ kubectl get cwl -n workloads
 ```
 
 <Callout type="warn">
-  **In-cluster clients: dial `c8s-iris`, not the KServe Service.** KServe also creates an
+  **In-cluster clients: dial `c8s-iris`, not the KServe Service.**
+
+  KServe also creates an
   ordinary ClusterIP Service (`iris-predictor`), but the mesh cannot intercept Service-VIP
   traffic — so c8s **drops** VIP flows to confidential pods rather than let them arrive in
   plaintext. The headless `c8s-iris` resolves to pod IPs, which the mesh wraps in attested
@@ -285,9 +289,11 @@ LB_ADDRESS=<EXTERNAL-IP>
 ```
 
 <Callout type="info">
-  **Not on the Azure tutorial's cluster?** Use the flags you originally installed with, and
-  expose `c8s-tls-lb` however your environment does it. With no cloud load balancer, set
-  `tlsLb.service.type: NodePort` in `values.yaml` and reach the front door on the node:
+  **Not on the Azure tutorial's cluster?**
+
+  Use the flags you originally installed with, and expose `c8s-tls-lb` however your
+  environment does it. With no cloud load balancer, set `tlsLb.service.type: NodePort` in
+  `values.yaml` and reach the front door on the node:
 
   ```bash
   NODE_PORT=$(kubectl get svc -n c8s-system c8s-tls-lb -o jsonpath='{.spec.ports[0].nodePort}')

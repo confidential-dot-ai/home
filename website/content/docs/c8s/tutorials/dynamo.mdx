@@ -1,5 +1,5 @@
 ---
-title: Deploy NVIDIA Dynamo as confidential workloads
+title: Deploy NVIDIA Dynamo as a confidential workload
 description: Run NVIDIA Dynamo's serving stack — frontend, router, worker, and discovery — on a c8s cluster, with every image digest-allowlisted, both serving components holding CDS-issued TEE identities, and the OpenAI endpoint behind the attested front door.
 ---
 
@@ -17,7 +17,9 @@ deployment from your laptop over a verified, sealed channel. Every image is publ
 nothing to build or push.
 
 <Callout type="info">
-  **CPU cluster, mock engine.** Dynamo's real engine backends (vLLM, SGLang, TensorRT-LLM) ship
+  **CPU cluster, mock engine.**
+
+  Dynamo's real engine backends (vLLM, SGLang, TensorRT-LLM) ship
   as CUDA images and need GPUs, and GPU confidential computing is not yet part of c8s — see
   [Limitations](/docs/c8s/limitations). So this tutorial runs Dynamo's own GPU-free **mocker**
   engine (`dynamo.mocker`, the upstream-supported way to exercise the frontend, router, and
@@ -143,7 +145,9 @@ The pods won't start yet — their images aren't on the allowlist. That's enforc
 Step 3 fixes it.
 
 <Callout type="warn">
-  **Scaling past one node changes the picture.** The RA-TLS mesh wraps **pod-IP** traffic —
+  **Scaling past one node changes the picture.**
+
+  The RA-TLS mesh wraps **pod-IP** traffic —
   which covers Dynamo's frontend→worker request plane, since workers register their pod IPs in
   etcd. But etcd and NATS are dialed here through Service VIPs, which the mesh cannot
   intercept: on a single node that traffic never leaves the CVM; across nodes it would cross
@@ -416,9 +420,11 @@ LB_ADDRESS=<EXTERNAL-IP>
 ```
 
 <Callout type="info">
-  **Not on the Azure tutorial's cluster?** Use the flags you originally installed with, and
-  expose `c8s-tls-lb` however your environment does it. With no cloud load balancer, set
-  `tlsLb.service.type: NodePort` in `values.yaml` and reach the front door on the node:
+  **Not on the Azure tutorial's cluster?**
+
+  Use the flags you originally installed with, and expose `c8s-tls-lb` however your
+  environment does it. With no cloud load balancer, set `tlsLb.service.type: NodePort` in
+  `values.yaml` and reach the front door on the node:
 
   ```bash
   NODE_PORT=$(kubectl get svc -n c8s-system c8s-tls-lb -o jsonpath='{.spec.ports[0].nodePort}')
@@ -526,7 +532,7 @@ intact:
 - **Real engines need confidential GPUs** — GPU CC is on the roadmap, not in the current
   milestone: [Limitations](/docs/c8s/limitations). The swap when it lands is the worker's
   image and command, not the c8s wiring.
-- **Classical model serving** — [Confidential model serving with KServe](/docs/c8s/tutorials/kserve)
+- **Classical model serving** — [Serving a confidential model with KServe](/docs/c8s/tutorials/kserve)
   runs the same pattern with KServe's `InferenceService`.
 - **Automate the digests** — wire `c8s allowlist add` into CI:
   [Automating the allowlist](/docs/c8s/attestation/allowlist#automating-the-allowlist).

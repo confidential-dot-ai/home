@@ -125,7 +125,9 @@ Know the boundaries of this design before relying on it:
   [Verify who can write](#verify-who-can-write)) — but not *measured*.
 
 <Callout type="info">
-  **Planned, not yet shipped.** Two hardenings are coming: **binding the pinned operator keys
+  **Planned, not yet shipped.**
+
+  Two hardenings are coming: **binding the pinned operator keys
   into the CDS's attestation**, so a verifier *proves* the key list instead of trusting the CDS
   to report it, and a **CA with short-lived operator certificates**, giving delegated issuance
   and real revocation. See [Limitations](/docs/c8s/limitations).
@@ -324,7 +326,9 @@ Registry UIs show it too — ghcr.io lists the digest on a package's version pag
 shows it per tag.
 
 <Callout type="warn">
-  **Multi-arch images:** a tag like `…:v3` can point to a manifest *list* with one entry per
+  **Multi-arch images.**
+
+  A tag like `…:v3` can point to a manifest *list* with one entry per
   platform. `crane digest` returns the **index** digest by default, but a node resolves that tag
   to its **platform-specific** manifest when it pulls — and the enforcer matches the
   `…@sha256:…` digest the runtime actually resolved. Pin *that* one, e.g.

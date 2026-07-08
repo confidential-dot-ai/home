@@ -70,7 +70,9 @@ az aks create \
 ```
 
 <Callout type="warn">
-  **Verify the node-pool shape.** If your subscription/region only allows the confidential size on
+  **Verify the node-pool shape.**
+
+  If your subscription/region only allows the confidential size on
   a **user** pool, create a regular system pool and add the confidential pool with
   `az aks nodepool add --mode User --node-vm-size Standard_DC4as_v5 --os-sku Ubuntu …` — then drop
   `--single-node` in step 5 and let the CDS schedule onto the confidential pool. See the
@@ -215,7 +217,9 @@ c8s install \
 `--single-node` makes every node CDS-eligible (no dedicated CDS node).
 
 <Callout type="warn">
-  **Validate on managed nodes.** This install runs privileged DaemonSets that touch the node host
+  **Validate on managed nodes.**
+
+  This install runs privileged DaemonSets that touch the node host
   — `nri-image-policy` patches containerd and restarts it, `ratls-mesh` sets up `iptables`, and
   `attestation-api` mounts `/dev/tpm0`. Confirm these complete on your AKS node pool (and survive
   node image upgrades) before relying on it.
@@ -302,7 +306,7 @@ with it over an encrypted channel from your laptop.
 Or bring your serving stack of choice onto this cluster:
 
 - [NVIDIA Dynamo](/docs/c8s/tutorials/dynamo) — a multi-component serving graph (frontend,
-  router, worker, discovery) as confidential workloads.
+  router, worker, discovery) run confidentially.
 - [KServe](/docs/c8s/tutorials/kserve) — `InferenceService` model serving in Standard mode,
   every image digest-allowlisted.
 

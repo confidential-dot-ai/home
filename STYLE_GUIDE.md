@@ -177,6 +177,10 @@ Code examples are the heart of these docs — make them correct and copy-paste-r
 Use Fumadocs `<Callout>` deliberately — they're signposts, not decoration. One or two per page
 at most; if everything is a callout, nothing is.
 
+When a callout opens with a bold title (`**Why Standard mode?**`, `**Verify the node-pool
+shape.**`), put a **blank line after the title** so it renders as its own line, with the body
+as its own paragraph below.
+
 | Type | Use for | Example |
 | --- | --- | --- |
 | `type="info"` | Helpful context, orientation, "new here?" pointers. | The site's intro "this walks you end-to-end" note. |
@@ -189,8 +193,10 @@ use a short, clearly-labeled callout and link to [Limitations](./content/docs/li
 
 ```md
 <Callout type="info">
-  **Planned, not yet shipped.** GPU confidential computing (NVIDIA CC mode) is out of scope for
-  the current milestone. See [Limitations](/docs/c8s/limitations).
+  **Planned, not yet shipped.**
+
+  GPU confidential computing (NVIDIA CC mode) is out of scope for the current milestone. See
+  [Limitations](/docs/c8s/limitations).
 </Callout>
 ```
 

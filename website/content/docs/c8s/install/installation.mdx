@@ -51,7 +51,9 @@ not preinstalled on stock Azure images (`sudo apt install make` on Debian/Ubuntu
 </details>
 
 <Callout type="info">
-  **Which TEEs?** The platform — CDS, attestation verification, the RA-TLS mesh, the allowlist,
+  **Which TEEs?**
+
+  The platform — CDS, attestation verification, the RA-TLS mesh, the allowlist,
   and the **node-as-CVM** shape — runs on both **AMD SEV-SNP** and **Intel TDX**. The per-pod
   **Kata runtime** (`--kata`) supports both, but a cluster picks **one** CPU TEE at install time
   with `--hardware-platform` (`sev-snp` by default; `tdx` renders the `kata-qemu-tdx`
@@ -188,7 +190,9 @@ kubectl label node <NODE> intel-tdx.node.kubernetes.io/enabled=true
 </details>
 
 <Callout type="info">
-  **`--image-pull-secret` is only needed while the images are private.** It exists because the
+  **`--image-pull-secret` is only needed while the images are private.**
+
+  It exists because the
   c8s component images currently ship from a private registry. After c8s's public launch those
   images will be public, and you can drop the flag (and skip creating the Secret) entirely —
   you'll only need it if you pull from a **private or custom registry**: an internal mirror, a

@@ -78,7 +78,9 @@ az aks create \
 ```
 
 <Callout type="warn">
-  **Verify the node-pool shape.** Some subscriptions/regions only allow the confidential VM size
+  **Verify the node-pool shape.**
+
+  Some subscriptions/regions only allow the confidential VM size
   on a **user** node pool, not the default system pool. If `az aks create` rejects the CVM size,
   create a minimal regular system pool and add the confidential pool separately:
 
@@ -124,7 +126,9 @@ provision-through-verify path on one page, follow
 [Deploy a confidential AKS cluster and run c8s](/docs/c8s/tutorials/azure-e2e).
 
 <Callout type="warn">
-  **Validate the host-side install on managed nodes.** c8s's node-as-CVM install runs privileged
+  **Validate the host-side install on managed nodes.**
+
+  c8s's node-as-CVM install runs privileged
   DaemonSets that touch the node host: `nri-image-policy` patches the node's containerd config and
   restarts it, `ratls-mesh` sets up `iptables`, and `attestation-api` mounts `/dev/tpm0`. This is
   routine on self-managed nodes; on a **managed AKS node pool**, confirm these complete and

@@ -42,7 +42,9 @@ Headless DNS returns pod IPs, which the node mesh wraps in attested mTLS. We ser
 **`facebook/opt-125m`**, a tiny model that's quick to load on CPU.
 
 <Callout type="warn">
-  **This tutorial uses a CPU build of vLLM.** vLLM's published `vllm/vllm-openai` image is a
+  **This tutorial uses a CPU build of vLLM.**
+
+  vLLM's published `vllm/vllm-openai` image is a
   **CUDA** build that won't start without a GPU, and vLLM ships no official prebuilt CPU image —
   so build one from
   [vLLM's CPU Dockerfile](https://docs.vllm.ai/en/latest/getting_started/installation/cpu/), push
