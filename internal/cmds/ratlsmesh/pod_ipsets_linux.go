@@ -345,6 +345,10 @@ func collectPodIPSetMembers(objs []interface{}, nodeIPs []string, excludedSource
 		if !ok || !podEligibleForMeshEndpoint(pod) {
 			continue
 		}
+		// Excluded-namespace pods (kube-system) are neither mesh source nor
+		// destination: redirecting TCP to a plaintext infra backend (e.g.
+		// CoreDNS, which GKE NodeLocalDNS reaches via force_tcp) hangs.
+		_, nsExcluded := excludedSourceNamespaces[pod.Namespace]
 		localSource := podIsLocal(pod, ourNodeIPs) && podEligibleForMeshSource(pod, excludedSourceNamespaces)
 		// cw membership is cluster-wide, mirroring the all-pods sets: the
 		// FORWARD guard then also drops at the source node when a Service
@@ -352,7 +356,9 @@ func collectPodIPSetMembers(objs []interface{}, nodeIPs []string, excludedSource
 		// enforcement is on; the sets are unreferenced otherwise.
 		cw := collectCW && podIsConfidentialWorkload(pod)
 		for _, ip := range podStatusIPs(pod) {
-			add(ip, v4Set, v6Set)
+			if !nsExcluded {
+				add(ip, v4Set, v6Set)
+			}
 			if localSource {
 				add(ip, localV4Set, localV6Set)
 			}

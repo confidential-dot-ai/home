@@ -43,6 +43,7 @@ func TestCollectPodIPSetMembersSkipsHostNetworkAndDeduplicates(t *testing.T) {
 				PodIP:  "10.244.0.6",
 			},
 		},
+		// Excluded-namespace pod: in neither the all (dst) nor local (src) sets.
 		&corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system"},
 			Status: corev1.PodStatus{
@@ -59,7 +60,7 @@ func TestCollectPodIPSetMembersSkipsHostNetworkAndDeduplicates(t *testing.T) {
 		},
 	}, []string{"10.0.0.1"}, parseExcludedNamespaces("kube-system"), true)
 
-	if want := []string{"10.244.0.5", "10.244.0.6", "10.244.0.7"}; !reflect.DeepEqual(sets.allIPv4, want) {
+	if want := []string{"10.244.0.5", "10.244.0.6"}; !reflect.DeepEqual(sets.allIPv4, want) {
 		t.Fatalf("IPv4 pod IPs = %#v, want %#v", sets.allIPv4, want)
 	}
 	if want := []string{"fd00::5"}; !reflect.DeepEqual(sets.allIPv6, want) {
