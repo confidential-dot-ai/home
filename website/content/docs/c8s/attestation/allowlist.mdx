@@ -192,6 +192,14 @@ To authorize several operators, concatenate their `.pub` files into one bundle �
 disabled (reads still work), so `c8s install` refuses the default path unless you acknowledge
 with `--force`.
 
+<Callout type="warn">
+`cds.operatorKeys` is the PEM **content**, never a file path. If you set the chart value
+yourself — a values file, a Flux `HelmRelease`, or helm `--set-file` — paste the PEM block; a
+path from the machine that rendered the values is meaningless in-cluster, and the chart fails
+the render if the value doesn't look like PEM. `c8s install --operator-keys` and
+`c8s render-values --operator-keys` both read the file and embed its content for you.
+</Callout>
+
 ### Reach the CDS
 
 The CDS has no public ingress. In base mode, port-forward it — and the attestation-api, which
