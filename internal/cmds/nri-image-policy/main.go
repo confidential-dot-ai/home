@@ -1,13 +1,11 @@
 // Package nriimagepolicy is an NRI plugin that validates container images
-// against a digest allowlist. The allowlist is sourced either from a remote
-// CDS service (pull mode) or from an operator-pushed payload on the local
-// unix socket (push mode), with a bootstrap file on disk as the cold-boot
-// baseline in both modes.
+// against a digest allowlist. Every plugin polls a remote CDS service (pull
+// mode) for the allowlist, with a bootstrap file on disk (always_allow) as the
+// cold-boot baseline.
 package nriimagepolicy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,24 +15,18 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
-
-	"gopkg.in/yaml.v3"
 
 	"github.com/confidential-dot-ai/c8s/internal/audit"
 	"github.com/confidential-dot-ai/c8s/internal/cache"
 	"github.com/confidential-dot-ai/c8s/internal/cmds/cmdsutil"
 	ctrdresolver "github.com/confidential-dot-ai/c8s/internal/containerd"
-	"github.com/confidential-dot-ai/c8s/internal/fileutil"
-	"github.com/confidential-dot-ai/c8s/internal/httputil"
 	"github.com/confidential-dot-ai/c8s/internal/version"
 	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/allowlistclient"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
-	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
 // Pull-startup retry parameters. Declared as vars so tests can shrink
@@ -47,20 +39,12 @@ var (
 var (
 	errInitialAllowlistNotModified = errors.New("initial allowlist fetch returned not modified without a cached CDS allowlist")
 	errInitialAllowlistNil         = errors.New("initial allowlist fetch returned nil allowlist")
-	errPushHandlerRequiresUnixAddr = errors.New("push mode requires plugin.health_addr to use unix://")
 	errPluginDied                  = errors.New("NRI plugin died during allowlist init")
 )
-
-// pushBodyLimit caps PUT /allowlist payloads. Push mode carries a
-// single digest entry so this is intentionally tight.
-const pushBodyLimit = 16 * 1024
 
 func startupSourceMode(cfg *config) string {
 	if cfg.PullEnabled() {
 		return "pull"
-	}
-	if cfg.PushEnabled() {
-		return "push"
 	}
 
 	sources := make([]string, 0, 2)
@@ -146,28 +130,8 @@ func Run(args []string) error {
 
 	bootstrap := alwaysAllowAllowlist(cfg.Allowlist.AlwaysAllow)
 
-	var pushed *allowlist.Allowlist
-	if cfg.PushEnabled() && cfg.Allowlist.Push.PersistPath != "" {
-		pushed, err = loadAllowlistFile(cfg.Allowlist.Push.PersistPath, "pushed", logger)
-		if err != nil {
-			return fmt.Errorf("load pushed %q: %w", cfg.Allowlist.Push.PersistPath, err)
-		}
-	}
-
-	seed := mergeAllowlists(bootstrap, pushed)
-	policyCache.SetAllowlist(seed)
-	logger.Info("cache seeded",
-		"always_allow_entries", entriesOf(bootstrap),
-		"pushed_entries", entriesOf(pushed),
-	)
-
-	var pushH *pushHandler
-	if cfg.PushEnabled() {
-		pushH, err = newPushHandler(policyCache, bootstrap, cfg.Allowlist.Push.PersistPath, logger)
-		if err != nil {
-			return fmt.Errorf("create push handler: %w", err)
-		}
-	}
+	policyCache.SetAllowlist(bootstrap)
+	logger.Info("cache seeded", "always_allow_entries", entriesOf(bootstrap))
 
 	addr := *healthAddr
 	if cfg.Plugin.HealthAddr != "" {
@@ -179,7 +143,6 @@ func Run(args []string) error {
 		addr:         addr,
 		readTimeout:  *readTimeout,
 		writeTimeout: *writeTimeout,
-		pushHandler:  pushH,
 	}); err != nil {
 		return fmt.Errorf("start health server on %q: %w", addr, err)
 	}
@@ -277,37 +240,6 @@ func alwaysAllowAllowlist(entries map[string]string) *allowlist.Allowlist {
 		wl.Digests[d] = image
 	}
 	return wl
-}
-
-// loadAllowlistFile reads a YAML/JSON allowlist from disk. Missing file
-// returns (nil, nil); parse errors fail closed.
-func loadAllowlistFile(path, kind string, logger *slog.Logger) (*allowlist.Allowlist, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			logger.Info("allowlist file absent", "kind", kind, "path", path)
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read: %w", err)
-	}
-	return parseAllowlistFile(data, path)
-}
-
-// parseAllowlistFile decodes YAML/JSON allowlist content. Digest keys
-// are validated via the typed wire shape; empty digest maps are allowed.
-func parseAllowlistFile(data []byte, path string) (*allowlist.Allowlist, error) {
-	var raw types.AllowlistListResponse
-	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("parse %q: %w", path, err)
-	}
-	out := &allowlist.Allowlist{
-		Version: raw.Version,
-		Digests: make(map[string]string, len(raw.Digests)),
-	}
-	for d, image := range raw.Digests {
-		out.Digests[d.String()] = image
-	}
-	return out, nil
 }
 
 func entriesOf(wl *allowlist.Allowlist) int {
@@ -452,99 +384,18 @@ func runPullLoop(ctx context.Context, args pullLoopArgs) {
 	}
 }
 
-// pushHandler implements PUT /allowlist for push-mode nodes.
-//
-// INVARIANT: pushedPath is non-empty (enforced by newPushHandler).
-// Persistence to disk is part of the contract; restarting must re-load
-// the last pushed payload, so silent skip-on-empty-path would defeat
-// the design.
-type pushHandler struct {
-	mu         sync.Mutex
-	cache      *cache.PolicyCache
-	bootstrap  *allowlist.Allowlist
-	pushedPath string
-	logger     *slog.Logger
-}
-
-// newPushHandler returns a handler that persists to pushedPath and
-// applies bootstrap ∪ pushed to cache. pushedPath must be non-empty.
-func newPushHandler(c *cache.PolicyCache, bootstrap *allowlist.Allowlist, pushedPath string, logger *slog.Logger) (*pushHandler, error) {
-	if pushedPath == "" {
-		return nil, fmt.Errorf("pushedPath must be non-empty")
-	}
-	return &pushHandler{
-		cache:      c,
-		bootstrap:  bootstrap,
-		pushedPath: pushedPath,
-		logger:     logger,
-	}, nil
-}
-
-// Body must be a single-entry AllowlistListResponse. pushed.json is
-// written atomically before the cache is updated.
-func (h *pushHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		w.Header().Set("Allow", http.MethodPut)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	body, ok := httputil.ReadCappedBody(w, r, pushBodyLimit)
-	if !ok {
-		return
-	}
-	pushed, err := allowlist.ParseJSON(body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if len(pushed.Digests) != 1 {
-		http.Error(w, "push mode accepts exactly one digest entry", http.StatusUnprocessableEntity)
-		return
-	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	persisted, err := json.Marshal(pushed)
-	if err != nil {
-		h.logger.Error("failed to marshal pushed payload", "error", err)
-		http.Error(w, "marshal push payload", http.StatusInternalServerError)
-		return
-	}
-	if err := fileutil.WriteAtomic(h.pushedPath, persisted, 0o600); err != nil {
-		h.logger.Error("failed to persist pushed.json", "path", h.pushedPath, "error", err)
-		http.Error(w, "persist push payload", http.StatusInternalServerError)
-		return
-	}
-
-	merged := mergeAllowlists(h.bootstrap, pushed)
-	h.cache.SetAllowlist(merged)
-	h.logger.Info("push applied",
-		"pushed_entries", len(pushed.Digests),
-		"merged_entries", len(merged.Digests),
-	)
-	w.WriteHeader(http.StatusNoContent)
-}
-
 type healthServerConfig struct {
 	logger       *slog.Logger
 	plugin       *plugin
 	addr         string
 	readTimeout  time.Duration
 	writeTimeout time.Duration
-	pushHandler  *pushHandler // nil disables PUT /allowlist
 }
 
 // startHealthServer starts an HTTP server for readiness/liveness probes.
 // addr accepts plain `host:port` for TCP or `unix:///path/to.sock` for a
-// Unix socket. PUT /allowlist is registered only when pushHandler is
-// non-nil and addr is unix://. Shuts down gracefully when ctx is cancelled.
+// Unix socket. Shuts down gracefully when ctx is cancelled.
 func startHealthServer(ctx context.Context, cfg healthServerConfig) error {
-	if cfg.pushHandler != nil && !isUnixSocketAddr(cfg.addr) {
-		return fmt.Errorf("%w, got %q", errPushHandlerRequiresUnixAddr, cfg.addr)
-	}
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if cfg.plugin.Ready() {
@@ -555,9 +406,6 @@ func startHealthServer(ctx context.Context, cfg healthServerConfig) error {
 			fmt.Fprintln(w, "not ready")
 		}
 	})
-	if cfg.pushHandler != nil {
-		mux.Handle("/allowlist", cfg.pushHandler)
-	}
 
 	listener, err := healthListener(cfg.addr)
 	if err != nil {
@@ -566,7 +414,7 @@ func startHealthServer(ctx context.Context, cfg healthServerConfig) error {
 
 	server := &http.Server{Handler: mux, ReadTimeout: cfg.readTimeout, WriteTimeout: cfg.writeTimeout}
 	go func() {
-		cfg.logger.Info("starting health server", "addr", cfg.addr, "push_enabled", cfg.pushHandler != nil)
+		cfg.logger.Info("starting health server", "addr", cfg.addr)
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			cfg.logger.Error("health server error", "error", err)
 		}
@@ -604,9 +452,4 @@ func healthListener(addr string) (net.Listener, error) {
 		return nil, fmt.Errorf("listen tcp %s: %w", addr, err)
 	}
 	return l, nil
-}
-
-func isUnixSocketAddr(addr string) bool {
-	_, ok := strings.CutPrefix(addr, "unix://")
-	return ok
 }

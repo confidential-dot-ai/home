@@ -98,29 +98,11 @@ func TestValidate_PullRejectsUnsupportedScheme(t *testing.T) {
 	}
 }
 
-func TestValidate_PullAndPushMutuallyExclusive(t *testing.T) {
-	cfg := validConfig()
-	cfg.Allowlist.Push.PersistPath = "/tmp/pushed.json"
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected error when both pull and push are configured")
-	}
-}
-
 func TestValidate_AlwaysAllowRequiredWithPull(t *testing.T) {
 	cfg := validConfig()
 	cfg.Allowlist.AlwaysAllow = nil
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error when pull is configured but always_allow is empty")
-	}
-}
-
-func TestValidate_AlwaysAllowRequiredWithPush(t *testing.T) {
-	cfg := validConfig()
-	cfg.Allowlist.Pull = pullConfig{}
-	cfg.Allowlist.Push.PersistPath = "/tmp/pushed.json"
-	cfg.Allowlist.AlwaysAllow = nil
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected error when push is configured but always_allow is empty")
 	}
 }
 

@@ -146,16 +146,13 @@ cds:
     nodePort: 30808
   ## CDS is a singleton, in-memory trust root reached over a node-local
   ## NodePort and (with persistence) an RWO volume, so it must land on a
-  ## known node. node.selector pins it to a dedicated node; it must be exactly
-  ## one label key/value pair. The default expects that node labelled
-  ## `role=cds`; override to match your cluster. When image policy is enabled,
-  ## the same selector also drives the cds-installer affinity, worker
-  ## anti-affinity, and push-hook placement.
+  ## known node. node.selector pins it there; the default expects a node
+  ## labelled `role=cds`; override to match your cluster.
   ##
   ## Set selector: {} for a single-node / single-CVM cluster with no dedicated
-  ## CDS node: CDS schedules on any node and the cds/worker installer split
-  ## collapses to a single push-mode installer on every node (`c8s install
-  ## --single-node` sets this for you).
+  ## CDS node: CDS schedules on any node (`c8s install --single-node` sets this
+  ## for you). The NRI installer is one pull-mode DaemonSet on every node
+  ## regardless, so each plugin pulls from whichever node hosts CDS.
   ##
   ## tolerations let CDS land on a node dedicated to it. The default tolerates
   ## `dedicated=cds:NoSchedule`, the conventional dedicated-CDS-node taint (the
@@ -811,12 +808,10 @@ nriImagePolicy:
   # relative to other NRI plugins.
   pluginFilename: 10-nri-image-policy
 
-  # CDS coordinates. The node selector that pins CDS lives at top-level
-  # cds.node.selector; the image policy reuses it for cds-installer affinity
-  # (In), worker-installer anti-affinity (NotIn), and the push-hook nodeSelector.
-  # The CDS image admitted by the push-hook and the seed self-entry comes from
-  # the top-level cds.image (digest required when image policy is on), so there
-  # is no separate CDS image to pin here.
+  # CDS coordinates. Every plugin pulls the allowlist from the node-local CDS
+  # NodePort below. The CDS image the floor self-admits comes from the top-level
+  # cds.image (digest required when image policy is on), so there is no separate
+  # CDS image to pin here.
   cds:
     ## Host-process NRI pulls through the chart-managed CDS NodePort and
     ## verifies CDS RA-TLS instead of trusting cluster DNS or ClusterIP routing.
@@ -842,25 +837,7 @@ nriImagePolicy:
   # Logging
   logLevel: info
 
-  # Tuning for the pre-upgrade keystone push (see
-  # docs/decisions/2026-07-03-upgrade-keystone-push.md).
-  push:
-    curlMaxTime: "10"
-    retries: "30"
-    retryDelay: "2"
-    backoffLimit: 3
-    ttlSecondsAfterFinished: 300
-    resources:
-      requests:
-        cpu: 10m
-        memory: 16Mi
-      limits:
-        cpu: 100m
-        memory: 32Mi
-
-  # Host paths the installer DaemonSets write to. runtimeDir (with
-  # healthSocketName) is the push-hook's contract with the PREVIOUS release's
-  # plugin — renaming it silently no-ops the upgrade keystone.
+  # Host paths the installer DaemonSet writes to.
   hostPaths:
     pluginDir: /opt/nri/plugins
     configDir: /etc/nri/conf.d

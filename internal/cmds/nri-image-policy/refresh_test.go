@@ -8,9 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,7 +16,6 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/cache"
 	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/allowlistclient"
-	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
 const (
@@ -95,13 +91,6 @@ func TestStartupSourceMode(t *testing.T) {
 			want: "pull",
 		},
 		{
-			name: "push",
-			cfg: &config{Allowlist: allowlistConfig{
-				Push: pushConfig{PersistPath: "/run/nri/pushed.json"},
-			}},
-			want: "push",
-		},
-		{
 			name: "always allow only",
 			cfg: &config{Allowlist: allowlistConfig{
 				AlwaysAllow: map[string]string{pushDigestA: "image-a"},
@@ -135,211 +124,6 @@ func TestStartupSourceMode(t *testing.T) {
 				t.Fatalf("startupSourceMode() = %q, want %q", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestLoadAllowlistFileMissingReturnsNil(t *testing.T) {
-	wl, err := loadAllowlistFile(filepath.Join(t.TempDir(), "absent.yaml"), "bootstrap", discardLogger())
-	if err != nil {
-		t.Fatalf("missing file should not error: %v", err)
-	}
-	if wl != nil {
-		t.Fatalf("missing file should return nil, got %+v", wl)
-	}
-}
-
-func TestLoadAllowlistFileParseError(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "bad.yaml")
-	if err := os.WriteFile(path, []byte("digests: not-a-map\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadAllowlistFile(path, "bootstrap", discardLogger()); err == nil {
-		t.Fatal("expected parse error")
-	}
-}
-
-func TestLoadAllowlistFileYAML(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "bootstrap.yaml")
-	yamlSrc := `version: "1"
-digests:
-  "` + pushDigestA + `": "image-a"
-`
-	if err := os.WriteFile(path, []byte(yamlSrc), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	wl, err := loadAllowlistFile(path, "bootstrap", discardLogger())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if wl.Digests[pushDigestA] != "image-a" {
-		t.Fatalf("digest not parsed: %+v", wl.Digests)
-	}
-}
-
-// --- push handler ---
-
-func makePushHandler(t *testing.T, bootstrap *allowlist.Allowlist) (*pushHandler, *cache.PolicyCache, string) {
-	t.Helper()
-	c := cache.NewPolicyCache()
-	c.SetAllowlist(bootstrap)
-	pushedPath := filepath.Join(t.TempDir(), "pushed.json")
-	h, err := newPushHandler(c, bootstrap, pushedPath, discardLogger())
-	if err != nil {
-		t.Fatalf("newPushHandler: %v", err)
-	}
-	return h, c, pushedPath
-}
-
-func pushBody(t *testing.T, entries ...string) string {
-	t.Helper()
-	if len(entries)%2 != 0 {
-		t.Fatalf("pushBody: entries must be pairs, got %d", len(entries))
-	}
-	payload := types.AllowlistListResponse{Version: "1", Digests: map[types.Digest]string{}}
-	for i := 0; i < len(entries); i += 2 {
-		d, err := types.ParseDigest(entries[i])
-		if err != nil {
-			t.Fatalf("pushBody: invalid digest %q: %v", entries[i], err)
-		}
-		payload.Digests[d] = entries[i+1]
-	}
-	b, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatalf("pushBody: marshal: %v", err)
-	}
-	return string(b)
-}
-
-func TestNewPushHandlerRejectsEmptyPath(t *testing.T) {
-	c := cache.NewPolicyCache()
-	if _, err := newPushHandler(c, &allowlist.Allowlist{Digests: map[string]string{}}, "", discardLogger()); err == nil {
-		t.Fatal("expected error for empty pushedPath")
-	}
-}
-
-func TestPushHandlerValidSingleEntry(t *testing.T) {
-	bootstrap := &allowlist.Allowlist{Digests: map[string]string{
-		pushDigestA: "bootstrap-image",
-	}}
-	h, c, pushedPath := makePushHandler(t, bootstrap)
-
-	req := httptest.NewRequest(http.MethodPut, "/allowlist", strings.NewReader(pushBody(t, pushDigestB, "pushed-image")))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
-	}
-	wl := c.GetAllowlist()
-	if wl.Digests[pushDigestA] != "bootstrap-image" {
-		t.Fatal("bootstrap entry lost after push")
-	}
-	if wl.Digests[pushDigestB] != "pushed-image" {
-		t.Fatal("pushed entry missing")
-	}
-	if _, err := os.Stat(pushedPath); err != nil {
-		t.Fatalf("pushed.json not written: %v", err)
-	}
-}
-
-func TestPushHandlerTwoEntriesRejected(t *testing.T) {
-	h, c, pushedPath := makePushHandler(t, &allowlist.Allowlist{Digests: map[string]string{
-		pushDigestA: "bootstrap-image",
-	}})
-	body := pushBody(t, pushDigestA, "a", pushDigestB, "b")
-
-	req := httptest.NewRequest(http.MethodPut, "/allowlist", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d, want 422", rec.Code)
-	}
-	if _, err := os.Stat(pushedPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("pushed.json should not exist on 422, err=%v", err)
-	}
-	if got := c.GetAllowlist().Digests[pushDigestA]; got != "bootstrap-image" {
-		t.Fatalf("cache mutated on 422; bootstrap entry = %q", got)
-	}
-}
-
-func TestPushHandlerMalformedJSON(t *testing.T) {
-	h, c, _ := makePushHandler(t, &allowlist.Allowlist{Digests: map[string]string{}})
-	req := httptest.NewRequest(http.MethodPut, "/allowlist", strings.NewReader("{not json"))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
-	}
-	if c.GetAllowlist() == nil || len(c.GetAllowlist().Digests) != 0 {
-		t.Fatal("cache should be untouched on 400")
-	}
-}
-
-func TestPushHandlerWrongMethod(t *testing.T) {
-	h, _, _ := makePushHandler(t, &allowlist.Allowlist{Digests: map[string]string{}})
-	req := httptest.NewRequest(http.MethodPost, "/allowlist", strings.NewReader(pushBody(t, pushDigestA, "img")))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", rec.Code)
-	}
-}
-
-func TestStartHealthServerRejectsPushHandlerOnTCP(t *testing.T) {
-	h, _, _ := makePushHandler(t, &allowlist.Allowlist{Digests: map[string]string{}})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	err := startHealthServer(ctx, healthServerConfig{
-		logger:       discardLogger(),
-		plugin:       &plugin{},
-		addr:         ":8080",
-		readTimeout:  time.Second,
-		writeTimeout: time.Second,
-		pushHandler:  h,
-	})
-
-	if err == nil {
-		t.Fatal("expected push handler on TCP health address to be rejected")
-	}
-	if !errors.Is(err, errPushHandlerRequiresUnixAddr) {
-		t.Fatalf("expected errPushHandlerRequiresUnixAddr, got %v", err)
-	}
-}
-
-func TestPushHandlerDiskWriteFailure(t *testing.T) {
-	// Point pushedPath at a path whose parent is a regular file so the
-	// atomic-write tempfile create fails with ENOTDIR.
-	tmp := t.TempDir()
-	blocker := filepath.Join(tmp, "blocker")
-	if err := os.WriteFile(blocker, []byte("file"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	bootstrap := &allowlist.Allowlist{Digests: map[string]string{
-		pushDigestA: "bootstrap-image",
-	}}
-	c := cache.NewPolicyCache()
-	c.SetAllowlist(bootstrap)
-	h, err := newPushHandler(c, bootstrap, filepath.Join(blocker, "pushed.json"), discardLogger())
-	if err != nil {
-		t.Fatalf("newPushHandler: %v", err)
-	}
-
-	preCache := c.GetAllowlist()
-
-	req := httptest.NewRequest(http.MethodPut, "/allowlist", strings.NewReader(pushBody(t, pushDigestB, "img")))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", rec.Code)
-	}
-	// Contract: cache pointer unchanged from pre-PUT state on disk failure.
-	if c.GetAllowlist() != preCache {
-		t.Fatal("cache pointer should be unchanged on disk-write failure")
 	}
 }
 
@@ -510,29 +294,6 @@ func TestPullLoop5xxLeavesCacheAndETagUntouched(t *testing.T) {
 
 	cancel()
 	<-done
-}
-
-func TestPushHandlerMergesBootstrapWithPushed(t *testing.T) {
-	bootstrap := &allowlist.Allowlist{Digests: map[string]string{
-		pushDigestA: "bootstrap-image",
-	}}
-	h, c, _ := makePushHandler(t, bootstrap)
-
-	req := httptest.NewRequest(http.MethodPut, "/allowlist",
-		strings.NewReader(pushBody(t, pushDigestB, "pushed-image")))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204", rec.Code)
-	}
-	wl := c.GetAllowlist()
-	if wl.Digests[pushDigestA] != "bootstrap-image" {
-		t.Fatal("bootstrap entry must survive push (always_allow is the static floor)")
-	}
-	if wl.Digests[pushDigestB] != "pushed-image" {
-		t.Fatal("pushed entry must be merged in")
-	}
 }
 
 func TestPullLoopMergesBootstrapWithPulled(t *testing.T) {

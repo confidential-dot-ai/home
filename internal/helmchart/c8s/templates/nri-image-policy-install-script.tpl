@@ -1,12 +1,12 @@
 {{/*
-Install shell script for the NRI plugin. Caller dict: .root, .archetype
-("cds"/"worker", log only), .bootConfig (rendered image-policy.yaml).
+Install shell script for the NRI plugin. Caller dict: .root, .bootConfig
+(rendered image-policy.yaml).
 */}}
 {{- define "nri-image-policy.installScript" -}}
 {{- $root := .root -}}
 set -eu
 
-echo "==> nri-image-policy {{ .archetype }} installer starting"
+echo "==> nri-image-policy installer starting"
 
 install_file() {
   src=$1; dst=$2; mode=$3
@@ -158,26 +158,20 @@ until curl --unix-socket "/host{{ include "nri-image-policy.hostHealthSocket" $r
   fi
   sleep 1
 done
-echo "==> nri-image-policy {{ .archetype }} installer finished; plugin healthy"
+echo "==> nri-image-policy installer finished; plugin healthy"
 {{- end }}
 
 {{/*
-Boot config (image-policy.yaml). Caller passes a dict with .root and .archetype
-("cds" or "worker"). CDS-node activates allowlist.push; workers activate
-allowlist.pull. allowlist.always_allow is identical on both and pins the
-install image so chart upgrades can roll.
+Boot config (image-policy.yaml). Caller passes a dict with .root. Every plugin
+runs pull mode (polls CDS); allowlist.always_allow is the floor that pins the
+install image + CDS digest so chart upgrades can roll.
 */}}
 {{- define "nri-image-policy.bootConfig" -}}
 {{- $root := .root -}}
-{{- $cds := eq .archetype "cds" -}}
 {{- $attestationNodePort := int $root.Values.attestationApi.service.nodePort -}}
 plugin:
   health_addr: {{ printf "unix://%s" (include "nri-image-policy.hostHealthSocket" $root) | quote }}
 allowlist:
-{{- if $cds }}
-  push:
-    persist_path: {{ printf "%s/pushed.json" $root.Values.nriImagePolicy.hostPaths.cacheDir | quote }}
-{{- else }}
   pull:
     url: {{ required "cds.url is required" $root.Values.nriImagePolicy.cds.url | quote }}
     interval: {{ $root.Values.nriImagePolicy.refresh.interval | quote }}
@@ -188,7 +182,6 @@ allowlist:
       - {{ . | quote }}
 {{- else }}
       []
-{{- end }}
 {{- end }}
 {{- /* Self-allow the installer image first (load-bearing when
        bootstrapAllowlist.deriveComponents=false, where the floor omits it), then

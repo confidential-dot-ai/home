@@ -18,7 +18,6 @@ import (
 	"gopkg.in/yaml.v3"
 	admissionregv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -570,49 +569,36 @@ func nodeAffinityHasKey(ds appsv1.DaemonSet, key string) bool {
 	return false
 }
 
-// Default (dedicated-CDS-node) install renders BOTH installers, the CDS one
-// pinned to role=cds and the worker one excluding it. The single-node mode
-// must collapse this; this test guards the default against an accidental
-// collapse.
-func TestChartNriInstallerPartitionedByDefault(t *testing.T) {
+// The chart renders exactly one pull-mode installer DaemonSet, `-worker`, that
+// targets every node — there is no CDS/worker partition. The old push archetype
+// (a role=cds-pinned `-cds` installer) is gone; this guards against it coming
+// back.
+func TestChartNriInstallerRendersSinglePullDaemonSet(t *testing.T) {
 	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	cds := renderedDaemonSet(t, out, "c8s-nri-image-policy-cds")
+	if renderedManifestHasNamedKind(t, out, "DaemonSet", "c8s-nri-image-policy-cds") {
+		t.Error("no cds/push installer must render; only the pull-mode -worker DaemonSet exists")
+	}
 	worker := renderedDaemonSet(t, out, "c8s-nri-image-policy-worker")
-	if !nodeAffinityHasKey(cds, "role") {
-		t.Error("default cds installer must pin to the role=cds selector")
+	if nodeAffinityHasKey(worker, "role") {
+		t.Error("worker installer must not key on role; it targets every node")
 	}
-	if !nodeAffinityHasKey(worker, "role") {
-		t.Error("default worker installer must NotIn the role=cds selector")
-	}
-	// The push hook's pod lookup filters on this label prefix; a rename here
-	// silently turns the upgrade keystone into a permanent fallback.
-	for name, ds := range map[string]appsv1.DaemonSet{"cds": cds, "worker": worker} {
-		if got, want := ds.Spec.Template.Labels["app.kubernetes.io/component"], "nri-installer-"+name; got != want {
-			t.Errorf("%s installer pod component label = %q, want %q (pushImage lookup contract)", name, got, want)
-		}
+	if got, want := worker.Spec.Template.Labels["app.kubernetes.io/component"], "nri-installer-worker"; got != want {
+		t.Errorf("worker installer pod component label = %q, want %q", got, want)
 	}
 }
 
-// --single-node (empty cds.node.selector) collapses the partition: only the
-// push-mode CDS installer renders, it targets every node (no role term), the
-// worker installer is absent, and the CDS Deployment carries no nodeSelector.
-func TestChartNriInstallerCollapsesOnEmptySelector(t *testing.T) {
+// Single-node (empty cds.node.selector) renders the installer identically to
+// the default (covered by TestChartNriInstallerRendersSinglePullDaemonSet);
+// what's unique here is the CDS Deployment carrying no nodeSelector so it lands
+// on the lone node.
+func TestChartCDSDeploymentHasNoNodeSelectorUnderEmptySelector(t *testing.T) {
 	out, err := helmTemplate(t, "--set", "cds.node.selector=null")
 	if err != nil {
 		t.Fatalf("helm template --set cds.node.selector=null: %v\n%s", err, out)
 	}
-	if findDoc(t, out, "DaemonSet", "c8s-nri-image-policy-worker", new(appsv1.DaemonSet)) {
-		t.Error("empty selector must not render the worker installer (would race the cds installer on the one node)")
-	}
-	cds := renderedDaemonSet(t, out, "c8s-nri-image-policy-cds")
-	if nodeAffinityHasKey(cds, "role") {
-		t.Error("with no partition the cds installer must not key on role; it should target every node")
-	}
-
-	// CDS Deployment must carry no nodeSelector so it lands on the lone node.
 	cdsDep := renderedDeployment(t, out, "c8s-cds")
 	if len(cdsDep.Spec.Template.Spec.NodeSelector) != 0 {
 		t.Errorf("cds Deployment must have no nodeSelector under single-node; got %v", cdsDep.Spec.Template.Spec.NodeSelector)
@@ -1199,7 +1185,7 @@ func TestChartRatlsMeshCDSMeasurementsFlagsThrough(t *testing.T) {
 	}
 }
 
-func TestChartNRIImagePolicyUsesCDSPushAndPullModes(t *testing.T) {
+func TestChartNRIImagePolicyUsesPullMode(t *testing.T) {
 	const measurement = "abc1230000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff"
 	out, err := helmTemplate(t,
 		"--set", "cds.measurements[0]="+measurement,
@@ -1221,105 +1207,9 @@ func TestChartNRIImagePolicyUsesCDSPushAndPullModes(t *testing.T) {
 	if want := []string{measurement}; !slices.Equal(workerCfg.Allowlist.Pull.CDSMeasurements, want) {
 		t.Fatalf("worker CDS measurements = %v, want %v", workerCfg.Allowlist.Pull.CDSMeasurements, want)
 	}
+	// Pull-only: the boot config never carries a push block.
 	if workerCfg.Allowlist.Push.PersistPath != "" {
 		t.Fatalf("worker boot config has push persist path %q, want empty", workerCfg.Allowlist.Push.PersistPath)
-	}
-
-	cdsCfg := renderedNRIBootConfig(t, out, "c8s-nri-image-policy-cds")
-	if got, want := cdsCfg.Allowlist.Push.PersistPath, "/var/lib/nri-image-policy/pushed.json"; got != want {
-		t.Fatalf("CDS-node push persist path = %q, want %q", got, want)
-	}
-	if cdsCfg.Allowlist.Pull.URL != "" {
-		t.Fatalf("CDS-node boot config has pull URL %q, want empty", cdsCfg.Allowlist.Pull.URL)
-	}
-}
-
-// renderedPushHookJob decodes the nri-image-policy push-hook Job.
-func renderedPushHookJob(t *testing.T, manifest string) batchv1.Job {
-	t.Helper()
-	var job batchv1.Job
-	if !findDoc(t, manifest, "Job", "c8s-nri-image-policy-push", &job) {
-		t.Fatalf("rendered manifest missing Job c8s-nri-image-policy-push\n%s", manifest)
-	}
-	return job
-}
-
-// The push hook is the upgrade keystone: it must fire BEFORE the roll and
-// push the new installer digest — not the cds digest — so the old CDS-node
-// plugin admits the new installer, which then delivers the full new floor.
-// Under helm template, lookup returns nothing, so the image is the fallback
-// (the chart's own installer image); the live-cluster path picks a Running
-// installer pod's image instead.
-func TestChartNriPushHookIsPreUpgradeKeystone(t *testing.T) {
-	out, err := helmTemplate(t)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	job := renderedPushHookJob(t, out)
-	// pre-upgrade only — rollback replays stored hooks (see the decision doc).
-	if got, want := job.Annotations["helm.sh/hook"], "pre-upgrade"; got != want {
-		t.Errorf("hook = %q, want %q", got, want)
-	}
-	if got, want := job.Annotations["helm.sh/hook-delete-policy"], "hook-succeeded,before-hook-creation"; got != want {
-		t.Errorf("hook-delete-policy = %q, want %q", got, want)
-	}
-
-	push := job.Spec.Template.Spec.Containers[0]
-	if got, want := push.Image, "ghcr.io/confidential-dot-ai/nri-image-policy@"+baseNRIDigest; got != want {
-		t.Errorf("hook image = %q, want lookup fallback %q", got, want)
-	}
-	var payload string
-	for _, env := range push.Env {
-		if env.Name == "PAYLOAD" {
-			payload = env.Value
-		}
-	}
-	if want := "ghcr.io/confidential-dot-ai/nri-image-policy@" + baseNRIDigest; !strings.Contains(payload, want) {
-		t.Errorf("PAYLOAD %q missing installer entry %q", payload, want)
-	}
-	if cdsDigest := "sha256:0000000000000000000000000000000000000000000000000000000000000001"; strings.Contains(payload, cdsDigest) {
-		t.Errorf("PAYLOAD %q still carries the cds digest; the floor's cds self-entry covers it", payload)
-	}
-
-	if got, want := job.Spec.Template.Spec.NodeSelector["role"], "cds"; got != want {
-		t.Errorf("hook nodeSelector role = %q, want %q (must land on the CDS node's socket)", got, want)
-	}
-	vol := job.Spec.Template.Spec.Volumes[0]
-	if vol.HostPath == nil || vol.HostPath.Type == nil || *vol.HostPath.Type != corev1.HostPathDirectoryOrCreate {
-		t.Errorf("socket hostPath type = %v, want DirectoryOrCreate (pod must start on an untouched node)", vol.HostPath)
-	}
-}
-
-// A missing plugin socket means image policy is not active on the node —
-// the hook must no-op instead of failing the release.
-func TestChartNriPushHookToleratesAbsentSocket(t *testing.T) {
-	out, err := helmTemplate(t)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	job := renderedPushHookJob(t, out)
-	script := job.Spec.Template.Spec.Containers[0].Args[0]
-	for _, want := range []string{
-		`if [ -S "$SOCKET" ]; then`,
-		`image policy not active on this node`,
-		"exit 0",
-	} {
-		if !strings.Contains(script, want) {
-			t.Errorf("hook script missing %q:\n%s", want, script)
-		}
-	}
-}
-
-// Single-node mode (empty cds.node.selector) still renders the hook, with no
-// nodeSelector so it lands on the lone node.
-func TestChartNriPushHookRendersInSingleNodeMode(t *testing.T) {
-	out, err := helmTemplate(t, "--set", "cds.node.selector=null")
-	if err != nil {
-		t.Fatalf("helm template --set cds.node.selector=null: %v\n%s", err, out)
-	}
-	job := renderedPushHookJob(t, out)
-	if len(job.Spec.Template.Spec.NodeSelector) != 0 {
-		t.Errorf("single-node hook must have no nodeSelector; got %v", job.Spec.Template.Spec.NodeSelector)
 	}
 }
 
@@ -3206,7 +3096,7 @@ func TestChartNriImagePolicyDistroSelectsContainerdLayout(t *testing.T) {
 			if err != nil {
 				t.Fatalf("helm template: %v\n%s", err, out)
 			}
-			for _, name := range []string{"c8s-nri-image-policy-worker", "c8s-nri-image-policy-cds"} {
+			for _, name := range []string{"c8s-nri-image-policy-worker"} {
 				ds := renderedDaemonSet(t, out, name)
 				if got := hostPathVolume(t, ds, "host-containerd-config"); got != tc.wantDir {
 					t.Fatalf("%s distro %q: host-containerd-config hostPath = %q, want %q", name, tc.distro, got, tc.wantDir)
@@ -3245,7 +3135,7 @@ func TestChartNriImagePolicyDetachesContainerdRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	ds := renderedDaemonSet(t, out, "c8s-nri-image-policy-cds")
+	ds := renderedDaemonSet(t, out, "c8s-nri-image-policy-worker")
 	script := strings.Join(containerArgs(t, &ds, "install"), "\n")
 	if !strings.Contains(script, "systemd-run") {
 		t.Fatalf("install script must detach the containerd restart via systemd-run\n%s", script)
@@ -3267,7 +3157,7 @@ func TestChartNriImagePolicyContainerdPrepInitContainer(t *testing.T) {
 		if err != nil {
 			t.Fatalf("helm template: %v\n%s", err, out)
 		}
-		for _, name := range []string{"c8s-nri-image-policy-worker", "c8s-nri-image-policy-cds"} {
+		for _, name := range []string{"c8s-nri-image-policy-worker"} {
 			ds := renderedDaemonSet(t, out, name)
 			names := containerNames(ds.Spec.Template.Spec.InitContainers)
 			prepIdx, installIdx := slices.Index(names, "containerd-prep"), slices.Index(names, "install")
@@ -3290,7 +3180,7 @@ func TestChartNriImagePolicyContainerdPrepInitContainer(t *testing.T) {
 		if err != nil {
 			t.Fatalf("helm template: %v\n%s", err, out)
 		}
-		for _, name := range []string{"c8s-nri-image-policy-worker", "c8s-nri-image-policy-cds"} {
+		for _, name := range []string{"c8s-nri-image-policy-worker"} {
 			ds := renderedDaemonSet(t, out, name)
 			if _, ok := findContainer(ds.Spec.Template.Spec.InitContainers, "containerd-prep"); ok {
 				t.Fatalf("k8s: %s must not carry a containerd-prep initContainer", name)
@@ -4404,14 +4294,11 @@ func TestChartBootConfigParsesAsPluginYAML(t *testing.T) {
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	// Worker pulls from CDS; the CDS-node accepts pushes. Asserting the
-	// mutually-exclusive field per archetype confirms the typed decode landed
-	// on the right document, not just that some YAML parsed.
+	// The single installer is pull-mode: it configures a pull URL and never a
+	// push block. Asserting both confirms the typed decode landed on the boot
+	// config document, not just that some YAML parsed.
 	if wl := bootConfigFromInstaller(t, out, "c8s-nri-image-policy-worker").Allowlist; wl.Pull.URL == "" || wl.Push.PersistPath != "" {
 		t.Errorf("worker boot config should configure pull, not push: pull.url=%q push.persist_path=%q", wl.Pull.URL, wl.Push.PersistPath)
-	}
-	if wl := bootConfigFromInstaller(t, out, "c8s-nri-image-policy-cds").Allowlist; wl.Push.PersistPath == "" || wl.Pull.URL != "" {
-		t.Errorf("cds boot config should configure push, not pull: pull.url=%q push.persist_path=%q", wl.Pull.URL, wl.Push.PersistPath)
 	}
 }
 
@@ -4440,7 +4327,7 @@ func TestChartFleetAllowlistOverridesDerived(t *testing.T) {
 }
 
 // deriveComponents is OFF by default (a demo convenience, like
-// --resolve-digests): the seed carries only the CDS push-hook self-entry and
+// --resolve-digests): the seed carries only the CDS floor self-entry and
 // operator-supplied digests, not the auto-derived component images. Covers both
 // the default (unset) and an explicit =false. Rendered in audit mode so the
 // deliberately-uncovered operator digest exercises derivation, not the
@@ -4468,9 +4355,9 @@ func TestChartDeriveComponentsDefaultsOff(t *testing.T) {
 			if _, ok := seed.Digests[opD]; ok {
 				t.Errorf("operator digest derived without deriveComponents: %v", seed.Digests)
 			}
-			// The CDS self-entry (push-hook) is always present, independent of derivation.
+			// The CDS floor self-entry is always present, independent of derivation.
 			if _, ok := seed.Digests[cdsDigest]; !ok {
-				t.Errorf("CDS push-hook self-entry missing: %v", seed.Digests)
+				t.Errorf("CDS floor self-entry missing: %v", seed.Digests)
 			}
 		})
 	}

@@ -121,9 +121,8 @@ spec:
       automountServiceAccountToken: false
       {{- /* CDS is a singleton trust root reached over a node-local NodePort
              and (with persistence) an RWO volume, so pin it to a known node.
-             When image policy is on, this is also the node whose push-mode
-             plugin and push-hook seed the CDS digest, so co-location keeps the
-             policy from denying CDS on a worker node. */}}
+             The CDS digest is always in the NRI floor (c8s.imageAllowlist),
+             so image policy admits CDS on whichever node it lands. */}}
       {{- with .Values.cds.node.selector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

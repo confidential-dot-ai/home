@@ -27,23 +27,19 @@ type config struct {
 type pluginConfig struct {
 	// HealthAddr is the listen address for the readiness/liveness HTTP
 	// server. `host:port` selects TCP; `unix:///path/to.sock` selects a
-	// Unix socket. The push handler is registered on this same server
-	// when push.persist_path is configured.
+	// Unix socket.
 	HealthAddr string `yaml:"health_addr"`
 }
 
 // allowlistConfig groups the digest-source mechanisms.
 //
 // AlwaysAllow is a static baseline, always merged into the cache at
-// startup (used by the chart to self-allow the installer image).
-//
-// Pull and Push are mutually-exclusive runtime-update modes:
-// the worker archetype configures Pull (poll CDS), the CDS-node
-// archetype configures Push (accept PUT /allowlist).
+// startup (the chart's floor: self-allows the installer + the CDS digest,
+// so a floor-rewrite roll admits the new images without a network round-trip).
+// Pull is the runtime-update source: every plugin polls CDS.
 type allowlistConfig struct {
 	AlwaysAllow map[string]string `yaml:"always_allow"`
 	Pull        pullConfig        `yaml:"pull"`
-	Push        pushConfig        `yaml:"push"`
 }
 
 // pullConfig configures the CDS polling source.
@@ -53,13 +49,6 @@ type pullConfig struct {
 	Timeout           time.Duration `yaml:"timeout"`             // per-request timeout; > 0 required when URL is set
 	AttestationApiURL string        `yaml:"attestation_api_url"` // required for https pull
 	CDSMeasurements   []string      `yaml:"cds_measurements"`    // SHA-384 hex launch digests
-}
-
-// pushConfig configures the operator-push source.
-type pushConfig struct {
-	// PersistPath is where pushed payloads persist across plugin restarts.
-	// Empty disables the push handler entirely.
-	PersistPath string `yaml:"persist_path"`
 }
 
 // containerdConfig contains containerd connection settings for tag-to-digest resolution.
@@ -156,21 +145,15 @@ func loadConfig(path string) (*config, error) {
 // PullEnabled reports whether the plugin should poll a remote CDS.
 func (c *config) PullEnabled() bool { return c.Allowlist.Pull.URL != "" }
 
-// PushEnabled reports whether the plugin should accept push payloads.
-func (c *config) PushEnabled() bool { return c.Allowlist.Push.PersistPath != "" }
-
 // AllowlistEnabled reports whether any digest-based enforcement is active.
 func (c *config) AllowlistEnabled() bool {
-	return c.PullEnabled() || c.PushEnabled() || len(c.Allowlist.AlwaysAllow) > 0
+	return c.PullEnabled() || len(c.Allowlist.AlwaysAllow) > 0
 }
 
 // Validate checks the configuration for errors.
 func (c *config) Validate() error {
-	if c.PullEnabled() && c.PushEnabled() {
-		return fmt.Errorf("allowlist.pull and allowlist.push are mutually exclusive; configure one runtime-update mode")
-	}
-	if (c.PullEnabled() || c.PushEnabled()) && len(c.Allowlist.AlwaysAllow) == 0 {
-		return fmt.Errorf("allowlist.always_allow must be non-empty when pull or push is configured (cold-boot baseline)")
+	if c.PullEnabled() && len(c.Allowlist.AlwaysAllow) == 0 {
+		return fmt.Errorf("allowlist.always_allow must be non-empty when pull is configured (cold-boot baseline)")
 	}
 	for d := range c.Allowlist.AlwaysAllow {
 		if _, err := types.ParseDigest(d); err != nil {
@@ -201,7 +184,7 @@ func (c *config) Validate() error {
 		}
 	}
 	if !c.AllowlistEnabled() && len(c.Policy.LabelRules) == 0 {
-		return fmt.Errorf("set allowlist.always_allow (required when pull or push is enabled) or configure policy.label_rules")
+		return fmt.Errorf("set allowlist.always_allow (required when pull is enabled) or configure policy.label_rules")
 	}
 	if c.Policy.Mode != ModeFailClosed && c.Policy.Mode != ModeAudit {
 		return fmt.Errorf("policy.mode must be '%s' or '%s'", ModeFailClosed, ModeAudit)

@@ -969,10 +969,10 @@ func preflightOperatorImage(ctx context.Context, components []c8sComponent, tag 
 
 // appendSingleNodeInstallArgs collapses the dedicated-CDS-node partition for a
 // single-node / single-CVM cluster: an empty cds.node.selector makes every node
-// CDS-eligible (one push-mode installer everywhere, no worker split), and the
-// dedicated-node taint toleration is meaningless without it. helm renders =null
-// as an empty value the chart reads as "no partition". --set wins over -f, so
-// the flag is authoritative if both are supplied.
+// CDS-eligible (worker/pull installer everywhere, no split; the node pulls from
+// its co-hosted CDS), and the dedicated-node taint toleration is meaningless
+// without it. helm renders =null as an empty value the chart reads as "no
+// partition". --set wins over -f, so the flag is authoritative if both are supplied.
 func appendSingleNodeInstallArgs(helmArgs []string, singleNode bool) []string {
 	if !singleNode {
 		return helmArgs
@@ -1071,8 +1071,8 @@ func appendResolvedDigestArgs(ctx context.Context, helmArgs []string, tag string
 // repository too means an operator's -f override of a repository cannot leave
 // the chart deploying repoA@<digest-of-repoB>: helm gives --set strict
 // precedence over -f, so the repository and digest move together. cds.image
-// covers both the CDS Deployment and the NRI push-hook / allowlist-seed
-// self-entry, which all read it. Any resolution failure aborts: a
+// covers both the CDS Deployment and the allowlist-seed / floor self-entry,
+// which all read it. Any resolution failure aborts: a
 // partially-pinned floor would let the render guard pass while the served
 // allowlist pointed at the wrong digest. The resolver is injected so the arg
 // assembly is testable without a registry.

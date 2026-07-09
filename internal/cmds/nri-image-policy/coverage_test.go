@@ -336,56 +336,6 @@ func TestEntriesOf(t *testing.T) {
 	}
 }
 
-func TestParseAllowlistFile_JSON(t *testing.T) {
-	data := []byte(`{"version":"7","digests":{"` + pushDigestA + `":"image-a"}}`)
-	wl, err := parseAllowlistFile(data, "test.json")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if wl.Version != "7" {
-		t.Fatalf("version = %q, want 7", wl.Version)
-	}
-	if wl.Digests[pushDigestA] != "image-a" {
-		t.Fatalf("digest not parsed: %+v", wl.Digests)
-	}
-}
-
-func TestParseAllowlistFile_EmptyDigests(t *testing.T) {
-	wl, err := parseAllowlistFile([]byte(`version: "1"`), "test.yaml")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if wl.Version != "1" {
-		t.Fatalf("version = %q, want 1", wl.Version)
-	}
-	if len(wl.Digests) != 0 {
-		t.Fatalf("expected empty digests, got %d", len(wl.Digests))
-	}
-}
-
-func TestParseAllowlistFile_InvalidDigestKey(t *testing.T) {
-	// A malformed digest key must fail closed via the typed wire shape.
-	data := []byte(`{"digests":{"sha256:not-hex":"image"}}`)
-	if _, err := parseAllowlistFile(data, "test.json"); err == nil {
-		t.Fatal("expected error for malformed digest key")
-	}
-}
-
-func TestIsUnixSocketAddr(t *testing.T) {
-	cases := map[string]bool{
-		"unix:///run/nri/health.sock": true,
-		"unix://relative.sock":        true,
-		":8080":                       false,
-		"127.0.0.1:8080":              false,
-		"":                            false,
-	}
-	for addr, want := range cases {
-		if got := isUnixSocketAddr(addr); got != want {
-			t.Errorf("isUnixSocketAddr(%q) = %v, want %v", addr, got, want)
-		}
-	}
-}
-
 func TestLabelOperator(t *testing.T) {
 	for _, op := range []string{OpIn, OpNotIn, OpExists, OpDoesNotExist} {
 		if _, err := labelOperator(op); err != nil {

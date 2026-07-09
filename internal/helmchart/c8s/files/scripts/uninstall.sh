@@ -13,7 +13,7 @@
 #                            /host<dir>
 #   CONTAINERD_CONFIG_MODE — "patch" or "dropin", matching install.sh
 #   HOST_CACHE_DIR         — host cache directory the plugin wrote into
-#   HOST_HEALTH_SOCKET     — host path of the plugin health/push unix socket
+#   HOST_HEALTH_SOCKET     — host path of the plugin health unix socket
 #   RESTART_COMMAND        — `systemctl restart …` run via nsenter into PID 1
 set -eu
 

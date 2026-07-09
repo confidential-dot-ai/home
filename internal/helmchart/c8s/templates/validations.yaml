@@ -52,7 +52,7 @@
 {{- end -}}
 {{- if and .Values.nriImagePolicy.enabled (not .Values.cds.image.digest) -}}
 {{- /* Structured marker (kind=...) lets tests discriminate this fail without substring-matching the prose. */ -}}
-{{- fail "VALIDATION_ERROR kind=cds_image_digest: nriImagePolicy.enabled requires cds.image.digest to be set. The CDS digest is seeded into CDS's served /allowlist and pushed to the CDS-node plugin by the push-hook; without it the image policy would deny CDS on its own node. A floating tag cannot be admitted by digest. Pass --resolve-digests to c8s install, or set cds.image.digest via -f." -}}
+{{- fail "VALIDATION_ERROR kind=cds_image_digest: nriImagePolicy.enabled requires cds.image.digest to be set. The CDS digest is pinned in every plugin's always_allow floor so image policy admits CDS on its own node. A floating tag cannot be admitted by digest. Pass --resolve-digests to c8s install, or set cds.image.digest via -f." -}}
 {{- end -}}
 {{- /*
   In fail-closed mode with deriveComponents off, every enabled c8s component

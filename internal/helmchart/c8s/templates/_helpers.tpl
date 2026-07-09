@@ -498,9 +498,8 @@ cache_max_entries = 1024
     1. derived c8s component images (from c8s.components) whose image.digest is
        set — only when bootstrapAllowlist.deriveComponents is true, so a
        digest-pinned `c8s install` self-allows the c8s components it deploys;
-    2. the CDS image self-entry (cds.image), the same one the push-hook pins —
-       always present (independent of deriveComponents) so CDS is admitted on
-       its own node;
+    2. the CDS image self-entry (cds.image) — always present (independent of
+       deriveComponents) so CDS is admitted on whichever node it lands;
     3. operator-supplied nriImagePolicy.bootstrapAllowlist.digests, which
        override a derived entry for the same sha256 (fleet values win).
 */}}
