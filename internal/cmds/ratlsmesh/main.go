@@ -583,7 +583,7 @@ type iptablesSyncConfig struct {
 	resyncPeriod            time.Duration
 	watchdogPeriod          time.Duration
 	ipsetMaxElem            int
-	enforceCWInbound        bool
+	cwInboundPassthrough    string
 	readyFile               string
 	metricsFile             string
 	logLevel                string
@@ -609,7 +609,7 @@ func newIptablesSyncCommand() *cobra.Command {
 	fs.DurationVar(&cfg.resyncPeriod, "resync-period", 30*time.Second, "periodic full ipset reconciliation interval")
 	fs.DurationVar(&cfg.watchdogPeriod, "watchdog-period", 2*time.Second, "interval at which the base-chain jump rules are re-asserted at position 1 (bounds the race window against kube-proxy reinserting KUBE-SERVICES)")
 	fs.IntVar(&cfg.ipsetMaxElem, "ipset-maxelem", defaultIPSetMaxElem, "maximum members per managed ipset")
-	fs.BoolVar(&cfg.enforceCWInbound, "enforce-cw-inbound", false, "drop FORWARD-path traffic to confidential-workload pods (label confidential.ai/cw) so only mesh-delivered and host-local traffic reaches them")
+	fs.StringVar(&cfg.cwInboundPassthrough, "cw-inbound-passthrough", formatCWPassthrough(defaultCWPassthrough), "comma-separated proto:source-port replies exempted from the always-on cw inbound guard (which drops FORWARD-path traffic to confidential.ai/cw pods). Empty = strict drop-all; DNS is the default")
 	fs.StringVar(&cfg.readyFile, "ready-file", "", "path to write after initial ipset and iptables sync succeeds")
 	fs.StringVar(&cfg.metricsFile, "iptables-metrics-file", defaultIptablesMetricsFile, "shared file where iptables-sync publishes counters (empty disables)")
 	fs.StringVar(&cfg.logLevel, "log-level", "info", "log level: debug, info, warn, error")

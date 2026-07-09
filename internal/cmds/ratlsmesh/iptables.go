@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 )
 
 // chainName is the dedicated iptables chain for locally generated traffic.
@@ -220,6 +221,73 @@ func makeDNATRule(spec dnatRuleSpec) iptablesRule {
 	}
 }
 
+// cwPassthrough is one entry in the cw guard's inbound allowlist: traffic to a
+// cw pod from this protocol+source-port is RETURNed before the drop, WITHOUT a
+// conntrack-state match — the whole point is to admit replies the dataplane
+// failed to track as ESTABLISHED (see defaultCWPassthrough), so a state match
+// would defeat it. The trade-off: this admits any packet with that source
+// port, tracked reply or not. Matching source port (never destination) keeps
+// an entry from reaching a cw pod's own listening ports; keep the list to
+// well-known service source ports (DNS) so the widened surface stays narrow.
+type cwPassthrough struct {
+	protocol   string // "udp" or "tcp"
+	sourcePort int
+}
+
+// defaultCWPassthrough is the built-in allowlist: DNS replies (udp+tcp 53).
+// DNS is not mesh-redirected (the redirect is TCP-to-pod-IP only, and UDP/53
+// goes to the kube-dns Service VIP), so the CoreDNS reply returns to the cw
+// pod via FORWARD; on dataplanes that do not track it as ESTABLISHED there
+// (e.g. GKE Dataplane V2 / Cilium) the drop eats every DNS reply and get-cert
+// can never resolve. Every cluster needs DNS, so this is the default rather
+// than a knob a caller has to remember to set.
+var defaultCWPassthrough = []cwPassthrough{
+	{protocol: "udp", sourcePort: 53},
+	{protocol: "tcp", sourcePort: 53},
+}
+
+// formatCWPassthrough renders entries as the --cw-inbound-passthrough flag
+// value (proto:port,proto:port). Inverse of parseCWPassthrough; used so the
+// flag default is derived from defaultCWPassthrough rather than restating it.
+func formatCWPassthrough(entries []cwPassthrough) string {
+	parts := make([]string, len(entries))
+	for i, e := range entries {
+		parts[i] = fmt.Sprintf("%s:%d", e.protocol, e.sourcePort)
+	}
+	return strings.Join(parts, ",")
+}
+
+// parseCWPassthrough parses the --cw-inbound-passthrough flag: a comma list of
+// `proto:port` entries (e.g. "udp:53,tcp:53"). An empty string is the strict
+// posture (no exemptions). protocol must be udp or tcp; port must be 1-65535.
+func parseCWPassthrough(raw string) ([]cwPassthrough, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var out []cwPassthrough
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		proto, portStr, ok := strings.Cut(part, ":")
+		if !ok {
+			return nil, fmt.Errorf("invalid cw-inbound-passthrough entry %q: want proto:port", part)
+		}
+		proto = strings.TrimSpace(proto)
+		if proto != "udp" && proto != "tcp" {
+			return nil, fmt.Errorf("invalid cw-inbound-passthrough protocol %q: want udp or tcp", proto)
+		}
+		port, err := strconv.Atoi(strings.TrimSpace(portStr))
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("invalid cw-inbound-passthrough port %q: want 1-65535", portStr)
+		}
+		out = append(out, cwPassthrough{protocol: proto, sourcePort: port})
+	}
+	return out, nil
+}
+
 // buildCWGuardRules computes the filter-table rules that fail closed on
 // inbound traffic to confidential-workload pods: any connection that reaches
 // a cw pod IP via the FORWARD hook is by definition not mesh-delivered, so
@@ -233,9 +301,13 @@ func makeDNATRule(spec dnatRuleSpec) iptablesRule {
 // cw-pod-originated egress match the conntrack RETURN below.
 //
 // The conntrack rule uses RETURN, not ACCEPT, so CNI or NetworkPolicy rules
-// later in FORWARD still run. The drop has no -p match: the mesh carries
+// later in FORWARD still run. The final drop has no -p match: the mesh carries
 // only TCP, so non-TCP inbound to a cw pod is unmeshed by definition.
-func buildCWGuardRules() []iptablesRule {
+//
+// passthrough entries are RETURNed before the drop for dataplanes that break a
+// reply's conntrack tuple (see defaultCWPassthrough). An empty passthrough is
+// the strict fail-closed posture (conntrack RETURN + drop-all).
+func buildCWGuardRules(passthrough []cwPassthrough) []iptablesRule {
 	var rules []iptablesRule
 	for _, spec := range []struct {
 		family  iptablesFamily
@@ -244,29 +316,40 @@ func buildCWGuardRules() []iptablesRule {
 		{iptablesFamilyIPv4, cwPodIPSetName4},
 		{iptablesFamilyIPv6, cwPodIPSetName6},
 	} {
-		rules = append(rules,
-			iptablesRule{
+		rules = append(rules, iptablesRule{
+			table:  "filter",
+			chain:  cwChainName,
+			label:  "cw-established-return",
+			family: spec.family,
+			args: []string{
+				"-m", "set", "--match-set", spec.setName, "dst",
+				"-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+				"-j", "RETURN",
+			},
+		})
+		for _, pt := range passthrough {
+			rules = append(rules, iptablesRule{
 				table:  "filter",
 				chain:  cwChainName,
-				label:  "cw-established-return",
+				label:  fmt.Sprintf("cw-passthrough-%s-%d", pt.protocol, pt.sourcePort),
 				family: spec.family,
 				args: []string{
+					"-p", pt.protocol, "--sport", strconv.Itoa(pt.sourcePort),
 					"-m", "set", "--match-set", spec.setName, "dst",
-					"-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
 					"-j", "RETURN",
 				},
+			})
+		}
+		rules = append(rules, iptablesRule{
+			table:  "filter",
+			chain:  cwChainName,
+			label:  "cw-inbound-drop",
+			family: spec.family,
+			args: []string{
+				"-m", "set", "--match-set", spec.setName, "dst",
+				"-j", "DROP",
 			},
-			iptablesRule{
-				table:  "filter",
-				chain:  cwChainName,
-				label:  "cw-inbound-drop",
-				family: spec.family,
-				args: []string{
-					"-m", "set", "--match-set", spec.setName, "dst",
-					"-j", "DROP",
-				},
-			},
-		)
+		})
 	}
 	return rules
 }

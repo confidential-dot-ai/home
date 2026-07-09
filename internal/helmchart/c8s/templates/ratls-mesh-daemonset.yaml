@@ -169,7 +169,16 @@ spec:
             - {{ .Values.ratlsMesh.iptablesSync.watchdogPeriod | quote }}
             - --ipset-maxelem
             - {{ .Values.ratlsMesh.iptablesSync.ipsetMaxElem | quote }}
-            - --enforce-cw-inbound={{ .Values.ratlsMesh.cwInboundEnforcement.enabled }}
+            {{- $pt := .Values.ratlsMesh.cwInboundEnforcement.passthrough }}
+            {{- /* Accept a real list (incl. []) only; the string "[]" is helm's --set [] quirk and means empty. Fail loud on any other non-list so a --set-string typo does not silently render strict drop-all and reproduce the DNS-resolution outage. */}}
+            {{- if not (kindIs "slice" $pt) }}{{ if ne (toString $pt) "[]" }}{{ fail (printf "ratlsMesh.cwInboundEnforcement.passthrough must be a list of {protocol, sourcePort} (use [] for none); do not set it via --set-string. Got %s: %v" (kindOf $pt) $pt) }}{{ end }}{{ $pt = list }}{{ end }}
+            {{- $entries := list }}
+            {{- range $pt }}
+            {{-   $port := int (default 0 .sourcePort) }}
+            {{-   if or (not (has .protocol (list "udp" "tcp"))) (lt $port 1) (gt $port 65535) }}{{ fail (printf "ratlsMesh.cwInboundEnforcement.passthrough entry must be {protocol: udp|tcp, sourcePort: 1-65535}; got %v" .) }}{{ end }}
+            {{-   $entries = append $entries (printf "%s:%d" .protocol $port) }}
+            {{- end }}
+            - --cw-inbound-passthrough={{ join "," $entries }}
             - --ready-file
             - /tmp/ratls-iptables-ready
             - --iptables-metrics-file

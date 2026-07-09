@@ -60,12 +60,17 @@ The flows the mesh does not intercept would otherwise reach pods in
 plaintext, including confidential workloads: a ClusterIP Service selecting
 cw pods hands kube-proxy a VIP the mesh never matches, and sources in
 `--exclude-source-namespaces` dial pod IPs directly. With
-`--enforce-cw-inbound` (chart: `ratlsMesh.cwInboundEnforcement.enabled`,
-default on), `iptables-sync` maintains an extra ipset of pod IPs labeled
-`confidential.ai/cw` and a filter-table chain (`RATLS-MESH-CW`, jumped from
-`FORWARD` position 1) that drops any connection to those IPs, all protocols
-(the mesh carries only TCP, so non-TCP inbound is unmeshed by definition).
-Replies to cw-pod egress pass via a conntrack `ESTABLISHED,RELATED` rule.
+the always-on cw inbound guard, `iptables-sync` maintains an extra ipset of
+pod IPs labeled `confidential.ai/cw` and a filter-table chain (`RATLS-MESH-CW`,
+jumped from `FORWARD` position 1) that drops any connection to those IPs, all
+protocols (the mesh carries only TCP, so non-TCP inbound is unmeshed by
+definition). Replies to cw-pod egress pass via a conntrack
+`ESTABLISHED,RELATED` rule. Because some dataplanes (e.g. GKE Dataplane V2 /
+Cilium) do not track a reply as `ESTABLISHED` on `FORWARD`, the guard also
+RETURNs replies from a configurable source-port allowlist
+(`--cw-inbound-passthrough`, chart `ratlsMesh.cwInboundEnforcement.passthrough`,
+default `udp:53,tcp:53` so DNS resolves); an empty list is the strict
+drop-all posture.
 
 Every legitimate delivery path avoids `FORWARD` and is unaffected: mesh
 delivery is a host-originated `OUTPUT` dial from the proxy UID, kubelet
@@ -146,7 +151,7 @@ it intercepts. The flags below tune that loop.
 | `--resync-period` | `30s` | Periodic full ipset reconciliation interval |
 | `--watchdog-period` | `2s` | Interval for re-asserting base-chain jumps at position 1 |
 | `--ipset-maxelem` | `262144` | Maximum members per managed ipset |
-| `--enforce-cw-inbound` | `false` | Drop `FORWARD`-path traffic to `confidential.ai/cw`-labeled pod IPs (see "Confidential-workload inbound guard"). The chart passes this explicitly; the binary default keeps an image bump from changing node behavior |
+| `--cw-inbound-passthrough` | `udp:53,tcp:53` | Comma-separated `proto:source-port` replies RETURNed before the always-on cw inbound guard's drop (see "Confidential-workload inbound guard"). Empty = strict drop-all; DNS is the default so get-cert can resolve |
 | `--ready-file` | `""` | Path written after the first successful pod cache, ipset, and iptables sync |
 | `--iptables-metrics-file` | `/tmp/ratls-iptables-metrics.json` | Shared file where `iptables-sync` publishes iptables/ipset counters for the proxy `/metrics` endpoint |
 | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |

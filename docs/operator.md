@@ -34,10 +34,12 @@ to those namespaces is unaffected because kube-proxy DNATs the VIP before the
 mesh chain matches.
 
 Confidential-workload pods (label `confidential.ai/cw`) get a stricter
-inbound posture: with `ratlsMesh.cwInboundEnforcement.enabled` (default on),
-the mesh drops FORWARD-path traffic to their pod IPs, so Service-VIP dials
-and excluded-namespace sources are blocked instead of reaching the workload
-in plaintext. Only mesh-delivered traffic and node-local host processes
+inbound posture from the always-on cw guard: the mesh drops FORWARD-path
+traffic to their pod IPs, so Service-VIP dials and excluded-namespace sources
+are blocked instead of reaching the workload in plaintext.
+`ratlsMesh.cwInboundEnforcement.passthrough` (default `udp:53,tcp:53`) is the
+reply allowlist that keeps DNS working; an empty list is strict drop-all.
+Only mesh-delivered traffic and node-local host processes
 (kubelet probes) reach cw pods.
 
 ## Ownership model
@@ -456,8 +458,8 @@ chart tests assert on):
   (app-TLS) manual address is admitted; there is no acknowledgment to override
   this. To reach a confidential workload, use `engine.name` +
   `engine.workloadId` instead: pointing the address at a Service VIP fronting
-  cw pods is unmeshed, and with `ratlsMesh.cwInboundEnforcement` (on by default)
-  the mesh drops it, so the hop fails closed rather than running plaintext.
+  cw pods is unmeshed, and the always-on cw guard drops it, so the hop fails
+  closed rather than running plaintext.
 - `engine_upstream_conflict`: both `engine.name` and a custom
   `tlsLb.upstream.address` are set. They are two ways to say the same thing;
   set one.
@@ -486,8 +488,7 @@ real cw workload: the chart validates the id is a DNS-1035 label but cannot
 confirm, at render time, that `c8s-<workloadId>` fronts attested cw pods. A
 wrong id derives a headless Service that resolves to nothing (tls-lb has no
 backend) rather than a plaintext leak; the runtime boundary that a peer is a
-genuine cw pod is the mesh's inbound enforcement (`ratlsMesh.cwInboundEnforcement`),
-not this render guard.
+genuine cw pod is the mesh's always-on cw inbound guard, not this render guard.
 
 ## Certificate file permissions
 

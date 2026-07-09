@@ -634,15 +634,21 @@ ratlsMesh:
   # UIDs excluded from iptables redirect (comma-separated)
   excludeUids: "0"
 
-  # Fail-closed inbound guard for confidential workloads: drop FORWARD-path
-  # traffic to pods labeled confidential.ai/cw. The mesh cannot intercept
-  # Service-VIP traffic, so without this guard a ClusterIP Service selecting
-  # cw pods (or a dial from an excluded source namespace) reaches the
-  # workload in plaintext. With it, those flows are dropped; mesh delivery,
-  # kubelet probes, and replies to pod egress are unaffected because none of
-  # them traverse the FORWARD hook.
+  # Always-on fail-closed inbound guard for confidential workloads: drop
+  # FORWARD-path traffic to pods labeled confidential.ai/cw (Service-VIP DNAT,
+  # excluded-namespace dials, cross-node direct-to-pod-IP), which the mesh
+  # cannot intercept. passthrough is the reply allowlist: proto:source-port
+  # entries RETURNed before the drop for dataplanes whose conntrack does not
+  # mark a reply ESTABLISHED (e.g. GKE Dataplane V2 / Cilium breaks the DNS
+  # reply, so without udp/tcp:53 get-cert can never resolve). Matching source
+  # port admits only replies, never a cw pod's own service ports. Empty list =
+  # strict drop-all.
   cwInboundEnforcement:
-    enabled: true
+    passthrough:
+      - protocol: udp
+        sourcePort: 53
+      - protocol: tcp
+        sourcePort: 53
 
   # Certificate settings
   certMode: cds  # self-signed | cds

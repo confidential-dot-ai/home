@@ -58,7 +58,7 @@ func TestCollectPodIPSetMembersSkipsHostNetworkAndDeduplicates(t *testing.T) {
 				PodIP:  "10.244.0.8",
 			},
 		},
-	}, []string{"10.0.0.1"}, parseExcludedNamespaces("kube-system"), true)
+	}, []string{"10.0.0.1"}, parseExcludedNamespaces("kube-system"))
 
 	if want := []string{"10.244.0.5", "10.244.0.6"}; !reflect.DeepEqual(sets.allIPv4, want) {
 		t.Fatalf("IPv4 pod IPs = %#v, want %#v", sets.allIPv4, want)
@@ -132,7 +132,7 @@ func TestCollectPodIPSetMembersCWPods(t *testing.T) {
 				PodIP: "10.244.0.8",
 			},
 		},
-	}, []string{"10.0.0.1"}, parseExcludedNamespaces("kube-system"), true)
+	}, []string{"10.0.0.1"}, parseExcludedNamespaces("kube-system"))
 
 	// 10.244.0.99 (cw pod in kube-system) is absent from both sets.
 	if want := []string{"10.244.0.5", "10.244.1.9"}; !reflect.DeepEqual(sets.cwIPv4, want) {

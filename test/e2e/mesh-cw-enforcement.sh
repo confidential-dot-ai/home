@@ -156,7 +156,7 @@ client_curl -o /dev/null --max-time 5 "http://${vip}:${cw_port}/" || rc=$?
 # = the bypass reached the workload; 7 = connection refused, i.e. the packet was
 # rejected not dropped (a listener/NetworkPolicy artifact, not our guard); other
 # codes = kubectl exec itself failed, which would false-green a bare "nonzero".
-[ "$rc" -ne 0 ] || fail "VIP bypass reached the workload: curl http://$vip:$cw_port succeeded. Is ratlsMesh.cwInboundEnforcement.enabled=true and the DaemonSet rolled?"
+[ "$rc" -ne 0 ] || fail "VIP bypass reached the workload: curl http://$vip:$cw_port succeeded. Is the ratls-mesh DaemonSet rolled with the cw guard (RATLS-MESH-CW chain present)?"
 [ "$rc" -eq 28 ] || fail "VIP dial to $vip:$cw_port exited $rc, expected 28 (timeout from a DROP); a non-timeout failure is not proof the cw guard blocked it"
 echo "ok: VIP bypass blocked (curl exit 28 = timeout from DROP)"
 

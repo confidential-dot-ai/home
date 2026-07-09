@@ -71,12 +71,15 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 	if err != nil {
 		return err
 	}
-	rules := buildPodIPSetRules(cfg.outboundPort, cfg.uid, excludeUIDs, nodeIPsByFamily)
-	jumps := jumpRules()
-	if cfg.enforceCWInbound {
-		rules = append(rules, buildCWGuardRules()...)
-		jumps = append(jumps, cwJumpRule())
+	cwPassthrough, err := parseCWPassthrough(cfg.cwInboundPassthrough)
+	if err != nil {
+		return err
 	}
+	// The cw inbound guard is always installed: it is a fail-closed security
+	// control, not an opt-in. Its posture is the passthrough allowlist.
+	rules := buildPodIPSetRules(cfg.outboundPort, cfg.uid, excludeUIDs, nodeIPsByFamily)
+	rules = append(rules, buildCWGuardRules(cwPassthrough)...)
+	jumps := append(jumpRules(), cwJumpRule())
 
 	logger, err := certutil.NewJSONLogger(cfg.logLevel)
 	if err != nil {
@@ -125,28 +128,19 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 	if err := reconcileLiveSetMaxElem(logger, cfg.ipsetMaxElem); err != nil {
 		return err
 	}
-	cwIPs, err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, excludedSourceNamespaces, cfg.ipsetMaxElem, cfg.enforceCWInbound, logger)
+	cwIPs, err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, excludedSourceNamespaces, cfg.ipsetMaxElem, logger)
 	if err != nil {
 		return err
 	}
 	if err := installIptablesRules(logger, rules, jumps); err != nil {
 		return err
 	}
-	if cfg.enforceCWInbound {
-		// The guard now fails closed only for NEW flows; tear down conntrack
-		// for existing connections to cw pods so pre-enforcement plaintext
-		// flows (and any that raced the chain-flush-then-append window in
-		// installIptablesRules) must re-establish through the DROP instead of
-		// being grandfathered by the ESTABLISHED,RELATED RETURN rule.
-		flushCWConntrack(logger, cwIPs)
-	} else {
-		// Converge on->off without a manual uninstall: the guard chain was
-		// flushed by the install above (it is a managed chain), but a stale
-		// FORWARD jump from a prior enforcing run must go too.
-		for _, ipt := range iptablesClients() {
-			deleteAllIptablesRules(logger, ipt, cwJumpRule())
-		}
-	}
+	// The guard fails closed only for NEW flows; tear down conntrack for
+	// existing connections to cw pods so pre-enforcement plaintext flows (and
+	// any that raced the chain-flush-then-append window in installIptablesRules)
+	// must re-establish through the DROP instead of being grandfathered by the
+	// ESTABLISHED,RELATED RETURN rule.
+	flushCWConntrack(logger, cwIPs)
 	publishIptablesMetrics(logger)
 	if cfg.readyFile != "" {
 		if err := os.WriteFile(cfg.readyFile, []byte("ready\n"), 0o600); err != nil {
@@ -187,23 +181,21 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 			resync = true
 		case <-syncCh:
 		}
-		cwIPs, err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, excludedSourceNamespaces, cfg.ipsetMaxElem, cfg.enforceCWInbound, logger)
+		cwIPs, err := reconcilePodIPSets(podInformer.GetStore(), cfg.nodeIPs, excludedSourceNamespaces, cfg.ipsetMaxElem, logger)
 		if err != nil {
 			logger.Warn("pod ipset sync failed", "error", err)
 			continue
 		}
-		if cfg.enforceCWInbound {
-			curr := stringSet(cwIPs)
-			flushCWConntrack(logger, newMembers(prevCWIPs, curr))
-			prevCWIPs = curr
-			// Drop counters change only on packet hits, not pod events, so
-			// refresh on the resync tick rather than every event-driven sync
-			// (which would fork iptables and take the xtables lock during
-			// churn, contending with kube-proxy and the jump watchdog).
-			if resync {
-				if err := refreshCWInboundDrops(); err != nil {
-					logger.Warn("cw drop counter read failed", "error", err)
-				}
+		curr := stringSet(cwIPs)
+		flushCWConntrack(logger, newMembers(prevCWIPs, curr))
+		prevCWIPs = curr
+		// Drop counters change only on packet hits, not pod events, so
+		// refresh on the resync tick rather than every event-driven sync
+		// (which would fork iptables and take the xtables lock during
+		// churn, contending with kube-proxy and the jump watchdog).
+		if resync {
+			if err := refreshCWInboundDrops(); err != nil {
+				logger.Warn("cw drop counter read failed", "error", err)
 			}
 		}
 		publishIptablesMetrics(logger)
@@ -262,13 +254,12 @@ type ipSetSpec struct {
 }
 
 // reconcilePodIPSets rewrites the managed ipsets from the pod cache. The cw
-// sets are only computed and written when enforceCWInbound is set: nothing
-// references them otherwise, so an unenforcing node does no cw ipset work.
-// reconcilePodIPSets returns the cw pod IPs it wrote (empty when enforcement
-// is off) so the caller can flush their conntrack entries and keep the guard
-// fail-closed across membership changes.
-func reconcilePodIPSets(store cache.Store, nodeIPs []string, excludedSourceNamespaces map[string]struct{}, ipsetMaxElem int, enforceCWInbound bool, logger *slog.Logger) ([]string, error) {
-	sets := collectPodIPSetMembers(store.List(), nodeIPs, excludedSourceNamespaces, enforceCWInbound)
+// guard is always installed, so the cw sets are always computed and written.
+// reconcilePodIPSets returns the cw pod IPs it wrote so the caller can flush
+// their conntrack entries and keep the guard fail-closed across membership
+// changes.
+func reconcilePodIPSets(store cache.Store, nodeIPs []string, excludedSourceNamespaces map[string]struct{}, ipsetMaxElem int, logger *slog.Logger) ([]string, error) {
+	sets := collectPodIPSetMembers(store.List(), nodeIPs, excludedSourceNamespaces)
 	if sets.exceeds(ipsetMaxElem) {
 		ipsetOverflows.Add(1)
 		publishIptablesMetrics(logger)
@@ -278,12 +269,8 @@ func reconcilePodIPSets(store cache.Store, nodeIPs []string, excludedSourceNames
 		{podIPSetName6, "inet6", sets.allIPv6, "IPv6 pod ipset"},
 		{localPodIPSetName4, "inet", sets.localIPv4, "local IPv4 pod ipset"},
 		{localPodIPSetName6, "inet6", sets.localIPv6, "local IPv6 pod ipset"},
-	}
-	if enforceCWInbound {
-		specs = append(specs,
-			ipSetSpec{cwPodIPSetName4, "inet", sets.cwIPv4, "IPv4 cw pod ipset"},
-			ipSetSpec{cwPodIPSetName6, "inet6", sets.cwIPv6, "IPv6 cw pod ipset"},
-		)
+		{cwPodIPSetName4, "inet", sets.cwIPv4, "IPv4 cw pod ipset"},
+		{cwPodIPSetName6, "inet6", sets.cwIPv6, "IPv6 cw pod ipset"},
 	}
 	for _, spec := range specs {
 		if err := replaceIPSetMembers(logger, spec.name, spec.family, spec.members, ipsetMaxElem); err != nil {
@@ -291,9 +278,6 @@ func reconcilePodIPSets(store cache.Store, nodeIPs []string, excludedSourceNames
 		}
 	}
 	logger.Debug("pod ipsets reconciled", "ipv4", len(sets.allIPv4), "ipv6", len(sets.allIPv6), "local_ipv4", len(sets.localIPv4), "local_ipv6", len(sets.localIPv6), "cw_ipv4", len(sets.cwIPv4), "cw_ipv6", len(sets.cwIPv6))
-	if !enforceCWInbound {
-		return nil, nil
-	}
 	return append(append([]string{}, sets.cwIPv4...), sets.cwIPv6...), nil
 }
 
@@ -315,7 +299,7 @@ func (m podIPSetMembers) exceeds(maxElem int) bool {
 		len(m.cwIPv6) > maxElem
 }
 
-func collectPodIPSetMembers(objs []interface{}, nodeIPs []string, excludedSourceNamespaces map[string]struct{}, collectCW bool) podIPSetMembers {
+func collectPodIPSetMembers(objs []interface{}, nodeIPs []string, excludedSourceNamespaces map[string]struct{}) podIPSetMembers {
 	ourNodeIPs := make(map[string]struct{}, len(nodeIPs))
 	for _, ip := range nodeIPs {
 		if canon := normalizeIP(ip); canon != "" {
@@ -353,9 +337,8 @@ func collectPodIPSetMembers(objs []interface{}, nodeIPs []string, excludedSource
 		localSource := podIsLocal(pod, ourNodeIPs) && podEligibleForMeshSource(pod, excludedSourceNamespaces)
 		// cw membership is cluster-wide, mirroring the all-pods sets: the
 		// FORWARD guard then also drops at the source node when a Service
-		// VIP is DNAT'd toward a cw pod on another node. Only computed when
-		// enforcement is on; the sets are unreferenced otherwise.
-		cw := collectCW && podIsConfidentialWorkload(pod)
+		// VIP is DNAT'd toward a cw pod on another node.
+		cw := podIsConfidentialWorkload(pod)
 		for _, ip := range podStatusIPs(pod) {
 			add(ip, v4Set, v6Set)
 			if localSource {

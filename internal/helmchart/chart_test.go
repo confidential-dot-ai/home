@@ -237,10 +237,10 @@ func TestChartRendersRATLSHostRoutingDefaults(t *testing.T) {
 	if slices.Contains(sync.Command, "--pod-cidrs") {
 		t.Errorf("iptables-sync must not require static --pod-cidrs; command=%q", sync.Command)
 	}
-	// Fail-closed inbound guard for cw pods defaults on; the binary default
-	// is off, so the chart must pass the flag explicitly.
-	if !slices.Contains(sync.Command, "--enforce-cw-inbound=true") {
-		t.Errorf("iptables-sync command missing --enforce-cw-inbound=true; command=%q", sync.Command)
+	// The cw inbound guard is always on; its posture is the passthrough
+	// allowlist, defaulting to DNS replies so get-cert can resolve.
+	if !slices.Contains(sync.Command, "--cw-inbound-passthrough=udp:53,tcp:53") {
+		t.Errorf("iptables-sync command missing --cw-inbound-passthrough=udp:53,tcp:53; command=%q", sync.Command)
 	}
 
 	mesh, ok := findContainer(ds.Spec.Template.Spec.Containers, "ratls-mesh")
@@ -283,8 +283,11 @@ func TestChartRendersRATLSHostRoutingDefaults(t *testing.T) {
 	}
 }
 
-func TestChartCWInboundEnforcementToggle(t *testing.T) {
-	out, err := helmTemplate(t, "--set", "ratlsMesh.cwInboundEnforcement.enabled=false")
+func TestChartCWInboundPassthrough(t *testing.T) {
+	// An empty passthrough renders the strict fail-closed posture (no
+	// exemptions), and the flag is present-but-empty so the manifest still
+	// self-documents that the guard is on.
+	out, err := helmTemplate(t, "--set", "ratlsMesh.cwInboundEnforcement.passthrough=[]")
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
@@ -293,10 +296,49 @@ func TestChartCWInboundEnforcementToggle(t *testing.T) {
 	if !ok {
 		t.Fatalf("iptables-sync init container missing; have %v", containerNames(ds.Spec.Template.Spec.InitContainers))
 	}
-	// Rendered explicitly even when off, so the manifest self-documents the
-	// enforcement posture.
-	if !slices.Contains(sync.Command, "--enforce-cw-inbound=false") {
-		t.Errorf("iptables-sync command missing --enforce-cw-inbound=false; command=%q", sync.Command)
+	if !slices.Contains(sync.Command, "--cw-inbound-passthrough=") {
+		t.Errorf("iptables-sync command missing empty --cw-inbound-passthrough=; command=%q", sync.Command)
+	}
+
+	// A custom passthrough list renders in order as proto:port,proto:port.
+	out, err = helmTemplate(t,
+		"--set", "ratlsMesh.cwInboundEnforcement.passthrough[0].protocol=udp",
+		"--set", "ratlsMesh.cwInboundEnforcement.passthrough[0].sourcePort=53",
+		"--set", "ratlsMesh.cwInboundEnforcement.passthrough[1].protocol=tcp",
+		"--set", "ratlsMesh.cwInboundEnforcement.passthrough[1].sourcePort=8443",
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	ds = findRATLSMeshDaemonSet(t, out)
+	sync, _ = findContainer(ds.Spec.Template.Spec.InitContainers, "iptables-sync")
+	if !slices.Contains(sync.Command, "--cw-inbound-passthrough=udp:53,tcp:8443") {
+		t.Errorf("iptables-sync command missing --cw-inbound-passthrough=udp:53,tcp:8443; command=%q", sync.Command)
+	}
+
+	// A wrong-typed value (e.g. --set-string) fails loudly instead of silently
+	// rendering strict drop-all, which would reproduce the DNS-resolution
+	// outage this guard exists to prevent.
+	out, err = helmTemplate(t, "--set-string", "ratlsMesh.cwInboundEnforcement.passthrough=udp:53")
+	if err == nil {
+		t.Fatalf("helm template succeeded on a string passthrough, want a fail\n%s", out)
+	}
+	if !strings.Contains(out, "must be a list") {
+		t.Errorf("passthrough type error should name the fix; got %s", out)
+	}
+
+	// A malformed entry fails at render, not at daemon startup — a rendered
+	// "udp:<nil>" would crash-loop the init container. The key prefix is elided
+	// to pt for readability.
+	const pt = "ratlsMesh.cwInboundEnforcement.passthrough"
+	for _, bad := range [][]string{
+		{"--set", pt + "[0].protocol=udp"},                                       // missing sourcePort
+		{"--set", pt + "[0].protocol=sctp", "--set", pt + "[0].sourcePort=53"},   // bad protocol
+		{"--set", pt + "[0].protocol=udp", "--set", pt + "[0].sourcePort=70000"}, // out-of-range port
+	} {
+		if out, err := helmTemplate(t, bad...); err == nil {
+			t.Errorf("helm template succeeded on malformed passthrough entry %v, want a fail\n%s", bad, out)
+		}
 	}
 }
 

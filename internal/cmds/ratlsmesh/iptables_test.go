@@ -3,6 +3,7 @@
 package ratlsmesh
 
 import (
+	"reflect"
 	"strconv"
 	"testing"
 )
@@ -216,21 +217,24 @@ func TestCWJumpRule(t *testing.T) {
 	assertContains(t, "cw jump", jump.args, "-j", cwChainName)
 }
 
-func TestBuildCWGuardRules(t *testing.T) {
-	rules := buildCWGuardRules()
-	if len(rules) != 4 {
-		t.Fatalf("expected 4 rules (RETURN + DROP per family), got %d", len(rules))
+func TestBuildCWGuardRulesDefaultPassthrough(t *testing.T) {
+	rules := buildCWGuardRules(defaultCWPassthrough)
+	// Per family, in order: conntrack RETURN, one passthrough RETURN per entry
+	// (udp:53, tcp:53), then DROP.
+	perFamily := 1 + len(defaultCWPassthrough) + 1
+	if len(rules) != 2*perFamily {
+		t.Fatalf("expected %d rules (%d per family), got %d", 2*perFamily, perFamily, len(rules))
 	}
-	for _, spec := range []struct {
+	for i, spec := range []struct {
 		family  iptablesFamily
 		setName string
-		ret     iptablesRule
-		drop    iptablesRule
 	}{
-		{iptablesFamilyIPv4, cwPodIPSetName4, rules[0], rules[1]},
-		{iptablesFamilyIPv6, cwPodIPSetName6, rules[2], rules[3]},
+		{iptablesFamilyIPv4, cwPodIPSetName4},
+		{iptablesFamilyIPv6, cwPodIPSetName6},
 	} {
-		for _, r := range []iptablesRule{spec.ret, spec.drop} {
+		group := rules[i*perFamily : (i+1)*perFamily]
+		ret, ptUDP, ptTCP, drop := group[0], group[1], group[2], group[3]
+		for _, r := range []iptablesRule{ret, ptUDP, ptTCP, drop} {
 			if r.table != "filter" || r.chain != cwChainName {
 				t.Errorf("%s: table=%q chain=%q, want filter/%s", spec.family, r.table, r.chain, cwChainName)
 			}
@@ -238,16 +242,90 @@ func TestBuildCWGuardRules(t *testing.T) {
 				t.Errorf("rule family=%q, want %q", r.family, spec.family)
 			}
 			assertContains(t, "cw guard", r.args, "--match-set", spec.setName)
-			// No -p match: non-TCP inbound to a cw pod is unmeshed by
-			// definition and must also be dropped.
-			assertArgNotContains(t, "cw guard", r.args, "-p")
 		}
-		// The conntrack RETURN must precede the DROP so replies to cw-pod
-		// egress pass.
-		assertContains(t, "cw return", spec.ret.args, "--ctstate", "ESTABLISHED,RELATED")
-		assertContains(t, "cw return", spec.ret.args, "-j", "RETURN")
-		assertContains(t, "cw drop", spec.drop.args, "-j", "DROP")
-		assertArgNotContains(t, "cw drop", spec.drop.args, "--ctstate")
+		// The conntrack RETURN comes first so replies to cw-pod egress pass.
+		assertContains(t, "cw return", ret.args, "--ctstate", "ESTABLISHED,RELATED")
+		assertContains(t, "cw return", ret.args, "-j", "RETURN")
+		assertArgNotContains(t, "cw return", ret.args, "-p")
+		// Passthrough exemptions (udp+tcp source port 53) precede the DROP so a
+		// dataplane that breaks the query's conntrack tuple still admits the
+		// reply that get-cert needs.
+		assertContains(t, "cw pt udp", ptUDP.args, "-p", "udp")
+		assertContains(t, "cw pt udp", ptUDP.args, "--sport", "53")
+		assertContains(t, "cw pt udp", ptUDP.args, "-j", "RETURN")
+		assertContains(t, "cw pt tcp", ptTCP.args, "-p", "tcp")
+		assertContains(t, "cw pt tcp", ptTCP.args, "--sport", "53")
+		assertContains(t, "cw pt tcp", ptTCP.args, "-j", "RETURN")
+		// The DROP stays protocol-agnostic and conntrack-agnostic.
+		assertContains(t, "cw drop", drop.args, "-j", "DROP")
+		assertArgNotContains(t, "cw drop", drop.args, "--ctstate")
+		assertArgNotContains(t, "cw drop", drop.args, "-p")
+	}
+}
+
+// An empty passthrough is the strict fail-closed posture: conntrack RETURN then
+// drop-all, no exemptions.
+func TestBuildCWGuardRulesEmptyPassthroughIsStrict(t *testing.T) {
+	rules := buildCWGuardRules(nil)
+	if len(rules) != 4 {
+		t.Fatalf("expected 4 rules (RETURN + DROP per family), got %d", len(rules))
+	}
+	for _, r := range rules {
+		assertArgNotContains(t, "strict", r.args, "--sport")
+	}
+	assertContains(t, "strict return", rules[0].args, "--ctstate", "ESTABLISHED,RELATED")
+	assertContains(t, "strict drop", rules[1].args, "-j", "DROP")
+}
+
+func TestParseCWPassthrough(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		in      string
+		want    []cwPassthrough
+		wantErr bool
+	}{
+		{name: "empty", in: "", want: nil},
+		{name: "dns default", in: "udp:53,tcp:53", want: []cwPassthrough{{"udp", 53}, {"tcp", 53}}},
+		{name: "whitespace", in: " udp:53 , tcp:53 ", want: []cwPassthrough{{"udp", 53}, {"tcp", 53}}},
+		{name: "single", in: "tcp:8443", want: []cwPassthrough{{"tcp", 8443}}},
+		{name: "bad proto", in: "sctp:53", wantErr: true},
+		{name: "missing port", in: "udp", wantErr: true},
+		{name: "port zero", in: "udp:0", wantErr: true},
+		{name: "port too big", in: "udp:70000", wantErr: true},
+		{name: "non-numeric port", in: "udp:dns", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseCWPassthrough(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got %v", tc.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("parseCWPassthrough(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// The flag default is derived from defaultCWPassthrough via formatCWPassthrough,
+// and the chart hardcodes the same string (asserted in the chart tests). Pin the
+// rendered form so the two sources of truth cannot silently drift.
+func TestFormatCWPassthroughDefaultMatchesChart(t *testing.T) {
+	if got := formatCWPassthrough(defaultCWPassthrough); got != "udp:53,tcp:53" {
+		t.Fatalf("default passthrough flag = %q, want udp:53,tcp:53 (chart default must match)", got)
+	}
+	// Round-trips: formatting then parsing yields the original.
+	round, err := parseCWPassthrough(formatCWPassthrough(defaultCWPassthrough))
+	if err != nil {
+		t.Fatalf("round-trip parse: %v", err)
+	}
+	if !reflect.DeepEqual(round, defaultCWPassthrough) {
+		t.Fatalf("round-trip = %v, want %v", round, defaultCWPassthrough)
 	}
 }
 
