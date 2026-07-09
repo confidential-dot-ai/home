@@ -320,21 +320,24 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 	}
 
 	prev := struct {
-		crds, singleNode, kata, resolveDigests                 bool
-		secret, cvm, engine, engineWID, engineNS, operatorKeys string
-	}{installCRDs, installSingleNode, installKata, installResolveDigests, installImagePullSecret, installCvmMode, installEngine, installEngineWorkloadID, installEngineNamespace, installOperatorKeys}
+		crds, singleNode, kata, resolveDigests bool
+		secret, cvm, upstream, operatorKeys    string
+		workloadRefs                           []string
+	}{installCRDs, installSingleNode, installKata, installResolveDigests, installImagePullSecret, installCvmMode, installUpstream, installOperatorKeys, slices.Clone(installWorkloadRefs)}
 	defer func() {
 		installCRDs, installSingleNode, installKata, installResolveDigests = prev.crds, prev.singleNode, prev.kata, prev.resolveDigests
 		installImagePullSecret, installCvmMode = prev.secret, prev.cvm
-		installEngine, installEngineWorkloadID, installEngineNamespace = prev.engine, prev.engineWID, prev.engineNS
+		installUpstream = prev.upstream
 		installOperatorKeys = prev.operatorKeys
+		installWorkloadRefs = prev.workloadRefs
 	}()
 	// Drive every value-producing toggle. --install-crds=false exercises the
 	// non-default CRD path; --resolve-digests=false keeps crane off PATH (the
 	// digest-arg shape is covered separately via buildDigestArgs below).
 	installCRDs, installSingleNode, installKata, installResolveDigests = false, true, true, false
 	installImagePullSecret, installCvmMode = "regcred", "aks"
-	installEngine, installEngineWorkloadID, installEngineNamespace = "vllm", "infer", "workloads"
+	installWorkloadRefs = []string{"infer=workloads/deployment/vllm:8000"}
+	installUpstream = "infer"
 	installOperatorKeys = writeTestOperatorKeys(t)
 
 	args, err := buildValueArgs(context.Background(), cmd, nil, "main", "rke2", appendResolvedDigestArgs)
@@ -374,6 +377,36 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 	keys, _ := tree["cds"].(map[string]any)["operatorKeys"].(string)
 	if keys == installOperatorKeys || !strings.Contains(keys, "BEGIN PUBLIC KEY") {
 		t.Fatalf("cds.operatorKeys = %q, want the PEM content of %s", keys, installOperatorKeys)
+	}
+}
+
+// --upstream derives tlsLb.upstream.address from an adopted --workload-ref (a
+// c8s-<id> headless-Service address the chart recognizes as mesh-wrapped). A
+// duplicate ref dedups to one adoption, so --upstream still resolves it.
+func TestBuildValueArgsDerivesUpstreamFromRef(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().String(flagCvmMode, "baremetal", "")
+
+	prev := struct {
+		resolveDigests bool
+		upstream       string
+		workloadRefs   []string
+	}{installResolveDigests, installUpstream, slices.Clone(installWorkloadRefs)}
+	defer func() {
+		installResolveDigests = prev.resolveDigests
+		installUpstream = prev.upstream
+		installWorkloadRefs = prev.workloadRefs
+	}()
+	installResolveDigests = false
+	installWorkloadRefs = []string{"infer=vllm/deployment/x:8000", "infer=vllm/deployment/x:8000"}
+	installUpstream = "infer"
+
+	args, err := buildValueArgs(context.Background(), cmd, nil, "main", "", appendResolvedDigestArgs)
+	if err != nil {
+		t.Fatalf("buildValueArgs: %v", err)
+	}
+	if !slices.Contains(args, "tlsLb.upstream.address=c8s-infer.vllm.svc.cluster.local:8000") {
+		t.Fatalf("want derived tlsLb.upstream.address, got %v", args)
 	}
 }
 

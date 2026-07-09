@@ -61,13 +61,14 @@ enforcing it are one shape, not two (see [Enforcement](#enforcement)).
 # Install the Kata stack and enforce it (see Enforcement below).
 # Works on RKE2 too: the host distro is detected from the cluster.
 # TEE platform labels are applied automatically from --hardware-platform
-# (see below). tls-lb runs as a kata CVM; --engine derives the mesh-wrapped
-# upstream (see operator.md, "Engine upstream preset").
-c8s install --kata --engine vllm --engine-workload-id <cw-id>
+# (see below). tls-lb runs as a kata CVM; --upstream (with the port on its
+# --workload-ref) points tls-lb at an adopted workload's mesh-wrapped headless
+# Service (see operator.md, "tls-lb upstream").
+c8s install --kata --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm
 
 # Dev only: use the -debug guest image so `kubectl logs` and `kubectl exec`
 # work against kata pods (host log/exec RPCs allowed in the guest policy).
-c8s install --kata --debug --engine vllm --engine-workload-id <cw-id>
+c8s install --kata --debug --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm
 ```
 
 Confidential pods only schedule to nodes carrying their platform label —

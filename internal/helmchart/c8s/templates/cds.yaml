@@ -23,7 +23,7 @@ metadata:
     app.kubernetes.io/component: cds
 {{ include "c8s.serviceAccountImagePullSecrets" . }}
 ---
-{{- if .Values.nriImagePolicy.enabled }}
+{{- if eq (include "c8s.serveAllowlistSeed" .) "true" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -155,7 +155,7 @@ spec:
             # attestation-service listens) and to the host Service otherwise.
             - --attestation-api-url={{ include "c8s.attestationApiURL" . }}
             - --allowlist-db={{ .Values.cds.allowlistDB }}
-            {{- if .Values.nriImagePolicy.enabled }}
+            {{- if eq (include "c8s.serveAllowlistSeed" .) "true" }}
             - --allowlist-seed=/etc/cds/allowlist-seed.json
             {{- end }}
             - --ear-issuer={{ .Values.cds.earIssuer }}
@@ -238,7 +238,7 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
-            {{- if .Values.nriImagePolicy.enabled }}
+            {{- if eq (include "c8s.serveAllowlistSeed" .) "true" }}
             - name: allowlist-seed
               mountPath: /etc/cds
               readOnly: true
@@ -269,7 +269,7 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
-        {{- if .Values.nriImagePolicy.enabled }}
+        {{- if eq (include "c8s.serveAllowlistSeed" .) "true" }}
         - name: allowlist-seed
           configMap:
             name: {{ include "c8s.cdsName" . }}-allowlist-seed

@@ -13,9 +13,11 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/confidential-dot-ai/c8s/internal/helmchart"
+	"github.com/confidential-dot-ai/c8s/internal/webhook"
 )
 
 var errTestResolve = errors.New("simulated resolve failure")
@@ -273,6 +275,416 @@ func TestAppendSingleNodeInstallArgsClearsCDSNodePinning(t *testing.T) {
 		"--set", "cds.node.selector=null",
 		"--set", "cds.node.tolerations=null",
 	})
+}
+
+func TestParseWorkloadRef(t *testing.T) {
+	tests := []struct {
+		ref     string
+		want    workloadRef
+		wantErr []string
+	}{
+		{
+			ref:  "workloads/deployment/vllm",
+			want: workloadRef{kind: "deployment", name: "vllm", namespace: "workloads"},
+		},
+		{
+			ref:  "workloads/sts/infer",
+			want: workloadRef{kind: "statefulset", name: "infer", namespace: "workloads"},
+		},
+		{
+			ref:  "workloads/ds/gpu-worker",
+			want: workloadRef{kind: "daemonset", name: "gpu-worker", namespace: "workloads"},
+		},
+		{
+			// A non-stock kind passes through verbatim for kubectl to resolve.
+			ref:  "workloads/controller/infer",
+			want: workloadRef{kind: "controller", name: "infer", namespace: "workloads"},
+		},
+		{
+			// A dotted kind.group survives the middle-'/' split.
+			ref:  "workloads/nodeset.example.net/worker",
+			want: workloadRef{kind: "nodeset.example.net", name: "worker", namespace: "workloads"},
+		},
+		{
+			// An optional :<port> suffix is the tls-lb upstream port.
+			ref:  "vllm/deployment/router:8000",
+			want: workloadRef{kind: "deployment", name: "router", namespace: "vllm", port: 8000},
+		},
+		{
+			ref:     "vllm/deployment/router:0",
+			wantErr: []string{"--workload-ref", "1-65535"},
+		},
+		{
+			ref:     "vllm/deployment/router:https",
+			wantErr: []string{"--workload-ref", "1-65535"},
+		},
+		{
+			ref:     "vllm/deployment/router:70000",
+			wantErr: []string{"--workload-ref", "1-65535"},
+		},
+		{
+			// A leading colon leaves an empty name before the :<port>.
+			ref:     "vllm/deployment/:8000",
+			wantErr: []string{"--workload-ref", "<namespace>/<kind>/<name>"},
+		},
+		{
+			// Non-canonical port spellings Atoi would accept are rejected.
+			ref:     "vllm/deployment/router:+8000",
+			wantErr: []string{"--workload-ref", "1-65535"},
+		},
+		{
+			ref:     "vllm/deployment/router:08000",
+			wantErr: []string{"--workload-ref", "1-65535"},
+		},
+		{
+			ref:     "deployment/vllm",
+			wantErr: []string{"--workload-ref", "<namespace>/<kind>/<name>"},
+		},
+		{
+			ref:     "vllm",
+			wantErr: []string{"--workload-ref", "<namespace>/<kind>/<name>"},
+		},
+		{
+			ref:     "",
+			wantErr: []string{"--workload-ref", "<namespace>/<kind>/<name>"},
+		},
+		{
+			// A mis-split leaking an '=' into the name.
+			ref:     "ns/deployment/na=me",
+			wantErr: []string{"--workload-ref", "DNS-1123"},
+		},
+		{
+			ref:     "ns/deployment/UPPER",
+			wantErr: []string{"--workload-ref", "DNS-1123"},
+		},
+		{
+			ref:     "BadNS/deployment/vllm",
+			wantErr: []string{"--workload-ref", "namespace", "DNS-1123"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.ref, func(t *testing.T) {
+			got, err := parseWorkloadRef(tt.ref, flagWorkloadRef)
+			if len(tt.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tt.want {
+					t.Fatalf("ref = %+v, want %+v", got, tt.want)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %v, got nil", tt.wantErr)
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateWorkloadAdoptionFlags(t *testing.T) {
+	tests := []struct {
+		name      string
+		releaseNS string
+		refs      []string
+		wait      bool
+		wantErr   []string
+	}{
+		{name: "no ref is valid", wait: false},
+		{name: "adopt in a separate namespace is valid", releaseNS: "c8s-system", refs: []string{"router=workloads/deployment/vllm"}, wait: true},
+		{name: "ref rejects release namespace", releaseNS: "c8s-system", refs: []string{"router=c8s-system/deployment/vllm"}, wait: true, wantErr: []string{"--workload-ref", "release namespace", "excluded"}},
+		{name: "ref requires wait", releaseNS: "c8s-system", refs: []string{"router=workloads/deployment/vllm"}, wait: false, wantErr: []string{"--workload-ref", "--wait=true"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			adoptions, err := collectWorkloadAdoptions(tt.refs)
+			if err != nil {
+				t.Fatalf("collectWorkloadAdoptions: %v", err)
+			}
+			err = validateWorkloadAdoptionFlags(tt.releaseNS, adoptions, tt.wait)
+			if len(tt.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %v, got nil", tt.wantErr)
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
+// TestUpstreamAddress drives the derivation buildValueArgs uses to set
+// tlsLb.upstream.address, so it guards the address the chart receives against
+// divergence from the RunE's --upstream validation. The port comes from the
+// selected ref's :<port> suffix, not a separate flag.
+func TestUpstreamAddress(t *testing.T) {
+	tests := []struct {
+		name     string
+		refs     []string
+		upstream string
+		want     string
+		wantErr  []string
+	}{
+		{name: "no upstream yields empty", refs: []string{"router=vllm/deployment/vllm-router:8000"}, want: ""},
+		{name: "selects a ref by cw id", refs: []string{"router=vllm/deployment/vllm-router:8000", "engine=vllm/deployment/vllm-engine"}, upstream: "router", want: "c8s-router.vllm.svc.cluster.local:8000"},
+		{name: "selects the other ref", refs: []string{"router=vllm/deployment/vllm-router", "engine=vllm/deployment/vllm-engine:30000"}, upstream: "engine", want: "c8s-engine.vllm.svc.cluster.local:30000"},
+		{name: "upstream must name a ref", refs: []string{"router=vllm/deployment/vllm-router:8000"}, upstream: "missing", wantErr: []string{"--upstream", "missing", "--workload-ref"}},
+		{name: "selected ref needs a port", refs: []string{"router=vllm/deployment/vllm-router"}, upstream: "router", wantErr: []string{"--upstream", "router", "no :<port>"}},
+		// The port must be on the SELECTED ref: a port on a different ref does
+		// not satisfy the selected one.
+		{name: "port on a different ref does not count", refs: []string{"router=vllm/deployment/vllm-router", "engine=vllm/deployment/vllm-engine:30000"}, upstream: "router", wantErr: []string{"--upstream", "router", "no :<port>"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			adoptions, err := collectWorkloadAdoptions(tt.refs)
+			if err != nil {
+				t.Fatalf("collectWorkloadAdoptions: %v", err)
+			}
+			got, err := upstreamAddress(tt.upstream, adoptions)
+			if len(tt.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tt.want {
+					t.Fatalf("upstreamAddress = %q, want %q", got, tt.want)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %v, got nil", tt.wantErr)
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestCollectWorkloadAdoptions(t *testing.T) {
+	got, err := collectWorkloadAdoptions([]string{
+		"vllm-router=vllm/deployment/vllm-deployment-router",
+		"vllm-engine=vllm/deployment/vllm-engine",
+	})
+	if err != nil {
+		t.Fatalf("collectWorkloadAdoptions: %v", err)
+	}
+	want := []workloadAdoption{
+		{cwID: "vllm-router", ref: workloadRef{kind: "deployment", name: "vllm-deployment-router", namespace: "vllm"}},
+		{cwID: "vllm-engine", ref: workloadRef{kind: "deployment", name: "vllm-engine", namespace: "vllm"}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("adoptions = %+v, want %+v", got, want)
+	}
+}
+
+func TestCollectWorkloadAdoptionsRejectsMalformedAdditionalRef(t *testing.T) {
+	_, err := collectWorkloadAdoptions([]string{"vllm/deployment/vllm-engine"})
+	if err == nil {
+		t.Fatal("expected malformed --workload-ref to fail")
+	}
+	for _, want := range []string{"--workload-ref", "<cw-id>=<namespace>/<kind>/<name>"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestCollectWorkloadAdoptionsRejectsInvalidWorkloadID(t *testing.T) {
+	_, err := collectWorkloadAdoptions([]string{"Bad_ID=vllm/deployment/vllm-engine"})
+	if err == nil {
+		t.Fatal("expected invalid workload id to fail")
+	}
+	for _, want := range []string{"--workload-ref", "Bad_ID", "DNS-1035"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestCollectWorkloadAdoptionsRejectsConflictingDuplicateRef(t *testing.T) {
+	_, err := collectWorkloadAdoptions([]string{"vllm-router=vllm/deployment/vllm", "vllm-engine=vllm/deployment/vllm"})
+	if err == nil {
+		t.Fatal("expected conflicting duplicate workload ref to fail")
+	}
+	for _, want := range []string{"vllm/deployment/vllm", "vllm-router", "vllm-engine"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestCollectWorkloadAdoptionsRejectsConflictingPort(t *testing.T) {
+	// Same workload + same cw id but different :<port> must error, not silently
+	// dedup to the first ref's port.
+	_, err := collectWorkloadAdoptions([]string{"vllm=vllm/deployment/x:8000", "vllm=vllm/deployment/x:9000"})
+	if err == nil {
+		t.Fatal("expected conflicting upstream ports to fail")
+	}
+	for _, want := range []string{"vllm/deployment/x", "8000", "9000"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestCollectWorkloadAdoptionsRejectsSharedCWID(t *testing.T) {
+	_, err := collectWorkloadAdoptions([]string{"shared=vllm/deployment/a", "shared=vllm/deployment/b"})
+	if err == nil {
+		t.Fatal("expected one cw id on two workloads to fail")
+	}
+	for _, want := range []string{"shared", "vllm/deployment/a", "vllm/deployment/b"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestConfidentialWorkloadPatchAnnotatesPodTemplate(t *testing.T) {
+	data, err := confidentialWorkloadPatch("infer")
+	if err != nil {
+		t.Fatalf("confidentialWorkloadPatch: %v", err)
+	}
+	var patch map[string]any
+	if err := json.Unmarshal(data, &patch); err != nil {
+		t.Fatalf("patch is not JSON: %v\n%s", err, data)
+	}
+	spec := patch["spec"].(map[string]any)
+	template := spec["template"].(map[string]any)
+	metadata := template["metadata"].(map[string]any)
+	annotations := metadata["annotations"].(map[string]any)
+	if got := annotations[webhook.AnnotationWorkload]; got != "infer" {
+		t.Fatalf("%s = %#v, want infer", webhook.AnnotationWorkload, got)
+	}
+}
+
+func TestWorkloadPodTemplateImages(t *testing.T) {
+	deployment := appsv1.Deployment{
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{{Image: "ghcr.io/acme/init:v1"}},
+					Containers: []corev1.Container{
+						{Image: "ghcr.io/acme/router:v1"},
+						{Image: "ghcr.io/acme/router:v1"},
+					},
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(deployment)
+	if err != nil {
+		t.Fatalf("marshal deployment: %v", err)
+	}
+	template, err := workloadPodTemplate(data)
+	if err != nil {
+		t.Fatalf("workloadPodTemplate: %v", err)
+	}
+	got := podTemplateImages(template)
+	want := []string{"ghcr.io/acme/init:v1", "ghcr.io/acme/router:v1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("images = %v, want %v", got, want)
+	}
+
+	// A CRD carrying its pod template at spec.template decodes the same way,
+	// with no matching Go type.
+	crd := []byte(`{
+		"apiVersion": "example.net/v1beta1",
+		"kind": "NodeSet",
+		"spec": {"template": {"spec": {"containers": [{"image": "ghcr.io/acme/worker:v3"}]}}}
+	}`)
+	template, err = workloadPodTemplate(crd)
+	if err != nil {
+		t.Fatalf("workloadPodTemplate crd: %v", err)
+	}
+	if got, want := podTemplateImages(template), []string{"ghcr.io/acme/worker:v3"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("crd images = %v, want %v", got, want)
+	}
+}
+
+func TestBuildWorkloadImageArgsAddsNRIAllowlistDigests(t *testing.T) {
+	resolve := func(ref string) (string, error) {
+		switch ref {
+		case "ghcr.io/acme/router:v1":
+			return "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", nil
+		case "ghcr.io/acme/engine:v2":
+			return "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil
+		}
+		t.Fatalf("unexpected ref resolved: %q", ref)
+		return "", nil
+	}
+	got, err := buildWorkloadImageArgs([]string{"upgrade"}, []string{
+		"ghcr.io/acme/router:v1",
+		"ghcr.io/acme/engine:v2",
+		"ghcr.io/acme/router:v1",
+		"busybox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+	}, resolve)
+	if err != nil {
+		t.Fatalf("buildWorkloadImageArgs: %v", err)
+	}
+	assertArgsEqual(t, got, []string{
+		"upgrade",
+		"--set-string", "nriImagePolicy.bootstrapAllowlist.digests.sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=ghcr.io/acme/engine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"--set-string", "nriImagePolicy.bootstrapAllowlist.digests.sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=ghcr.io/acme/router@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"--set-string", "nriImagePolicy.bootstrapAllowlist.digests.sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc=docker.io/library/busybox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+	})
+}
+
+func TestBuildWorkloadImageArgsFailsClosedOnResolveError(t *testing.T) {
+	_, err := buildWorkloadImageArgs(nil, []string{"ghcr.io/acme/router:v1"}, func(string) (string, error) {
+		return "", errTestResolve
+	})
+	if err == nil {
+		t.Fatal("expected workload image resolver failure to abort")
+	}
+}
+
+// A workload image already pinned by a non-sha256 digest (distribution/reference
+// accepts sha512) must fail closed with a message naming the sha256 constraint,
+// since the NRI allowlist keys on sha256 only.
+func TestBuildWorkloadImageArgsRejectsNonSHA256Digest(t *testing.T) {
+	sha512Image := "busybox@sha512:ee26b0dd4af7e749aa1a8ee3c10ae9923f618980772e473f8819a5d4940e0db27ac185f8a0e1d5f84f88bc887fd67b143732c304cc5fa9ad8e6f57f50028a8ff"
+	_, err := buildWorkloadImageArgs(nil, []string{sha512Image}, func(string) (string, error) {
+		t.Fatal("resolve must not run for an already-digested image")
+		return "", nil
+	})
+	if err == nil {
+		t.Fatal("expected non-sha256 pinned digest to be rejected")
+	}
+	if !strings.Contains(err.Error(), "sha256") {
+		t.Errorf("error %q should name the sha256 constraint", err.Error())
+	}
+}
+
+func TestImagePinnedByDigest(t *testing.T) {
+	cases := []struct {
+		image string
+		want  bool
+	}{
+		{"busybox@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", true},
+		{"ghcr.io/acme/router:v1@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", true},
+		{"ghcr.io/acme/router:v1", false},
+		{"busybox", false},
+		{"busybox:latest", false},
+		{"not a ref", false},
+	}
+	for _, c := range cases {
+		if got := imagePinnedByDigest(c.image); got != c.want {
+			t.Errorf("imagePinnedByDigest(%q) = %v, want %v", c.image, got, c.want)
+		}
+	}
 }
 
 func TestCheckImagePullSecret(t *testing.T) {

@@ -326,24 +326,25 @@ already deleted. See [`kata.md`](kata.md#uninstalling).
 ## Quick reference
 
 ```bash
-# --engine derives tls-lb's mesh-wrapped upstream for every flow below
-# (see operator.md, "Engine upstream preset").
+# --upstream (with the port on its --workload-ref) points tls-lb at an adopted
+# workload's mesh-wrapped headless Service for every flow below
+# (see operator.md, "tls-lb upstream").
 
 # Base — normal cluster, host-side components, no confidentiality.
-c8s install --engine vllm --engine-workload-id <cw-id>
+c8s install --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm
 
 # Kata (enforcing): every workload pod becomes a kata VM, non-kata pods
 # rejected, host-side mesh/attestation/image-policy replaced by their
 # in-guest counterparts.
-c8s install --kata --engine vllm --engine-workload-id <cw-id>
+c8s install --kata --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm
 
 # RKE2 host — the distro is detected from the cluster, no extra flag.
-c8s install --kata --engine vllm --engine-workload-id <cw-id>
+c8s install --kata --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm
 
 # Single-node / local build (no registry artifact, don't starve the one node).
 # The puller + node-taint are on by default; switch them off via a values file:
 #   kata: {guestImage: {enabled: false}, nodeTaint: {enabled: false}}
-c8s install --kata --engine vllm --engine-workload-id <cw-id> -f single-node.values.yaml
+c8s install --kata --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm -f single-node.values.yaml
 
 # Uninstall: helm uninstall + sweep the kata artifacts off every node.
 c8s uninstall

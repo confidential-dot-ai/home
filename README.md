@@ -107,8 +107,12 @@ IMAGE_PULL_SECRET=<ghcr-token> NAMESPACE=c8s-system ./scripts/deploy-image-pull-
 
 # 3. THEN install, referencing the Secret by name.
 c8s install --namespace c8s-system --image-pull-secret ghcr-pull-secret \
-  --engine vllm --engine-workload-id <cw-id>
+  --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm
 ```
+
+For existing workloads, `c8s install --workload-ref <cw-id>=<namespace>/<kind>/<name>`
+adopts them as CWs and resolves their images into the NRI bootstrap allowlist.
+See [existing workload adoption](docs/operator.md#existing-workload-adoption).
 
 The chart wires the Secret into every component's `imagePullSecrets`
 (kubelet pulls, and under `--kata` the kata-image-puller's oras pull too), so

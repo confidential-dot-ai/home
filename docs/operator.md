@@ -99,12 +99,42 @@ webhook, attestation-api, and CDS. It does not mutate
 application workloads until those workloads opt in with
 `confidential.ai/cw`.
 
-Install with the CLI. `--engine` derives tls-lb's mesh-wrapped upstream from
-the inference workload's `confidential.ai/cw` id:
+Install with the CLI. Adopt a running workload as a CW and front it behind
+tls-lb with `--upstream` (see [Existing workload adoption](#existing-workload-adoption)
+and [tls-lb upstream](#tls-lb-upstream)):
 
 ```bash
-c8s install --engine vllm --engine-workload-id <cw-id>
+c8s install \
+  --workload-ref vllm=vllm/deployment/serving:8000 \
+  --upstream vllm
 ```
+
+### Existing workload adoption
+
+If vLLM is already deployed, `install` can adopt the router as one CW and the
+serving engine as another, giving each its own confidential workload identity
+without any GitOps overlay wiring:
+
+```bash
+c8s install \
+  --workload-ref vllm-router=vllm/deployment/vllm-deployment-router:8000 \
+  --workload-ref vllm-engine=vllm/deployment/<serving-engine-deployment> \
+  --upstream vllm-router
+```
+
+The ref syntax is `<cw-id>=<namespace>/<kind>/<name>[:<port>]`, where kind is any
+resource exposing a pod template at `spec.template` (`deployment`,
+`statefulset`, `daemonset`, or an operator CRD such as `<kind>.<group>`); the
+optional `:<port>` is the tls-lb upstream port, needed on the ref `--upstream`
+selects. After Helm reports the c8s release ready, the CLI patches each workload
+pod template with `confidential.ai/cw: <id>`. Those rollouts go through the
+webhook, and the workload-service reconciler creates the `c8s-<id>` headless
+Services. `--upstream vllm-router` points tls-lb at
+`c8s-vllm-router.vllm.svc.cluster.local:8000` (its `<cw-id>` must be one of the
+adopted refs, carrying a `:<port>`). With `--resolve-digests=true`, install resolves adopted workload
+images into `nriImagePolicy.bootstrapAllowlist.digests` so image admission (the
+host NRI plugin, or the in-guest policy-monitor under `--kata`) allows those
+rollouts.
 
 `c8s install --install-crds=false` passes Helm's `--skip-crds`; CRDs are
 advisory and not required for pod injection. That path also disables the
@@ -390,105 +420,76 @@ webhook rejects incomplete reload-watch or discovery annotation sets during pod
 admission instead of admitting a pod that cannot serve its configured
 certificate/discovery path.
 
-## Engine upstream preset
+## tls-lb upstream
 
 tls-lb proxies its catch-all route to one upstream, `tlsLb.upstream.address`,
 an opaque `host:port` the chart never interprets. For a workload run as the
 operator-managed headless Service (annotated `confidential.ai/cw`, see
 [Injection contract](#injection-contract)), that upstream must be the headless
 Service's own DNS name and container port,
-`c8s-<workloadId>.<namespace>.svc.cluster.local:<port>`. Headless DNS resolves
+`c8s-<id>.<namespace>.svc.cluster.local:<port>`. Headless DNS resolves
 to pod IPs, which the node mesh intercepts to wrap the hop in attested mTLS; a
 regular Service VIP it cannot intercept, so dialing one leaves the hop in
 plaintext. Dialing the pod IP also bypasses the Service's port remapping, which
 is why the explicit container port is required.
 
-The `engine` preset derives that string for known inference engines so you do
-not hand-write it or look up the port:
-
-```yaml
-engine:
-  name: sglang        # "" | vllm | sglang
-  workloadId: infer   # the confidential.ai/cw id on the engine pod
-  namespace: ""       # where the engine runs; empty = release namespace
-```
-
-`engine.presets` maps each engine to its default server port and is the single
-source of truth (both the resolver and validation read it); adding an engine is
-one edit there:
-
-```yaml
-engine:
-  presets:
-    vllm: "8000"
-    sglang: "30000"
-```
-
-With `engine.name=sglang` and `engine.workloadId=infer` in namespace
-`c8s-system`, tls-lb's upstream resolves to
-`c8s-infer.c8s-system.svc.cluster.local:30000` (`c8s install` plumbs these as
-`--engine sglang --engine-workload-id infer`, plus `--engine-namespace` when
-the workload runs elsewhere). Leaving `engine.name` empty preserves
-`tlsLb.upstream.address` verbatim, so an upstream that is not a c8s-managed
-workload (an existing Service, an external address) is set directly, but the
-chart cannot verify such an upstream resolves to pod IPs the mesh intercepts,
-so a manual address must be `protocol: https` with `tls.verify: true`: an
-upstream that terminates and authenticates TLS itself (app-TLS). There is no
-plaintext-to-unattested escape hatch and no default upstream.
-
-Leaving both unset is legal: tls-lb installs and serves its cert, discovery,
-and any explicit routes with **no catch-all** `location /` until an upstream is
-wired. This is the install-then-attach flow: `c8s install` stands up the front
-door, and the operator attaches inference later by setting the engine preset
-(or a verified-https address). An unmatched request gets nginx's default 404
-until then.
+`c8s install --upstream <cw-id>` builds that string for you from an adopted
+workload: `<cw-id>` must be one of your `--workload-ref` ids and that ref must
+carry a `:<port>`, and install sets `tlsLb.upstream.address` to
+`c8s-<id>.<ns>.svc.cluster.local:<port>` (the ref's namespace and port). The
+chart recognizes that headless-Service address shape as mesh-wrapped and admits
+the plaintext http hop; any other address must be app-TLS (see below):
 
 ```bash
-helm template c8s internal/helmchart/c8s \
-  --set-string engine.name=sglang \
-  --set-string engine.workloadId=infer \
-  ...
+c8s install --namespace c8s-system \
+  --workload-ref infer=vllm/deployment/serving:8000 --wait \
+  --upstream infer
+# tlsLb.upstream.address = c8s-infer.vllm.svc.cluster.local:8000
 ```
+
+Without `--upstream`, `tlsLb.upstream.address` is used as-is: an upstream that
+is not a c8s-managed workload (an existing Service, an external address). The
+chart cannot verify a manual address resolves to pod IPs the mesh intercepts,
+so it must be `protocol: https` with `tls.verify: true`: an upstream that
+terminates and authenticates TLS itself (app-TLS). There is no
+plaintext-to-unattested escape hatch and no default upstream.
+
+Leaving the upstream unset is legal: tls-lb installs and serves its cert,
+discovery, and any explicit routes with **no catch-all** `location /` until one
+is wired. This is the install-then-attach flow: `c8s install` stands up the
+front door, and the operator attaches the workload later (`--upstream`, or a
+verified-https `tlsLb.upstream.address` via `-f`). An unmatched request gets
+nginx's default 404 until then.
 
 The chart rejects, at render time, with stable `kind=` markers (the same the
 chart tests assert on):
 
-- `tlslb_unsecured_upstream`: `tlsLb.upstream.address` is set to a plaintext
-  http backend, or https without `tls.verify=true`. Only a verified-https
-  (app-TLS) manual address is admitted; there is no acknowledgment to override
-  this. To reach a confidential workload, use `engine.name` +
-  `engine.workloadId` instead: pointing the address at a Service VIP fronting
-  cw pods is unmeshed, and the always-on cw guard drops it, so the hop fails
-  closed rather than running plaintext.
-- `engine_upstream_conflict`: both `engine.name` and a custom
-  `tlsLb.upstream.address` are set. They are two ways to say the same thing;
-  set one.
-- `engine_https_upstream`: `engine.name` is set with
-  `tlsLb.upstream.protocol=https`. The derived headless-Service hop is
+- `tlslb_unsecured_upstream`: a `tlsLb.upstream.address` that is not a
+  `c8s-<id>.<ns>.svc.cluster.local` headless-Service address is a plaintext http
+  backend, or https without `tls.verify=true`. Only a verified-https (app-TLS)
+  manual address is admitted; there is no acknowledgment to override this. To
+  reach a confidential workload, adopt it with `--workload-ref` and pass
+  `--upstream`: pointing a manual address at a Service VIP fronting cw pods is
+  unmeshed, and the always-on cw guard drops it, so the hop fails closed rather
+  than running plaintext.
+- `workload_https_upstream`: the address is a `c8s-<id>` headless Service (a
+  mesh-wrapped upstream) with `tlsLb.upstream.protocol=https`. That hop is
   plaintext at the app layer (the mesh wraps it in attested mTLS), so an https
-  protocol could only fail at runtime.
-- `engine_missing_workload_id`: `engine.name` is set but `engine.workloadId` is
-  empty.
-- `engine_invalid_workload_id`: `c8s-<workloadId>` is not a DNS-1035 label
-  (start with a letter, then `[a-z0-9-]`, end alphanumeric; the `c8s-` prefix
-  caps `workloadId` at 59 chars), so the operator would refuse to mint the
-  Service and tls-lb would dial a name that resolves to nothing. The rule
-  mirrors `webhook.WorkloadServiceName`.
-- `unknown_engine`: `engine.name` is not a key of `engine.presets`.
+  protocol could only fail at runtime; use http for a mesh-wrapped upstream.
 
 The same secured-backend rule applies to every `tlsLb.routes[].backend`: it
 must use `protocol: https` with `tls.verify: true` (app-TLS). A plaintext http
 or unverified-https route backend fails the render (`tlslb_unsecured_route`);
 there is no acknowledgment to override it. Routes have no default backend, so
 this only affects routes you configure. A confidential workload is reached via
-the engine preset, not a route.
+`tlsLb.upstream` (the `--upstream` flow), not a route.
 
-The engine path's mesh guarantee holds only when `engine.workloadId` names a
-real cw workload: the chart validates the id is a DNS-1035 label but cannot
-confirm, at render time, that `c8s-<workloadId>` fronts attested cw pods. A
-wrong id derives a headless Service that resolves to nothing (tls-lb has no
-backend) rather than a plaintext leak; the runtime boundary that a peer is a
-genuine cw pod is the mesh's always-on cw inbound guard, not this render guard.
+The mesh guarantee holds only when `--upstream` names a real cw workload: the
+CLI checks the id is one of the adopted refs, but cannot confirm `c8s-<id>`
+fronts attested cw pods. A wrong id derives a headless Service that resolves to
+nothing (tls-lb has no backend) rather than a plaintext leak; the runtime
+boundary that a peer is a genuine cw pod is the mesh's always-on cw inbound
+guard, not this render guard.
 
 ## Certificate file permissions
 

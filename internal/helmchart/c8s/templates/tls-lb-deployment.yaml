@@ -7,7 +7,7 @@ Recreate, silently defeating the operator's opt-out. */ -}}
 {{- $defaultMeshCAPath := printf "%s/ca.pem" .Values.tlsLb.tlsMountPath -}}
 {{- $upstreamTrustedCAPath := default $defaultMeshCAPath .Values.tlsLb.upstream.tls.trustedCAPath -}}
 {{- $attestUsesHTTPSUpstream := and .Values.tlsLb.attest.enabled (eq .Values.tlsLb.upstream.protocol "https") -}}
-{{- $upstreamAddress := include "c8s.tlsLb.resolvedUpstreamAddress" . -}}
+{{- $upstreamAddress := .Values.tlsLb.upstream.address -}}
 {{- $attestUpstreamServerName := default (include "tls-lb.serverNameFromAddress" $upstreamAddress) .Values.tlsLb.upstream.tls.serverName -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -164,7 +164,7 @@ spec:
             # session key), so the client pins the mesh CA out of band instead.
             # Terminate over-encryption here and forward to the same workload
             # backend nginx proxies to. An http upstream is plaintext at the
-            # app layer; pointed at a headless Service (the engine preset),
+            # app layer; pointed at a headless Service (an adopted workload),
             # the node mesh wraps the pod-IP hop in attested mTLS. An https
             # upstream terminates TLS itself and gets the mTLS args below.
             - --upstream={{ .Values.tlsLb.upstream.protocol }}://{{ $upstreamAddress }}

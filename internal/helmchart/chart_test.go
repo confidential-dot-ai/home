@@ -1518,7 +1518,7 @@ func hasPullSecret(refs []corev1.LocalObjectReference, name string) bool {
 }
 
 func TestChartRendersTLSLBPublicTLSAndDiscovery(t *testing.T) {
-	out, err := helmTemplate(t, noEngineArgs(
+	out, err := helmTemplate(t, noUpstreamArgs(
 		"--set-string", "tlsLb.publicTLS.secretName=tls-lb-public-tls",
 		"--set-string", "tlsLb.publicTLS.mountPath=/edge-tls",
 		"--set-string", "tlsLb.publicTLS.certKey=public.crt",
@@ -1623,7 +1623,7 @@ func TestChartRendersTLSLBAttestSidecar(t *testing.T) {
 		"--port=8800",
 		"--generation=milan",
 		"--attestation-api-url=http://",
-		// The baseline engine preset derives a plain-HTTP workload upstream;
+		// The baseline mesh-wrapped upstream is a plain-HTTP workload upstream;
 		// the mTLS args render only for an https upstream.
 		"--upstream=http://c8s-infer.c8s-system.svc.cluster.local:8000",
 	} {
@@ -1662,7 +1662,7 @@ func TestChartRendersTLSLBAttestSidecar(t *testing.T) {
 	// An https upstream: the sidecar presents the CDS client cert and
 	// verifies the upstream against the CA chain get-cert writes to
 	// /tls/cert.pem, mirroring the nginx proxy_ssl_* config.
-	httpsOut, err := helmTemplate(t, noEngineArgs(
+	httpsOut, err := helmTemplate(t, noUpstreamArgs(
 		"--set", "tlsLb.attest.enabled=true",
 		"--set-string", "tlsLb.upstream.address=my-backend.other-ns.svc:8443",
 		"--set", "tlsLb.upstream.protocol=https",
@@ -1793,10 +1793,10 @@ func TestTLSLBProbesAvoidMTLSHandshakeUnderKata(t *testing.T) {
 // layer (the node mesh wraps pod-IP hops in attested mTLS), with no
 // proxy_ssl_* directives on the default route. The upstream is dialed via a
 // variable with a resolver so nginx re-resolves per DNS TTL: a headless
-// Service (the engine preset) returns pod IPs that change on pod churn, and
+// Service (an adopted workload) returns pod IPs that change on pod churn, and
 // a static upstream block would pin the startup-time IPs and 502 until the
 // next config reload.
-func TestChartTLSLBEnginePresetUpstreamIsWorkloadDirect(t *testing.T) {
+func TestChartTLSLBMeshWrappedUpstreamIsWorkloadDirect(t *testing.T) {
 	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
@@ -1804,7 +1804,7 @@ func TestChartTLSLBEnginePresetUpstreamIsWorkloadDirect(t *testing.T) {
 	cfg := renderedTLSLBNginxConf(t, out)
 	for _, want := range []string{
 		"resolver kube-dns.kube-system.svc.cluster.local;",
-		// The baseline engine preset derives the operator-managed headless
+		// The baseline mesh-wrapped upstream is the operator-managed headless
 		// Service, so the pod-IP hop is mesh-wrapped.
 		"set $backend_addr c8s-infer.c8s-system.svc.cluster.local:8000;",
 		"proxy_pass http://$backend_addr;",
@@ -3243,11 +3243,11 @@ func helmTemplate(t *testing.T, args ...string) (string, error) {
 		"--set", "ratlsMesh.image.tag=dev",
 		"--set", "nriImagePolicy.image.tag=dev",
 		// tls-lb has no default upstream (a silently-plaintext VIP was
-		// removed); the engine preset is the representative mesh-wrapped
-		// baseline. Tests for the manual-upstream paths clear it via
-		// noEngineArgs.
-		"--set-string", "engine.name=vllm",
-		"--set-string", "engine.workloadId=infer",
+		// removed); a c8s-<id> headless-Service address (what `c8s install
+		// --upstream` derives) is the representative mesh-wrapped baseline, and
+		// the chart recognizes that shape as mesh-wrapped. Tests for the
+		// manual-upstream paths clear it via noUpstreamArgs.
+		"--set-string", "tlsLb.upstream.address=c8s-infer.c8s-system.svc.cluster.local:8000",
 		"--set", "nriImagePolicy.image.digest=" + baseNRIDigest,
 		// The fail-closed default (this PR) activates the
 		// uncovered_component_digest guard: every digest-pinned component must be
@@ -3265,10 +3265,10 @@ func helmTemplate(t *testing.T, args ...string) (string, error) {
 	return string(out), err
 }
 
-// noEngineArgs clears the engine preset that helmTemplate pins by default,
-// for tests exercising the manual tlsLb.upstream paths.
-func noEngineArgs(args ...string) []string {
-	return append([]string{"--set-string", "engine.name=", "--set-string", "engine.workloadId="}, args...)
+// noUpstreamArgs clears the mesh-wrapped upstream that helmTemplate pins by
+// default, for tests exercising the manual tlsLb.upstream paths.
+func noUpstreamArgs(args ...string) []string {
+	return append([]string{"--set-string", "tlsLb.upstream.address="}, args...)
 }
 
 func renderedValue(t *testing.T, manifest, key string) string {
@@ -3698,10 +3698,10 @@ func TestChartNoTeeProxyRemnants(t *testing.T) {
 // same charset guard every routes[].backend.address gets: an address with
 // nginx metacharacters must fail the render, not corrupt the config.
 func TestChartRejectsMalformedUpstreamAddress(t *testing.T) {
-	// Clear the engine baseline and secure the manual upstream (https + verify)
+	// Clear the workload baseline and secure the manual upstream (https + verify)
 	// so the render reaches the address-format check rather than tripping the
-	// engine-conflict / unsecured-upstream guards first.
-	out, err := helmTemplate(t, noEngineArgs(
+	// workload-conflict / unsecured-upstream guards first.
+	out, err := helmTemplate(t, noUpstreamArgs(
 		"--set-string", "tlsLb.upstream.address=bad addr;{}",
 		"--set-string", "tlsLb.upstream.protocol=https",
 		"--set", "tlsLb.upstream.tls.verify=true")...)
@@ -3993,8 +3993,8 @@ func Example_tlsLBConfig() {
 	//
 	//     # The catch-all upstream is dialed via a variable (see location /), so
 	//     # nginx re-resolves it here at request time per record TTL. A static
-	//     # upstream block would pin the pod IPs a headless-Service name (the
-	//     # engine preset) resolved to at startup and 502 after pod churn.
+	//     # upstream block would pin the pod IPs a headless-Service name (an
+	//     # adopted workload) resolved to at startup and 502 after pod churn.
 	//     resolver kube-dns.kube-system.svc.cluster.local;
 	//     upstream route_0 {
 	//         server c8s-cds.c8s-system.svc:8443;
@@ -4396,8 +4396,8 @@ func TestChartWiresCDSAllowlistSeedFlagAndVolume(t *testing.T) {
 	}
 }
 
-// With nriImagePolicy disabled there is no floor to seed and no image-policy to
-// admit CDS, so the seed wiring must drop out entirely.
+// With host NRI disabled and no kata, nothing consumes CDS's served allowlist,
+// so the seed wiring must drop out entirely.
 func TestChartOmitsCDSSeedWhenImagePolicyDisabled(t *testing.T) {
 	out, err := helmTemplate(t, "--set", "nriImagePolicy.enabled=false")
 	if err != nil {
@@ -4408,6 +4408,35 @@ func TestChartOmitsCDSSeedWhenImagePolicyDisabled(t *testing.T) {
 	}
 	cds := renderedDeploymentContainer(t, out, "c8s-cds", "cds")
 	assertContainerNoArgPrefix(t, "cds", cds.Args, "--allowlist-seed")
+}
+
+// Under kata the host NRI plugin is off, but admission is the in-guest
+// policy-monitor fed from CDS's served allowlist, so the seed must still render.
+// Otherwise adopted --workload-ref digests (in bootstrapAllowlist.digests) never
+// reach CDS and the in-guest monitor denies those images.
+func TestChartRendersCDSSeedUnderKata(t *testing.T) {
+	const (
+		wlDigest = "sha256:00000000000000000000000000000000000000000000000000000000000000a1"
+		wlRepo   = "example.test/vllm-router"
+	)
+	out, err := helmTemplateKata(t,
+		"--set-string", "nriImagePolicy.bootstrapAllowlist.digests."+wlDigest+"="+wlRepo+"@"+wlDigest,
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+	seed, err := pkgallowlist.ParseJSON([]byte(cm.Data["allowlist-seed.json"]))
+	if err != nil {
+		t.Fatalf("seed JSON does not parse: %v\n%s", err, cm.Data["allowlist-seed.json"])
+	}
+	if got, want := seed.Digests[wlDigest], wlRepo+"@"+wlDigest; got != want {
+		t.Errorf("adopted workload digest not in kata seed = %q, want %q\nseed: %v", got, want, seed.Digests)
+	}
+	cds := renderedDeploymentContainer(t, out, "c8s-cds", "cds")
+	if !slices.Contains(cds.Args, "--allowlist-seed=/etc/cds/allowlist-seed.json") {
+		t.Errorf("cds missing --allowlist-seed flag under kata\nargs: %v", cds.Args)
+	}
 }
 
 // The CDS image must be admittable by digest in the floor/seed; without
@@ -4835,15 +4864,15 @@ func tlsLbUpstreamAddress(t *testing.T, manifest string) string {
 
 // TestChartTLSLBUpstreamChoice: there is no default upstream. An unset upstream
 // is a legal install-then-attach state (tls-lb serves with no catch-all); when
-// an upstream IS set without the engine preset it must be https with
-// tls.verify=true (app-TLS) — a plaintext http address or unverified https
+// an upstream IS set that is not a c8s-<id> headless Service it must be https
+// with tls.verify=true (app-TLS) — a plaintext http address or unverified https
 // fails instead of shipping a silently-plaintext hop.
 func TestChartTLSLBUpstreamChoice(t *testing.T) {
-	// No engine and no upstream renders a healthy front door with NO catch-all:
-	// the operator attaches inference later by setting the engine preset. The
-	// cert, discovery, and /healthz still render; only location / is withheld.
+	// No upstream renders a healthy front door with NO catch-all: the operator
+	// attaches a workload later via --upstream. The cert, discovery, and
+	// /healthz still render; only location / is withheld.
 	t.Run("no-upstream-renders-without-catch-all", func(t *testing.T) {
-		out, err := helmTemplate(t, noEngineArgs()...)
+		out, err := helmTemplate(t, noUpstreamArgs()...)
 		if err != nil {
 			t.Fatalf("helm template: %v\n%s", err, out)
 		}
@@ -4859,7 +4888,7 @@ func TestChartTLSLBUpstreamChoice(t *testing.T) {
 	// authenticates TLS itself: that hop is app-TLS, the only manual-address
 	// shape the guard admits, and the address passes through verbatim.
 	t.Run("verified-https-upstream-passes-verbatim", func(t *testing.T) {
-		out, err := helmTemplate(t, noEngineArgs(
+		out, err := helmTemplate(t, noUpstreamArgs(
 			"--set-string", "tlsLb.upstream.address=my-backend.other-ns.svc:8443",
 			"--set", "tlsLb.upstream.protocol=https")...)
 		if err != nil {
@@ -4878,8 +4907,8 @@ func TestChartTLSLBUpstreamChoice(t *testing.T) {
 		name string
 		args []string
 	}{
-		{"tlslb-disabled-needs-no-upstream", noEngineArgs("--set", "tlsLb.enabled=false")},
-		{"tlslb-disabled-ignores-leftover-upstream", noEngineArgs(
+		{"tlslb-disabled-needs-no-upstream", noUpstreamArgs("--set", "tlsLb.enabled=false")},
+		{"tlslb-disabled-ignores-leftover-upstream", noUpstreamArgs(
 			"--set", "tlsLb.enabled=false",
 			"--set-string", "tlsLb.upstream.address=my-router.ns.svc:9000")},
 	} {
@@ -4897,109 +4926,46 @@ func TestChartTLSLBUpstreamChoice(t *testing.T) {
 	}
 }
 
-func TestChartEnginePresetDerivesUpstream(t *testing.T) {
-	for _, tt := range []struct {
-		name string
-		port string
-	}{
-		{"vllm", "8000"},
-		{"sglang", "30000"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			out, err := helmTemplate(t,
-				"--set-string", "engine.name="+tt.name,
-				"--set-string", "engine.workloadId=infer",
-			)
-			if err != nil {
-				t.Fatalf("helm template: %v\n%s", err, out)
-			}
-			// Derives the operator-managed headless Service in the release
-			// namespace (c8s-system), with the preset's port appended.
-			want := "c8s-infer.c8s-system.svc.cluster.local:" + tt.port
-			if got := tlsLbUpstreamAddress(t, out); got != want {
-				t.Fatalf("%s upstream = %q, want %q", tt.name, got, want)
-			}
-		})
-	}
-}
-
-func TestChartEnginePresetHonorsNamespace(t *testing.T) {
-	out, err := helmTemplate(t,
-		"--set-string", "engine.name=sglang",
-		"--set-string", "engine.workloadId=infer",
-		"--set-string", "engine.namespace=workloads",
-	)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	if got, want := tlsLbUpstreamAddress(t, out), "c8s-infer.workloads.svc.cluster.local:30000"; got != want {
-		t.Fatalf("upstream = %q, want %q", got, want)
-	}
-}
-
-func TestChartEnginePresetValidation(t *testing.T) {
+func TestChartUpstreamValidation(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		args []string
 		kind string
 	}{
 		{
-			name: "unknown-engine",
-			args: []string{"--set-string", "engine.name=tgi", "--set-string", "engine.workloadId=infer"},
-			kind: "unknown_engine",
-		},
-		{
-			name: "missing-workload-id",
-			args: []string{"--set-string", "engine.name=sglang", "--set-string", "engine.workloadId="},
-			kind: "engine_missing_workload_id",
-		},
-		{
-			name: "invalid-workload-id",
-			args: []string{"--set-string", "engine.name=sglang", "--set-string", "engine.workloadId=Bad_ID"},
-			kind: "engine_invalid_workload_id",
-		},
-		{
-			name: "invalid-namespace",
+			// A c8s-<id> headless-Service address is recognized as mesh-wrapped
+			// (plaintext http, the mesh secures it), so https can only fail at runtime.
+			name: "mesh-wrapped-https",
 			args: []string{
-				"--set-string", "engine.name=sglang",
-				"--set-string", "engine.workloadId=infer",
-				"--set-string", "engine.namespace=bad_ns",
-			},
-			kind: "engine_invalid_namespace",
-		},
-		{
-			name: "upstream-conflict",
-			args: []string{
-				"--set-string", "engine.name=sglang",
-				"--set-string", "engine.workloadId=infer",
-				"--set-string", "tlsLb.upstream.address=my-router.ns.svc:9000",
-			},
-			kind: "engine_upstream_conflict",
-		},
-		{
-			name: "https-upstream",
-			args: []string{
-				"--set-string", "engine.name=sglang",
-				"--set-string", "engine.workloadId=infer",
+				"--set-string", "tlsLb.upstream.address=c8s-infer.c8s-system.svc.cluster.local:8000",
 				"--set", "tlsLb.upstream.protocol=https",
 			},
-			kind: "engine_https_upstream",
+			kind: "workload_https_upstream",
 		},
 		{
 			// A plaintext http manual upstream cannot render: there is no
 			// acknowledgment, only https + verify is admitted.
 			name: "http-upstream",
-			args: noEngineArgs("--set-string", "tlsLb.upstream.address=my-router.ns.svc:9000"),
+			args: noUpstreamArgs("--set-string", "tlsLb.upstream.address=my-router.ns.svc:9000"),
 			kind: "tlslb_unsecured_upstream",
 		},
 		{
 			// https alone does not secure the hop: verify=false is an
 			// encrypted-but-unauthenticated backend, rejected like http.
 			name: "unverified-https-upstream",
-			args: noEngineArgs(
+			args: noUpstreamArgs(
 				"--set-string", "tlsLb.upstream.address=my-router.ns.svc:8443",
 				"--set", "tlsLb.upstream.protocol=https",
 				"--set", "tlsLb.upstream.tls.verify=false"),
+			kind: "tlslb_unsecured_upstream",
+		},
+		{
+			// A near-miss of the c8s-<id>.<ns>.svc.cluster.local shape (here the
+			// short .svc form) is NOT recognized as mesh-wrapped, so plaintext
+			// http fails closed: only the exact headless-Service FQDN gets the
+			// plaintext pass. Guards the shape regex against being too loose.
+			name: "c8s-shape-short-svc-not-meshwrapped",
+			args: noUpstreamArgs("--set-string", "tlsLb.upstream.address=c8s-infer.vllm.svc:8000"),
 			kind: "tlslb_unsecured_upstream",
 		},
 	} {

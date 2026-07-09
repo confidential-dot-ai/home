@@ -547,6 +547,18 @@ cache_max_entries = 1024
 {{ dict "version" "1" "digests" (include "c8s.imageAllowlist" . | fromJson) | toJson }}
 {{- end -}}
 
+{{/*
+  c8s.serveAllowlistSeed is true when CDS should render the --allowlist-seed
+  ConfigMap/flag/mount. Two admission shapes consume CDS's served allowlist and
+  so need the seed: the host NRI plugin (nriImagePolicy.enabled), and the
+  in-guest policy-monitor baked into the kata-guest-base image (kata.enabled),
+  where the host plugin is off. Gating on nriImagePolicy.enabled alone dropped
+  the seed under kata, so adopted --workload-ref digests never reached CDS.
+*/}}
+{{- define "c8s.serveAllowlistSeed" -}}
+{{- or .Values.nriImagePolicy.enabled .Values.kata.enabled -}}
+{{- end -}}
+
 {{- define "c8s.commonLabels" -}}
 app.kubernetes.io/name: c8s-operator
 app.kubernetes.io/instance: {{ .Release.Name }}

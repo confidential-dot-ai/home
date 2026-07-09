@@ -5,7 +5,7 @@
 {{- include "tls-lb.validateProtocol" (required "protocol must be http or https" .Values.tlsLb.upstream.protocol) -}}
 {{- $defaultMeshCAPath := printf "%s/ca.pem" .Values.tlsLb.tlsMountPath -}}
 {{- $upstreamTrustedCAPath := default $defaultMeshCAPath .Values.tlsLb.upstream.tls.trustedCAPath -}}
-{{- $upstreamAddress := include "c8s.tlsLb.resolvedUpstreamAddress" . | trim -}}
+{{- $upstreamAddress := .Values.tlsLb.upstream.address | trim -}}
 {{- /*
   No upstream is a legal state: tls-lb serves its cert and explicit routes with
   no catch-all until one is wired (an install-then-attach-inference flow). The
@@ -58,8 +58,8 @@ data:
 
         # The catch-all upstream is dialed via a variable (see location /), so
         # nginx re-resolves it here at request time per record TTL. A static
-        # upstream block would pin the pod IPs a headless-Service name (the
-        # engine preset) resolved to at startup and 502 after pod churn.
+        # upstream block would pin the pod IPs a headless-Service name (an
+        # adopted workload) resolved to at startup and 502 after pod churn.
         resolver {{ .Values.tlsLb.nginx.resolver }};
 
         {{- range $i, $route := .Values.tlsLb.routes }}

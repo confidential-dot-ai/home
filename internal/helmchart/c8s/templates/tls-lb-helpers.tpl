@@ -109,7 +109,7 @@ serverName, trustedCAPath, label.
 tls-lb.requireSecuredBackend fails the render on a proxied backend hop that is
 not authenticated: plaintext http, or https without tls.verify. A confidential
 platform has exactly two safe paths to a backend and this helper admits only
-them: the engine preset (a mesh-wrapped headless Service, validated separately),
+them: an adopted workload (a mesh-wrapped headless Service, validated separately),
 or an https backend that terminates and verifies TLS itself (app-TLS). There is
 no plaintext-to-unattested escape hatch. Shared by the catch-all upstream and
 every route backend so the invariant lives in one place.

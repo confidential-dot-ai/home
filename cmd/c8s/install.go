@@ -13,16 +13,22 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/distribution/reference"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/confidential-dot-ai/c8s/internal/helmchart"
 	"github.com/confidential-dot-ai/c8s/internal/version"
+	"github.com/confidential-dot-ai/c8s/internal/webhook"
+	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
 var (
@@ -49,9 +55,8 @@ var (
 	installOperatorKeys     string
 	installForce            bool
 
-	installEngine           string
-	installEngineWorkloadID string
-	installEngineNamespace  string
+	installUpstream     string
+	installWorkloadRefs []string
 
 	installResolveDigests bool
 )
@@ -62,6 +67,8 @@ var (
 const (
 	flagCvmMode          = "cvm-mode"
 	flagHardwarePlatform = "hardware-platform"
+	flagWorkloadRef      = "workload-ref"
+	flagUpstream         = "upstream"
 )
 
 // c8sComponent maps a chart image to the helm value keys --resolve-digests
@@ -424,10 +431,32 @@ the kata-guest-base artifact (override: kata.guestImage.pullerAuthSecret).
 This is the cluster-side (kubelet) credential; digest resolution runs locally
 via crane and uses your local docker login.
 
+To adopt already-running workloads, pass --workload-ref <id>=<namespace>/<kind>/<name>[:<port>].
+The release namespace is excluded from workload injection, so adopted workloads
+must live in a separate namespace. After the chart is ready, install patches each
+workload's pod template with confidential.ai/cw=<id>; the rollout then goes
+through the c8s webhook and the operator provisions the c8s-<id> headless Service.
+To front one of them behind tls-lb, give that ref a :<port> and pass --upstream <id>;
+tls-lb routes its catch-all to that adopted workload's headless Service
+(c8s-<id>.<ns>.svc.cluster.local:<port>). With --resolve-digests, install also
+resolves adopted workload images into nriImagePolicy.bootstrapAllowlist.digests
+so image admission (the host NRI plugin, or the in-guest policy-monitor under
+--kata) allows those rollouts.
+
 Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 --resolve-digests=false.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := validateKataDebugFlags(installKata, installKataDebug); err != nil {
+			return err
+		}
+		adoptions, err := collectWorkloadAdoptions(installWorkloadRefs)
+		if err != nil {
+			return err
+		}
+		if err := validateWorkloadAdoptionFlags(installNamespace, adoptions, installWait); err != nil {
+			return err
+		}
+		if _, err := upstreamAddress(installUpstream, adoptions); err != nil {
 			return err
 		}
 		if warn, err := operatorKeysPreflight(installOperatorKeys, installValues, installForce); err != nil {
@@ -440,6 +469,19 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 		}
 		if _, err := exec.LookPath("kubectl"); err != nil {
 			return fmt.Errorf("kubectl CLI not found on PATH: %w", err)
+		}
+		// Always read the adopted workloads, even when --resolve-digests=false
+		// discards workloadImages: this is the only pre-install existence check,
+		// so it fails fast before any helm install or post-install patch runs.
+		// Don't gate it on installResolveDigests.
+		workloadImages := []string{}
+		for _, adoption := range adoptions {
+			images, err := adoptedWorkloadImages(cmd.Context(), adoption.ref)
+			if err != nil {
+				return err
+			}
+			reportAdoptedImages(adoption, images)
+			workloadImages = append(workloadImages, images...)
 		}
 
 		dir, err := extractChart()
@@ -482,6 +524,12 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 		setArgs, err := buildValueArgs(cmd.Context(), cmd, components, imageTag, distro, appendResolvedDigestArgs)
 		if err != nil {
 			return err
+		}
+		if installResolveDigests {
+			setArgs, err = appendResolvedWorkloadImageArgs(cmd.Context(), setArgs, workloadImages)
+			if err != nil {
+				return err
+			}
 		}
 		computedValues, err := writeComputedValues(setArgs)
 		if err != nil {
@@ -566,6 +614,11 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 		hc.Stderr = os.Stderr
 		if err := hc.Run(); err != nil {
 			return fmt.Errorf("helm install failed: %w", err)
+		}
+		for _, adoption := range adoptions {
+			if err := patchAdoptedWorkload(cmd.Context(), adoption.ref, adoption.cwID); err != nil {
+				return err
+			}
 		}
 
 		return nil
@@ -983,22 +1036,330 @@ func appendSingleNodeInstallArgs(helmArgs []string, singleNode bool) []string {
 	)
 }
 
-// appendEngineInstallArgs emits the engine-preset values that derive tls-lb's
-// mesh-wrapped upstream. Empty values are not plumbed so an operator's -f (or
-// the chart's no-catch-all install-then-attach state) stands. The chart
-// validates the combinations (engine_missing_workload_id, unknown_engine, ...),
-// so no CLI-side checks here.
-func appendEngineInstallArgs(setArgs []string, engine, workloadID, namespace string) []string {
-	if engine != "" {
-		setArgs = append(setArgs, "--set-string", "engine.name="+engine)
+type workloadRef struct {
+	kind      string
+	name      string
+	namespace string
+	// port is the tls-lb upstream port from the ref's optional :<port> suffix,
+	// or 0 when absent. Only consumed for the ref --upstream selects.
+	port int
+}
+
+type workloadAdoption struct {
+	cwID string
+	ref  workloadRef
+}
+
+func validateWorkloadAdoptionFlags(releaseNamespace string, adoptions []workloadAdoption, wait bool) error {
+	if len(adoptions) == 0 {
+		return nil
 	}
-	if workloadID != "" {
-		setArgs = append(setArgs, "--set-string", "engine.workloadId="+workloadID)
+	for _, a := range adoptions {
+		if a.ref.namespace == releaseNamespace {
+			return fmt.Errorf("--%s cannot target the release namespace %q; that namespace is excluded from c8s workload injection", flagWorkloadRef, releaseNamespace)
+		}
 	}
-	if namespace != "" {
-		setArgs = append(setArgs, "--set-string", "engine.namespace="+namespace)
+	if !wait {
+		return fmt.Errorf("--%s requires --wait=true so the c8s webhook is ready before existing workloads roll", flagWorkloadRef)
 	}
-	return setArgs
+	return nil
+}
+
+// upstreamAddress derives tls-lb's upstream from --upstream (a cw id that must
+// name an adopted workload): the selected workload's headless-Service FQDN with
+// the port from that ref's :<port> suffix appended, so tls-lb dials the Service
+// the operator provisions. Empty --upstream yields "" (tlsLb.upstream.address is
+// used as-is).
+func upstreamAddress(upstream string, adoptions []workloadAdoption) (string, error) {
+	if upstream == "" {
+		return "", nil
+	}
+	for _, a := range adoptions {
+		if a.cwID == upstream {
+			if a.ref.port == 0 {
+				return "", fmt.Errorf("--%s %q names a --%s with no :<port>; add the upstream port to that ref (<cw-id>=<namespace>/<kind>/<name>:<port>)", flagUpstream, upstream, flagWorkloadRef)
+			}
+			return fmt.Sprintf("%s:%d", webhook.WorkloadServiceFQDN(upstream, a.ref.namespace), a.ref.port), nil
+		}
+	}
+	return "", fmt.Errorf("--%s %q must name a --%s confidential.ai/cw id so tls-lb routes to an adopted workload", flagUpstream, upstream, flagWorkloadRef)
+}
+
+func collectWorkloadAdoptions(rawRefs []string) ([]workloadAdoption, error) {
+	adoptions := make([]workloadAdoption, 0, len(rawRefs))
+	for _, raw := range rawRefs {
+		cwID, refText, err := parseWorkloadAdoptionRef(raw)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateWorkloadID(cwID, flagWorkloadRef); err != nil {
+			return nil, err
+		}
+		ref, err := parseWorkloadRef(refText, flagWorkloadRef)
+		if err != nil {
+			return nil, err
+		}
+		adoptions = append(adoptions, workloadAdoption{cwID: cwID, ref: ref})
+	}
+	return dedupeWorkloadAdoptions(adoptions)
+}
+
+func validateWorkloadID(cwID, flagName string) error {
+	if webhook.WorkloadServiceName(cwID) == "" {
+		return fmt.Errorf("--%s confidential.ai/cw id %q must make c8s-<id> a DNS-1035 label: start with a letter, then lowercase letters, digits, or '-', end alphanumeric, <=63 chars total", flagName, cwID)
+	}
+	return nil
+}
+
+func parseWorkloadAdoptionRef(raw string) (cwID, ref string, err error) {
+	cwID, ref, ok := strings.Cut(strings.TrimSpace(raw), "=")
+	if !ok || strings.TrimSpace(cwID) == "" || strings.TrimSpace(ref) == "" {
+		return "", "", errWorkloadRefFormat(flagWorkloadRef)
+	}
+	return strings.TrimSpace(cwID), strings.TrimSpace(ref), nil
+}
+
+func dedupeWorkloadAdoptions(in []workloadAdoption) ([]workloadAdoption, error) {
+	seenByWorkload := map[string]workloadAdoption{}
+	seenByCWID := map[string]string{}
+	out := make([]workloadAdoption, 0, len(in))
+	for _, a := range in {
+		key := a.ref.namespace + "/" + a.ref.kind + "/" + a.ref.name
+		if existing, ok := seenByWorkload[key]; ok {
+			if existing.cwID != a.cwID {
+				return nil, fmt.Errorf("workload %s is listed with conflicting confidential.ai/cw ids %q and %q", key, existing.cwID, a.cwID)
+			}
+			if existing.ref.port != a.ref.port {
+				return nil, fmt.Errorf("workload %s is listed with conflicting upstream ports %d and %d", key, existing.ref.port, a.ref.port)
+			}
+			continue
+		}
+		// One cw id names one confidential workload: it maps to a single
+		// c8s-<id> headless Service whose selector matches every pod carrying
+		// the label, so two different workloads under one id would silently
+		// share an identity and cross-wire that Service's endpoints.
+		if other, ok := seenByCWID[a.cwID]; ok {
+			return nil, fmt.Errorf("confidential.ai/cw id %q is assigned to two different workloads %s and %s", a.cwID, other, key)
+		}
+		seenByWorkload[key] = a
+		seenByCWID[a.cwID] = key
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+func parseWorkloadRef(ref, flagName string) (workloadRef, error) {
+	namespace, rest, ok := strings.Cut(ref, "/")
+	if !ok {
+		return workloadRef{}, errWorkloadRefFormat(flagName)
+	}
+	kind, namePort, ok := strings.Cut(rest, "/")
+	if !ok || namespace == "" || kind == "" || namePort == "" || strings.Contains(namePort, "/") {
+		return workloadRef{}, errWorkloadRefFormat(flagName)
+	}
+	// The <name> may carry an optional :<port> upstream suffix.
+	name, portText, hasPort := strings.Cut(namePort, ":")
+	if name == "" {
+		return workloadRef{}, errWorkloadRefFormat(flagName)
+	}
+	port := 0
+	if hasPort {
+		// strconv.Itoa round-trip rejects non-canonical spellings Atoi would
+		// otherwise accept (a leading '+' or sign, or leading zeros).
+		p, err := strconv.Atoi(portText)
+		if err != nil || strconv.Itoa(p) != portText || len(validation.IsValidPortNum(p)) > 0 {
+			return workloadRef{}, fmt.Errorf("--%s port %q in %q must be an integer in 1-65535", flagName, portText, ref)
+		}
+		port = p
+	}
+	// namespace and name are DNS-1123 subdomains; reject anything else here so a
+	// bad ref fails with a clear message instead of an opaque kubectl error.
+	if errs := validation.IsDNS1123Subdomain(namespace); len(errs) > 0 {
+		return workloadRef{}, fmt.Errorf("--%s namespace %q is not a valid DNS-1123 subdomain: %s", flagName, namespace, strings.Join(errs, "; "))
+	}
+	if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+		return workloadRef{}, fmt.Errorf("--%s workload name %q is not a valid DNS-1123 subdomain: %s", flagName, name, strings.Join(errs, "; "))
+	}
+	return workloadRef{kind: normalizeWorkloadKind(kind), name: name, namespace: namespace, port: port}, nil
+}
+
+func errWorkloadRefFormat(flagName string) error {
+	return fmt.Errorf("--%s must be <cw-id>=<namespace>/<kind>/<name>[:<port>] (kind is any resource exposing a pod template at spec.template, e.g. deployment, statefulset, daemonset, or an operator CRD; :<port> is the tls-lb upstream port, required on the --upstream ref)", flagName)
+}
+
+// normalizeWorkloadKind canonicalizes the built-in aliases and passes any other
+// kind through verbatim for kubectl to resolve. A dotted kind.group form is
+// accepted; parseWorkloadRef splits on the first '/', so the group survives.
+func normalizeWorkloadKind(kind string) string {
+	lower := strings.ToLower(kind)
+	switch lower {
+	case "deployment", "deploy", "deployments":
+		return "deployment"
+	case "statefulset", "sts", "statefulsets":
+		return "statefulset"
+	case "daemonset", "ds", "daemonsets":
+		return "daemonset"
+	}
+	return lower
+}
+
+func patchAdoptedWorkload(ctx context.Context, ref workloadRef, workloadID string) error {
+	patch, err := confidentialWorkloadPatch(workloadID)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "+ kubectl patch %s %s -n %s --type merge # set pod-template %s=%s\n", ref.kind, ref.name, ref.namespace, webhook.AnnotationWorkload, workloadID)
+	kc := exec.CommandContext(ctx, "kubectl", "patch", ref.kind, ref.name, "-n", ref.namespace, "--type", "merge", "-p", string(patch))
+	kc.Stdout = os.Stdout
+	kc.Stderr = os.Stderr
+	if err := kc.Run(); err != nil {
+		return fmt.Errorf("patch adopted workload %s/%s in namespace %s: %w", ref.kind, ref.name, ref.namespace, err)
+	}
+	return nil
+}
+
+func confidentialWorkloadPatch(workloadID string) ([]byte, error) {
+	patch := map[string]any{
+		"spec": map[string]any{
+			"template": map[string]any{
+				"metadata": map[string]any{
+					"annotations": map[string]string{
+						webhook.AnnotationWorkload: workloadID,
+					},
+				},
+			},
+		},
+	}
+	return json.Marshal(patch)
+}
+
+func adoptedWorkloadImages(ctx context.Context, ref workloadRef) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "kubectl", "get", ref.kind, ref.name, "-n", ref.namespace, "-o", "json").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("preflight adopted workload %s/%s in namespace %s: kubectl get failed: %w: %s", ref.kind, ref.name, ref.namespace, err, strings.TrimSpace(string(out)))
+	}
+	template, err := workloadPodTemplate(out)
+	if err != nil {
+		return nil, fmt.Errorf("read adopted workload %s/%s in namespace %s: %w", ref.kind, ref.name, ref.namespace, err)
+	}
+	return podTemplateImages(template), nil
+}
+
+// reportAdoptedImages prints the images c8s pins into the NRI allowlist for one
+// adopted workload, and flags each image referenced by a mutable tag rather than
+// a digest. A tag is a TOCTOU risk: the digest read here (and pinned) can differ
+// from what the operator's rollout actually pulls later. An unparseable ref is
+// reported verbatim; workloadImageAllowlistEntry rejects it downstream.
+func reportAdoptedImages(a workloadAdoption, images []string) {
+	fmt.Fprintf(os.Stdout, "+ adopt %s -> %s/%s/%s (%d image(s))\n", a.cwID, a.ref.namespace, a.ref.kind, a.ref.name, len(images))
+	for _, image := range images {
+		fmt.Fprintf(os.Stdout, "    %s\n", image)
+		if !imagePinnedByDigest(image) {
+			fmt.Fprintf(os.Stderr, "warning: adopted workload %s image %s is pinned by tag, not digest; the digest resolved now may differ from what the rollout pulls\n", a.cwID, image)
+		}
+	}
+}
+
+// imagePinnedByDigest reports whether an image reference carries an explicit
+// digest. An unparseable ref counts as not pinned (its parse fails again,
+// fatally, in workloadImageAllowlistEntry).
+func imagePinnedByDigest(image string) bool {
+	named, err := reference.ParseDockerRef(image)
+	if err != nil {
+		return false
+	}
+	_, pinned := named.(reference.Digested)
+	return pinned
+}
+
+// workloadPodTemplate reads the pod template at spec.template, which every
+// supported kind exposes. A kind without one yields an empty template.
+func workloadPodTemplate(data []byte) (corev1.PodTemplateSpec, error) {
+	var workload struct {
+		Spec struct {
+			Template corev1.PodTemplateSpec `json:"template"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(data, &workload); err != nil {
+		return corev1.PodTemplateSpec{}, fmt.Errorf("decode pod template: %w", err)
+	}
+	return workload.Spec.Template, nil
+}
+
+func podTemplateImages(template corev1.PodTemplateSpec) []string {
+	seen := map[string]bool{}
+	var images []string
+	add := func(image string) {
+		if image == "" || seen[image] {
+			return
+		}
+		seen[image] = true
+		images = append(images, image)
+	}
+	for _, c := range template.Spec.InitContainers {
+		add(c.Image)
+	}
+	for _, c := range template.Spec.Containers {
+		add(c.Image)
+	}
+	// EphemeralContainers are intentionally skipped: they cannot be set on a
+	// workload pod template (only added to a live Pod via the ephemeralcontainers
+	// subresource), so a workload read here never carries them.
+	return images
+}
+
+func appendResolvedWorkloadImageArgs(ctx context.Context, helmArgs []string, images []string) ([]string, error) {
+	return buildWorkloadImageArgs(helmArgs, images, func(ref string) (string, error) {
+		digest, err := craneDigest(ctx, ref)
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(os.Stderr, "+ resolved adopted workload image %s -> %s\n", ref, digest)
+		return digest, nil
+	})
+}
+
+func buildWorkloadImageArgs(helmArgs []string, images []string, resolve func(ref string) (string, error)) ([]string, error) {
+	entries := map[string]string{}
+	for _, image := range images {
+		digest, ref, err := workloadImageAllowlistEntry(image, resolve)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := entries[digest]; !ok {
+			entries[digest] = ref
+		}
+	}
+	digests := make([]string, 0, len(entries))
+	for digest := range entries {
+		digests = append(digests, digest)
+	}
+	sort.Strings(digests)
+	for _, digest := range digests {
+		helmArgs = append(helmArgs, "--set-string", "nriImagePolicy.bootstrapAllowlist.digests."+digest+"="+entries[digest])
+	}
+	return helmArgs, nil
+}
+
+func workloadImageAllowlistEntry(image string, resolve func(ref string) (string, error)) (digest, ref string, err error) {
+	named, err := reference.ParseDockerRef(image)
+	if err != nil {
+		return "", "", fmt.Errorf("parse adopted workload image %q: %w", image, err)
+	}
+	repo := reference.TrimNamed(named).String()
+	raw := ""
+	if digested, ok := named.(reference.Digested); ok {
+		raw = digested.Digest().String()
+	} else if raw, err = resolve(named.String()); err != nil {
+		return "", "", err
+	}
+	// ParseDigest enforces sha256:<64 hex> (NRI allowlist keys must be sha256)
+	// and lowercases the hex so the emitted key matches containerd's lookup form.
+	parsed, err := types.ParseDigest(raw)
+	if err != nil {
+		return "", "", fmt.Errorf("adopted workload image %q digest %q is not sha256; NRI allowlist entries must be sha256: %w", image, raw, err)
+	}
+	return parsed.String(), repo + "@" + parsed.String(), nil
 }
 
 // isImageNotFound reports whether a resolve error means the reference does
@@ -1111,9 +1472,8 @@ func init() {
 	installCmd.Flags().Int64Var(&installGetCertRunAsGroup, "webhook-get-cert-run-as-group", 65532, "runAsGroup for injected get-cert containers")
 	installCmd.Flags().BoolVar(&installGetCertRunAsNonRoot, "webhook-get-cert-run-as-non-root", true, "set runAsNonRoot for injected get-cert containers")
 	installCmd.Flags().BoolVar(&installSingleNode, "single-node", false, "single-node / single-CVM cluster: clear the dedicated-CDS-node selector and taint toleration so every node is CDS-eligible (no role=cds label or dedicated node needed). Sets cds.node.selector={} and cds.node.tolerations=[]")
-	installCmd.Flags().StringVar(&installEngine, "engine", "", "inference engine preset deriving tls-lb's upstream (chart engine.name): vllm or sglang. Requires --engine-workload-id. Without this or a verified-https tlsLb.upstream, tls-lb renders no catch-all route until one is attached")
-	installCmd.Flags().StringVar(&installEngineWorkloadID, "engine-workload-id", "", "confidential.ai/cw id of the engine workload (chart engine.workloadId); with --engine, derives the mesh-wrapped upstream c8s-<id>.<ns>.svc.cluster.local:<port>")
-	installCmd.Flags().StringVar(&installEngineNamespace, "engine-namespace", "", "namespace the engine workload runs in (chart engine.namespace); empty = release namespace")
+	installCmd.Flags().StringSliceVar(&installWorkloadRefs, flagWorkloadRef, nil, "existing workload to adopt as a c8s confidential workload, as <cw-id>=<namespace>/<kind>/<name>[:<port>]; repeatable. Kind is any resource exposing a pod template at spec.template (deployment, statefulset, daemonset, or an operator CRD such as <kind>.<group>). The optional :<port> is the tls-lb upstream port, needed on the ref --upstream selects")
+	installCmd.Flags().StringVar(&installUpstream, flagUpstream, "", "confidential.ai/cw id of the adopted --workload-ref workload tls-lb routes its catch-all to; derives the mesh-wrapped upstream c8s-<id>.<ns>.svc.cluster.local:<port> from that ref's :<port>. Without this or a verified-https tlsLb.upstream, tls-lb renders no catch-all route until one is attached")
 	installCmd.Flags().StringVar(&installCvmMode, flagCvmMode, "baremetal", "CVM deployment shape (orthogonal to --hardware-platform): baremetal, or node (generalized node-as-CVM: our own TDX/SNP nodes are themselves confidential VMs, pods run as ordinary processes), or gke (GKE managed confidential VMs), or aks (vTPM /dev/tpm0). All modes render a privileged attestation-api (a hostPath device mount alone does not grant device-cgroup access)")
 	installCmd.Flags().StringVar(&installHardwarePlatform, flagHardwarePlatform, "sev-snp", "CPU-level TEE hardware (orthogonal to --cvm-mode): sev-snp (default, /dev/sev-guest) or tdx (Intel TDX, /dev/tdx-guest). Ignored when --cvm-mode=aks (Azure vTPM path); combining --cvm-mode=aks with --hardware-platform=tdx is refused")
 	installCmd.Flags().BoolVar(&installKata, "kata", false, "install and enforce the Kata Containers runtime stack: every workload pod runs as a confidential VM (kata RuntimeClass injected; non-kata classes rejected), including NVIDIA GPU pods. Labels every kata node for the declared --hardware-platform (clearing the other platform's label), failing fast when no node qualifies")

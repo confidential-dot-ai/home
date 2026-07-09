@@ -78,54 +78,29 @@
 {{- fail (printf "attestationApi.service.nodePort must be within the Kubernetes NodePort range 30000-32767 when nriImagePolicy.enabled=true (got %d)" $attestationNodePort) -}}
 {{- end -}}
 {{- /*
-  engine preset checks. The resolvedUpstreamAddress helper fails closed on the
-  unknown engine too, but validate here so they surface independent of whether
-  the helper is reached, with stable kind= markers for the tests.
+  Catch-all upstream check. No upstream is a legal state: tls-lb installs and
+  serves with no catch-all until a backend is wired (install-then-attach). When
+  an upstream IS set, it must be either:
+   - an operator-managed headless Service (c8s-<id>.<ns>.svc.cluster.local:<port>,
+     which `c8s install --upstream` derives): the app-layer hop is plaintext
+     http, the node mesh intercepts the pod-IP hop and wraps it in attested mTLS.
+     The shape match below is ADVISORY — it can't prove the Service is headless
+     (a ClusterIP Service of the same name would be a VIP the mesh skips), so the
+     real boundary is ratlsMesh.cwInboundEnforcement, which drops VIP/FORWARD-path
+     hops to cw pods at runtime. This guard only catches accidental plaintext.
+     An https protocol on this shape can only fail at runtime, so reject it.
+   - a manual address that terminates and verifies TLS itself (app-TLS): must
+     be https with tls.verify=true. A silently plaintext manual address would
+     leave the hop unprotected. There is no plaintext-to-unattested escape hatch.
 */ -}}
-{{- $engine := .Values.engine -}}
-{{- if and $engine.name $tlsLB.enabled -}}
-{{- if not (hasKey $engine.presets $engine.name) -}}
-{{- fail (printf "VALIDATION_ERROR kind=unknown_engine: engine.name=%q is not in engine.presets (%s)" $engine.name (join ", " (keys $engine.presets))) -}}
-{{- end -}}
-{{- if not $engine.workloadId -}}
-{{- fail "VALIDATION_ERROR kind=engine_missing_workload_id: engine.name selects a preset but engine.workloadId is empty; set the confidential.ai/cw id of the engine pod" -}}
-{{- end -}}
-{{- /*
-  c8s-<workloadId> must be a DNS-1035 label, mirroring
-  webhook.WorkloadServiceName: the operator refuses to mint a Service with an
-  invalid name, so an unchecked id would render an upstream that resolves to
-  nothing. validation.IsDNS1035Label = ^[a-z]([-a-z0-9]*[a-z0-9])?$, max 63.
-*/ -}}
-{{- $svc := printf "c8s-%s" $engine.workloadId -}}
-{{- if or (gt (len $svc) 63) (not (regexMatch "^[a-z]([-a-z0-9]*[a-z0-9])?$" $svc)) -}}
-{{- fail (printf "VALIDATION_ERROR kind=engine_invalid_workload_id: engine.workloadId=%q makes Service name %q, not a DNS-1035 label (start with a letter, then [a-z0-9-], end alphanumeric, <=63 chars)" $engine.workloadId $svc) -}}
-{{- end -}}
-{{- $engineNamespace := $engine.namespace | default .Release.Namespace -}}
-{{- if or (gt (len $engineNamespace) 63) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $engineNamespace)) -}}
-{{- fail (printf "VALIDATION_ERROR kind=engine_invalid_namespace: engine namespace %q is not a DNS-1123 label (lowercase alphanumeric or '-', start/end alphanumeric, <=63 chars)" $engineNamespace) -}}
-{{- end -}}
-{{- if $tlsLB.upstream.address -}}
-{{- fail (printf "VALIDATION_ERROR kind=engine_upstream_conflict: engine.name=%q derives tlsLb.upstream.address, but tlsLb.upstream.address is also set to %q; set one, not both. If upgrading from a chart that shipped a default tlsLb.upstream.address, clear it (it is no longer defaulted)" $engine.name $tlsLB.upstream.address) -}}
-{{- end -}}
-{{- /*
-  The derived headless-Service hop is plaintext at the app layer; the node
-  mesh wraps it in attested mTLS. An https upstream protocol can only fail at
-  runtime against that backend, so reject it at render time.
-*/ -}}
+{{- if and $tlsLB.enabled $tlsLB.upstream.address -}}
+{{- /* c8s-<id> is a DNS-1035 label, <ns> a DNS-1123 label — the exact
+  webhook.WorkloadServiceFQDN form the operator provisions and the mesh wraps. */ -}}
+{{- if regexMatch "^c8s-[a-z]([-a-z0-9]*[a-z0-9])?\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?\\.svc\\.cluster\\.local:[0-9]+$" $tlsLB.upstream.address -}}
 {{- if eq $tlsLB.upstream.protocol "https" -}}
-{{- fail (printf "VALIDATION_ERROR kind=engine_https_upstream: engine.name=%q derives a plaintext headless-Service upstream (the mesh wraps the hop in attested mTLS), but tlsLb.upstream.protocol=https; use protocol http with the engine preset" $engine.name) -}}
+{{- fail "VALIDATION_ERROR kind=workload_https_upstream: a c8s-<id> headless-Service upstream is plaintext http at the app layer (the mesh wraps the hop in attested mTLS), but tlsLb.upstream.protocol=https; use protocol http for a mesh-wrapped upstream" -}}
 {{- end -}}
+{{- else -}}
+{{- include "tls-lb.requireSecuredBackend" (dict "protocol" $tlsLB.upstream.protocol "tls" $tlsLB.upstream.tls "address" $tlsLB.upstream.address "label" "tlsLb.upstream" "kind" "tlslb_unsecured_upstream" "suggest" "To reach a confidential workload adopt it with --workload-ref <id>=<ns>/<kind>/<name>:<port> and pass --upstream <id> (the mesh wraps that plaintext hop in attested mTLS); ") -}}
 {{- end -}}
-{{- /*
-  No upstream is a legal state: tls-lb installs and serves with no catch-all
-  until an inference backend is wired (install-then-attach). But when an
-  upstream IS set without the engine preset, it must be secured: the engine
-  preset (the mesh-wrapped headless path, how a confidential workload like vllm
-  is reached) or a manual address that terminates and verifies TLS itself
-  (app-TLS). A silently-defaulted Service VIP would leave the inference hop
-  plaintext. The secured-only check is the shared tls-lb.requireSecuredBackend,
-  also applied per route. There is no plaintext-to-unattested escape hatch.
-*/ -}}
-{{- if and $tlsLB.enabled (not $engine.name) $tlsLB.upstream.address -}}
-{{- include "tls-lb.requireSecuredBackend" (dict "protocol" $tlsLB.upstream.protocol "tls" $tlsLB.upstream.tls "address" $tlsLB.upstream.address "label" "tlsLb.upstream" "kind" "tlslb_unsecured_upstream" "suggest" "To reach a confidential workload like vllm set engine.name + engine.workloadId instead (the mesh wraps that plaintext hop in attested mTLS); ") -}}
 {{- end -}}

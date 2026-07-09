@@ -28,10 +28,10 @@ common_set=(
   --set nriImagePolicy.image.digest=sha256:aaaa000000000000000000000000000000000000000000000000000000000000
   --set cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001
   --set nriImagePolicy.cds.node.selector.role=cds-node
-  # tls-lb has no default upstream; the engine preset is the
-  # representative mesh-wrapped configuration.
-  --set-string engine.name=vllm
-  --set-string engine.workloadId=infer
+  # tls-lb has no default upstream; a c8s-<id> headless-Service address (what
+  # `c8s install --upstream` derives, recognized as mesh-wrapped) is the
+  # representative configuration.
+  --set-string tlsLb.upstream.address=c8s-infer.c8s-system.svc.cluster.local:8000
   # The default policy mode is fail-closed, which requires every digest-pinned
   # c8s component to be covered in the allowlist floor or the plugin would deny
   # it on its own node. deriveComponents auto-covers the c8s images from their

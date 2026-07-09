@@ -559,16 +559,37 @@ func WorkloadServiceName(cwID string) string {
 	return name
 }
 
+// workloadServiceDNS is the managed headless Service's in-cluster DNS name,
+// c8s-<id>.<namespace>.svc, or "" when the id cannot name a Service. Callers add
+// the ".cluster.local" suffix (or not) per their DNS-name needs.
+func workloadServiceDNS(cwID, namespace string) string {
+	svc := WorkloadServiceName(cwID)
+	if svc == "" || namespace == "" {
+		return ""
+	}
+	return svc + "." + namespace + ".svc"
+}
+
+// WorkloadServiceFQDN is the managed headless Service's fully-qualified DNS name,
+// c8s-<id>.<namespace>.svc.cluster.local, or "" when the id cannot name a
+// Service. It is the name tls-lb dials for an adopted workload upstream.
+func WorkloadServiceFQDN(cwID, namespace string) string {
+	dns := workloadServiceDNS(cwID, namespace)
+	if dns == "" {
+		return ""
+	}
+	return dns + ".cluster.local"
+}
+
 // workloadSAN is the DNS SAN get-cert requests for a workload. An id that
 // names a managed headless Service gets that Service's in-cluster DNS name,
 // which CDS's default --dns-san-pattern signs; any other id passes through
 // verbatim (e.g. the <name>.<ns>.svc ids the chart's own components use).
 func workloadSAN(cwID, namespace string) string {
-	svc := WorkloadServiceName(cwID)
-	if svc == "" || namespace == "" {
-		return cwID
+	if dns := workloadServiceDNS(cwID, namespace); dns != "" {
+		return dns
 	}
-	return svc + "." + namespace + ".svc"
+	return cwID
 }
 
 // validateWorkloadLabel rejects pods that set the confidential.ai/cw label
