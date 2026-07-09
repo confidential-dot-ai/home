@@ -14,12 +14,17 @@
 #
 # Env (all required; set by `c8s uninstall` from the release's computed
 # values):
-#   HOST_CONTAINERD_DIR — host containerd config directory (distro-specific)
-#   GUEST_IMAGE_DIR     — host dir the kata-image-puller pulled kata-guest-base
-#                         into (kata.guestImage.hostPath)
-#   RKE2_PREP           — "true" when the install ran the RKE2 containerd-prep
-#                         initContainer whose template/lock this sweep owns
-#   RESTART_COMMAND     — host runtime restart, run via nsenter into PID 1
+#   HOST_CONTAINERD_DIR    — host containerd config directory (distro-specific)
+#   GUEST_IMAGE_DIR        — host dir the kata-image-puller pulled kata-guest-base
+#                            into (kata.guestImage.hostPath)
+#   GUEST_IMAGE_DIR_NVIDIA — host dir the GPU puller pulled the <tag>-nvidia
+#                            guest image into (kata.gpu.guestImage.hostPath).
+#                            GPU ships with every --kata install, so this is
+#                            set for any kata release; empty only for a
+#                            pre-GPU release (no kata.gpu block)
+#   RKE2_PREP              — "true" when the install ran the RKE2 containerd-prep
+#                            initContainer whose template/lock this sweep owns
+#   RESTART_COMMAND        — host runtime restart, run via nsenter into PID 1
 set -eu
 
 echo "==> c8s kata sweep starting"
@@ -63,6 +68,18 @@ if [ -d "/host${GUEST_IMAGE_DIR}" ]; then
   echo "guest image dir removed: ${GUEST_IMAGE_DIR}"
 else
   echo "guest image dir already absent: ${GUEST_IMAGE_DIR}"
+fi
+
+# 3b. The confidential-GPU guest image the nvidia puller pulled into its own
+#     dir (see GUEST_IMAGE_DIR_NVIDIA above; empty -> step skipped).
+GUEST_IMAGE_DIR_NVIDIA="${GUEST_IMAGE_DIR_NVIDIA:-}"
+if [ -n "${GUEST_IMAGE_DIR_NVIDIA}" ]; then
+  if [ -d "/host${GUEST_IMAGE_DIR_NVIDIA}" ]; then
+    rm -rf "/host${GUEST_IMAGE_DIR_NVIDIA}"
+    echo "nvidia guest image dir removed: ${GUEST_IMAGE_DIR_NVIDIA}"
+  else
+    echo "nvidia guest image dir already absent: ${GUEST_IMAGE_DIR_NVIDIA}"
+  fi
 fi
 
 # 4. RKE2 containerd-prep leftovers: the sentinel-marked managed template

@@ -49,7 +49,10 @@ var (
 // kataRuntimeClassNames are the RuntimeClass objects the chart renders under
 // kata.enabled — a fixed contract with templates/kata.yaml (and, there, with
 // kata-deploy's SHIMS_X86_64 and the kata-enforcement allowlist).
-var kataRuntimeClassNames = []string{"kata-qemu", "kata-clh", "kata-qemu-snp"}
+// kata-qemu-snp-nvidia / kata-qemu-tdx-nvidia are the confidential-GPU classes
+// that ship with every kata install; listing them here keeps the running-pods
+// guard covering GPU pods too.
+var kataRuntimeClassNames = []string{"kata-qemu", "kata-clh", "kata-qemu-snp", "kata-qemu-tdx", "kata-qemu-snp-nvidia", "kata-qemu-tdx-nvidia"}
 
 // confidentialWorkloadCRD is the chart's one CRD (crds/ dir, so helm never
 // deletes it); --delete-crds removes it by name.
@@ -60,6 +63,15 @@ const confidentialWorkloadCRD = "confidentialworkloads.confidential.ai"
 // completion).
 const kataRuntimeNodeLabel = "katacontainers.io/kata-runtime"
 
+// snpCapabilityNodeLabel is the c8s-owned SNP platform label the install
+// applies under --hardware-platform=sev-snp (the chart's kata.snpNodeSelector
+// default — keep in lockstep with internal/helmchart/c8s/values.yaml). The
+// sweep removes only this exact key (plus tdxHostLabelKey, the TDX
+// counterpart the install applies under --hardware-platform=tdx): a custom
+// kata.snpNodeSelector (an NFD or provisioning-owned label) was never applied
+// by c8s and is not c8s's to strip.
+const snpCapabilityNodeLabel = "confidential.ai/sev-snp"
+
 // kataUninstallConfig is the slice of the release's computed values the kata
 // host sweep needs. It is read from `helm get values --all` BEFORE the
 // release is deleted — afterwards the -f/--set overrides from install time
@@ -69,8 +81,13 @@ type kataUninstallConfig struct {
 	Distro              string
 	ContainerdConfigDir string // resolved absolute host dir
 	GuestImageHostPath  string
-	SweepImage          string
-	NodeSelector        map[string]string
+	// GuestImageNvidiaHostPath is the GPU guest-image dir (kata.gpu.guestImage.hostPath).
+	// The GPU stack ships with every kata install, so it is set for any kata
+	// release; empty only for a pre-GPU release (no kata.gpu block), where the
+	// sweep skips it.
+	GuestImageNvidiaHostPath string
+	SweepImage               string
+	NodeSelector             map[string]string
 }
 
 var uninstallCmd = &cobra.Command{
@@ -99,9 +116,12 @@ removes, idempotently:
   - kata-deploy's containerd runtime drop-in, restarting containerd/RKE2
     only if the drop-in was still registered
   - the pulled kata-guest-base artifact (kata.guestImage.hostPath, multi-GB —
-    nothing else cleans this up)
+    nothing else cleans this up), and the separate GPU guest image
+    (kata.gpu.guestImage.hostPath)
   - on RKE2: the c8s-managed containerd template and the containerd-prep lock
-  - the katacontainers.io/kata-runtime node labels (via kubectl)
+  - the katacontainers.io/kata-runtime node labels and the
+    confidential.ai/sev-snp capability labels the install's probe applied
+    (via kubectl)
 
 Whether kata was installed — and which host paths, distro layout, and node
 set to sweep — is read from the release's computed values
@@ -321,6 +341,12 @@ func kataConfigFromValues(tree map[string]any) (kataUninstallConfig, error) {
 		return kataUninstallConfig{}, err
 	}
 
+	// GPU guest image — a second multi-GB dir the GPU puller wrote; see
+	// GuestImageNvidiaHostPath.
+	if gpuImg, ok := nestedMap(tree, "kata", "gpu", "guestImage"); ok {
+		cfg.GuestImageNvidiaHostPath, _ = gpuImg["hostPath"].(string)
+	}
+
 	cfg.SweepImage, err = sweepImageRef(tree)
 	if err != nil {
 		return kataUninstallConfig{}, err
@@ -435,7 +461,7 @@ func runKataSweep(ctx context.Context, namespace, release string, cfg kataUninst
 	// helm --wait already drained them or the release was already deleted.
 	// Polled via kubectl get rather than `kubectl wait --for=delete`, whose
 	// zero-matches exit status varies across kubectl versions.
-	for _, component := range []string{"kata-deploy", "kata-image-puller"} {
+	for _, component := range []string{"kata-deploy", "kata-image-puller", "kata-image-puller-nvidia"} {
 		selector := fmt.Sprintf("app.kubernetes.io/instance=%s,app.kubernetes.io/component=%s", release, component)
 		if err := waitPodsGone(ctx, namespace, selector); err != nil {
 			return fmt.Errorf("waiting for %s pods to terminate: %w", component, err)
@@ -450,18 +476,23 @@ func runKataSweep(ctx context.Context, namespace, release string, cfg kataUninst
 	}
 
 	// kata-deploy's cleanup unlabels nodes when it runs to completion; sweep
-	// the stragglers. Best-effort — a leftover label is cosmetic and must not
-	// abort the nuke mid-flight. The pre-check avoids handing `kubectl label`
-	// an empty node set, whose exit status varies across kubectl versions.
-	labelled, err := exec.CommandContext(ctx, "kubectl", "get", "nodes",
-		"-l", kataRuntimeNodeLabel, "-o", "name").Output()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: listing %s-labelled nodes failed (continuing): %v\n", kataRuntimeNodeLabel, err)
-	} else if strings.TrimSpace(string(labelled)) != "" {
-		fmt.Fprintf(os.Stdout, "+ kubectl label nodes -l %s %s-\n", kataRuntimeNodeLabel, kataRuntimeNodeLabel)
-		if out, err := exec.CommandContext(ctx, "kubectl", "label", "nodes",
-			"-l", kataRuntimeNodeLabel, kataRuntimeNodeLabel+"-").CombinedOutput(); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: removing %s node labels failed (continuing): %v: %s\n", kataRuntimeNodeLabel, err, bytes.TrimSpace(out))
+	// the stragglers. The platform labels the install applied from
+	// --hardware-platform are swept the same way (only the c8s-owned default
+	// keys — see snpCapabilityNodeLabel). Best-effort — a leftover label is
+	// cosmetic and must not abort the nuke mid-flight. The pre-check avoids
+	// handing `kubectl label` an empty node set, whose exit status varies
+	// across kubectl versions.
+	for _, label := range []string{kataRuntimeNodeLabel, snpCapabilityNodeLabel, tdxHostLabelKey} {
+		labelled, err := exec.CommandContext(ctx, "kubectl", "get", "nodes",
+			"-l", label, "-o", "name").Output()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: listing %s-labelled nodes failed (continuing): %v\n", label, err)
+		} else if strings.TrimSpace(string(labelled)) != "" {
+			fmt.Fprintf(os.Stdout, "+ kubectl label nodes -l %s %s-\n", label, label)
+			if out, err := exec.CommandContext(ctx, "kubectl", "label", "nodes",
+				"-l", label, label+"-").CombinedOutput(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: removing %s node labels failed (continuing): %v: %s\n", label, err, bytes.TrimSpace(out))
+			}
 		}
 	}
 
@@ -565,6 +596,8 @@ func kataSweepDaemonSet(release, namespace string, cfg kataUninstallConfig) *app
 						Env: []corev1.EnvVar{
 							{Name: "HOST_CONTAINERD_DIR", Value: cfg.ContainerdConfigDir},
 							{Name: "GUEST_IMAGE_DIR", Value: cfg.GuestImageHostPath},
+							// Empty only for a pre-GPU release; the sweep skips it then.
+							{Name: "GUEST_IMAGE_DIR_NVIDIA", Value: cfg.GuestImageNvidiaHostPath},
 							{Name: "RKE2_PREP", Value: strconv.FormatBool(cfg.Distro == "rke2")},
 							{Name: "RESTART_COMMAND", Value: kataRestartCommand(cfg.Distro)},
 						},

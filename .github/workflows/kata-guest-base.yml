@@ -16,11 +16,17 @@ name: Kata guest base
 # (ghcr.io/confidential-dot-ai/{assam,cert-issuer,ratls-mesh,...}).
 #
 # Every build also publishes a DEBUG variant at <tag>-debug (build.sh
-# Step 5/5): the same rootfs except the baked kata-agent policy allows the
+# Step 5): the same rootfs except the baked kata-agent policy allows the
 # host log/exec stream RPCs, so `kubectl logs` / `kubectl exec` work
 # against kata-qemu-snp pods. Its launch measurement differs from the
 # locked image, so locked-reference attestation rejects it. Selected by
 # `c8s install --kata --debug` (kata.guestImage.debug=true). Dev only.
+#
+# The confidential-GPU pair publishes in lockstep too: <tag>-nvidia and
+# <tag>-nvidia-debug (build.sh Step 6) — the SAME c8s rootfs + in-guest
+# stack with the NVIDIA payload grafted from kata's stock GPU image,
+# booting kata's GPU kernel. Pulled by the GPU image puller for the
+# kata-qemu-snp-nvidia RuntimeClass (docs/kata-gpu.md).
 
 on:
   # Run AFTER the Docker workflow finishes so the cds/get-cert image digests
@@ -104,9 +110,16 @@ jobs:
     # This workflow's OWN workflow_dispatch stays the manual-rebuild escape
     # hatch and always runs — it can be invoked on a side branch on purpose, and
     # that path does publish a branch-* tag (see Compute tags).
+    #
+    # head_repository == repository: belt-and-braces against checking out fork
+    # code in this packages:write context (CodeQL js/actions/unsafe-checkout).
+    # Already unreachable — fork pushes never trigger base-repo workflows and
+    # the event filter above excludes Docker's pull_request runs — but the
+    # explicit guard makes the invariant local instead of inferred.
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
        (github.event.workflow_run.event == 'push' ||
         github.event.workflow_run.event == 'workflow_dispatch') &&
        (github.event.workflow_run.head_branch == 'main' ||
@@ -326,27 +339,34 @@ jobs:
       - name: Install kata-guest-base build deps
         run: c8s/kata-guest-base/scripts/ci/install-build-deps.sh
 
-      # The confidential image is immutable per kata version, so cache it — the
-      # multi-GB kata-static download then happens once, not on every run.
-      - name: Restore kata confidential image
+      # The staged artifacts are immutable per kata version, so cache them —
+      # the multi-GB kata-static download then happens once, not on every run.
+      # v2: the set grew from the confidential image alone to + the NVIDIA
+      # confidential image + NVIDIA guest kernel (Step 6 graft sources, so the
+      # build no longer needs kata-deploy's /opt/kata on the runner host); the
+      # key bump retires v1 caches that lack the NVIDIA artifacts.
+      - name: Restore kata guest artifacts
         id: kata-conf-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ runner.temp }}/kata-conf
-          key: kata-confidential-image-${{ env.KATA_VERSION }}
+          key: kata-guest-artifacts-v2-${{ env.KATA_VERSION }}
 
       # Stage kata's confidential rootfs image (the source of the CoCo
-      # guest-components that build.sh bakes into the measured rootfs).
+      # guest-components that build.sh bakes into the measured rootfs) plus
+      # the stock NVIDIA confidential image + guest kernel (Step 6's graft
+      # sources), all from the sha-pinned kata-static release.
       # Standalone script so shellcheck sees it; reads KATA_VERSION + the
-      # runner's RUNNER_TEMP/GITHUB_ENV and exports KATA_CONFIDENTIAL_IMG.
-      - name: Stage kata confidential image (CoCo guest-components source)
+      # runner's RUNNER_TEMP/GITHUB_ENV and exports KATA_CONFIDENTIAL_IMG,
+      # KATA_NVIDIA_CONFIDENTIAL_IMG and KATA_NVIDIA_VMLINUZ.
+      - name: Stage kata guest artifacts (CoCo + NVIDIA graft sources)
         id: stage-kata-conf
         run: c8s/kata-guest-base/scripts/ci/stage-kata-conf.sh
 
       # Save right after staging (see the attestation-api note): the unified
       # cache action would skip this when the kata-guest-base build later fails,
       # forcing the multi-GB kata-static re-download on every run.
-      - name: Save kata confidential image
+      - name: Save kata guest artifacts
         if: steps.kata-conf-cache.outputs.cache-hit != 'true' && steps.stage-kata-conf.outcome == 'success'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -494,6 +514,11 @@ jobs:
           # an in-flight kernel change can still publish a branch-* image before
           # the snapshot is committed.
           CHECK_SNAPSHOT: ${{ (github.event.workflow_run.head_branch == 'main' || startsWith(github.event.workflow_run.head_branch, 'v')) && '1' || '0' }}
+          # GPU variants are mandatory in CI. build.sh Step 6 grafts the
+          # NVIDIA payload from the staged kata-static artifacts
+          # (KATA_NVIDIA_CONFIDENTIAL_IMG / KATA_NVIDIA_VMLINUZ, exported by
+          # the staging step above) — no /opt/kata needed on the runner host.
+          BUILD_NVIDIA: "1"
         run: ./scripts/build.sh
 
       # Restore the AppArmor posture torn down above. if: always() so it runs
@@ -657,3 +682,43 @@ jobs:
           oras push "${{ steps.tags.outputs.image }}:${{ steps.tags.outputs.debug_tags }}" \
             --artifact-type application/vnd.confidential.kata-guest.v2 \
             ./*
+
+      # Confidential-GPU variants: the SAME c8s rootfs + in-guest stack +
+      # locked policy, with the NVIDIA payload grafted from the stock kata
+      # GPU image and kata's GPU kernel (build.sh Step 6). Published as
+      # <tag>-nvidia / <tag>-nvidia-debug in lockstep with the non-GPU pair;
+      # the chart derives all four from kata.guestImage.tag + debug
+      # (c8s.kataGuestImageTag / c8s.kataGuestImageNvidiaTag).
+      - name: Push nvidia variant to GHCR
+        working-directory: c8s/kata-guest-base/output-nvidia
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}
+          BASE_TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          nv_tags=""
+          IFS=',' read -ra base <<< "${BASE_TAGS}"
+          for t in "${base[@]}"; do nv_tags="${nv_tags}${nv_tags:+,}${t}-nvidia"; done
+          echo "==> oras push ${IMAGE}:${nv_tags}"
+          oras push "${IMAGE}:${nv_tags}" \
+            --artifact-type application/vnd.confidential.kata-guest.v2 \
+            ./*
+
+      - name: Push nvidia debug variant to GHCR
+        working-directory: c8s/kata-guest-base/output-nvidia-debug
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}
+          BASE_TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          nv_tags=""
+          IFS=',' read -ra base <<< "${BASE_TAGS}"
+          for t in "${base[@]}"; do nv_tags="${nv_tags}${nv_tags:+,}${t}-nvidia-debug"; done
+          echo "==> oras push ${IMAGE}:${nv_tags}"
+          oras push "${IMAGE}:${nv_tags}" \
+            --artifact-type application/vnd.confidential.kata-guest.v2 \
+            ./*
+
+  # RETIRED: the interim build-nvidia job (repackaging the stock kata GPU
+  # rootfs verbatim on ubuntu-latest) is gone — the GPU variants are now real
+  # c8s guests built by `build` above alongside the non-GPU pair.

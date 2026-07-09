@@ -33,6 +33,12 @@
 #   5. debug re-seal             -> same rootfs with the host log/exec
 #                                   RPCs allowed in the kata-agent policy
 #                                   (kubectl logs/exec work) -> output-debug/
+#   6. NVIDIA variants           -> same rootfs + the NVIDIA payload grafted
+#                                   from kata's stock GPU image (modules,
+#                                   GSP firmware, driver userland) + the
+#                                   extra-nvidia/ NVRC-replacement units,
+#                                   booting kata's GPU kernel; sealed locked
+#                                   and debug -> output-nvidia[-debug]/
 #
 # Steps 1-3 (the expensive parts) are shared; only the verity seal +
 # assembly runs per variant. The two variants differ in exactly one file:
@@ -94,10 +100,27 @@ OS_VERSION="${OS_VERSION:-noble}"
 STEEP_DIR="${STEEP_DIR:-${WORKSPACE}/steep}"
 OUTPUT_DIR="${OUTPUT_DIR:-${IMAGE_DIR}/output}"
 DEBUG_OUTPUT_DIR="${DEBUG_OUTPUT_DIR:-${IMAGE_DIR}/output-debug}"
+NVIDIA_OUTPUT_DIR="${NVIDIA_OUTPUT_DIR:-${IMAGE_DIR}/output-nvidia}"
+NVIDIA_DEBUG_OUTPUT_DIR="${NVIDIA_DEBUG_OUTPUT_DIR:-${IMAGE_DIR}/output-nvidia-debug}"
 WORK_DIR="${WORK_DIR:-${IMAGE_DIR}/.build}"
 KATA_SRC="${KATA_SRC:-${WORK_DIR}/kata-${KATA_VERSION}}"
 
 EXTRA_DIR="${IMAGE_DIR}/extra"
+EXTRA_NVIDIA_DIR="${IMAGE_DIR}/extra-nvidia"
+# GPU variant (Step 6). auto = build when the stock kata NVIDIA artifacts are
+# present at the paths below, skip loudly otherwise; 1 = require; 0 = skip.
+# CI sets BUILD_NVIDIA=1 and points both paths at artifacts staged from the
+# sha-pinned kata-static release (scripts/ci/stage-kata-conf.sh) — the build
+# does not depend on runner state; the /opt/kata defaults below are a
+# local-dev fallback for a box that already has kata-deploy's payload.
+# The NVIDIA driver payload (kernel modules, GSP firmware, driver userland)
+# is grafted from kata's own nvidia-gpu-confidential rootfs image — the SAME
+# digest-pinned kata release that provides the agent — and the GPU variant
+# boots kata's matching GPU kernel, NOT the steep one (the steep kernel has
+# CONFIG_MODULES=n; the NVIDIA modules need the kernel they were built for).
+BUILD_NVIDIA="${BUILD_NVIDIA:-auto}"
+KATA_NVIDIA_CONFIDENTIAL_IMG="${KATA_NVIDIA_CONFIDENTIAL_IMG:-/opt/kata/share/kata-containers/kata-containers-nvidia-gpu-confidential.img}"
+KATA_NVIDIA_VMLINUZ="${KATA_NVIDIA_VMLINUZ:-/opt/kata/share/kata-containers/vmlinuz-nvidia-gpu.container}"
 # c8s's kernel config fragment, merged after steep's required + hardening
 # baseline by `steep kernel --kernel-config-fragment`. steep resolves the
 # merged .config and writes it to a fixed path in its own tree (the old
@@ -180,6 +203,16 @@ if [[ ! -s "${GHCR_AUTH_FILE}" ]]; then
     ( umask 077; printf '{"auths":{}}\n' > "${GHCR_AUTH_FILE}" )
 fi
 
+# A prior run's images must not survive to publish time: CI pushes the output
+# dirs verbatim (oras push ./*), and on a persistent runner the root-owned
+# artifacts dodge actions/checkout's git clean. Wipe them up front —
+# SKIP_KERNEL=1 keeps only the reusable kernel.
+if [[ "${SKIP_KERNEL:-0}" == "1" && -f "${OUTPUT_DIR}/vmlinuz" ]]; then
+    sudo find "${OUTPUT_DIR}" -mindepth 1 ! -name vmlinuz -exec rm -rf {} +
+else
+    sudo rm -rf "${OUTPUT_DIR}"
+fi
+sudo rm -rf "${DEBUG_OUTPUT_DIR}" "${NVIDIA_OUTPUT_DIR}" "${NVIDIA_DEBUG_OUTPUT_DIR}"
 mkdir -p "${OUTPUT_DIR}" "${WORK_DIR}"
 
 # --- Step 1/5: hardened kernel (steep) ---------------------------------
@@ -280,9 +313,7 @@ mkdir -p "${ROOTFS_BUILD_DEST}" "${IMAGES_BUILD_DEST}" "${GO_PATH_DIR}"
 # "libtss2-esys.so.0: cannot open shared object file" and ratls-mesh's
 # Requires=attestation-service.service then blocks c8s-ready.target. osbuilder's
 # ubuntu rootfs_lib feeds EXTRA_PKGS to debootstrap --include. Names are the
-# ubuntu-noble (t64) package names. (packages.txt in this dir is dead config
-# from the old steep-only rootfs path — build.sh uses osbuilder, not steep, for
-# the rootfs, so it is NOT consulted; keep additions here.)
+# ubuntu-noble (t64) package names.
 # ca-certificates: attestation-service's background cert-cache warm-up and the
 # verifier path fetch AMD KDS / Intel PCS collateral over HTTPS and need the CA
 # bundle to validate those TLS connections (osbuilder's `required`-variant
@@ -291,7 +322,11 @@ mkdir -p "${ROOTFS_BUILD_DEST}" "${IMAGES_BUILD_DEST}" "${GO_PATH_DIR}"
 # Only `main`-component packages are installable (osbuilder sets
 # REPO_COMPONENTS=main); universe packages (e.g. traceroute, mtr-tiny) fail the
 # rootfs build with "no installation candidate".
-KATA_EXTRA_PKGS="libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-sys1t64 libtss2-tctildr0t64 ca-certificates"
+# kmod: modprobe for the GPU variant's nvidia-gpu-init.sh (nvidia +
+# nvidia-uvm load; udev's builtin libkmod only auto-loads nvidia via PCI
+# modalias — nvidia-uvm has no modalias). Without it the unit exits 127,
+# kata-agent never starts, and every GPU pod hangs in ContainerCreating.
+KATA_EXTRA_PKGS="libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-sys1t64 libtss2-tctildr0t64 ca-certificates kmod"
 # --- Step 1b/5: stage the CoCo guest-components ------------------------
 # confidential-data-hub (CDH), attestation-agent (AA), api-server-rest. The
 # kata-agent SPAWNS these at boot (its guest_components_procs default is
@@ -441,6 +476,10 @@ sudo cp -a "${WORK_DIR}/pause_bundle" "${TARGET_ROOTFS}/pause_bundle"
 # container). The host-tool preflight above guarantees the deps are present.
 seal_and_assemble() {
     local variant="$1" outdir="$2"
+    # Third arg: kernel to ship with (and hash into) this artifact. Defaults
+    # to the steep kernel; the NVIDIA variants pass kata's GPU kernel, which
+    # the grafted driver modules were built for.
+    local kernel="${3:-${VMLINUZ_OUT}}"
     local img="${IMAGES_BUILD_DEST}/kata-rootfs-${variant}.img"
     sudo env \
         MEASURED_ROOTFS=yes \
@@ -465,11 +504,11 @@ seal_and_assemble() {
     sudo chown "$(id -u):$(id -g)" "${outdir}/kata-rootfs.img"
     # Step 1 writes the (shared) kernel straight into ${OUTPUT_DIR}; copy it
     # for any other outdir so each artifact is self-contained.
-    [[ "${outdir}/vmlinuz" -ef "${VMLINUZ_OUT}" ]] \
-        || install -m 0644 "${VMLINUZ_OUT}" "${outdir}/vmlinuz"
+    [[ "${outdir}/vmlinuz" -ef "${kernel}" ]] \
+        || install -m 0644 "${kernel}" "${outdir}/vmlinuz"
 
     local vmlinuz_sha image_sha
-    vmlinuz_sha="$(sha256sum "${VMLINUZ_OUT}" | awk '{print $1}')"
+    vmlinuz_sha="$(sha256sum "${kernel}" | awk '{print $1}')"
     image_sha="$(sha256sum "${outdir}/kata-rootfs.img" | awk '{print $1}')"
 
     # The manifest carries everything the c8s side needs to (a) wire the kata
@@ -544,8 +583,137 @@ for rpc in ExecProcessRequest ReadStreamRequest WriteStreamRequest; do
 done
 grep -q '^default SetPolicyRequest := false$' "${DEBUG_POLICY}" \
     || die "debug policy generation failed: SetPolicyRequest must stay denied"
+# The debug-guest marker rides the same variant split as the policy:
+# debug-only runtime behaviors key on it (nvidia-gpu-ready.sh tolerates a
+# non-CC GPU only when it is present). Fixed bytes — deterministic seal.
+DEBUG_MARKER="${WORK_DIR}/debug-guest"
+printf 'debug guest variant — generated by build.sh Step 5; locked images must not carry this file.\n' > "${DEBUG_MARKER}"
 sudo install -m 0644 "${DEBUG_POLICY}" "${TARGET_ROOTFS}/etc/kata-opa/default-policy.rego"
+sudo install -D -m 0644 "${DEBUG_MARKER}" "${TARGET_ROOTFS}/etc/c8s/debug-guest"
 seal_and_assemble "${BUILD_VARIANT}-debug" "${DEBUG_OUTPUT_DIR}"
+
+# --- Step 6/6: NVIDIA GPU variants --------------------------------------
+# The confidential-GPU guest is the SAME c8s rootfs (same base, same in-guest
+# stack — attestation-service / ratls-mesh / policy-monitor — same locked
+# policy, same allowlist) plus the NVIDIA payload grafted from kata's own
+# nvidia-gpu-confidential rootfs image: driver kernel modules, GSP firmware,
+# driver libraries, and the four admin binaries upstream's "chisseled" image
+# ships — chiselled as in Canonical's cut-down distroless-style Ubuntu rootfs;
+# kata spells it chisseled (tools/osbuilder/rootfs-builder/nvidia/
+# nvidia_rootfs.sh chisseled_compute is the authoritative list this graft
+# mirrors). Both rootfs trees are ubuntu-noble, so the copied userland shares
+# our glibc.
+#
+# Upstream's GPU image boots NVRC as PID 1; ours boots systemd like the
+# non-GPU guest (the in-guest stack is systemd-managed), so NVRC's GPU
+# bring-up is re-expressed as three units in extra-nvidia/ (driver+nodes ->
+# persistenced -> CDI/CC-ready/lockdown), with kata-agent Requires= the last.
+#
+# The variant boots kata's GPU kernel (modules must match it), not the steep
+# kernel — the one hardening delta vs the non-GPU guest, recorded in
+# docs/kata-gpu.md. Measured boot is identical: verity-sealed rootfs, root
+# hash on the cmdline, kernel-hashes launch measurement, manifest published.
+build_nvidia_variants() {
+    log "Step 6/6: NVIDIA GPU variants (graft from ${KATA_NVIDIA_CONFIDENTIAL_IMG})"
+
+    # Steps 4-5 left the DEBUG policy + marker in TARGET_ROOTFS; the locked
+    # GPU variant must seal the locked state. Restore before grafting.
+    sudo install -m 0644 "${EXTRA_DIR}/etc/kata-opa/default-policy.rego" \
+        "${TARGET_ROOTFS}/etc/kata-opa/default-policy.rego"
+    sudo rm -f "${TARGET_ROOTFS}/etc/c8s/debug-guest"
+
+    local nv_loop nv_mnt
+    nv_loop="$(sudo losetup -fP --show "${KATA_NVIDIA_CONFIDENTIAL_IMG}")"
+    nv_mnt="$(mktemp -d)"
+    sudo mount -o ro "${nv_loop}p1" "${nv_mnt}"
+    # Best-effort cleanup if the graft dies mid-way; the happy path unmounts
+    # explicitly right after the graft, before the seals.
+    # shellcheck disable=SC2064  # expand now: the values are set here and final
+    trap "{ sudo umount '${nv_mnt}'; sudo losetup -d '${nv_loop}'; rmdir '${nv_mnt}'; } 2>/dev/null || true" RETURN
+
+    # Upstream's chisseled tree uses real top-level /lib and /bin; tolerate a
+    # usr-merged layout too so an upstream refactor fails loudly, not weirdly.
+    local src_lib src_bin
+    for src_lib in "${nv_mnt}/lib/x86_64-linux-gnu" "${nv_mnt}/usr/lib/x86_64-linux-gnu" ""; do
+        [[ -n "${src_lib}" && -d "${src_lib}" ]] && break
+    done
+    [[ -n "${src_lib}" ]] || die "no x86_64-linux-gnu libdir in ${KATA_NVIDIA_CONFIDENTIAL_IMG}"
+    for src_bin in "${nv_mnt}/bin" "${nv_mnt}/usr/bin" ""; do
+        [[ -n "${src_bin}" && -x "${src_bin}/nvidia-smi" ]] && break
+    done
+    [[ -n "${src_bin}" ]] || die "nvidia-smi not found in ${KATA_NVIDIA_CONFIDENTIAL_IMG}"
+
+    # Kernel modules + GSP firmware: must match KATA_NVIDIA_VMLINUZ (same
+    # kata-static payload, same kernel build).
+    [[ -d "${nv_mnt}/lib/modules" ]] || die "no /lib/modules in the stock GPU image"
+    sudo mkdir -p "${TARGET_ROOTFS}/usr/lib/modules" "${TARGET_ROOTFS}/usr/lib/firmware"
+    sudo cp -a "${nv_mnt}/lib/modules/." "${TARGET_ROOTFS}/usr/lib/modules/"
+    [[ -d "${nv_mnt}/lib/firmware/nvidia" ]] || die "no /lib/firmware/nvidia (GSP) in the stock GPU image"
+    sudo cp -a "${nv_mnt}/lib/firmware/nvidia" "${TARGET_ROOTFS}/usr/lib/firmware/"
+
+    # Driver libraries (libnv* covers libnvidia-* incl. -pkcs11 and libnvat).
+    sudo cp -a "${src_lib}"/libnv* "${src_lib}"/libcuda.so.* \
+        "${TARGET_ROOTFS}/usr/lib/x86_64-linux-gnu/"
+    # Runtime deps the chisseled image carries for persistenced/NVAT that a
+    # minimal noble base may lack — copy only what we don't already provide
+    # (ours win: same distro release, and ours are the measured baseline).
+    local dep base
+    for dep in "${src_lib}"/libtirpc.so.* "${src_lib}"/libgssapi_krb5.so.* \
+               "${src_lib}"/libkrb5.so.* "${src_lib}"/libkrb5support.so.* \
+               "${src_lib}"/libk5crypto.so.* "${src_lib}"/libcom_err.so.* \
+               "${src_lib}"/libkeyutils.so.* "${src_lib}"/libxml2.so.* \
+               "${src_lib}"/libstdc++.so.* "${src_lib}"/liblzma.so.* \
+               "${src_lib}"/libicuuc.so.* "${src_lib}"/libicudata.so.*; do
+        [[ -e "${dep}" ]] || continue
+        base="$(basename "${dep}")"
+        [[ -e "${TARGET_ROOTFS}/usr/lib/x86_64-linux-gnu/${base}" ]] \
+            || sudo cp -a "${dep}" "${TARGET_ROOTFS}/usr/lib/x86_64-linux-gnu/"
+    done
+    [[ -e "${TARGET_ROOTFS}/etc/netconfig" ]] \
+        || sudo cp -a "${nv_mnt}/etc/netconfig" "${TARGET_ROOTFS}/etc/netconfig" 2>/dev/null || true
+
+    # The four admin binaries upstream ships (chisseled_compute).
+    local nvbin
+    for nvbin in nvidia-persistenced nvidia-smi nvidia-ctk nvidia-cdi-hook; do
+        sudo install -m 0755 "${src_bin}/${nvbin}" "${TARGET_ROOTFS}/usr/bin/${nvbin}"
+    done
+
+    # Graft complete — release the stock image before the (long) seals.
+    sudo umount "${nv_mnt}"; sudo losetup -d "${nv_loop}"; rmdir "${nv_mnt}"
+    trap - RETURN
+
+    sudo ldconfig -r "${TARGET_ROOTFS}"
+
+    # GPU overlay: the NVRC-replacement units + scripts, then enable them the
+    # same way Step 3 enables the c8s units (multi-user wants + the
+    # kata-containers.target.wants symlink kata's boot target needs).
+    sudo rsync -a "${EXTRA_NVIDIA_DIR}/" "${TARGET_ROOTFS}/"
+    local nvunit
+    for nvunit in nvidia-gpu-init.service nvidia-persistenced.service nvidia-gpu-ready.service; do
+        sudo systemctl --root="${TARGET_ROOTFS}" enable "${nvunit}" \
+            || echo "    WARN: could not enable ${nvunit} offline" >&2
+        sudo ln -sf "/etc/systemd/system/${nvunit}" \
+            "${TARGET_ROOTFS}/etc/systemd/system/kata-containers.target.wants/${nvunit}"
+    done
+
+    seal_and_assemble "${BUILD_VARIANT}-nvidia" "${NVIDIA_OUTPUT_DIR}" "${KATA_NVIDIA_VMLINUZ}"
+
+    # GPU debug variant: same two-file debug delta as Step 5 (policy +
+    # debug-guest marker; the marker also relaxes nvidia-gpu-ready's CC gate).
+    sudo install -m 0644 "${DEBUG_POLICY}" "${TARGET_ROOTFS}/etc/kata-opa/default-policy.rego"
+    sudo install -D -m 0644 "${DEBUG_MARKER}" "${TARGET_ROOTFS}/etc/c8s/debug-guest"
+    seal_and_assemble "${BUILD_VARIANT}-nvidia-debug" "${NVIDIA_DEBUG_OUTPUT_DIR}" "${KATA_NVIDIA_VMLINUZ}"
+}
+
+if [[ "${BUILD_NVIDIA}" == "0" ]]; then
+    log "Step 6/6: NVIDIA GPU variants SKIPPED (BUILD_NVIDIA=0)"
+elif [[ -f "${KATA_NVIDIA_CONFIDENTIAL_IMG}" && -f "${KATA_NVIDIA_VMLINUZ}" ]]; then
+    build_nvidia_variants
+elif [[ "${BUILD_NVIDIA}" == "1" ]]; then
+    die "BUILD_NVIDIA=1 but the stock kata NVIDIA artifacts are missing (${KATA_NVIDIA_CONFIDENTIAL_IMG}, ${KATA_NVIDIA_VMLINUZ}) — install kata-deploy's payload on this host or point KATA_NVIDIA_CONFIDENTIAL_IMG / KATA_NVIDIA_VMLINUZ at them"
+else
+    log "Step 6/6: NVIDIA GPU variants SKIPPED (stock kata NVIDIA artifacts not found; set BUILD_NVIDIA=1 to require them)"
+fi
 
 cat <<EOF
 
@@ -553,6 +721,7 @@ cat <<EOF
   kata-guest-base build complete
   locked: ${OUTPUT_DIR}
   debug:  ${DEBUG_OUTPUT_DIR}   (host log/exec RPCs allowed — dev only)
+  nvidia: ${NVIDIA_OUTPUT_DIR} + ${NVIDIA_DEBUG_OUTPUT_DIR}  (when built — see Step 6/6 log)
   rootfs type: ${FS_TYPE}
   Each dir: vmlinuz, kata-rootfs.img, kernel_verity_params, rootfs_type,
   manifest.json

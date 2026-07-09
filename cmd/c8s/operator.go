@@ -3,11 +3,13 @@
 package main
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/confidential-dot-ai/c8s/internal/controller"
+	"github.com/confidential-dot-ai/c8s/internal/webhook"
 )
 
 var operatorCmd = &cobra.Command{
@@ -21,6 +23,14 @@ in via annotation.
 Pod-to-pod mTLS is handled by the node-level ratls-mesh DaemonSet, not
 by this command.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Fail at start, not at first injection: an unknown platform would
+		// otherwise silently select the SNP classes.
+		switch operatorHardwarePlatform {
+		case webhook.HardwarePlatformSNP, webhook.HardwarePlatformTDX:
+		default:
+			return fmt.Errorf("--hardware-platform must be %s or %s, got %q",
+				webhook.HardwarePlatformSNP, webhook.HardwarePlatformTDX, operatorHardwarePlatform)
+		}
 		return controller.Run(cmd.Context(), controller.Options{
 			MetricsAddr:             metricsAddr,
 			HealthAddr:              healthAddr,
@@ -42,6 +52,7 @@ by this command.`,
 			GetCertRunAsGroup:       getCertRunAsGroup,
 			GetCertRunAsNonRoot:     getCertRunAsNonRoot,
 			KataEnforce:             kataEnforce,
+			HardwarePlatform:        operatorHardwarePlatform,
 		})
 	},
 }
@@ -66,7 +77,8 @@ var (
 	getCertRunAsGroup       int64
 	getCertRunAsNonRoot     bool
 
-	kataEnforce bool
+	kataEnforce              bool
+	operatorHardwarePlatform string
 )
 
 func init() {
@@ -88,6 +100,7 @@ func init() {
 	operatorCmd.Flags().Int64Var(&getCertRunAsUser, "get-cert-run-as-user", 65532, "runAsUser for injected get-cert containers")
 	operatorCmd.Flags().Int64Var(&getCertRunAsGroup, "get-cert-run-as-group", 65532, "runAsGroup for injected get-cert containers")
 	operatorCmd.Flags().BoolVar(&getCertRunAsNonRoot, "get-cert-run-as-non-root", true, "set runAsNonRoot for injected get-cert containers")
-	operatorCmd.Flags().BoolVar(&kataEnforce, "kata-enforce", false, "inject a kata runtimeClassName into workload pods that don't request one and enforce kata RuntimeClasses")
+	operatorCmd.Flags().BoolVar(&kataEnforce, "kata-enforce", false, "inject a kata runtimeClassName into workload pods that don't request one and enforce kata RuntimeClasses (set by the chart under kata.enabled)")
+	operatorCmd.Flags().StringVar(&operatorHardwarePlatform, "hardware-platform", webhook.HardwarePlatformSNP, "CPU TEE the injected confidential kata classes target: sev-snp or tdx (set by the chart to match the RuntimeClasses it renders)")
 	rootCmd.AddCommand(operatorCmd)
 }

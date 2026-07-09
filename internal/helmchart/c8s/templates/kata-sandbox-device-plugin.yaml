@@ -1,0 +1,120 @@
+{{- if and .Values.kata.enabled .Values.kata.gpu.sandboxDevicePlugin.enabled }}
+{{- /*
+  NVIDIA sandbox device plugin — discovers NVIDIA GPUs bound to vfio-pci on the
+  host and advertises them to kubelet as per-model `nvidia.com/<MODEL>`
+  resources (P_GPU_ALIAS="" → per-model). It writes a CDI spec to
+  /var/run/cdi/nvidia.com-<MODEL>.yaml; kata's cold-plug reads that spec and
+  attaches a vfio-pci device behind a pcie-root-port at sandbox creation.
+
+  This is the SANDBOX (whole-VFIO-device → VM) plugin, distinct from the
+  ordinary bare-container NVIDIA device plugin — it hands the device to the
+  kata VM, not to a host container.
+
+  On a node with no GPUs bound to vfio-pci it advertises nothing, so a pod that
+  requests nvidia.com/<MODEL> stays Pending (Insufficient nvidia.com/<MODEL>) —
+  the expected shape on a box without GPUs.
+
+  THREAT MODEL: privileged + hostPID + host /dev/vfio, /sys, /var/run/cdi. That
+  is inherent to handing a host PCIe device to a VM; it is a host-side operator
+  component, outside the guest TEE boundary. The image is digest-pinned for the
+  same supply-chain reason as kata-deploy.
+
+  Scheduling: runs on the same nodes as kata-deploy (linux + kata.nodeSelector).
+  Scope kata.nodeSelector to your GPU nodes so the privileged plugin does not
+  land on GPU-less nodes (harmless there — it just finds no devices).
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "c8s.kataName" . }}-sandbox-device-plugin
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-sandbox-device-plugin
+{{ include "c8s.serviceAccountImagePullSecrets" . }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "c8s.kataName" . }}-sandbox-device-plugin
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-sandbox-device-plugin
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: c8s-operator
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: kata-sandbox-device-plugin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: c8s-operator
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: kata-sandbox-device-plugin
+    spec:
+      serviceAccountName: {{ include "c8s.kataName" . }}-sandbox-device-plugin
+      hostPID: true
+      priorityClassName: system-node-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+        {{- with .Values.kata.nodeSelector }}
+{{ toYaml . | indent 8 }}
+        {{- end }}
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: nvidia-sandbox-device-plugin
+          image: {{ include "c8s.kataSandboxDevicePluginImage" . }}
+          imagePullPolicy: {{ .Values.kata.gpu.sandboxDevicePlugin.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          env:
+            # Empty → per-model resource names (e.g.
+            # nvidia.com/GB202GL_RTX_PRO_6000_BLACKWELL_SERVER_EDITION) so a
+            # heterogeneous fleet schedules to the right card.
+            - name: P_GPU_ALIAS
+              value: ""
+            - name: NVSWITCH_ALIAS
+              value: ""
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: vfio
+              mountPath: /dev/vfio
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            # CDI spec output. The plugin writes nvidia.com-<MODEL>.yaml here at
+            # startup; the host-side kata shim reads the SAME path. Without this
+            # hostPath bind the spec lands in the container's ephemeral layer and
+            # the shim sees no CDI provider, failing sandbox creation with
+            # "unresolvable CDI devices nvidia.com/<MODEL>=N".
+            - name: cdi
+              mountPath: /var/run/cdi
+            # Masked emptyDir over /dev/iommu — rolling the DaemonSet releases
+            # GPUs wedged by sandboxes killed mid-flight. Harmless: on no code
+            # path the plugin's iommufd auto-detection takes. See the prior-art
+            # role for the full history.
+            - name: mask-iommu
+              mountPath: /dev/iommu
+          resources:
+{{ toYaml .Values.kata.gpu.sandboxDevicePlugin.resources | indent 12 }}
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: vfio
+          hostPath:
+            path: /dev/vfio
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: cdi
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: mask-iommu
+          emptyDir: {}
+{{- end }}

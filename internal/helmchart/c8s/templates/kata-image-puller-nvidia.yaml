@@ -1,0 +1,148 @@
+{{- if and .Values.kata.enabled .Values.kata.guestImage.enabled }}
+{{- /*
+  c8s-kata-image-puller-nvidia: the confidential-GPU twin of the
+  kata-image-puller DaemonSet (templates/kata-image-puller.yaml). It pulls the
+  `<tag>-nvidia` kata-guest-base oras artifact onto each kata node and writes
+  the config.d/50-c8s.toml drop-in for the platform's confidential GPU runtime
+  (qemu-nvidia-gpu-snp or qemu-nvidia-gpu-tdx, per c8s.kataGpuShimName —
+  guest-pull + the VFIO cold-plug knobs). Same drop-in mechanism, reconcile
+  rationale, and threat model as the non-GPU puller — see its header and
+  docs/kata-gpu.md.
+
+  It reuses the non-GPU puller's ConfigMap (the same parametrized
+  pull-and-configure.sh, driven by SHIM_NAME / GPU_* env), so there is one
+  shellcheck'd script for all confidential runtimes. Kept a separate DaemonSet
+  (not a second container in the non-GPU puller pod) so the GPU pull — whose
+  `<tag>-nvidia` artifact may not yet be published — cannot block the non-GPU
+  puller's readiness, which the kata-qemu-snp pods order against.
+*/}}
+{{- $pullerAuthSecret := .Values.kata.guestImage.pullerAuthSecret | default .Values.imagePullSecret -}}
+{{- $gpuShim := include "c8s.kataGpuShimName" . -}}
+{{- $gpuDropInPath := printf "/host/opt/kata/share/defaults/kata-containers/runtimes/%s/config.d/50-c8s.toml" $gpuShim -}}
+{{- /* GPU in-guest registry auth: "" inherits the non-GPU setting (the GPU
+     guest bakes the same auth.json), "none" forces anonymous, anything else
+     is used verbatim. See values.yaml kata.gpu.guestImage.registryAuth. */ -}}
+{{- $gpuRegistryAuth := .Values.kata.gpu.guestImage.registryAuth | default .Values.kata.guestImage.registryAuth -}}
+{{- if eq $gpuRegistryAuth "none" -}}
+{{- $gpuRegistryAuth = "" -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "c8s.kataName" . }}-image-puller-nvidia
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-image-puller-nvidia
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: c8s-operator
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: kata-image-puller-nvidia
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: c8s-operator
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: kata-image-puller-nvidia
+      annotations:
+        checksum/config: {{ printf "%s|%s" .Values.kata.guestImage.repository (include "c8s.kataGuestImageNvidiaTag" .) | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "c8s.kataName" . }}-image-puller
+      nodeSelector:
+        kubernetes.io/os: linux
+        {{- with .Values.kata.nodeSelector }}
+{{ toYaml . | indent 8 }}
+        {{- end }}
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: reconcile
+          image: {{ if .Values.kata.guestImage.pullerImage.digest -}}
+              {{ .Values.kata.guestImage.pullerImage.repository }}@{{ .Values.kata.guestImage.pullerImage.digest }}
+            {{- else -}}
+              {{ .Values.kata.guestImage.pullerImage.repository }}:{{ .Values.kata.guestImage.pullerImage.tag }}
+            {{- end }}
+          imagePullPolicy: {{ .Values.kata.guestImage.pullerImage.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              DROPIN={{ $gpuDropInPath }}
+              while true; do
+                if [ ! -f "$DROPIN" ]; then
+                  echo "reconcile(nvidia): drop-in absent — (re)applying"
+                  sh /scripts/pull-and-configure.sh || echo "reconcile(nvidia): not ready (kata-deploy still installing, or <tag>-nvidia artifact unpublished?)" >&2
+                fi
+                sleep 30
+              done
+          env:
+            - name: REGISTRY
+              value: {{ .Values.kata.guestImage.repository | quote }}
+            - name: TAG
+              value: {{ include "c8s.kataGuestImageNvidiaTag" . | quote }}
+            - name: HOST_IMG_DIR
+              value: "/host{{ .Values.kata.gpu.guestImage.hostPath }}"
+            # In-guest registry auth: inherits kata.guestImage.registryAuth by
+            # default (the GPU guest bakes the same auth.json as the non-GPU
+            # one); see the $gpuRegistryAuth resolution at the top.
+            - name: REGISTRY_AUTH
+              value: {{ $gpuRegistryAuth | quote }}
+            - name: ORAS_INSECURE
+              value: {{ .Values.kata.guestImage.insecure | quote }}
+            # Target the platform's confidential-GPU runtime, not qemu-snp.
+            - name: SHIM_NAME
+              value: {{ $gpuShim | quote }}
+            # VFIO cold-plug + BAR-mapping memory floor (kata.gpu.guestImage.*).
+            - name: GPU_PCIE_ROOT_PORT
+              value: {{ .Values.kata.gpu.guestImage.pcieRootPort | quote }}
+            - name: GPU_DEFAULT_MEMORY
+              value: {{ .Values.kata.gpu.guestImage.defaultMemory | quote }}
+            # Same debug semantics as the non-GPU puller: the drop-in carries
+            # debug_console_enabled, forced false unless kata.guestImage.debug.
+            - name: KATA_DEBUG
+              value: {{ .Values.kata.guestImage.debug | default false | quote }}
+          securityContext:
+            privileged: true
+          readinessProbe:
+            # Ready once the c8s config.d drop-in is present next to the GPU
+            # shim's config (same probe shape as the non-GPU puller).
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f {{ $gpuDropInPath }}
+            periodSeconds: 10
+            failureThreshold: 30
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: host
+              mountPath: /host
+            {{- if $pullerAuthSecret }}
+            - name: dockercfg
+              mountPath: /root/.docker
+              readOnly: true
+            {{- end }}
+          resources:
+{{ toYaml .Values.kata.gpu.guestImage.resources | indent 12 }}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "c8s.kataName" . }}-image-puller
+            defaultMode: 0755
+        - name: host
+          hostPath:
+            path: /
+        {{- if $pullerAuthSecret }}
+        - name: dockercfg
+          projected:
+            sources:
+              - secret:
+                  name: {{ $pullerAuthSecret }}
+                  items:
+                    - key: .dockerconfigjson
+                      path: config.json
+        {{- end }}
+{{- end }}

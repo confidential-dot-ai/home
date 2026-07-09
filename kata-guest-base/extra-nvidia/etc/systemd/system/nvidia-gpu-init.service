@@ -1,0 +1,25 @@
+# NVIDIA driver bring-up for the c8s confidential GPU guest. First of the
+# three-unit NVRC replacement (see /usr/local/bin/nvidia-gpu-init.sh):
+# init -> persistenced -> ready -> kata-agent. Failure here cascades into
+# kata-agent.service (Requires= chain), killing the sandbox at creation —
+# NVRC's fail-fast, expressed in systemd.
+[Unit]
+Description=NVIDIA driver load + device nodes (c8s GPU guest)
+DefaultDependencies=no
+After=systemd-udevd.service local-fs.target
+Before=kata-agent.service
+# Requires= only blocks kata-agent from starting — the VM then idles until
+# the shim's dial_timeout (20 min) instead of failing the pod. Power off so
+# the sandbox dies at creation, which is the fail-fast the NVRC image gets
+# from its init panicking.
+FailureAction=poweroff-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/nvidia-gpu-init.sh
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

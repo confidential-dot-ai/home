@@ -62,6 +62,7 @@ spec:
             - --get-cert-run-as-non-root={{ .Values.webhook.getCert.runAsNonRoot }}
             {{- if .Values.kata.enabled }}
             - --kata-enforce=true
+            - --hardware-platform={{ include "c8s.hardwarePlatform" . }}
             {{- end }}
             {{- range .Values.operator.extraArgs }}
             - {{ . | quote }}

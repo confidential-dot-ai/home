@@ -76,8 +76,14 @@ type Options struct {
 	// KataEnforce makes the pod webhook inject a kata runtimeClassName into
 	// in-scope workload pods that do not request one. Independent of
 	// GetCertImage — the webhook registers when either is set. The injected
-	// classes (kata-qemu / kata-qemu-snp) are fixed in the webhook.
+	// classes are fixed in the webhook; HardwarePlatform picks which
+	// confidential (CPU, GPU) pair, and a pod requesting an nvidia.com/*
+	// resource gets the GPU one, which ships with every kata install.
 	KataEnforce bool
+
+	// HardwarePlatform is the CPU TEE the confidential kata classes target
+	// (webhook.HardwarePlatformSNP or ...TDX; the operator command validates).
+	HardwarePlatform string
 }
 
 var scheme = runtime.NewScheme()
@@ -182,13 +188,15 @@ func Run(ctx context.Context, opts Options) error {
 			GetCertRunAsGroup:   int64Ptr(opts.GetCertRunAsGroup),
 			GetCertRunAsNonRoot: boolPtr(opts.GetCertRunAsNonRoot),
 			KataEnforce:         opts.KataEnforce,
+			HardwarePlatform:    opts.HardwarePlatform,
 		}); err != nil {
 			return fmt.Errorf("register webhook: %w", err)
 		}
 		logger.Info("pod-injection webhook enabled",
 			"image", opts.GetCertImage,
 			"cds_url", opts.CDSURL,
-			"kata_enforce", opts.KataEnforce)
+			"kata_enforce", opts.KataEnforce,
+			"hardware_platform", opts.HardwarePlatform)
 
 		// One-shot startup sweep: delete cw-annotated pods that were admitted
 		// while the webhook was down (so never injected) and let their owners

@@ -82,6 +82,33 @@ func TestResolveImageTag(t *testing.T) {
 	}
 }
 
+// labelSelector feeds the --kata SNP-node preflight: it must produce a stable
+// kubectl -l selector from the chart's kata.snpNodeSelector map, and report
+// ok=false for the empty (opt-out) and malformed shapes so the preflight
+// skips rather than guesses.
+func TestLabelSelector(t *testing.T) {
+	tests := []struct {
+		name string
+		sel  map[string]any
+		want string
+		ok   bool
+	}{
+		{name: "chart default", sel: map[string]any{"confidential.ai/sev-snp": "true"}, want: "confidential.ai/sev-snp=true", ok: true},
+		{name: "multiple pairs sorted", sel: map[string]any{"b": "2", "a": "1"}, want: "a=1,b=2", ok: true},
+		{name: "empty map is the opt-out", sel: map[string]any{}, ok: false},
+		{name: "nil map is the opt-out", sel: nil, ok: false},
+		{name: "non-string value skips", sel: map[string]any{"a": true}, ok: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := labelSelector(tt.sel)
+			if ok != tt.ok || got != tt.want {
+				t.Fatalf("labelSelector(%v) = (%q, %t), want (%q, %t)", tt.sel, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
 func TestNamespaceManifestSetsPrivilegedPodSecurityLabels(t *testing.T) {
 	data, err := namespaceManifest("c8s-system")
 	if err != nil {
@@ -147,7 +174,7 @@ func TestBuildInstallHelmArgsOrdering(t *testing.T) {
 	installRelease, installNamespace = "c8s", "c8s-system"
 
 	// CRDs installed, two operator -f files, wait on: computed file is LAST -f.
-	assertArgsEqual(t, buildInstallHelmArgs("/chart", "/tmp/computed.yaml", []string{"a.yaml", "b.yaml"}, true, true), []string{
+	assertArgsEqual(t, buildInstallHelmArgs("/chart", "/tmp/computed.yaml", []string{"a.yaml", "b.yaml"}, true, true, false), []string{
 		"upgrade", "--install", "c8s", "/chart", "--namespace", "c8s-system",
 		"-f", "a.yaml", "-f", "b.yaml", "-f", "/tmp/computed.yaml",
 		"--wait", "--timeout=5m",
@@ -155,9 +182,17 @@ func TestBuildInstallHelmArgsOrdering(t *testing.T) {
 
 	// CRDs skipped, no operator -f, wait off: --skip-crds present, computed file
 	// still the last (only) -f, no --wait.
-	assertArgsEqual(t, buildInstallHelmArgs("/chart", "/tmp/computed.yaml", nil, false, false), []string{
+	assertArgsEqual(t, buildInstallHelmArgs("/chart", "/tmp/computed.yaml", nil, false, false, false), []string{
 		"upgrade", "--install", "c8s", "/chart", "--namespace", "c8s-system",
 		"--skip-crds", "-f", "/tmp/computed.yaml",
+	})
+
+	// --kata raises the wait ceiling: kata-deploy's first-install payload
+	// download routinely exceeds 5m (docs/pitfalls.md).
+	assertArgsEqual(t, buildInstallHelmArgs("/chart", "/tmp/computed.yaml", nil, true, true, true), []string{
+		"upgrade", "--install", "c8s", "/chart", "--namespace", "c8s-system",
+		"-f", "/tmp/computed.yaml",
+		"--wait", "--timeout=10m",
 	})
 }
 
@@ -511,6 +546,69 @@ func TestBuildDigestArgsFailsClosedOnResolveError(t *testing.T) {
 	}
 	if _, err := buildDigestArgs(nil, "v1", testComponents, resolve); err == nil {
 		t.Fatal("buildDigestArgs ignored a resolver error, want fail-closed")
+	}
+}
+
+// A missing tag (registry MANIFEST_UNKNOWN) must abort with the tag-coupling
+// guidance — pointing at kata.guestImage.tag for guest-image-only tags like
+// gpu-test, and at the lockstep publish model — while preserving the cause.
+func TestBuildDigestArgsExplainsTagCouplingOnMissingTag(t *testing.T) {
+	notFound := errors.New(`crane digest "ghcr.io/confidential-dot-ai/c8s-operator:gpu-test": exit status 1: MANIFEST_UNKNOWN: manifest unknown`)
+	resolve := func(string) (string, error) { return "", notFound }
+	_, err := buildDigestArgs(nil, "gpu-test", testComponents, resolve)
+	if err == nil {
+		t.Fatal("buildDigestArgs accepted a missing tag, want fail-closed")
+	}
+	if !errors.Is(err, notFound) {
+		t.Errorf("wrapped error must preserve the cause, got: %v", err)
+	}
+	// The hint must be self-contained (end users don't have the repo, so no
+	// docs/ paths) and steer to the guest-image knob for guest-image tags.
+	for _, want := range []string{"kata.guestImage.tag", "lockstep"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error must mention %q, got: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "docs/") {
+		t.Errorf("user-facing hint must not reference in-repo docs paths, got: %v", err)
+	}
+}
+
+// Auth/network resolve failures must pass through without the tag-coupling
+// hint — advising a tag change for a 401 would send the operator down the
+// wrong path.
+func TestBuildDigestArgsLeavesOtherResolveErrorsUnhinted(t *testing.T) {
+	resolve := func(string) (string, error) { return "", errTestResolve }
+	_, err := buildDigestArgs(nil, "v1", testComponents, resolve)
+	if err == nil {
+		t.Fatal("buildDigestArgs ignored a resolver error, want fail-closed")
+	}
+	if strings.Contains(err.Error(), "kata.guestImage.tag") {
+		t.Errorf("non-not-found error must not carry the tag-coupling hint: %v", err)
+	}
+}
+
+// isImageNotFound keys the tag-coupling guidance to the registry's own
+// missing-reference error codes, so auth and network failures never
+// masquerade as a missing tag.
+func TestIsImageNotFound(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "missing tag", err: errors.New("crane digest: MANIFEST_UNKNOWN: manifest unknown"), want: true},
+		{name: "missing repository", err: errors.New("crane digest: NAME_UNKNOWN: repository name not known to registry"), want: true},
+		{name: "auth failure", err: errors.New("crane digest: UNAUTHORIZED: authentication required"), want: false},
+		{name: "network failure", err: errors.New("dial tcp: lookup ghcr.io: no such host"), want: false},
+		{name: "nil", err: nil, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isImageNotFound(tt.err); got != tt.want {
+				t.Fatalf("isImageNotFound(%v) = %t, want %t", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 

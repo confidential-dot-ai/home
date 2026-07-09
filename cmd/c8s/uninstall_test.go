@@ -52,6 +52,8 @@ func TestFilterKataPodsKeepsOnlyKataRuntimeClasses(t *testing.T) {
 		"team-a\tbatch-1\tkata-qemu",
 		"team-b\tsandbox-2\tgvisor", // non-kata RuntimeClass
 		"team-c\tclh-0\tkata-clh",
+		"team-d\ttd-0\tkata-qemu-tdx",
+		"team-e\tgpu-0\tkata-qemu-snp-nvidia",
 		"", // trailing blank line from kubectl
 		"malformed-line-no-tabs",
 	}
@@ -60,6 +62,8 @@ func TestFilterKataPodsKeepsOnlyKataRuntimeClasses(t *testing.T) {
 		"default/inference-0 (kata-qemu-snp)",
 		"team-a/batch-1 (kata-qemu)",
 		"team-c/clh-0 (kata-clh)",
+		"team-d/td-0 (kata-qemu-tdx)",
+		"team-e/gpu-0 (kata-qemu-snp-nvidia)",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("filterKataPods = %v, want %v", got, want)
@@ -186,6 +190,48 @@ kata:
 	}
 }
 
+// Every kata install carries a second GPU guest-image dir the sweep must
+// remove. The path is read from the kata.gpu.guestImage block; a pre-GPU
+// release (no kata.gpu block) leaves it empty and the sweep skips it.
+func TestKataConfigFromValuesExtractsGpuImagePath(t *testing.T) {
+	base := `
+kata:
+  enabled: true
+  distro: k8s
+  containerdConfigDir: ""
+  containerdPrep:
+    image:
+      repository: busybox
+      tag: "1.37"
+      digest: ""
+  guestImage:
+    hostPath: /var/lib/c8s/kata-images
+`
+	t.Run("gpu block present", func(t *testing.T) {
+		tree := chartValuesTree(t, base+`  gpu:
+    guestImage:
+      hostPath: /var/lib/c8s/kata-images-nvidia
+`)
+		cfg, err := kataConfigFromValues(tree)
+		if err != nil {
+			t.Fatalf("kataConfigFromValues: %v", err)
+		}
+		if cfg.GuestImageNvidiaHostPath != "/var/lib/c8s/kata-images-nvidia" {
+			t.Errorf("GuestImageNvidiaHostPath = %q, want /var/lib/c8s/kata-images-nvidia", cfg.GuestImageNvidiaHostPath)
+		}
+	})
+	t.Run("no gpu block (pre-GPU release)", func(t *testing.T) {
+		// A release that predates the GPU stack must not error.
+		cfg, err := kataConfigFromValues(chartValuesTree(t, base))
+		if err != nil {
+			t.Fatalf("kataConfigFromValues: %v", err)
+		}
+		if cfg.GuestImageNvidiaHostPath != "" {
+			t.Errorf("GuestImageNvidiaHostPath = %q, want empty when no kata.gpu block", cfg.GuestImageNvidiaHostPath)
+		}
+	})
+}
+
 // Values without a kata block mean the release isn't the c8s chart; sweeping
 // host paths based on guesses must fail loudly instead.
 func TestKataConfigFromValuesRejectsForeignChart(t *testing.T) {
@@ -252,12 +298,13 @@ kata:
 
 func TestKataSweepDaemonSetShape(t *testing.T) {
 	cfg := kataUninstallConfig{
-		Enabled:             true,
-		Distro:              "rke2",
-		ContainerdConfigDir: "/var/lib/rancher/rke2/agent/etc/containerd",
-		GuestImageHostPath:  "/var/lib/c8s/kata-images",
-		SweepImage:          "busybox@sha256:abc",
-		NodeSelector:        map[string]string{"confidential.ai/kata": "true"},
+		Enabled:                  true,
+		Distro:                   "rke2",
+		ContainerdConfigDir:      "/var/lib/rancher/rke2/agent/etc/containerd",
+		GuestImageHostPath:       "/var/lib/c8s/kata-images",
+		GuestImageNvidiaHostPath: "/var/lib/c8s/kata-images-nvidia",
+		SweepImage:               "busybox@sha256:abc",
+		NodeSelector:             map[string]string{"confidential.ai/kata": "true"},
 	}
 	ds := kataSweepDaemonSet("c8s", "c8s-system", cfg)
 
@@ -299,10 +346,11 @@ func TestKataSweepDaemonSetShape(t *testing.T) {
 	// The script's env contract (see kata-sweep.sh header) — every value the
 	// release config carries must be plumbed.
 	wantEnv := map[string]string{
-		"HOST_CONTAINERD_DIR": "/var/lib/rancher/rke2/agent/etc/containerd",
-		"GUEST_IMAGE_DIR":     "/var/lib/c8s/kata-images",
-		"RKE2_PREP":           "true",
-		"RESTART_COMMAND":     kataRestartCommand("rke2"),
+		"HOST_CONTAINERD_DIR":    "/var/lib/rancher/rke2/agent/etc/containerd",
+		"GUEST_IMAGE_DIR":        "/var/lib/c8s/kata-images",
+		"GUEST_IMAGE_DIR_NVIDIA": "/var/lib/c8s/kata-images-nvidia",
+		"RKE2_PREP":              "true",
+		"RESTART_COMMAND":        kataRestartCommand("rke2"),
 	}
 	gotEnv := map[string]string{}
 	for _, e := range sweep.Env {

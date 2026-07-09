@@ -5,9 +5,10 @@
   not a supported shape (a workload could silently dodge the CVM boundary).
 
   Two pieces work together:
-   - the c8s operator's pod webhook (operator.yaml passes --kata-enforce)
-     injects a runtimeClassName into workload pods that do not request one:
-     kata-qemu, or kata-qemu-snp for pods annotated confidential.ai/cw;
+   - the c8s operator's pod webhook (operator.yaml passes --kata-enforce and
+     --hardware-platform) injects a runtimeClassName into workload pods that
+     do not request one: kata-qemu, or the platform's confidential class for
+     pods annotated confidential.ai/cw or requesting an nvidia.com/* GPU;
    - the ValidatingAdmissionPolicy below rejects a workload pod that requests
      a non-kata runtimeClassName.
 
@@ -41,22 +42,25 @@ spec:
         resources: [pods]
   validations:
     # Allow a pod when it requests one of the kata RuntimeClasses this chart
-    # installs, or when it uses a host namespace (kata cannot run those — the
-    # webhook leaves them as ordinary containers). Reject everything else,
-    # including a pod with no runtimeClassName: with enforcement on the
-    # webhook injects one, so a pod reaching validation without a class means
-    # the webhook did not run.
+    # installs — the non-confidential pair plus the declared platform's
+    # confidential (CPU, GPU) pair (c8s.kataAllowedRuntimeClasses; keep in
+    # lockstep with the RuntimeClasses and SHIMS_X86_64 in
+    # templates/kata.yaml) — or when it uses a host namespace (kata cannot
+    # run those — the webhook leaves them as ordinary containers). Reject
+    # everything else, including a pod with no runtimeClassName: with
+    # enforcement on the webhook injects one, so a pod reaching validation
+    # without a class means the webhook did not run.
     - expression: >-
-        (has(object.spec.runtimeClassName) && object.spec.runtimeClassName in ['kata-qemu', 'kata-clh', 'kata-qemu-snp', 'kata-qemu-tdx'])
+        (has(object.spec.runtimeClassName) && object.spec.runtimeClassName in [{{ include "c8s.kataAllowedRuntimeClasses" . }}])
         || (has(object.spec.hostNetwork) && object.spec.hostNetwork)
         || (has(object.spec.hostPID) && object.spec.hostPID)
         || (has(object.spec.hostIPC) && object.spec.hostIPC)
       message: >-
         c8s kata enforcement: workload pods must run under a kata RuntimeClass
-        (kata-qemu, kata-clh, kata-qemu-snp, or kata-qemu-tdx). The c8s
-        operator webhook injects one automatically for pods that do not set
-        runtimeClassName; a rejection here means the pod explicitly set a
-        non-kata runtimeClassName, or the c8s operator is not running.
+        ({{ include "c8s.kataAllowedRuntimeClasses" . | replace "'" "" }}).
+        The c8s operator webhook injects one automatically for pods that do
+        not set runtimeClassName; a rejection here means the pod explicitly
+        set a non-kata runtimeClassName, or the c8s operator is not running.
         Host-namespace pods are exempt.
       reason: Forbidden
 ---

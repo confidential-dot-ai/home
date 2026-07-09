@@ -616,6 +616,17 @@ func findContainer(containers []corev1.Container, name string) (corev1.Container
 	return corev1.Container{}, false
 }
 
+// envValue returns the value of the named env var on a container, or "" if it
+// is absent (or set via valueFrom rather than a literal value).
+func envValue(env []corev1.EnvVar, name string) string {
+	for _, e := range env {
+		if e.Name == name {
+			return e.Value
+		}
+	}
+	return ""
+}
+
 func containerNames(containers []corev1.Container) []string {
 	names := make([]string, 0, len(containers))
 	for _, c := range containers {
@@ -2609,15 +2620,22 @@ func TestChartKataDisabledByDefault(t *testing.T) {
 }
 
 // TestChartKataEnabledRendersDeployStack: kata.enabled renders the
-// kata-deploy DaemonSet and the three RuntimeClasses.
+// kata-deploy DaemonSet and the platform's RuntimeClasses — on the default
+// (SNP) platform the two non-confidential classes plus the SNP pair; the TDX
+// classes must NOT render (one CPU TEE per cluster).
 func TestChartKataEnabledRendersDeployStack(t *testing.T) {
 	out, err := helmTemplateKata(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
-	for _, rc := range []string{"kata-qemu", "kata-clh", "kata-qemu-snp"} {
+	for _, rc := range []string{"kata-qemu", "kata-clh", "kata-qemu-snp", "kata-qemu-snp-nvidia"} {
 		if !renderedManifestHasNamedKind(t, out, "RuntimeClass", rc) {
 			t.Fatalf("kata.enabled missing RuntimeClass %q\n%s", rc, out)
+		}
+	}
+	for _, rc := range []string{"kata-qemu-tdx", "kata-qemu-tdx-nvidia"} {
+		if renderedManifestHasNamedKind(t, out, "RuntimeClass", rc) {
+			t.Fatalf("TDX RuntimeClass %q rendered on an SNP install — only the declared platform's classes ship\n%s", rc, out)
 		}
 	}
 
@@ -2640,6 +2658,250 @@ func TestChartKataEnabledRendersDeployStack(t *testing.T) {
 	}
 	if !slices.Contains(renderedOperatorArgs(t, out), "--kata-enforce=true") {
 		t.Errorf("operator must get --kata-enforce under kata.enabled — kata is enforcing")
+	}
+	// The webhook injects the platform's confidential classes; the operator
+	// must be told which platform the chart rendered for.
+	if !slices.Contains(renderedOperatorArgs(t, out), "--hardware-platform=sev-snp") {
+		t.Errorf("operator must get --hardware-platform=sev-snp on a default kata install; args: %v", renderedOperatorArgs(t, out))
+	}
+	// The enforcement allowlist is platform-scoped too: a TDX class name must
+	// not be admissible on an SNP install.
+	if strings.Contains(out, "'kata-qemu-tdx'") || strings.Contains(out, "'kata-qemu-tdx-nvidia'") {
+		t.Errorf("kata-enforcement allowlist must not accept TDX classes on an SNP install\n%s", out)
+	}
+}
+
+// rcScheduling captures the scheduling block of a rendered RuntimeClass.
+type rcScheduling struct {
+	Scheduling struct {
+		NodeSelector map[string]string `json:"nodeSelector"`
+	} `json:"scheduling"`
+}
+
+// TestChartKataSnpRuntimeClassesCarryNodeSelector: the confidential classes
+// must select SNP-labelled nodes (kata.snpNodeSelector). Without the selector
+// a confidential pod scheduled onto a non-SNP TEE host (e.g. Intel TDX) does
+// not fail cleanly — kata's confidential_guest auto-detects the host TEE and
+// QEMU aborts in an unbounded crash-loop; with it the pod stays Pending with a
+// clear scheduling message. kata-qemu / kata-clh work on any kata node and
+// must stay unrestricted.
+func TestChartKataSnpRuntimeClassesCarryNodeSelector(t *testing.T) {
+	out, err := helmTemplateKata(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	for _, name := range []string{"kata-qemu-snp", "kata-qemu-snp-nvidia"} {
+		var rc rcScheduling
+		if !findDoc(t, out, "RuntimeClass", name, &rc) {
+			t.Fatalf("RuntimeClass %q not rendered\n%s", name, out)
+		}
+		if got := rc.Scheduling.NodeSelector["confidential.ai/sev-snp"]; got != "true" {
+			t.Errorf("%s scheduling.nodeSelector[confidential.ai/sev-snp] = %q, want \"true\"", name, got)
+		}
+	}
+	for _, name := range []string{"kata-qemu", "kata-clh"} {
+		var rc rcScheduling
+		if !findDoc(t, out, "RuntimeClass", name, &rc) {
+			t.Fatalf("RuntimeClass %q not rendered\n%s", name, out)
+		}
+		if len(rc.Scheduling.NodeSelector) != 0 {
+			t.Errorf("%s must carry no scheduling.nodeSelector (it runs on any kata node), got %v", name, rc.Scheduling.NodeSelector)
+		}
+	}
+}
+
+// kata.snpNodeSelector={} is the documented opt-out: the confidential classes
+// render with no scheduling block (unrestricted scheduling, e.g. a uniformly
+// SNP cluster that wants no capability label).
+func TestChartKataSnpNodeSelectorClearable(t *testing.T) {
+	out, err := helmTemplateKata(t, "--set", "kata.snpNodeSelector=null")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	for _, name := range []string{"kata-qemu-snp", "kata-qemu-snp-nvidia"} {
+		var rc rcScheduling
+		if !findDoc(t, out, "RuntimeClass", name, &rc) {
+			t.Fatalf("RuntimeClass %q not rendered\n%s", name, out)
+		}
+		if len(rc.Scheduling.NodeSelector) != 0 {
+			t.Errorf("%s scheduling.nodeSelector = %v, want none with kata.snpNodeSelector cleared", name, rc.Scheduling.NodeSelector)
+		}
+	}
+}
+
+// TestChartGpuAbsentWithoutKata: with kata disabled (the chart default) none of
+// the confidential-GPU stack renders — the whole GPU stack is part of the kata
+// stack, gated on kata.enabled.
+func TestChartGpuAbsentWithoutKata(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if renderedManifestHasNamedKind(t, out, "RuntimeClass", "kata-qemu-snp-nvidia") {
+		t.Errorf("GPU RuntimeClass rendered without kata.enabled\n%s", out)
+	}
+	if renderedManifestHasNamedKind(t, out, "DaemonSet", "c8s-kata-deploy-image-puller-nvidia") {
+		t.Errorf("GPU image puller rendered without kata.enabled")
+	}
+	if renderedManifestHasNamedKind(t, out, "DaemonSet", "c8s-kata-deploy-sandbox-device-plugin") {
+		t.Errorf("sandbox device plugin rendered without kata.enabled")
+	}
+}
+
+// TestChartKataRendersGpuStack: a plain --kata install (no GPU flag) ships the
+// confidential-GPU stack — the GPU RuntimeClass (handler kata-qemu-nvidia-gpu-snp),
+// the GPU shim in SHIMS_X86_64, the enforcement allowlist entry, the GPU image
+// puller, and the privileged digest-pinned sandbox device plugin. GPU is part of
+// every kata install; there is no separate toggle.
+func TestChartKataRendersGpuStack(t *testing.T) {
+	out, err := helmTemplateKata(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+
+	// RuntimeClass name follows the c8s convention; handler is the kata shim.
+	var rc struct {
+		Handler string `yaml:"handler"`
+	}
+	if !findDoc(t, out, "RuntimeClass", "kata-qemu-snp-nvidia", &rc) {
+		t.Fatalf("a kata install must render RuntimeClass kata-qemu-snp-nvidia\n%s", out)
+	}
+	if rc.Handler != "kata-qemu-nvidia-gpu-snp" {
+		t.Errorf("kata-qemu-snp-nvidia handler = %q, want kata-qemu-nvidia-gpu-snp", rc.Handler)
+	}
+
+	// GPU shim registered with kata-deploy.
+	ds := renderedDaemonSet(t, out, "c8s-kata-deploy")
+	kube, _ := findContainer(ds.Spec.Template.Spec.Containers, "kube-kata")
+	if v := envValue(kube.Env, "SHIMS_X86_64"); !strings.Contains(v, "qemu-nvidia-gpu-snp") {
+		t.Errorf("SHIMS_X86_64 = %q must register qemu-nvidia-gpu-snp", v)
+	}
+
+	// Enforcement allowlist accepts the class.
+	if !strings.Contains(out, "'kata-qemu-snp-nvidia'") {
+		t.Errorf("kata-enforcement allowlist must accept kata-qemu-snp-nvidia\n%s", out)
+	}
+
+	// GPU image puller: pulls the -nvidia tag and patches the GPU config.
+	puller := renderedDaemonSet(t, out, "c8s-kata-deploy-image-puller-nvidia")
+	pc, ok := findContainer(puller.Spec.Template.Spec.Containers, "reconcile")
+	if !ok {
+		t.Fatalf("GPU puller missing reconcile container")
+	}
+	if got := envValue(pc.Env, "TAG"); got != "main-nvidia" {
+		t.Errorf("GPU puller TAG = %q, want main-nvidia", got)
+	}
+	if got := envValue(pc.Env, "SHIM_NAME"); got != "qemu-nvidia-gpu-snp" {
+		t.Errorf("GPU puller SHIM_NAME = %q, want qemu-nvidia-gpu-snp", got)
+	}
+	if got := envValue(pc.Env, "GPU_PCIE_ROOT_PORT"); got != "8" {
+		t.Errorf("GPU puller GPU_PCIE_ROOT_PORT = %q, want 8", got)
+	}
+
+	// Sandbox device plugin: privileged, digest-pinned, advertises GPUs.
+	plugin := renderedDaemonSet(t, out, "c8s-kata-deploy-sandbox-device-plugin")
+	dp, ok := findContainer(plugin.Spec.Template.Spec.Containers, "nvidia-sandbox-device-plugin")
+	if !ok {
+		t.Fatalf("sandbox device plugin missing its container")
+	}
+	if dp.SecurityContext == nil || dp.SecurityContext.Privileged == nil || !*dp.SecurityContext.Privileged {
+		t.Errorf("sandbox device plugin must run privileged (it mounts host /dev/vfio)")
+	}
+	if !strings.Contains(dp.Image, "@sha256:") {
+		t.Errorf("sandbox device plugin image %q must be digest-pinned", dp.Image)
+	}
+}
+
+// TestChartKataRendersGpuStackTdx: under attestationApi.teeDevices.tdxGuest
+// the TDX classes render (and the SNP ones do NOT — one CPU TEE per cluster),
+// the TDX shims register with kata-deploy, the enforcement allowlist accepts
+// the TDX pair only, the GPU puller targets the qemu-nvidia-gpu-tdx shim
+// (mirroring the non-GPU puller's qemu-tdx switch), and the operator is told
+// the platform so webhook injection matches.
+func TestChartKataRendersGpuStackTdx(t *testing.T) {
+	out, err := helmTemplateKata(t,
+		"--set", "attestationApi.teeDevices.tdxGuest=true",
+		"--set", "attestationApi.teeDevices.sevGuest=false",
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+
+	var rc struct {
+		Handler    string `yaml:"handler"`
+		Scheduling struct {
+			NodeSelector map[string]string `yaml:"nodeSelector"`
+		} `yaml:"scheduling"`
+	}
+	if !findDoc(t, out, "RuntimeClass", "kata-qemu-tdx-nvidia", &rc) {
+		t.Fatalf("a kata install must render RuntimeClass kata-qemu-tdx-nvidia\n%s", out)
+	}
+	if rc.Handler != "kata-qemu-nvidia-gpu-tdx" {
+		t.Errorf("kata-qemu-tdx-nvidia handler = %q, want kata-qemu-nvidia-gpu-tdx", rc.Handler)
+	}
+	if got := rc.Scheduling.NodeSelector["confidential.ai/tdx"]; got != "true" {
+		t.Errorf("kata-qemu-tdx-nvidia nodeSelector[confidential.ai/tdx] = %q, want \"true\" (same guard as kata-qemu-tdx)", got)
+	}
+
+	ds := renderedDaemonSet(t, out, "c8s-kata-deploy")
+	kube, _ := findContainer(ds.Spec.Template.Spec.Containers, "kube-kata")
+	if v := envValue(kube.Env, "SHIMS_X86_64"); !strings.Contains(v, "qemu-nvidia-gpu-tdx") {
+		t.Errorf("SHIMS_X86_64 = %q must register qemu-nvidia-gpu-tdx", v)
+	}
+	if v := envValue(kube.Env, "SNAPSHOTTER_HANDLER_MAPPING_X86_64"); !strings.Contains(v, "qemu-nvidia-gpu-tdx:nydus") {
+		t.Errorf("SNAPSHOTTER_HANDLER_MAPPING_X86_64 = %q must route qemu-nvidia-gpu-tdx through nydus", v)
+	}
+
+	if !strings.Contains(out, "'kata-qemu-tdx-nvidia'") {
+		t.Errorf("kata-enforcement allowlist must accept kata-qemu-tdx-nvidia\n%s", out)
+	}
+
+	puller := renderedDaemonSet(t, out, "c8s-kata-deploy-image-puller-nvidia")
+	pc, ok := findContainer(puller.Spec.Template.Spec.Containers, "reconcile")
+	if !ok {
+		t.Fatalf("GPU puller missing reconcile container")
+	}
+	if got := envValue(pc.Env, "SHIM_NAME"); got != "qemu-nvidia-gpu-tdx" {
+		t.Errorf("GPU puller SHIM_NAME = %q, want qemu-nvidia-gpu-tdx on a TDX cluster", got)
+	}
+
+	// One CPU TEE per cluster: the SNP classes must not render on TDX, the
+	// SNP shims must not register, and the allowlist must not accept them.
+	for _, rc := range []string{"kata-qemu-snp", "kata-qemu-snp-nvidia"} {
+		if renderedManifestHasNamedKind(t, out, "RuntimeClass", rc) {
+			t.Errorf("SNP RuntimeClass %q rendered on a TDX install — only the declared platform's classes ship", rc)
+		}
+	}
+	if v := envValue(kube.Env, "SHIMS_X86_64"); strings.Contains(v, "-snp") {
+		t.Errorf("SHIMS_X86_64 = %q must not register SNP shims on a TDX install", v)
+	}
+	if strings.Contains(out, "'kata-qemu-snp'") || strings.Contains(out, "'kata-qemu-snp-nvidia'") {
+		t.Errorf("kata-enforcement allowlist must not accept SNP classes on a TDX install\n%s", out)
+	}
+	if !strings.Contains(out, "'kata-qemu-tdx'") {
+		t.Errorf("kata-enforcement allowlist must accept kata-qemu-tdx on a TDX install\n%s", out)
+	}
+
+	// Webhook injection follows the platform.
+	if !slices.Contains(renderedOperatorArgs(t, out), "--hardware-platform=tdx") {
+		t.Errorf("operator must get --hardware-platform=tdx on a TDX kata install; args: %v", renderedOperatorArgs(t, out))
+	}
+}
+
+// TestChartKataSandboxDevicePluginOptOut: the privileged sandbox device plugin
+// (the only nvcr.io-pulled, host-/dev/vfio-mounting GPU component) can be opted
+// out via kata.gpu.sandboxDevicePlugin.enabled while the rest of the GPU stack
+// (runtime class, shim, puller) still ships.
+func TestChartKataSandboxDevicePluginOptOut(t *testing.T) {
+	out, err := helmTemplateKata(t, "--set", "kata.gpu.sandboxDevicePlugin.enabled=false")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if renderedManifestHasNamedKind(t, out, "DaemonSet", "c8s-kata-deploy-sandbox-device-plugin") {
+		t.Errorf("sandbox device plugin rendered with sandboxDevicePlugin.enabled=false")
+	}
+	if !renderedManifestHasNamedKind(t, out, "RuntimeClass", "kata-qemu-snp-nvidia") {
+		t.Errorf("the rest of the GPU stack must still render with the device plugin opted out")
 	}
 }
 
@@ -2789,6 +3051,20 @@ func TestChartKataRendersPolicyAndOperatorFlag(t *testing.T) {
 	}
 	if !slices.Contains(renderedOperatorArgs(t, out), "--kata-enforce=true") {
 		t.Fatalf("operator missing --kata-enforce=true with enforcement on\n%s", out)
+	}
+}
+
+// pcie_root_port=0 disables VFIO cold-plug: a GPU pod would boot as a
+// confidential VM with no device and the only symptom is a missing
+// /dev/nvidia* in-guest. The chart must refuse the render instead of
+// shipping that silently (the puller script double-checks at run time).
+func TestChartKataRejectsZeroPcieRootPort(t *testing.T) {
+	out, err := helmTemplateKata(t, "--set", "kata.gpu.guestImage.pcieRootPort=0")
+	if err == nil {
+		t.Fatalf("helm template succeeded with kata.gpu.guestImage.pcieRootPort=0, want failure\n%s", out)
+	}
+	if msg := helmFailMessage(t, out); !strings.Contains(msg, "kind=gpu_pcie_root_port") {
+		t.Errorf("fail message %q missing the gpu_pcie_root_port marker", msg)
 	}
 }
 
@@ -4549,6 +4825,56 @@ func TestChartKataGuestImageDebugSelectsDebugTag(t *testing.T) {
 	}
 	if got := pullerEnv(t, out, "TAG"); got != "main-debug" {
 		t.Errorf("debug puller TAG = %q, want main-debug", got)
+	}
+}
+
+// GPU in-guest registry auth: "" inherits the non-GPU setting (the GPU guest
+// bakes the same auth.json), "none" forces anonymous, anything else wins
+// verbatim — the contract documented on kata.gpu.guestImage.registryAuth.
+func TestChartKataGpuRegistryAuthInheritance(t *testing.T) {
+	gpuAuth := func(t *testing.T, args ...string) string {
+		t.Helper()
+		out, err := helmTemplateKata(t, args...)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		puller := renderedDaemonSet(t, out, "c8s-kata-deploy-image-puller-nvidia")
+		pc, ok := findContainer(puller.Spec.Template.Spec.Containers, "reconcile")
+		if !ok {
+			t.Fatalf("GPU puller missing reconcile container")
+		}
+		return envValue(pc.Env, "REGISTRY_AUTH")
+	}
+	if got := gpuAuth(t); got != "file:///run/image-security/auth.json" {
+		t.Errorf("default GPU REGISTRY_AUTH = %q, want the inherited non-GPU baked-auth path", got)
+	}
+	if got := gpuAuth(t, "--set-string", "kata.gpu.guestImage.registryAuth=none"); got != "" {
+		t.Errorf(`registryAuth=none GPU REGISTRY_AUTH = %q, want "" (anonymous)`, got)
+	}
+	if got := gpuAuth(t, "--set-string", "kata.gpu.guestImage.registryAuth=kbs:///default/creds/gpu"); got != "kbs:///default/creds/gpu" {
+		t.Errorf("explicit registryAuth GPU REGISTRY_AUTH = %q, want the verbatim override", got)
+	}
+}
+
+// kata.guestImage.debug must vary the GPU guest tag in lockstep with the
+// non-GPU one: CI publishes `<tag>-nvidia` and `<tag>-nvidia-debug` together
+// (kata-guest-base.yml build job, build.sh Step 6) — see
+// c8s.kataGuestImageNvidiaTag.
+func TestChartKataGuestImageDebugDerivesNvidiaDebugTag(t *testing.T) {
+	out, err := helmTemplateKata(t, "--set", "kata.guestImage.debug=true")
+	if err != nil {
+		t.Fatalf("helm template (debug): %v\n%s", err, out)
+	}
+	puller := renderedDaemonSet(t, out, "c8s-kata-deploy-image-puller-nvidia")
+	pc, ok := findContainer(puller.Spec.Template.Spec.Containers, "reconcile")
+	if !ok {
+		t.Fatalf("GPU puller missing reconcile container")
+	}
+	if got := envValue(pc.Env, "TAG"); got != "main-nvidia-debug" {
+		t.Errorf("GPU puller TAG under debug = %q, want main-nvidia-debug (published in lockstep with main-nvidia)", got)
+	}
+	if got := envValue(pc.Env, "KATA_DEBUG"); got != "true" {
+		t.Errorf("GPU puller KATA_DEBUG under debug = %q, want true", got)
 	}
 }
 

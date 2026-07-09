@@ -406,6 +406,25 @@ kata:
   ## the one-shot install posture. kata-deploy labels each node
   ## katacontainers.io/kata-runtime=true once install completes.
   nodeSelector: {}
+  ## Node label marking a host SEV-SNP capable, rendered as
+  ## scheduling.nodeSelector on the confidential SNP RuntimeClasses so a
+  ## wrong-TEE node leaves pods Pending instead of crash-looping QEMU (see
+  ## docs/pitfalls.md "kata-qemu-snp on a non-SNP host"). Scheduling aid, not
+  ## a security boundary — attestation is. `c8s install --kata` applies it to
+  ## every kata-targeted node (declarative, no probe); -f/GitOps installs
+  ## label out-of-band. Swept by `c8s uninstall` — keep in lockstep with
+  ## snpCapabilityNodeLabel in cmd/c8s/uninstall.go. Set {} for unrestricted
+  ## scheduling, or point at an existing capability label (e.g. NFD's
+  ## feature.node.kubernetes.io/cpu-security.sev.snp.enabled: "true").
+  snpNodeSelector:
+    confidential.ai/sev-snp: "true"
+  ## TDX twin of snpNodeSelector: rendered as scheduling.nodeSelector on the
+  ## confidential TDX RuntimeClasses, applied by `c8s install --kata
+  ## --hardware-platform=tdx`, swept by `c8s uninstall` — keep in lockstep
+  ## with tdxHostLabelKey in cmd/c8s/install.go. Same opt-out and
+  ## repoint-at-NFD semantics as snpNodeSelector.
+  tdxNodeSelector:
+    confidential.ai/tdx: "true"
   ## kata-deploy copies the full kata-static payload (runtime, QEMU + Cloud
   ## Hypervisor, guest kernel and images) onto the host during install — peak
   ## memory is large and payload-dependent, so no limits: a fixed cap
@@ -434,13 +453,12 @@ kata:
     tag: main
     ## Use the `<tag>-debug` guest image variant, published in lockstep with
     ## every locked tag (.github/workflows/kata-guest-base.yml). Same build,
-    ## one delta: the baked kata-agent OPA policy allows the host
-    ## Exec/ReadStream/WriteStream RPCs, so `kubectl logs` and `kubectl exec`
-    ## work against kata-qemu-snp pods. That host access is exactly what the
-    ## locked policy exists to deny — container I/O becomes readable by the
-    ## untrusted host — and the debug image's SNP launch measurement differs
-    ## from the locked one, so attestation pinned to the locked reference
-    ## value rejects debug guests. Dev/debugging only;
+    ## two deltas: the baked kata-agent OPA policy allows the host
+    ## Exec/ReadStream/WriteStream RPCs (kubectl logs/exec work — container
+    ## I/O becomes readable by the untrusted host), and the GPU guest
+    ## tolerates a non-CC GPU instead of refusing to boot. The debug launch
+    ## measurement differs from the locked one, so attestation pinned to the
+    ## locked reference value rejects debug guests. Dev/debugging only;
     ## `c8s install --kata --debug` sets this.
     debug: false
     ## Pull the kata-guest-base oras artifact over plain HTTP (no TLS). For a
@@ -507,6 +525,65 @@ kata:
       limits:
         cpu: 500m
         memory: 256Mi
+
+  ## Confidential GPU (NVIDIA). Ships with every kata install — no
+  ## gpu.enabled: `c8s install --kata` renders the GPU shim + RuntimeClass,
+  ## webhook injection for nvidia.com/* pods, the <tag>-nvidia guest-image
+  ## puller, and the sandbox device plugin (its `enabled` below is the only
+  ## opt-out). Host GPU provisioning (vfio-pci binding, GPU CC mode, BAR
+  ## resize) is out of scope — see docs/kata-gpu.md.
+  gpu:
+    ## Confidential-GPU guest image: a second kata-image-puller pulls the
+    ## `<tag>-nvidia` kata-guest-base variant (same registry/credentials as
+    ## kata.guestImage; kata.guestImage.debug selects `<tag>-nvidia-debug`)
+    ## and wires the platform's qemu-nvidia-gpu-* shim at it. What's in the
+    ## artifact: docs/kata-gpu.md "The -nvidia artifact".
+    guestImage:
+      ## Host dir the GPU puller writes into — sibling of
+      ## kata.guestImage.hostPath; both swept on `c8s uninstall`.
+      hostPath: /var/lib/c8s/kata-images-nvidia
+      ## In-guest workload registry auth for GPU pods. "" inherits
+      ## kata.guestImage.registryAuth; "none" forces anonymous; anything else
+      ## is used verbatim (file:// or kbs://).
+      registryAuth: ""
+      ## PCIe root ports QEMU pre-allocates for VFIO cold-plug — one per
+      ## passed-through GPU; the stock SNP-GPU config ships 0, i.e.
+      ## passthrough disabled (the chart refuses to render 0). 8 = a full HGX
+      ## board (8x H100/B200); an unused port costs only a little guest
+      ## ACPI/QEMU overhead.
+      pcieRootPort: 8
+      ## In-guest memory floor (MiB): the NVIDIA driver's BAR-mapping path
+      ## OOMs the stock 8 GiB guest; 64 GiB fits B200-class BAR working sets
+      ## plus in-guest OCI extraction.
+      defaultMemory: 65536
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+    ## NVIDIA kata sandbox device plugin: advertises vfio-bound GPUs as
+    ## per-model nvidia.com/<MODEL> resources and writes the CDI spec kata's
+    ## cold-plug consumes (docs/kata-gpu.md). Privileged with host /dev, /sys
+    ## and the CDI dir mounted, pulled from nvcr.io — hence digest-pinned.
+    ## Disable for clusters that advertise GPU devices some other way.
+    sandboxDevicePlugin:
+      enabled: true
+      image:
+        repository: nvcr.io/nvidia/cloud-native/nvidia-sandbox-device-plugin
+        ## v0.0.3, digest-pinned. Bump in pairs (tag is human-readable; digest
+        ## is what's used).
+        tag: "v0.0.3"
+        digest: "sha256:a897db2f25b1b0ff6195726ba6c307d8567b2285f59cde5f8409683fd9bd12e5"
+        pullPolicy: IfNotPresent
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
 
 ## RA-TLS service mesh: transparent L4 proxy with hardware-attested mTLS.
 ##

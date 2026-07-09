@@ -30,11 +30,56 @@ final security model. Each bullet links to the tracking issue.
 - The NRI plugin gates image digest, not args, env, mounts, capabilities, or
   other pod-spec fields (tracked at [#49](https://github.com/confidential-dot-ai/c8s/issues/49)).
 
+## Confidential GPU
+
+- GPU pods on SNP are pinned to a single vCPU
+  (`default_vcpus = default_maxvcpus = 1`) to keep the SNP launch digest
+  stable; CPU hotplug cannot raise it at runtime. A deliberate default, not a
+  hard limit — any fixed count works if the reference measurement is
+  re-predicted (`docs/kata-gpu.md` "Raising the vCPU pin"); TDX needs no pin.
+  Note this caps vCPUs, not GPUs: a pod can request multiple GPUs of one
+  model (each cold-plugs behind its own PCIe root port, up to
+  `kata.gpu.guestImage.pcieRootPort`).
+- The `<tag>-nvidia` guest is the c8s rootfs (in-guest stack, locked policy,
+  measured, manifest published — parity with the non-GPU guest), but it boots
+  **kata's GPU kernel** with the NVIDIA modules/userland grafted from kata's
+  digest-pinned GPU rootfs (`kata-guest-base/scripts/build.sh` Step 6): the
+  steep kernel has `CONFIG_MODULES=n` and cannot load the driver. Remaining
+  hardening: a steep GPU kernel flavor (`CONFIG_MODULES=y` +
+  `CONFIG_MODULE_SIG_FORCE=y`, ephemeral build-time key) compiling and
+  signing the NVIDIA open GPU kernel modules, replacing the graft — needs
+  GPU hardware in CI to validate. Until then the guest locks module loading
+  after driver bring-up (`nvidia-gpu-ready.service`,
+  `kernel.modules_disabled=1`).
+- GPU attestation (SPDM / `nvidia-smi conf-compute`) is not wired — GPU CC mode
+  is assumed correct on the host. The locked guest fails closed on a non-CC
+  GPU (`nvidia-gpu-ready` refuses and powers the VM off before the kata-agent
+  starts; the `-debug` guest tolerates it with a warning), but no positive
+  GPU attestation is surfaced to the relying party.
+- Host GPU provisioning (vfio-pci binding, GPU CC mode, BAR resize) is out of
+  scope — assumed done by the host-provisioning system before c8s installs.
+- TEE node labelling is declarative: the install labels kata nodes from the
+  operator's `--hardware-platform` flag (`cmd/c8s/tee_label.go`) with no
+  verification against host facts — a wrong declaration surfaces only as
+  runtime failures. First-class host inventory ("confidential metal") that
+  knows and attests each machine's TEE capability at provisioning time is the
+  eventual replacement for flag-trusting labels.
+- Node-as-CVM GPU is a separate mechanism (drivers baked into the node guest OS,
+  measured into the node launch digest); this puller/runtime is pod-as-CVM only.
+
 ## Operations
 
 - Chart-managed CDS is not highly available by default (broker side tracked at [#75](https://github.com/confidential-dot-ai/c8s/issues/75)).
 - Multi-tenancy isolation has no complete design (tracked at [#56](https://github.com/confidential-dot-ai/c8s/issues/56)).
 - Federation and multi-cluster orchestration remain fleet-level concerns.
+- No operator↔chart capability handshake: the chart renders webhook-dependent
+  features (e.g. GPU class injection) without knowing whether the deployed
+  operator binary implements them, so a version-skewed operator silently
+  mis-injects. `c8s install` preflights that the operator image *exists* at
+  the install tag, but existence is not capability — the handshake (operator
+  reports its webhook feature set; the render fails if the chart needs more)
+  is not built. See `docs/pitfalls.md` "GPU webhook injection needs an
+  operator image that has the GPU code".
 
 ## Browser / out-of-cluster verification
 

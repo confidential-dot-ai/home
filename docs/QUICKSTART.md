@@ -121,6 +121,13 @@ credential). The one pull this does **not** cover (see docs/pitfalls.md):
 guest-side workload image pulls inside kata CVMs
 (`agent.image_registry_auth`).
 
+On kata clusters, also raise kubelet's `runtime-request-timeout` (default
+2 m): the effective ceiling on kata pod creation is `min(kubelet timeout,
+kata timeout)`, and a slow path — cold registry, a multi-GB model image
+guest-pulled inside the VM — hits the 2 m wall with the cause hidden. RKE2:
+`kubelet-arg: runtime-request-timeout=20m` in `/etc/rancher/rke2/config.yaml`.
+Details: docs/pitfalls.md "kubelet's runtime-request-timeout".
+
 ## Certificate path
 
 The chart wires workload injection to chart-managed CDS. CDS generates its

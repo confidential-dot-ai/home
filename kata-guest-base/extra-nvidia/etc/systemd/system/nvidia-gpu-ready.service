@@ -1,0 +1,23 @@
+# Final GPU readiness gate: in-guest CDI spec, confidential-compute
+# ready-state, health check, module-loading lockdown. Last of the
+# three-unit NVRC replacement — kata-agent Requires/After THIS unit
+# (kata-agent.service.d/30-nvidia-gpu.conf), so no container ever starts
+# on a GPU that didn't come up clean.
+[Unit]
+Description=NVIDIA GPU readiness gate (c8s GPU guest)
+Requires=nvidia-gpu-init.service nvidia-persistenced.service
+After=nvidia-gpu-init.service nvidia-persistenced.service
+Before=kata-agent.service
+# Same fail-fast as nvidia-gpu-init.service: a failed gate must kill the
+# VM, not leave the shim dialing a never-starting agent for 20 minutes.
+FailureAction=poweroff-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/nvidia-gpu-ready.sh
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

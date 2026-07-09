@@ -10,6 +10,7 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -459,6 +460,148 @@ func TestKataRuntimeClassForDisabled(t *testing.T) {
 	}
 	if got := kataRuntimeClassFor(pod, Config{KataEnforce: false}.withDefaults()); got != "" {
 		t.Fatalf("kataRuntimeClassFor = %q, want \"\" when kata enforcement is off", got)
+	}
+}
+
+// gpuPod builds a pod whose first container requests one unit of the given
+// per-model GPU resource (the shape the sandbox-device-plugin advertises).
+func gpuPod(resourceName string, annotations map[string]string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: annotations},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "app",
+			Resources: corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					corev1.ResourceName(resourceName): resource.MustParse("1"),
+				},
+			},
+		}}},
+	}
+}
+
+func TestKataRuntimeClassForGpuRequestGetsConfidentialGpuClass(t *testing.T) {
+	// Per-model resource name, no confidential.ai/cw annotation: a GPU request
+	// alone selects the confidential-GPU class.
+	pod := gpuPod("nvidia.com/GB202GL_RTX_PRO_6000_BLACKWELL_SERVER_EDITION", nil)
+	if got := kataRuntimeClassFor(pod, kataEnforceConfig()); got != "kata-qemu-snp-nvidia" {
+		t.Fatalf("kataRuntimeClassFor = %q, want kata-qemu-snp-nvidia for an nvidia.com/* GPU pod", got)
+	}
+}
+
+func TestKataRuntimeClassForGpuWinsOverConfidentialAnnotation(t *testing.T) {
+	// confidential.ai/cw would give kata-qemu-snp; the GPU request upgrades it
+	// to the GPU variant (still confidential).
+	pod := gpuPod("nvidia.com/GB202GL_RTX_PRO_6000_BLACKWELL_SERVER_EDITION",
+		map[string]string{AnnotationWorkload: "api"})
+	if got := kataRuntimeClassFor(pod, kataEnforceConfig()); got != "kata-qemu-snp-nvidia" {
+		t.Fatalf("kataRuntimeClassFor = %q, want kata-qemu-snp-nvidia (GPU implies confidential)", got)
+	}
+}
+
+func TestKataRuntimeClassForGpuRequestInInitContainer(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{{
+				Name: "warmup",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/GB202GL_RTX_PRO_6000_BLACKWELL_SERVER_EDITION": resource.MustParse("1"),
+					},
+				},
+			}},
+			Containers: []corev1.Container{{Name: "app"}},
+		},
+	}
+	if got := kataRuntimeClassFor(pod, kataEnforceConfig()); got != "kata-qemu-snp-nvidia" {
+		t.Fatalf("kataRuntimeClassFor = %q, want kata-qemu-snp-nvidia for a GPU init container", got)
+	}
+}
+
+func TestKataRuntimeClassForGpuExemptsHostNamespacePods(t *testing.T) {
+	// A host-namespace GPU pod cannot be a VM; the exemption wins over the GPU
+	// path just as it does over the confidential path.
+	pod := gpuPod("nvidia.com/GB202GL_RTX_PRO_6000_BLACKWELL_SERVER_EDITION", nil)
+	pod.Spec.HostNetwork = true
+	if got := kataRuntimeClassFor(pod, kataEnforceConfig()); got != "" {
+		t.Fatalf("kataRuntimeClassFor = %q, want \"\" — a host-namespace GPU pod cannot run as a VM", got)
+	}
+}
+
+func TestKataRuntimeClassForGpuRespectsExplicitRuntimeClass(t *testing.T) {
+	pod := gpuPod("nvidia.com/GB202GL_RTX_PRO_6000_BLACKWELL_SERVER_EDITION", nil)
+	existing := "kata-qemu-snp"
+	pod.Spec.RuntimeClassName = &existing
+	if got := kataRuntimeClassFor(pod, kataEnforceConfig()); got != "" {
+		t.Fatalf("kataRuntimeClassFor = %q, want \"\" — an explicit runtimeClassName must not be overridden", got)
+	}
+}
+
+// tdxEnforceConfig mirrors kataEnforceConfig for a --hardware-platform=tdx
+// operator: the confidential (CPU, GPU) pair resolves to the TDX classes.
+func tdxEnforceConfig() Config {
+	return Config{KataEnforce: true, HardwarePlatform: HardwarePlatformTDX}.withDefaults()
+}
+
+func TestKataRuntimeClassForTDXPlatform(t *testing.T) {
+	t.Run("confidential.ai/cw pod gets kata-qemu-tdx", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+		}
+		if got := kataRuntimeClassFor(pod, tdxEnforceConfig()); got != "kata-qemu-tdx" {
+			t.Fatalf("kataRuntimeClassFor = %q, want kata-qemu-tdx on a TDX install", got)
+		}
+	})
+
+	t.Run("GPU pod gets kata-qemu-tdx-nvidia", func(t *testing.T) {
+		pod := gpuPod("nvidia.com/GB202GL_RTX_PRO_6000_BLACKWELL_SERVER_EDITION", nil)
+		if got := kataRuntimeClassFor(pod, tdxEnforceConfig()); got != "kata-qemu-tdx-nvidia" {
+			t.Fatalf("kataRuntimeClassFor = %q, want kata-qemu-tdx-nvidia on a TDX install", got)
+		}
+	})
+
+	t.Run("plain workload pod still gets kata-qemu", func(t *testing.T) {
+		pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}}}
+		if got := kataRuntimeClassFor(pod, tdxEnforceConfig()); got != "kata-qemu" {
+			t.Fatalf("kataRuntimeClassFor = %q, want kata-qemu — the non-confidential default is platform-independent", got)
+		}
+	})
+}
+
+func TestConfigDefaultsHardwarePlatformToSNP(t *testing.T) {
+	if got := (Config{KataEnforce: true}).withDefaults().HardwarePlatform; got != HardwarePlatformSNP {
+		t.Fatalf("withDefaults().HardwarePlatform = %q, want %q", got, HardwarePlatformSNP)
+	}
+}
+
+func TestPodRequestsNvidiaGpu(t *testing.T) {
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{"no resources", &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}}}, false},
+		{"per-model GPU", gpuPod("nvidia.com/GB202GL_RTX_PRO_6000_BLACKWELL_SERVER_EDITION", nil), true},
+		{"generic GPU", gpuPod("nvidia.com/gpu", nil), true},
+		{"zero quantity", gpuPod("nvidia.com/gpu", nil), true}, // overwritten below
+		{"non-nvidia vendor", gpuPod("amd.com/gpu", nil), false},
+		{"cpu only", gpuPod("cpu", nil), false},
+	}
+	// Patch the zero-quantity case to a real zero request — a 0 GPU request is
+	// not a GPU pod.
+	cases[3].pod = &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+		Name: "app",
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("0")},
+		},
+	}}}}
+	cases[3].want = false
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := podRequestsNvidiaGpu(tc.pod); got != tc.want {
+				t.Fatalf("podRequestsNvidiaGpu = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

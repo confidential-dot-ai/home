@@ -1,0 +1,20 @@
+# NVIDIA persistence daemon — keeps the driver initialized between CUDA
+# clients. Required for confidential compute (a GPU falling out of
+# persistence mode would re-initialize and drop its CC session state).
+# Second of the three-unit NVRC replacement; binary grafted from the
+# upstream kata GPU rootfs (see build.sh "NVIDIA GPU variant").
+[Unit]
+Description=NVIDIA persistence daemon (c8s GPU guest)
+Requires=nvidia-gpu-init.service
+After=nvidia-gpu-init.service
+Before=kata-agent.service
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/nvidia-persistenced --user root
+PIDFile=/var/run/nvidia-persistenced/nvidia-persistenced.pid
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target

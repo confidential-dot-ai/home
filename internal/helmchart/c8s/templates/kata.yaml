@@ -171,17 +171,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            # Non-GPU shims only. GPU / confidential-GPU runtimes
-            # (kata-qemu-nvidia-gpu*) are out of scope — see docs/kata.md.
-            # qemu-tdx installs the Intel TDX shim + config alongside the
-            # SEV-SNP one; a cluster can be TDX-only, SNP-only, or mixed —
-            # the kata-qemu-tdx RuntimeClass carries a nodeSelector so pods
-            # only land on TDX-capable hosts. Stock upstream kata-deploy
-            # 3.30.0 ships the qemu-tdx shim + qemu-system-x86_64-tdx-
-            # experimental + OVMF.inteltdx.fd + confidential rootfs; no
-            # fork build required.
+            # The shims kata-deploy registers as containerd runtimes
+            # (kata-<shim>): the two non-confidential shims plus the declared
+            # platform's confidential (CPU, GPU) pair — one CPU TEE per
+            # cluster, so the other platform's shims are not installed (see
+            # c8s.kataConfidentialShims). The non-confidential GPU shim
+            # (qemu-nvidia-gpu) is intentionally absent: c8s only runs GPU
+            # workloads as confidential VMs. Keep in sync with the
+            # RuntimeClasses below and the kata-enforcement allowlist.
             - name: SHIMS_X86_64
-              value: "qemu clh qemu-snp qemu-tdx"
+              value: "qemu clh {{ include "c8s.kataConfidentialShims" . }}"
             - name: DEFAULT_SHIM_X86_64
               value: "qemu"
             - name: ALLOWED_HYPERVISOR_ANNOTATIONS
@@ -191,29 +190,22 @@ spec:
             # can stay read-only on runtimeclasses.
             - name: CREATE_RUNTIMECLASSES
               value: "false"
-            # Per-shim snapshotter routing. Confidential shims (qemu-snp,
-            # qemu-tdx) ship `shared_fs = "none"` — virtio-fs from the
-            # host would defeat CC — so kata cannot use containerd's
-            # default overlayfs snapshotter (which prepares the container
-            # rootfs on the host and expects it shared into the guest;
-            # kata-shim then hits `failed to mount ... shared/containers
-            # /<id>/rootfs ... ENOENT` at sandbox creation). Instead
-            # route these shims through nydus-snapshotter in guest-pull
-            # mode: containerd emits an image_guest_pull annotation
-            # instead of a host-prepared rootfs, and the kata-agent
-            # inside the guest pulls the OCI image over the guest's
-            # network. kata-deploy 3.30's install binary installs
-            # nydus-snapshotter as a systemd service
-            # (`nydus-for-kata-tee.service`), registers it as a
-            # containerd proxy_plugin, and writes the per-shim
-            # snapshotter mapping into the containerd runtime drop-in
-            # when this env var is set.
-            #
-            # kata-qemu (non-confidential) and kata-clh use virtio-fs
-            # from host — omitted from the map, so they keep the
-            # default overlayfs snapshotter.
+            # Per-shim snapshotter routing: every confidential shim (CPU and
+            # GPU) routes through nydus-snapshotter in guest-pull mode.
+            # They ship `shared_fs = "none"` (host virtio-fs would defeat
+            # CC), so containerd's default overlayfs snapshotter — which
+            # prepares the rootfs on the host and expects it shared into the
+            # guest — fails sandbox creation with `failed to mount ...
+            # shared/containers/<id>/rootfs ... ENOENT`; with nydus,
+            # containerd emits an image_guest_pull annotation and the
+            # kata-agent pulls the OCI image inside the guest. kata-qemu /
+            # kata-clh keep overlayfs (they use host virtio-fs).
             - name: SNAPSHOTTER_HANDLER_MAPPING_X86_64
-              value: "qemu-snp:nydus,qemu-tdx:nydus"
+              {{- if .Values.attestationApi.teeDevices.tdxGuest }}
+              value: "qemu-tdx:nydus,qemu-nvidia-gpu-tdx:nydus"
+              {{- else }}
+              value: "qemu-snp:nydus,qemu-nvidia-gpu-snp:nydus"
+              {{- end }}
             # SNAPSHOTTER_HANDLER_MAPPING only wires containerd's per-shim
             # snapshotter selection. The nydus-snapshotter binary itself is
             # not installed by default — kata-deploy gates that behind
@@ -266,25 +258,17 @@ spec:
             type: DirectoryOrCreate
 {{- /*
   RuntimeClass objects. `handler` == the containerd runtime name kata-deploy
-  registers (kata-<shim>); the shim binary containerd-shim-kata-<shim>-v2 is a
-  symlink to containerd-shim-kata-v2. These names are a fixed contract with
-  SHIMS_X86_64 above and the allowlist in kata-enforcement.yaml — keep all
-  three in sync.
+  registers (kata-<shim>). The names are a fixed contract with SHIMS_X86_64
+  above and the allowlist in kata-enforcement.yaml — keep all three in sync.
+  Only the declared platform's confidential classes render (one CPU TEE per
+  cluster). Which class is which: docs/kata.md.
 
-  kata-qemu      QEMU microVM.      VM isolation, NOT confidential.
-  kata-clh       Cloud Hypervisor.  VM isolation, NOT confidential.
-  kata-qemu-snp  QEMU + SEV-SNP.    The pod is a confidential VM — its memory
-                                    is encrypted against the host. Needs an
-                                    SEV-SNP host; on a non-SNP node these
-                                    pods fail to start while kata-qemu and
-                                    kata-clh still work.
-  kata-qemu-tdx  QEMU + Intel TDX.  The pod is a confidential VM on an Intel
-                                    TDX host. Carries a nodeSelector on
-                                    intel-tdx.node.kubernetes.io/enabled to
-                                    keep TDX pods on TDX hosts; a mixed
-                                    SNP+TDX cluster keeps both RCs and both
-                                    are honored by their respective node
-                                    label.
+  The confidential classes carry a scheduling.nodeSelector on their platform
+  label (kata.snpNodeSelector / kata.tdxNodeSelector) so a wrong-TEE node
+  leaves pods Pending instead of crash-looping QEMU — docs/pitfalls.md
+  "kata-qemu-snp on a non-SNP host". The selector reaches webhook-injected
+  pods because the apiserver re-invokes in-tree mutating plugins after a
+  webhook mutates (apiserver/pkg/admission/reinvocation.go).
 */}}
 ---
 apiVersion: node.k8s.io/v1
@@ -304,15 +288,7 @@ metadata:
 {{ include "c8s.commonLabels" . | indent 4 }}
     app.kubernetes.io/component: kata-deploy
 handler: kata-clh
----
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: kata-qemu-snp
-  labels:
-{{ include "c8s.commonLabels" . | indent 4 }}
-    app.kubernetes.io/component: kata-deploy
-handler: kata-qemu-snp
+{{- if .Values.attestationApi.teeDevices.tdxGuest }}
 ---
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
@@ -322,7 +298,64 @@ metadata:
 {{ include "c8s.commonLabels" . | indent 4 }}
     app.kubernetes.io/component: kata-deploy
 handler: kata-qemu-tdx
+{{- with .Values.kata.tdxNodeSelector }}
 scheduling:
   nodeSelector:
-    intel-tdx.node.kubernetes.io/enabled: "true"
+{{ toYaml . | indent 4 }}
+{{- end }}
+{{- else }}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu-snp
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-deploy
+handler: kata-qemu-snp
+{{- with .Values.kata.snpNodeSelector }}
+scheduling:
+  nodeSelector:
+{{ toYaml . | indent 4 }}
+{{- end }}
+{{- end }}
+{{- /*
+  Confidential-GPU RuntimeClass — ships with every kata install, like the CPU
+  class. The NAME (kata-qemu-snp-nvidia / kata-qemu-tdx-nvidia) follows the
+  c8s kata-qemu-snp convention; the HANDLER stays the upstream shim name
+  kata-deploy registers (kata-qemu-nvidia-gpu-*). Same platform nodeSelector
+  as its CPU sibling. The pod webhook injects the platform's GPU class for
+  pods requesting nvidia.com/* — see docs/kata-gpu.md.
+*/}}
+{{- if .Values.attestationApi.teeDevices.tdxGuest }}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu-tdx-nvidia
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-deploy
+handler: kata-qemu-nvidia-gpu-tdx
+{{- with .Values.kata.tdxNodeSelector }}
+scheduling:
+  nodeSelector:
+{{ toYaml . | indent 4 }}
+{{- end }}
+{{- else }}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu-snp-nvidia
+  labels:
+{{ include "c8s.commonLabels" . | indent 4 }}
+    app.kubernetes.io/component: kata-deploy
+handler: kata-qemu-nvidia-gpu-snp
+{{- with .Values.kata.snpNodeSelector }}
+scheduling:
+  nodeSelector:
+{{ toYaml . | indent 4 }}
+{{- end }}
+{{- end }}
 {{- end }}

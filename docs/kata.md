@@ -26,39 +26,65 @@ normal c8s components:
     installing the Kata bundle. The QEMU in the bundle is the SEV-SNP-capable
     build that `kata-qemu-snp` uses;
   - the guest kernel, guest images, and OVMF firmware;
-  - a containerd runtime drop-in registering the `kata-qemu`, `kata-clh`, and
-    `kata-qemu-snp` runtimes.
+  - a containerd runtime drop-in registering `kata-qemu`, `kata-clh`, and
+    the declared platform's confidential runtimes (SNP:
+    `kata-qemu-snp` + `kata-qemu-nvidia-gpu-snp`; TDX: `kata-qemu-tdx` +
+    `kata-qemu-nvidia-gpu-tdx`).
 
   kata-deploy then restarts containerd (or RKE2) so the runtimes become
   usable. Running pods survive the restart — containerd shims outlive the
   daemon.
 
-- **Three RuntimeClass objects** — `kata-qemu`, `kata-clh`, `kata-qemu-snp`.
-  kata-deploy's install binary does **not** create RuntimeClasses (only its
-  own Helm chart does), so the c8s chart renders them itself.
+- **Four RuntimeClass objects** — `kata-qemu`, `kata-clh`, and the declared
+  platform's confidential (CPU, GPU) pair. kata-deploy's install binary does
+  **not** create RuntimeClasses (only its own Helm chart does), so the c8s
+  chart renders them itself. Only the `--hardware-platform` you declare gets
+  its classes: a single cluster is one CPU TEE, and the other platform's
+  classes would be unschedulable decoys the enforcement allowlist should not
+  accept.
 
 `c8s install --kata` is **enforcing** — installing the Kata stack and
 enforcing it are one shape, not two (see [Enforcement](#enforcement)).
 
-| RuntimeClass | Hypervisor | Confidential? |
-|---|---|---|
-| `kata-qemu` | QEMU microVM | No — VM isolation from the host only |
-| `kata-clh` | Cloud Hypervisor | No — VM isolation from the host only |
-| `kata-qemu-snp` | QEMU + SEV-SNP | **Yes** — the pod's memory is encrypted against the host |
+| RuntimeClass | Hypervisor | Confidential? | Renders under |
+|---|---|---|---|
+| `kata-qemu` | QEMU microVM | No — VM isolation from the host only | always |
+| `kata-clh` | Cloud Hypervisor | No — VM isolation from the host only | always |
+| `kata-qemu-snp` | QEMU + SEV-SNP | **Yes** — the pod's memory is encrypted against the host | `--hardware-platform=sev-snp` (default) |
+| `kata-qemu-snp-nvidia` | QEMU + SEV-SNP + VFIO GPU passthrough | **Yes** — see [`docs/kata-gpu.md`](kata-gpu.md) | `--hardware-platform=sev-snp` (default) |
+| `kata-qemu-tdx` | QEMU + Intel TDX | **Yes** — the pod's memory is encrypted against the host | `--hardware-platform=tdx` |
+| `kata-qemu-tdx-nvidia` | QEMU + Intel TDX + VFIO GPU passthrough | **Yes** — see [`docs/kata-gpu.md`](kata-gpu.md) | `--hardware-platform=tdx` |
 
 ## Installing
 
 ```bash
 # Install the Kata stack and enforce it (see Enforcement below).
 # Works on RKE2 too: the host distro is detected from the cluster.
-# tls-lb runs as a kata CVM; --engine derives the mesh-wrapped upstream
-# (see operator.md, "Engine upstream preset").
+# TEE platform labels are applied automatically from --hardware-platform
+# (see below). tls-lb runs as a kata CVM; --engine derives the mesh-wrapped
+# upstream (see operator.md, "Engine upstream preset").
 c8s install --kata --engine vllm --engine-workload-id <cw-id>
 
 # Dev only: use the -debug guest image so `kubectl logs` and `kubectl exec`
 # work against kata pods (host log/exec RPCs allowed in the guest policy).
 c8s install --kata --debug --engine vllm --engine-workload-id <cw-id>
 ```
+
+Confidential pods only schedule to nodes carrying their platform label —
+`confidential.ai/sev-snp=true` for the SNP classes,
+`confidential.ai/tdx=true` for the TDX classes. The install
+applies the label for you, declaratively: every kata-targeted node gets the
+label matching `--hardware-platform` (an already-correct label is a no-op).
+There is no hardware probe — the flag is trusted, and a wrongly-declared
+platform surfaces as confidential pods failing on every node (per-pod
+attestation remains the real boundary). If any node still carries the
+**other** platform's label — an earlier install under a different
+`--hardware-platform` — the install refuses and prints the exact
+`kubectl label nodes ... <key>-` command to clear it: a platform switch must
+be the operator's explicit act, not a side effect of a mistyped flag.
+Installs that bypass the CLI — a GitOps `HelmRelease`, or `c8s install -f` —
+get no auto-labelling and must label out-of-band (provisioning, NFD, or
+`kubectl label node <node> <platform-label>=true` after checking the host).
 
 `--debug` switches the guest image to the `<tag>-debug` variant published in
 lockstep with every locked tag: the same build except the baked kata-agent
@@ -68,6 +94,12 @@ exactly what the locked policy exists to deny — and the debug image's SNP
 launch measurement differs from the locked one, so attestation pinned to the
 locked reference value rejects debug guests (the two cannot be confused).
 Never use it in production.
+
+`--debug` switches the GPU guest image the same way: the GPU puller pulls
+`<tag>-nvidia-debug`, published in lockstep with `<tag>-nvidia` and carrying
+the same debug delta as the non-GPU pair (debug policy + `debug-guest`
+marker; on GPU guests the marker also relaxes the non-CC-GPU refusal) — see
+[`docs/kata-gpu.md`](kata-gpu.md) "`--debug` and the GPU guest".
 
 The host containerd config layout the installers target — it drives both
 kata-deploy and the nri-image-policy installer — is detected from the
@@ -129,17 +161,24 @@ Enforcement is two cooperating pieces, installed together with the stack.
 
 1. **A mutating step in the c8s operator's pod webhook.** For every workload
    pod that does not already request a `runtimeClassName`, the webhook injects
-   one:
-   - `kata-qemu-snp` if the pod is annotated `confidential.ai/cw` — a pod that
-     opts in to a c8s workload identity also gets a confidential VM;
+   one. The confidential classes follow the install's `--hardware-platform`
+   (the chart passes it to the operator as `--hardware-platform`, keeping
+   injection and the rendered RuntimeClasses in lockstep):
+   - the platform's confidential-GPU class (`kata-qemu-snp-nvidia` /
+     `kata-qemu-tdx-nvidia`) if any container requests an `nvidia.com/*`
+     resource — GPU implies confidential, and this wins over the annotation
+     (see [`docs/kata-gpu.md`](kata-gpu.md));
+   - the platform's confidential CPU class (`kata-qemu-snp` /
+     `kata-qemu-tdx`) if the pod is annotated `confidential.ai/cw` — a pod
+     that opts in to a c8s workload identity also gets a confidential VM;
    - `kata-qemu` otherwise.
 
    This rides on the existing `pods.c8s.confidential.ai` webhook, which already
    matches every pod in non-system namespaces — no new webhook, no new TLS.
 
 2. **A `ValidatingAdmissionPolicy`** (`c8s-kata-enforcement`) that rejects a
-   workload pod requesting a `runtimeClassName` that is not one of
-   `kata-qemu` / `kata-clh` / `kata-qemu-snp`.
+   workload pod requesting a `runtimeClassName` outside the installed set:
+   `kata-qemu` / `kata-clh` plus the platform's confidential (CPU, GPU) pair.
 
 [c8s#77](https://github.com/confidential-dot-ai/c8s/issues/77) asked for a
 `ValidatingAdmissionWebhook`. A **`ValidatingAdmissionPolicy`** (built-in CEL,
@@ -172,11 +211,11 @@ policy-monitor consumes it even though the host NRI plugin is gone.
 
 The release namespace is excluded from the webhook (next section), so the
 chart-managed tls-lb Deployment cannot rely on injection. Under
-`kata.enabled` the chart pins `runtimeClassName: kata-qemu-snp` on it
-directly, the same pattern as CDS: its get-cert containers dial the
-in-guest attestation-api on loopback, which only exists inside an SNP guest,
-and it terminates TLS with mesh-issued keys, so its plaintext must stay
-inside the TEE boundary.
+`kata.enabled` the chart pins the platform's confidential CPU class
+(`kata-qemu-snp` / `kata-qemu-tdx`) on it directly, the same pattern as
+CDS: its get-cert containers dial the in-guest attestation-api on loopback,
+which only exists inside a confidential guest, and it terminates TLS with
+mesh-issued keys, so its plaintext must stay inside the TEE boundary.
 
 ### Host-namespace pods are exempt
 
@@ -329,27 +368,56 @@ boundary is the per-pod SEV-SNP attestation of each `kata-qemu-snp` pod.
   runtime; it does **not** enable SEV-SNP. The host needs the
   `kvm_amd.sev=1 kvm_amd.sev_es=1 kvm_amd.sev_snp=1` kernel cmdline, the AMD
   PSP firmware, and BIOS support — none of which a DaemonSet can apply (kernel
-  cmdline + reboot + BIOS are out of reach). On a non-SNP host, `kata-qemu`
-  and `kata-clh` work but `kata-qemu-snp` pods fail to start. Verify with
+  cmdline + reboot + BIOS are out of reach). Verify with
   `cat /sys/module/kvm_amd/parameters/sev_snp` (`Y`). See
   `bare-metal-infra-management/docs/host_setup/snp-cpu-bios-setup.md`.
 
-- **x86_64 only.** The chart renders `SHIMS_X86_64`
-  (`qemu clh qemu-snp qemu-tdx`) and no AArch64 equivalent, so kata-deploy
+  On a non-SNP host, `kata-qemu` and `kata-clh` work but `kata-qemu-snp` pods
+  **cannot start — and the failure is not a clean rejection**: kata
+  auto-detects the host TEE, and on a host with a *different* TEE (e.g. Intel
+  TDX) QEMU aborts in an unbounded crash-loop (forensic detail in
+  [`docs/pitfalls.md`](pitfalls.md) "kata-qemu-snp on a non-SNP host"). That
+  is why the confidential RuntimeClasses schedule only to labelled nodes
+  (next bullet): a mis-scheduled confidential pod stays `Pending` with a
+  clear message instead of crash-looping QEMU.
+
+- **Confidential pods schedule only to platform-labelled nodes.** The SNP
+  classes carry a `scheduling.nodeSelector` on `confidential.ai/sev-snp=true`
+  (`kata.snpNodeSelector`), the TDX classes on `confidential.ai/tdx=true`
+  (`kata.tdxNodeSelector`), so confidential pods — including the chart's own
+  CDS and tls-lb — only land on nodes declared capable.
+  `c8s install --kata` labels every kata-targeted node automatically from
+  `--hardware-platform` (see [Installing](#installing) — declarative, no
+  hardware probe; refuses when the other platform's label lingers) and fails
+  fast when none qualifies; with `-f` or a GitOps install the labels are
+  yours to apply.
+  This also makes mixed confidential/non-confidential clusters safe:
+  unlabelled nodes still run `kata-qemu`/`kata-clh` pods. The label is a
+  **scheduling aid, not a security boundary** — a mislabelled node cannot
+  fake a TEE; the boundary remains per-pod attestation. Clusters that label
+  capability some other way (e.g. NFD's
+  `feature.node.kubernetes.io/cpu-security.sev.snp.enabled`) can point
+  `kata.snpNodeSelector` / `kata.tdxNodeSelector` at that label, or set `{}`
+  to restore unrestricted scheduling. `c8s uninstall` removes the default
+  label keys again (only those exact keys — custom selectors are never
+  touched).
+
+- **x86_64 only.** The chart renders `SHIMS_X86_64` (`qemu clh` plus the
+  platform's confidential pair — `qemu-snp qemu-nvidia-gpu-snp` or
+  `qemu-tdx qemu-nvidia-gpu-tdx`) and no AArch64 equivalent, so kata-deploy
   installs nothing on ARM nodes. Pods scheduled there will fail to start
   under any kata RuntimeClass. Use `kata.nodeSelector` to keep kata-deploy
   off non-x86_64 nodes if you have a mixed-arch cluster.
 
 - **Confidential kata: SEV-SNP or TDX per install.** A single cluster picks
-  one CPU TEE at install time via `--hardware-platform=<sev-snp|tdx>`. Under
-  `--hardware-platform=tdx`, the chart renders the `kata-qemu-tdx`
-  RuntimeClass with `nodeSelector: intel-tdx.node.kubernetes.io/enabled=true`
-  and the c8s control-plane pods (CDS, tls-lb) resolve to
-  `kata-qemu-tdx`; under `--hardware-platform=sev-snp` (the default) the
-  same rendering happens for `kata-qemu-snp`. The kata-enforcement
-  allowlist accepts all four (`kata-qemu`, `kata-clh`, `kata-qemu-snp`,
-  `kata-qemu-tdx`), and the mutating webhook promotes `confidential.ai/cw`
-  pods to whichever confidential class the install chose.
+  one CPU TEE at install time via `--hardware-platform=<sev-snp|tdx>`, and
+  ONLY that platform's stack ships: its RuntimeClasses render, its shims
+  register, the kata-enforcement allowlist accepts `kata-qemu`, `kata-clh`,
+  and its confidential (CPU, GPU) pair, the c8s control-plane pods (CDS,
+  tls-lb) pin its CPU class, and the operator webhook injects its
+  classes (the chart forwards the platform via the operator's
+  `--hardware-platform` flag). The other platform's class names are rejected
+  at admission like any non-kata class.
 
   The kata-guest-base image is a **single artifact for both TEEs**: its
   hardened bzImage carries both `CONFIG_SEV_GUEST=y` and
@@ -358,14 +426,14 @@ boundary is the per-pod SEV-SNP attestation of each `kata-qemu-snp` pod.
   differs is the shim toml (per-shim `configuration-<shim>.toml`),
   populated by the kata-image-puller from the same artifact bytes.
 
-- **No mixed-platform clusters.** Even though the `kata-qemu-tdx`
-  RuntimeClass carries the intel-tdx nodeSelector, the mutating webhook
-  chooses ONE confidential class per install; a mixed SNP+TDX cluster
-  would silently promote everything to whichever the install chose and
-  reject the other TEE's pods at admission. Assume the cluster is
-  uniformly one TEE. Per-install platform-labelling for heterogeneous
-  clusters is future work; until then, do not mix TEE hardware on a
-  single kata install.
+- **No mixed-platform clusters.** One platform's stack per install (previous
+  bullet) makes this structural: a mixed SNP+TDX cluster would leave the
+  undeclared platform's nodes unable to run confidential pods at all — no
+  RuntimeClass, no shim, rejected at admission. Assume the cluster is
+  uniformly one TEE. Per-node platform selection for heterogeneous clusters
+  is future work; until then, do not mix TEE hardware on a single kata
+  install.
+
 
 - **Host kernel modules.** Kata needs `/dev/kvm`, `/dev/vhost-vsock`, and
   `/dev/vhost-net`. On standard systemd distros the `vhost_vsock` / `vhost_net`
@@ -386,7 +454,7 @@ boundary is the per-pod SEV-SNP attestation of each `kata-qemu-snp` pod.
      `quote-generation-socket=vsock:2:4050` both reach the same qgsd.
   4. Intel PCS API key in `/etc/sgx_default_qcnl.conf` — DCAP fetches
      TCB collateral from Intel PCS during verify.
-  5. The node label `intel-tdx.node.kubernetes.io/enabled=true` — the
+  5. The node label `confidential.ai/tdx=true` — the
      `kata-qemu-tdx` RuntimeClass nodeSelector expects it. `c8s install
      --hardware-platform=tdx` preflight-checks for this label and refuses
      to proceed if no node has it.
@@ -403,7 +471,7 @@ boundary is the per-pod SEV-SNP attestation of each `kata-qemu-snp` pod.
   systemctl is-active qgsd                    # active
   systemctl is-active tdx-qgs-bridge          # active
   kubectl get node <node> \
-    -o jsonpath='{.metadata.labels.intel-tdx\.node\.kubernetes\.io/enabled}'
+    -o jsonpath='{.metadata.labels.confidential\.ai/tdx}'
   # → true
   ```
 
@@ -462,11 +530,14 @@ boundary is the per-pod SEV-SNP attestation of each `kata-qemu-snp` pod.
   privileged with the host root mounted, narrow this if your trust model
   treats some nodes as out-of-scope for c8s.
 
-- **GPU is out of scope.** No `kata-qemu-nvidia-gpu(-snp)` RuntimeClass, no
-  VFIO binding, no NVIDIA sandbox-device-plugin. Confidential-GPU support
-  means porting the GPU half of the `bare-metal-infra-management` `kata` /
-  `base` / `sandbox-device-plugin` roles — future work, tracked separately
-  per the [c8s#77](https://github.com/confidential-dot-ai/c8s/issues/77) discussion.
+- **Confidential GPU ships with every `--kata` install.** There is no separate
+  flag: `c8s install --kata` always renders the platform's confidential-GPU
+  RuntimeClass (`kata-qemu-snp-nvidia` / `kata-qemu-tdx-nvidia`, handler
+  `kata-qemu-nvidia-gpu-*`), the webhook injection for pods requesting
+  `nvidia.com/*`, the `<tag>-nvidia` guest image puller, and the NVIDIA
+  sandbox device plugin — alongside the CPU stack. The host GPU setup
+  (vfio-pci binding, GPU CC mode, BAR resize) is assumed already provisioned —
+  see [`docs/kata-gpu.md`](kata-gpu.md). NVIDIA only; pod-as-CVM only.
 
 - **No node attestation.** Pod-as-host means the node is not a CVM. Only each
   `kata-qemu-snp` pod carries its own SNP attestation. There is no launch
@@ -475,10 +546,11 @@ boundary is the per-pod SEV-SNP attestation of each `kata-qemu-snp` pod.
 
 - **`kata-qemu` is not confidential.** Enforcement's default for an
   un-annotated pod is `kata-qemu` — VM isolation from the host, but the host
-  can read the pod's memory. Only `kata-qemu-snp` (pods annotated
-  `confidential.ai/cw`) is a confidential VM. "Pod-as-kata-cvm by default" is
-  a posture the operator opts into with `confidential.ai/cw`, not something a
-  bare `c8s install --kata` gives every pod.
+  can read the pod's memory. Only the platform's confidential classes (pods
+  annotated `confidential.ai/cw`, or requesting a GPU) are confidential VMs.
+  "Pod-as-kata-cvm by default" is a posture the operator opts into with
+  `confidential.ai/cw`, not something a bare `c8s install --kata` gives every
+  pod.
 
 ## Uninstalling
 
@@ -498,10 +570,16 @@ containerd-prep initContainer) on the nodes kata-deploy targeted, removing:
   cleanup was cut short — restarting containerd/RKE2 only when the runtime
   drop-in was still registered;
 - the pulled kata-guest-base artifact (`kata.guestImage.hostPath`,
-  multi-GB) — nothing else cleans this up;
+  multi-GB) — nothing else cleans this up; and the separate GPU guest image
+  (`kata.gpu.guestImage.hostPath`);
 - on RKE2, the sentinel-marked containerd template the containerd-prep
   initContainer wrote, and its lock file;
-- the `katacontainers.io/kata-runtime` node labels (via kubectl).
+- the `katacontainers.io/kata-runtime` node labels and the platform labels
+  the install applied from `--hardware-platform`
+  (`confidential.ai/sev-snp`, `confidential.ai/tdx`) — via
+  kubectl. Only those exact default keys are removed — a custom
+  `kata.snpNodeSelector` (an NFD or provisioning-owned label) was never
+  applied by c8s and is left alone.
 
 The RuntimeClass objects and the enforcement policy are deleted with the
 release. The uninstall refuses to run while pods with a kata RuntimeClass
@@ -515,14 +593,24 @@ the preStop-hook cleanup, but none of the sweep guarantees above.
 ## Future work
 
 - Automatic host kernel-module loading (`vhost_vsock`, `vhost_net`).
-- GPU / confidential-GPU RuntimeClasses and the VFIO + sandbox-device-plugin
-  stack.
-- Node-side scheduling for mixed clusters (labelling SNP-capable nodes so
-  `kata-qemu-snp` pods only land where they can run).
+- A steep GPU kernel flavor for the `<tag>-nvidia` guest: compile and sign
+  the NVIDIA open GPU kernel modules against a c8s-built kernel, replacing
+  the modules/kernel grafted from kata's GPU rootfs — see
+  [`docs/kata-gpu.md`](kata-gpu.md) "Threat-model gaps" and `docs/GAPS.md`.
+- A persistent TEE-capability reconciler. The install labels kata nodes once,
+  at install time, from the declared `--hardware-platform`; a long-lived
+  controller that labels nodes added after install (and verifies the declared
+  platform against host facts) would keep labels current on growing clusters
+  and cover GitOps installs that never run the CLI.
+- An operator↔chart capability handshake so a chart that renders the GPU stack
+  refuses to pair with an operator image that predates the GPU webhook — see
+  docs/pitfalls.md "GPU webhook injection needs an operator image that has the
+  GPU code".
 - Tested support for k3s and k0s.
 
 ## See also
 
+- [`docs/kata-gpu.md`](kata-gpu.md) — GPU usage with kata (confidential GPU passthrough).
 - [`docs/operator.md`](operator.md) — the c8s operator and embedded chart.
 - [`docs/THREAT_MODEL.md`](THREAT_MODEL.md) — what c8s enforces today.
 - `bare-metal-infra-management/docs/kata.md` and `docs/kata-cc-mode.md` — the

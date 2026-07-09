@@ -89,13 +89,35 @@ const discoveryPublicTLSModeCDS = "cds"
 const discoveryPublicTLSModeWebPKI = "webpki"
 
 // runtimeClassName values injected by kata enforcement. kata-qemu is a
-// VM-isolated (non-confidential) pod; kata-qemu-snp is a confidential VM.
+// VM-isolated (non-confidential) pod; the confidential classes come in a
+// (CPU, GPU) pair per hardware platform, selected by Config.HardwarePlatform.
 // These are NOT configurable: the names are a fixed contract with the
 // RuntimeClasses the c8s chart installs (internal/helmchart/c8s/templates/kata.yaml)
 // AND with the kata-enforcement ValidatingAdmissionPolicy allowlist, so a custom
 // class would be rejected by the policy and have no matching shim or measurement.
 const kataRuntimeClass = "kata-qemu"
-const kataConfidentialRuntimeClass = "kata-qemu-snp"
+
+const (
+	kataSnpRuntimeClass    = "kata-qemu-snp"
+	kataSnpGpuRuntimeClass = "kata-qemu-snp-nvidia"
+	kataTdxRuntimeClass    = "kata-qemu-tdx"
+	kataTdxGpuRuntimeClass = "kata-qemu-tdx-nvidia"
+)
+
+// Hardware platforms the kata confidential classes target. Values match the
+// install CLI's --hardware-platform flag; the chart forwards its platform
+// choice to the operator so webhook injection and the rendered RuntimeClasses
+// stay in lockstep.
+const (
+	HardwarePlatformSNP = "sev-snp"
+	HardwarePlatformTDX = "tdx"
+)
+
+// nvidiaGpuResourcePrefix is the vendor prefix every NVIDIA GPU extended
+// resource carries. The sandbox-device-plugin advertises per-model names
+// (e.g. nvidia.com/GB202GL_RTX_PRO_6000_BLACKWELL_SERVER_EDITION), so the
+// webhook matches the prefix rather than a fixed resource name.
+const nvidiaGpuResourcePrefix = "nvidia.com/"
 
 // Config tunes the injector.
 type Config struct {
@@ -132,9 +154,17 @@ type Config struct {
 	// injects a runtimeClassName into every in-scope workload pod that does
 	// not already request one. Independent of get-cert injection — a pod with
 	// no confidential.ai/cw annotation is still given a runtimeClassName. The
-	// injected classes are the fixed kataRuntimeClass / kataConfidentialRuntimeClass
-	// constants (kata-qemu / kata-qemu-snp); they are not configurable.
+	// injected classes are fixed constants, not configurable;
+	// kataRuntimeClassFor picks between them per HardwarePlatform.
 	KataEnforce bool
+
+	// HardwarePlatform selects which confidential (CPU, GPU) class pair kata
+	// enforcement injects: HardwarePlatformSNP (kata-qemu-snp /
+	// kata-qemu-snp-nvidia, the default) or HardwarePlatformTDX
+	// (kata-qemu-tdx / kata-qemu-tdx-nvidia). Set from the operator's
+	// --hardware-platform flag, which the chart derives from the same values
+	// that pick the RuntimeClasses it renders.
+	HardwarePlatform string
 }
 
 // Register wires the pod mutator onto the manager's webhook server.
@@ -461,13 +491,16 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 		inj.SAN = workloadSAN(inj.WorkloadID, req.Namespace)
 	}
 
-	// confidential.ai/cw drives both get-cert injection and kata-qemu-snp
+	// confidential.ai/cw drives both get-cert injection and confidential
 	// class selection: a pod that opts in to a c8s workload identity also
-	// gets a confidential VM. Kata-only injection (no annotation) under
-	// --kata-enforce gives kata-qemu, not kata-qemu-snp. An operator-set
-	// runtimeClassName is always honored — an explicit kata-qemu-snp
-	// without the annotation runs as a confidential VM without c8s
-	// identity (the bring-your-own-attestation path; see docs/kata.md).
+	// gets a confidential VM (the platform's CPU class). Kata-only injection
+	// (no annotation) under --kata-enforce gives kata-qemu. A pod that
+	// requests an nvidia.com/* GPU gets the platform's confidential-GPU class
+	// — GPU implies confidential, regardless of the annotation. An
+	// operator-set runtimeClassName is always honored — an explicit
+	// confidential class without the annotation runs as a confidential VM
+	// without c8s identity (the bring-your-own-attestation path; see
+	// docs/kata.md).
 	_, alreadyInjected := pod.Annotations[AnnotationInjected]
 	getCertNeeded := inj != nil && m.cfg.GetCertImage != "" && !alreadyInjected
 	kataClass := kataRuntimeClassFor(pod, m.cfg)
@@ -569,9 +602,14 @@ func validateWorkloadLabel(pod *corev1.Pod) error {
 // or when the pod uses a host namespace (a VM cannot share the host's
 // namespaces, so such a pod can only run as an ordinary container).
 //
-// A pod annotated confidential.ai/cw gets the confidential runtime class:
-// opting in to a c8s workload identity also means running as a confidential
-// VM. Any other in-scope pod gets the non-confidential kata class.
+// A pod that requests an nvidia.com/* GPU gets the platform's confidential-GPU
+// class: c8s has no non-confidential GPU runtime, so a GPU request alone means
+// a confidential VM with the device passed through — independent of
+// confidential.ai/cw. The GPU runtime ships with every kata install, so this
+// needs no separate gate. A pod annotated confidential.ai/cw gets the
+// platform's confidential CPU class: opting in to a c8s workload identity also
+// means running as a confidential VM. Any other in-scope pod gets the
+// non-confidential kata class.
 func kataRuntimeClassFor(pod *corev1.Pod, cfg Config) string {
 	if !cfg.KataEnforce {
 		return ""
@@ -582,10 +620,46 @@ func kataRuntimeClassFor(pod *corev1.Pod, cfg Config) string {
 	if kataIncompatible(pod) {
 		return ""
 	}
+	tdx := cfg.HardwarePlatform == HardwarePlatformTDX
+	if podRequestsNvidiaGpu(pod) {
+		if tdx {
+			return kataTdxGpuRuntimeClass
+		}
+		return kataSnpGpuRuntimeClass
+	}
 	if pod.Annotations[AnnotationWorkload] != "" {
-		return kataConfidentialRuntimeClass
+		if tdx {
+			return kataTdxRuntimeClass
+		}
+		return kataSnpRuntimeClass
 	}
 	return kataRuntimeClass
+}
+
+// podRequestsNvidiaGpu reports whether any container (regular or init) asks
+// for an nvidia.com/* extended resource. Extended resources must appear in
+// Limits (kubernetes copies the value into Requests), but a hand-written pod
+// can set Requests directly, so both maps are scanned. Sidecar containers
+// live in InitContainers, so they are scanned too.
+func podRequestsNvidiaGpu(pod *corev1.Pod) bool {
+	containers := make([]corev1.Container, 0, len(pod.Spec.Containers)+len(pod.Spec.InitContainers))
+	containers = append(containers, pod.Spec.Containers...)
+	containers = append(containers, pod.Spec.InitContainers...)
+	for _, c := range containers {
+		if resourceListHasNvidiaGpu(c.Resources.Limits) || resourceListHasNvidiaGpu(c.Resources.Requests) {
+			return true
+		}
+	}
+	return false
+}
+
+func resourceListHasNvidiaGpu(list corev1.ResourceList) bool {
+	for name, qty := range list {
+		if strings.HasPrefix(string(name), nvidiaGpuResourcePrefix) && !qty.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // kataIncompatible reports whether pod uses a host namespace. Kata launches
@@ -805,6 +879,9 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.GetCertRunAsNonRoot == nil {
 		cfg.GetCertRunAsNonRoot = boolPtr(defaultGetCertRunAsNonRoot)
+	}
+	if cfg.HardwarePlatform == "" {
+		cfg.HardwarePlatform = HardwarePlatformSNP
 	}
 	return cfg
 }

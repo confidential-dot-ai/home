@@ -177,15 +177,20 @@ func preflightCDSNode(ctx context.Context, chartPath string) error {
 }
 
 // preflightTDXNodes fails fast when --hardware-platform=tdx but no node carries
-// the intel-tdx.node.kubernetes.io/enabled=true label — the label the
-// kata-qemu-tdx RuntimeClass nodeSelector expects. The operator applies it
-// once the host has /dev/tdx_guest, qgsd running, and a unix→vsock QGS
-// bridge. Without a labelled node, kata-qemu-tdx pods would sit Pending
-// until timeout with an opaque scheduler error.
+// the confidential.ai/tdx=true label — the label the kata-qemu-tdx*
+// RuntimeClass nodeSelectors expect (kata.tdxNodeSelector default). On the
+// default --kata path the install applies it itself right before this check
+// (autoLabelTEENodes, trusting --hardware-platform), so a failure there means
+// no node matched the kata node selector at all; with -f, or without --kata
+// (e.g. --cvm-mode=node), the operator owns the label. Without a labelled
+// node, TDX pods would sit Pending until timeout with an opaque scheduler
+// error.
 //
-// Runs regardless of -f: the label is a fact about the host, not a values
-// choice, and every TDX install needs it.
-const tdxHostLabelKey = "intel-tdx.node.kubernetes.io/enabled"
+// Runs regardless of -f: the label requirement is a fact about the cluster,
+// not a values choice, and every TDX install needs it. Note the label says
+// nothing about qgsd or its vsock bridge being up — quote generation failing
+// on a labelled-but-unready host surfaces at attestation time, not here.
+const tdxHostLabelKey = "confidential.ai/tdx"
 
 func preflightTDXNodes(ctx context.Context) error {
 	out, err := exec.CommandContext(ctx, "kubectl", "get", "nodes",
@@ -194,10 +199,82 @@ func preflightTDXNodes(ctx context.Context) error {
 		return fmt.Errorf("kubectl get nodes -l %s=true: %w", tdxHostLabelKey, err)
 	}
 	if strings.TrimSpace(string(out)) == "" {
-		return fmt.Errorf("--hardware-platform=tdx but no node is labelled %s=true. Every TDX install needs at least one host with /dev/tdx_guest available, qgsd (Intel DCAP Quote Generation Service) running, and a socat unix→vsock bridge so kata's QGS-over-vsock path reaches qgsd. Once your host is TDX-ready, label it:\n\n    kubectl label node <node> %s=true",
+		return fmt.Errorf("--hardware-platform=tdx but no node is labelled %s=true. A default `c8s install --kata` labels every kata-targeted node automatically, so either no node matched the kata node selector, or this is a -f/non-kata install where labels are yours to manage. A TDX node also needs /dev/tdx_guest available, qgsd (Intel DCAP Quote Generation Service) running, and a socat unix→vsock bridge so kata's QGS-over-vsock path reaches qgsd. To label a host yourself:\n\n    kubectl label node <node> %s=true",
 			tdxHostLabelKey, tdxHostLabelKey)
 	}
 	return nil
+}
+
+// preflightTEENodes fails fast (before the helm install) when a --kata
+// install would schedule confidential pods that can never start: the
+// platform's confidential RuntimeClasses select platform-labelled nodes
+// (kata.snpNodeSelector / kata.tdxNodeSelector), and the chart-managed CDS
+// and tls-lb both pin the platform's CPU class — with no labelled
+// node the whole release sits Pending and `helm --wait` blocks for the full
+// timeout before failing opaquely. It runs right after autoLabelTEENodes,
+// which labels every kata-targeted node from --hardware-platform, so "no
+// labelled node" means no node matched the kata node selector at all. (Why a
+// wrong-TEE node cannot run these pods: docs/pitfalls.md "kata-qemu-snp on a
+// non-SNP host is a QEMU crash-loop".)
+//
+// Like preflightCDSNode it reads the chart's default values, so it guards the
+// default path only; an operator who customizes via -f owns node labels (the
+// caller skips this when -f is supplied).
+func preflightTEENodes(ctx context.Context, chartPath, hardwarePlatform string) error {
+	out, err := exec.CommandContext(ctx, "helm", "show", "values", chartPath).Output()
+	if err != nil {
+		return fmt.Errorf("helm show values %q: %w", chartPath, err)
+	}
+	var tree map[string]any
+	if err := yaml.Unmarshal(out, &tree); err != nil {
+		return fmt.Errorf("parse chart values: %w", err)
+	}
+
+	selKey, otherPlatform := "snpNodeSelector", "tdx"
+	if hardwarePlatform == "tdx" {
+		selKey, otherPlatform = "tdxNodeSelector", "sev-snp"
+	}
+	sel, _ := nestedMap(tree, "kata", selKey)
+	selector, ok := labelSelector(sel)
+	if !ok {
+		// Empty/cleared selector means unrestricted confidential scheduling —
+		// nothing to preflight (and the chart renders no scheduling block).
+		return nil
+	}
+
+	labeled, err := exec.CommandContext(ctx, "kubectl", "get", "nodes",
+		"-l", selector, "-o", "name").Output()
+	if err != nil {
+		return fmt.Errorf("kubectl get nodes -l %s: %w", selector, err)
+	}
+	if strings.TrimSpace(string(labeled)) == "" {
+		return fmt.Errorf("no node is labelled %s: the install labels every kata-targeted node from --hardware-platform=%s, so no node matched the kata node selector — without a labelled node no confidential pod can schedule, including the chart's own CDS and tls-lb. Check the cluster has schedulable Linux nodes; on a %s cluster pass --hardware-platform=%s instead. To label a host yourself: kubectl label node <node> %s", selector, hardwarePlatform, otherPlatform, otherPlatform, strings.ReplaceAll(selector, ",", " "))
+	}
+	return nil
+}
+
+// labelSelector flattens a decoded values map into a kubectl -l selector
+// ("k=v,k2=v2", keys sorted for determinism). ok=false for an empty map or a
+// non-string value — an empty kata.snpNodeSelector is the documented opt-out,
+// and a malformed one is the chart's to reject, not the preflight's.
+func labelSelector(sel map[string]any) (string, bool) {
+	if len(sel) == 0 {
+		return "", false
+	}
+	keys := make([]string, 0, len(sel))
+	for k := range sel {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	pairs := make([]string, 0, len(keys))
+	for _, k := range keys {
+		v, ok := sel[k].(string)
+		if !ok {
+			return "", false
+		}
+		pairs = append(pairs, k+"="+v)
+	}
+	return strings.Join(pairs, ","), true
 }
 
 // clusterDistroNodes reads every node's kubeletVersion via kubectl and splits
@@ -411,7 +488,7 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 			return err
 		}
 		defer os.Remove(computedValues)
-		helmArgs := buildInstallHelmArgs(chartPath, computedValues, installValues, installCRDs, installWait)
+		helmArgs := buildInstallHelmArgs(chartPath, computedValues, installValues, installCRDs, installWait, installKata)
 
 		// Fail fast on the default path if the CDS node is unlabelled, before
 		// mutating the cluster. Skipped when -f is supplied: a custom values
@@ -424,21 +501,50 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 			}
 		}
 
-		// Fail fast when --hardware-platform=tdx but no node carries the
-		// intel-tdx label. Under --kata the kata-qemu-tdx RuntimeClass has a
-		// nodeSelector on that label; under --cvm-mode=node the attestationApi
-		// DaemonSet needs at least one TDX-capable node. Runs whether or not
-		// -f was supplied — it's checking a fact about the cluster, not the
-		// values. Whichever provisioning path applied the label is out of
-		// scope here; the error message documents the host state expected.
-		if installHardwarePlatform == "tdx" && installCvmMode != "aks" {
-			if err := preflightTDXNodes(cmd.Context()); err != nil {
+		// Digest resolution off + default values: verify at least the
+		// operator image exists (see preflightOperatorImage); a -f owner may
+		// pin different repositories or digests.
+		if !installResolveDigests && len(installValues) == 0 {
+			if err := preflightOperatorImage(cmd.Context(), components, imageTag); err != nil {
 				return err
 			}
 		}
 
 		if installImagePullSecret != "" {
 			if err := preflightImagePullSecret(cmd.Context(), installNamespace, installImagePullSecret); err != nil {
+				return err
+			}
+		}
+
+		// --kata: label every kata-targeted node for the declared
+		// --hardware-platform (refusing if the other platform's label is
+		// still present — a platform switch must be the operator's explicit
+		// act), then fail fast if the platform's confidential pods still
+		// have nowhere to schedule. Declarative — the flag is trusted, no
+		// hardware probe (see autoLabelTEENodes). Runs after the read-only
+		// preflights above — it mutates the cluster (node labels). Skipped
+		// with -f, whose owner owns node labels; NOT skipped under
+		// --single-node — even a one-node cluster needs its platform label
+		// for confidential pods to schedule.
+		kataDefaultPath := installKata && len(installValues) == 0
+		if kataDefaultPath {
+			if err := autoLabelTEENodes(cmd.Context(), chartPath, installHardwarePlatform); err != nil {
+				return err
+			}
+			if err := preflightTEENodes(cmd.Context(), chartPath, installHardwarePlatform); err != nil {
+				return err
+			}
+		}
+
+		// Fail fast when --hardware-platform=tdx but no node carries the TDX
+		// label. Under --kata the TDX RuntimeClasses have a nodeSelector on
+		// it; under --cvm-mode=node the attestationApi DaemonSet needs at
+		// least one TDX-capable node. Checks a fact about the cluster, not
+		// the values, so it runs with -f too — but the default --kata path
+		// above already checked the chart's actual tdxNodeSelector (which
+		// may be customized or cleared), so skip the fixed-key check there.
+		if installHardwarePlatform == "tdx" && installCvmMode != "aks" && !kataDefaultPath {
+			if err := preflightTDXNodes(cmd.Context()); err != nil {
 				return err
 			}
 		}
@@ -544,8 +650,12 @@ func defaultInstallImageTag(buildVersion string) string {
 // load-bearing: the operator's -f files come first and the computed values file
 // LAST, so the CLI's computed values win on the keys they set (helm merges -f
 // last-wins) — matching the prior "--set beats -f" precedence. --skip-crds is a
-// helm invocation flag (not a value), emitted iff CRDs are skipped.
-func buildInstallHelmArgs(chartPath, computedValues string, valueFiles []string, installCRDs, wait bool) []string {
+// helm invocation flag (not a value), emitted iff CRDs are skipped. A --kata
+// install waits 10m instead of 5m: on a node without a prior kata install,
+// kata-deploy downloads the multi-GB kata-static payload inside the --wait
+// window, and 5m routinely left the release `failed` with the cluster
+// converging fine underneath.
+func buildInstallHelmArgs(chartPath, computedValues string, valueFiles []string, installCRDs, wait, kata bool) []string {
 	helmArgs := []string{
 		"upgrade", "--install", installRelease, chartPath,
 		"--namespace", installNamespace,
@@ -558,7 +668,11 @@ func buildInstallHelmArgs(chartPath, computedValues string, valueFiles []string,
 	}
 	helmArgs = append(helmArgs, "-f", computedValues)
 	if wait {
-		helmArgs = append(helmArgs, "--wait", "--timeout=5m")
+		timeout := "--timeout=5m"
+		if kata {
+			timeout = "--timeout=10m"
+		}
+		helmArgs = append(helmArgs, "--wait", timeout)
 	}
 	return helmArgs
 }
@@ -753,9 +867,12 @@ func validateKataDebugFlags(kata, debug bool) error {
 // left enabled alongside kata.enabled (see validations.yaml).
 //
 // debug selects the kata-guest-base debug image variant (--debug; the chart
-// derives the `<tag>-debug` artifact tag). RunE rejects --debug without
-// --kata before args are built; everything here still keys on kata so a
-// call-order change cannot emit a debug value for a non-kata install.
+// derives the `<tag>-debug` artifact tag). The confidential-GPU stack (runtime
+// class, shim, GPU image puller, sandbox device plugin) ships with every kata
+// install — it renders off kata.enabled, so there is no GPU flag here. RunE
+// rejects --debug without --kata before args are built; everything here still
+// keys on kata so a call-order change cannot emit a debug value for a non-kata
+// install.
 func appendKataInstallArgs(helmArgs []string, kata, debug bool) []string {
 	if !kata {
 		return helmArgs
@@ -813,6 +930,43 @@ func checkImagePullSecret(sec *corev1.Secret, namespace, name string) error {
 	return nil
 }
 
+// preflightOperatorImage verifies the operator image exists in the registry
+// before installing, for the path where digest resolution is off
+// (--resolve-digests=false). With resolution on, appendResolvedDigestArgs
+// already fails fast for every component; without it a missing tag surfaces
+// only as ImagePullBackOff after a successful-looking install — and the
+// tempting fallback (an older tag like :main) is worse: an operator that
+// predates the chart's webhook features silently mis-injects
+// (docs/pitfalls.md). The operator is the one component checked: this path
+// deliberately opted out of full resolution, and the operator is the image
+// whose chart coupling bites hardest. Best-effort beyond that: crane absent
+// or an auth/network failure warns and continues; only a confirmed missing
+// tag aborts.
+func preflightOperatorImage(ctx context.Context, components []c8sComponent, tag string) error {
+	// The operator's valuePath in c8sComponents is the top-level "image".
+	var repo string
+	for _, c := range components {
+		if c.valuePrefix == "image" {
+			repo = c.repository
+			break
+		}
+	}
+	if repo == "" {
+		return nil
+	}
+	if _, err := exec.LookPath("crane"); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot verify operator image %s:%s exists (crane not on PATH); a missing tag surfaces only as ImagePullBackOff after install\n", repo, tag)
+		return nil
+	}
+	if _, err := craneDigest(ctx, repo+":"+tag); err != nil {
+		if isImageNotFound(err) {
+			return fmt.Errorf("operator image %s:%s is not published — %s: %w", repo, tag, tagCouplingHint(repo, tag), err)
+		}
+		fmt.Fprintf(os.Stderr, "warning: could not verify operator image %s:%s exists (%v); continuing\n", repo, tag, err)
+	}
+	return nil
+}
+
 // appendSingleNodeInstallArgs collapses the dedicated-CDS-node partition for a
 // single-node / single-CVM cluster: an empty cds.node.selector makes every node
 // CDS-eligible (one push-mode installer everywhere, no worker split), and the
@@ -845,6 +999,32 @@ func appendEngineInstallArgs(setArgs []string, engine, workloadID, namespace str
 		setArgs = append(setArgs, "--set-string", "engine.namespace="+namespace)
 	}
 	return setArgs
+}
+
+// isImageNotFound reports whether a resolve error means the reference does
+// not exist in the registry (as opposed to auth/network trouble). crane
+// surfaces the registry's OCI error codes verbatim: MANIFEST_UNKNOWN for a
+// missing tag, NAME_UNKNOWN for a missing repository. Matching them lets the
+// callers attach the tag-coupling guidance only when the tag is genuinely
+// absent — a 401 or a DNS failure gets the raw error instead.
+func isImageNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "MANIFEST_UNKNOWN") || strings.Contains(msg, "NAME_UNKNOWN")
+}
+
+// tagCouplingHint explains a missing component image in terms of the c8s
+// publish model, so the operator lands on the right knob instead of retrying
+// tags. The c8s component images (operator, cds, …) publish in lockstep
+// (docker.yml) and the chart+operator ship as a unit; a tag that exists only
+// for some other artifact — e.g. a kata-guest-base guest-image tag like
+// branch-<name> — is not an install tag, and falling back to a mismatched
+// component tag is worse than failing (an operator predating the chart's
+// webhook features silently mis-injects; docs/pitfalls.md).
+func tagCouplingHint(repo, tag string) string {
+	return fmt.Sprintf("every c8s component image must be published at the install tag (they publish in lockstep; a mismatched older operator would silently lack webhook features the chart expects). If %q is a kata-guest-base guest-image tag, that is a separate axis: keep --image-tag on a published component tag and set kata.guestImage.tag=%s via -f instead. Verify with: crane ls %s", tag, tag, repo)
 }
 
 // craneDigest resolves an image reference to its registry digest by shelling
@@ -901,6 +1081,9 @@ func buildDigestArgs(helmArgs []string, tag string, components []c8sComponent, r
 		repo := c.repository
 		digest, err := resolve(repo + ":" + tag)
 		if err != nil {
+			if isImageNotFound(err) {
+				return nil, fmt.Errorf("component %s: image %s:%s is not published — %s: %w", c.valuePrefix, repo, tag, tagCouplingHint(repo, tag), err)
+			}
 			return nil, err
 		}
 		helmArgs = append(helmArgs,
@@ -933,8 +1116,8 @@ func init() {
 	installCmd.Flags().StringVar(&installEngineNamespace, "engine-namespace", "", "namespace the engine workload runs in (chart engine.namespace); empty = release namespace")
 	installCmd.Flags().StringVar(&installCvmMode, flagCvmMode, "baremetal", "CVM deployment shape (orthogonal to --hardware-platform): baremetal, or node (generalized node-as-CVM: our own TDX/SNP nodes are themselves confidential VMs, pods run as ordinary processes), or gke (GKE managed confidential VMs), or aks (vTPM /dev/tpm0). All modes render a privileged attestation-api (a hostPath device mount alone does not grant device-cgroup access)")
 	installCmd.Flags().StringVar(&installHardwarePlatform, flagHardwarePlatform, "sev-snp", "CPU-level TEE hardware (orthogonal to --cvm-mode): sev-snp (default, /dev/sev-guest) or tdx (Intel TDX, /dev/tdx-guest). Ignored when --cvm-mode=aks (Azure vTPM path); combining --cvm-mode=aks with --hardware-platform=tdx is refused")
-	installCmd.Flags().BoolVar(&installKata, "kata", false, "install the Kata Containers runtime stack (kata-deploy DaemonSet + RuntimeClasses) and enforce it: workload pods are injected with kata RuntimeClasses and non-kata classes are rejected. Also disables the host-side ratls-mesh, attestation-api, and nri-image-policy — under kata their function runs inside the kata-guest-base VM image")
-	installCmd.Flags().BoolVar(&installKataDebug, "debug", false, "use the kata-guest-base DEBUG image variant (tag <tag>-debug, kata.guestImage.debug=true): its baked guest policy allows host log/exec streams so 'kubectl logs' and 'kubectl exec' work on kata pods — container I/O becomes readable by the untrusted host and the SNP launch measurement differs from the locked image. Requires --kata; development only")
+	installCmd.Flags().BoolVar(&installKata, "kata", false, "install and enforce the Kata Containers runtime stack: every workload pod runs as a confidential VM (kata RuntimeClass injected; non-kata classes rejected), including NVIDIA GPU pods. Labels every kata node for the declared --hardware-platform (clearing the other platform's label), failing fast when no node qualifies")
+	installCmd.Flags().BoolVar(&installKataDebug, "debug", false, "use the kata-guest-base DEBUG guest variant (<tag>-debug): kubectl logs/exec work on kata pods, but container I/O becomes readable by the untrusted host and the launch measurement differs from the locked image. Requires --kata; development only")
 	installCmd.Flags().BoolVar(&installResolveDigests, "resolve-digests", true, "resolve each c8s component image tag to its registry digest (via crane), pin it, and add the resolved images to the NRI allowlist (enables deriveComponents). On by default; pass --resolve-digests=false when supplying digests via -f")
 	installCmd.Flags().StringVar(&installImagePullSecret, "image-pull-secret", "", "name of an existing registry-credential Secret (kubernetes.io/dockerconfigjson) in the release namespace; the chart appends it to every component's imagePullSecrets, so all pods can pull private c8s images from first start. The Secret itself is never created or managed by the install — the install fails fast if it is missing or has the wrong type")
 	installCmd.Flags().StringVar(&installImageTag, "image-tag", "", "component image tag to resolve digests at (default: the CLI build version, or 'main' for an unstamped build). Override to pin a specific branch/tag/release")

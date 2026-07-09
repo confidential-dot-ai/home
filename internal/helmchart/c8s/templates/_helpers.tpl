@@ -109,6 +109,80 @@ qemu-snp
 {{- end -}}
 {{- end -}}
 
+{{/*
+  Confidential-GPU RuntimeClass for this cluster's TEE. Mirrors
+  c8s.controlPlaneKataRuntimeClass: tdxGuest=true → kata-qemu-tdx-nvidia,
+  else kata-qemu-snp-nvidia. Keep in sync with kata.yaml's GPU RC blocks and
+  kata-enforcement.yaml's admission allowlist.
+*/}}
+{{- define "c8s.kataGpuRuntimeClass" -}}
+{{- if .Values.attestationApi.teeDevices.tdxGuest -}}
+kata-qemu-tdx-nvidia
+{{- else -}}
+kata-qemu-snp-nvidia
+{{- end -}}
+{{- end -}}
+
+{{/*
+  Confidential-GPU shim name (kata-deploy dir under
+  /opt/kata/share/defaults/kata-containers/runtimes/) for this cluster's TEE.
+  Mirrors c8s.kataShimName: tdxGuest=true → qemu-nvidia-gpu-tdx, else
+  qemu-nvidia-gpu-snp. Passed as SHIM_NAME to pull-and-configure.sh by
+  kata-image-puller-nvidia.yaml.
+*/}}
+{{- define "c8s.kataGpuShimName" -}}
+{{- if .Values.attestationApi.teeDevices.tdxGuest -}}
+qemu-nvidia-gpu-tdx
+{{- else -}}
+qemu-nvidia-gpu-snp
+{{- end -}}
+{{- end -}}
+
+{{/*
+  c8s.hardwarePlatform — the CPU TEE this install targets, in the install
+  CLI's --hardware-platform vocabulary (sev-snp | tdx). Keys off the same
+  value as every platform helper above; forwarded to the operator so webhook
+  injection matches the RuntimeClasses the chart renders.
+*/}}
+{{- define "c8s.hardwarePlatform" -}}
+{{- if .Values.attestationApi.teeDevices.tdxGuest -}}
+tdx
+{{- else -}}
+sev-snp
+{{- end -}}
+{{- end -}}
+
+{{/*
+  c8s.kataConfidentialShims — the confidential shim set for this platform, as
+  kata-deploy SHIMS_X86_64 tokens: the CPU shim + the NVIDIA GPU shim. Only
+  the declared platform's shims are installed and only its RuntimeClasses
+  render (kata.yaml) — a single cluster is one CPU TEE, so the other
+  platform's classes would be unschedulable decoys at best. Keep in lockstep
+  with the RuntimeClasses in kata.yaml and the kata-enforcement allowlist
+  (c8s.kataAllowedRuntimeClasses).
+*/}}
+{{- define "c8s.kataConfidentialShims" -}}
+{{- if .Values.attestationApi.teeDevices.tdxGuest -}}
+qemu-tdx qemu-nvidia-gpu-tdx
+{{- else -}}
+qemu-snp qemu-nvidia-gpu-snp
+{{- end -}}
+{{- end -}}
+
+{{/*
+  c8s.kataAllowedRuntimeClasses — the RuntimeClass names kata enforcement
+  accepts, as a quoted CEL list body: the two non-confidential classes plus
+  this platform's confidential (CPU, GPU) pair. Single source for the
+  kata-enforcement expression and its message.
+*/}}
+{{- define "c8s.kataAllowedRuntimeClasses" -}}
+{{- if .Values.attestationApi.teeDevices.tdxGuest -}}
+'kata-qemu', 'kata-clh', 'kata-qemu-tdx', 'kata-qemu-tdx-nvidia'
+{{- else -}}
+'kata-qemu', 'kata-clh', 'kata-qemu-snp', 'kata-qemu-snp-nvidia'
+{{- end -}}
+{{- end -}}
+
 {{- define "c8s.kataDeployImage" -}}
 {{- if and .Values.kata.image.digest .Values.kata.image.tag -}}
 {{ fail "kata.image.tag and kata.image.digest are mutually exclusive — set one, not both (digest wins silently otherwise, which surprises operators bumping versions)" }}
@@ -153,6 +227,38 @@ convention is fixed by kata-guest-base/scripts/ci/compute-tags.sh.
 {{- printf "%s-debug" .Values.kata.guestImage.tag -}}
 {{- else -}}
 {{- .Values.kata.guestImage.tag -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+c8s.kataGuestImageNvidiaTag — the confidential-GPU guest-image tag the nvidia
+puller fetches: the base tag with a `-nvidia` suffix, or `-nvidia-debug` under
+kata.guestImage.debug. CI publishes both in lockstep with the non-GPU pair
+(kata-guest-base.yml), so one debug toggle drives every guest image — see
+docs/kata-gpu.md "`--debug` and the GPU guest".
+*/ -}}
+{{- define "c8s.kataGuestImageNvidiaTag" -}}
+{{- if .Values.kata.guestImage.debug -}}
+{{- printf "%s-nvidia-debug" .Values.kata.guestImage.tag -}}
+{{- else -}}
+{{- printf "%s-nvidia" .Values.kata.guestImage.tag -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+c8s.kataSandboxDevicePluginImage — the NVIDIA kata sandbox device plugin image.
+Digest wins; the tag is kept only for human readability (same shape as the
+puller image), because the plugin runs privileged with host devices mounted and
+a floating tag would be root on every GPU node — so the digest is what's used.
+*/ -}}
+{{- define "c8s.kataSandboxDevicePluginImage" -}}
+{{- $img := .Values.kata.gpu.sandboxDevicePlugin.image -}}
+{{- if $img.digest -}}
+{{ $img.repository }}@{{ $img.digest }}
+{{- else if $img.tag -}}
+{{ $img.repository }}:{{ $img.tag }}
+{{- else -}}
+{{ fail "kata.gpu.sandboxDevicePlugin.image.tag or .digest must be set" }}
 {{- end -}}
 {{- end -}}
 

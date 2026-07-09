@@ -29,6 +29,9 @@
 {{- if and .Values.kata.enabled (ne .Values.webhook.failurePolicy "Fail") -}}
 {{- fail (printf "kata.enabled=true requires webhook.failurePolicy=Fail (got %q): kata is enforcing — the ValidatingAdmissionPolicy rejects pods that reach validation without a kata RuntimeClass, so the mutating webhook that injects that class must also fail closed — otherwise an operator-down event silently bypasses enforcement" .Values.webhook.failurePolicy) -}}
 {{- end -}}
+{{- if and .Values.kata.enabled (lt (int .Values.kata.gpu.guestImage.pcieRootPort) 1) -}}
+{{- fail (printf "VALIDATION_ERROR kind=gpu_pcie_root_port: kata.gpu.guestImage.pcieRootPort must be >= 1 (got %v). VFIO cold-plug attaches each passed-through GPU behind a pcie-root-port, so 0 disables passthrough: a GPU pod boots as a confidential VM with NO device and the only symptom is a missing /dev/nvidia* in-guest. Size it to the node's GPU count (default 8 = a full HGX board)." .Values.kata.gpu.guestImage.pcieRootPort) -}}
+{{- end -}}
 {{- /*
   kata.enabled is enforcing: every workload runs as a kata CVM, where these
   host-side components are replaced by their in-guest counterparts baked into
