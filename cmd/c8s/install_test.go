@@ -729,15 +729,33 @@ func TestCheckImagePullSecret(t *testing.T) {
 func TestAppendDistroInstallArgsSetsBothComponents(t *testing.T) {
 	// The detected distro feeds both the kata-deploy and nri-image-policy
 	// installers; nri-image-policy installs regardless of --kata, so the two
-	// values always travel together.
-	for _, distro := range []string{"k8s", "rke2"} {
-		t.Run(distro, func(t *testing.T) {
-			got := appendDistroInstallArgs([]string{"upgrade"}, distro)
-			assertArgsEqual(t, got, []string{
+	// values always travel together. RKE2 additionally gets a tls-lb nginx
+	// resolver override, since it has no kube-dns Service (the chart default).
+	for _, tt := range []struct {
+		distro string
+		want   []string
+	}{
+		{
+			distro: "k8s",
+			want: []string{
 				"upgrade",
-				"--set-string", "kata.distro=" + distro,
-				"--set-string", "nriImagePolicy.distro=" + distro,
-			})
+				"--set-string", "kata.distro=k8s",
+				"--set-string", "nriImagePolicy.distro=k8s",
+			},
+		},
+		{
+			distro: "rke2",
+			want: []string{
+				"upgrade",
+				"--set-string", "kata.distro=rke2",
+				"--set-string", "nriImagePolicy.distro=rke2",
+				"--set-string", "tlsLb.nginx.resolver=rke2-coredns-rke2-coredns.kube-system.svc.cluster.local",
+			},
+		},
+	} {
+		t.Run(tt.distro, func(t *testing.T) {
+			got := appendDistroInstallArgs([]string{"upgrade"}, tt.distro)
+			assertArgsEqual(t, got, tt.want)
 		})
 	}
 }
