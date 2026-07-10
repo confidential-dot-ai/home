@@ -48,6 +48,7 @@ const (
 	envMeshMeasurements      = "C8S_MESH_MEASUREMENTS"
 	envPlatform              = "C8S_PLATFORM"
 	envPodIP                 = "C8S_POD_IP"
+	envInboundPassthrough    = "C8S_MESH_INBOUND_PASSTHROUGH"
 )
 
 // defaultInGuestAttestationServiceURL is the loopback URL the in-guest
@@ -72,6 +73,10 @@ type inGuestConfig struct {
 	cdsMeasurements       string
 	meshMeasurements      string
 	podIP                 string
+	inboundPassthrough    string
+
+	// Parsed from inboundPassthrough by validate().
+	inboundPassthroughPorts []int
 
 	certTTL            time.Duration
 	rotationTimeout    time.Duration
@@ -125,6 +130,7 @@ func loadInGuestConfig(env func(string) string) inGuestConfig {
 	c.cdsMeasurements = env(envCDSMeasurements)
 	c.meshMeasurements = env(envMeshMeasurements)
 	c.podIP = env(envPodIP)
+	c.inboundPassthrough = env(envInboundPassthrough)
 	return c
 }
 
@@ -144,7 +150,52 @@ func (c *inGuestConfig) validate() error {
 	if !hasURLScheme(c.attestationServiceURL) {
 		return fmt.Errorf("%s %q must start with http:// or https://", envAttestationServiceURL, c.attestationServiceURL)
 	}
+	ports, err := parseInboundPassthrough(c.inboundPassthrough)
+	if err != nil {
+		return fmt.Errorf("%s: %w", envInboundPassthrough, err)
+	}
+	c.inboundPassthroughPorts = ports
 	return validateConfig(c.attestationServiceURL, inGuestOutboundPort, inGuestInboundPort, inGuestHealthPort, c.certTTL)
+}
+
+// parseInboundPassthrough parses C8S_MESH_INBOUND_PASSTHROUGH: a comma list of
+// `tcp:<port>` destination ports exempted from the in-guest PREROUTING
+// redirect, so a designated public front door (tls-lb nginx, CDS RA-TLS — both
+// terminate their own attestation-anchored TLS) is reachable by clients that
+// hold no mesh client cert. Only tcp is accepted: the redirect is tcp-only, so
+// a udp entry could never do anything — reject it rather than let it imply
+// coverage it doesn't have. The mesh's own ports are rejected too; they are
+// already skipped, and listing them suggests a misunderstanding worth failing
+// loudly on. Empty = fully meshed inbound (the strict posture).
+func parseInboundPassthrough(raw string) ([]int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	seen := make(map[int]bool)
+	var out []int
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		proto, portStr, ok := strings.Cut(part, ":")
+		if !ok || strings.TrimSpace(proto) != "tcp" {
+			return nil, fmt.Errorf("invalid entry %q: want tcp:<port> (the inbound redirect is tcp-only)", part)
+		}
+		port, err := strconv.Atoi(strings.TrimSpace(portStr))
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("invalid port %q: want 1-65535", portStr)
+		}
+		if port == inGuestOutboundPort || port == inGuestInboundPort || port == inGuestHealthPort {
+			return nil, fmt.Errorf("port %d is a mesh listener port, not a workload front door", port)
+		}
+		if !seen[port] {
+			seen[port] = true
+			out = append(out, port)
+		}
+	}
+	return out, nil
 }
 
 func hasURLScheme(s string) bool {
@@ -171,6 +222,10 @@ Optional environment variables:
   C8S_CDS_MEASUREMENTS          comma-separated hex SHA-384 measurements
   C8S_MESH_MEASUREMENTS         comma-separated hex SHA-384 measurements
   C8S_POD_IP                    in-guest pod IP (auto-detected if empty)
+  C8S_MESH_INBOUND_PASSTHROUGH  comma-separated tcp:<port> destination ports
+                                exempted from the inbound mTLS redirect (public
+                                front doors that terminate their own TLS, e.g.
+                                tcp:8443 for tls-lb/CDS); empty = fully meshed
 
 Requires CAP_NET_ADMIN to install iptables redirects on the guest
 interface; the systemd unit owns granting that capability.`,
@@ -223,7 +278,7 @@ func runInGuest(ctx context.Context, c *inGuestConfig) error {
 	// Install iptables redirects first. A failure here is non-recoverable:
 	// the proxy would otherwise come up but the workload's traffic would
 	// silently bypass the mesh — a worse failure mode than crashing.
-	if err := setupInGuestIptables(logger, podIP); err != nil {
+	if err := setupInGuestIptables(logger, podIP, c.inboundPassthroughPorts); err != nil {
 		return fmt.Errorf("in-guest iptables setup: %w", err)
 	}
 
@@ -698,11 +753,11 @@ sidecar, one container later in the boot, with the same end state.`,
 // Returns an error on the first failure; the caller exits non-zero.
 // Idempotent: installIptablesRules flushes the managed chains first so
 // a crash-restart does not double-install rules.
-func setupInGuestIptables(logger *slog.Logger, podIP string) error {
+func setupInGuestIptables(logger *slog.Logger, podIP string, inboundPassthroughPorts []int) error {
 	if err := initIptablesClients(); err != nil {
 		return err
 	}
-	rules := buildInGuestIptablesRules(inGuestOutboundPort, inGuestInboundPort, inGuestHealthPort)
+	rules := buildInGuestIptablesRules(inGuestOutboundPort, inGuestInboundPort, inGuestHealthPort, inboundPassthroughPorts)
 	jumps := jumpRules()
 	logger.Info("installing in-guest iptables redirects",
 		"outbound_port", inGuestOutboundPort,
@@ -710,6 +765,12 @@ func setupInGuestIptables(logger *slog.Logger, podIP string) error {
 		"health_port", inGuestHealthPort,
 		"pod_ip", podIP,
 	)
+	if len(inboundPassthroughPorts) > 0 {
+		// Config-posture change worth its own audit line: these inbound
+		// ports bypass the mesh's mutual-RA-TLS inbound proxy by design.
+		logger.Info("inbound mesh redirect passthrough active — these ports serve external clients without mesh mTLS",
+			"ports", inboundPassthroughPorts)
+	}
 	return installIptablesRules(logger, rules, jumps)
 }
 
@@ -720,7 +781,7 @@ func setupInGuestIptables(logger *slog.Logger, podIP string) error {
 // Rule ordering matters: the early RETURN rules let the proxy's own
 // traffic and the in-VM IPC (attestation-service on loopback) through
 // without redirect; the trailing REDIRECT rules catch everything else.
-func buildInGuestIptablesRules(outboundPort, inboundPort, healthPort int) []iptablesRule {
+func buildInGuestIptablesRules(outboundPort, inboundPort, healthPort int, inboundPassthroughPorts []int) []iptablesRule {
 	uidStr := strconv.Itoa(defaultProxyUID)
 	outPortStr := strconv.Itoa(outboundPort)
 	inPortStr := strconv.Itoa(inboundPort)
@@ -813,6 +874,29 @@ func buildInGuestIptablesRules(outboundPort, inboundPort, healthPort int) []ipta
 			"-j", "RETURN",
 		},
 	})
+	// Designated public front doors (C8S_MESH_INBOUND_PASSTHROUGH) skip the
+	// inbound mTLS redirect: without this, a guest that terminates its own
+	// TLS for external clients (tls-lb nginx, CDS) is unreachable — every
+	// certless client gets "certificate required" from the mesh proxy.
+	// multiport matches at most 15 ports per rule, so longer lists chunk
+	// across rules rather than failing at install time.
+	const multiportMax = 15
+	for start := 0; start < len(inboundPassthroughPorts); start += multiportMax {
+		chunk := inboundPassthroughPorts[start:min(start+multiportMax, len(inboundPassthroughPorts))]
+		dports := make([]string, len(chunk))
+		for i, p := range chunk {
+			dports[i] = strconv.Itoa(p)
+		}
+		rules = append(rules, iptablesRule{
+			table: "nat", chain: preroutingChainName,
+			label: "in-guest-prerouting-passthrough",
+			args: []string{
+				"-p", "tcp",
+				"-m", "multiport", "--dports", strings.Join(dports, ","),
+				"-j", "RETURN",
+			},
+		})
+	}
 	rules = append(rules, iptablesRule{
 		table: "nat", chain: preroutingChainName,
 		label: "in-guest-prerouting-redirect",

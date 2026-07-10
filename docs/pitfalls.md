@@ -390,19 +390,52 @@ gh api repos/kata-containers/kata-containers/git/refs/tags/<ver> --jq .object.sh
 (The `kata-static` release asset is separately sha256-pinned in
 `stage-kata-conf.sh`, so only the git-tag source fetch needed this treatment.)
 
-## Running clusters do NOT pick up new kata-guest-base artifacts
+## Running clusters do NOT pick up re-published kata-guest-base artifacts
 
-`internal/helmchart/c8s/templates/kata-image-puller.yaml` (+ `-nvidia` twin)
+`internal/helmchart/c8s/files/scripts/pull-and-configure.sh`
 
-The puller's reconcile loop re-pulls **only when its config drop-in is absent**
-(`if [ ! -f "$DROPIN" ]`) — it exists to heal kata-deploy clobbers, not to track
-the registry. Publishing a new `kata-guest-base:<tag>` artifact changes nothing
-on a live cluster: pods keep booting the previously pulled guest until someone
-deletes the drop-in (forces one re-pull ~30 s later) or reinstalls. During the
-2026-07-07 GPU bring-up this masked three consecutive artifact updates. Verify
-what a node actually runs by hashing
-`/var/lib/c8s/kata-images*/base/kata-rootfs.img` against the CI run's uploaded
-blob digest, not by looking at tags.
+The puller reconcile is level-triggered on its **inputs** (a `# c8s-config:`
+fingerprint embedded in the drop-in): a changed value (tag, debug, registry
+auth, GPU knobs) or a deleted drop-in/artifact re-pulls and rewrites within a
+tick. What it deliberately does NOT detect is a re-published artifact under
+the **same** tag — the fingerprint is env-only, there is no registry-digest
+poll. Pods keep booting the previously pulled guest until the tag changes or
+the drop-in is deleted. During the 2026-07-07 GPU bring-up this masked three
+consecutive same-tag artifact updates. Verify what a node actually runs by
+hashing `/var/lib/c8s/kata-images*/base/kata-rootfs.img` against the CI run's
+uploaded blob digest, not by looking at tags — and publish immutable tags.
+
+## kata-agent replaces /run/kata-containers at sandbox creation — inotify watches die
+
+`internal/cmds/policymonitor/monitor.go`, kata-agent `rpc.rs` (`create_sandbox`)
+
+kata-agent's `create_sandbox` does `remove_dir_all` + `create_dir_all` on
+`CONTAINER_BASE` (`/run/kata-containers`) — the whole directory is a new inode
+by the time the first bundle is written, and an inotify watch installed at
+guest boot is bound to the dead inode. This made policy-monitor silently
+non-enforcing in the field ("active, 3 seed entries loaded", zero decisions):
+the fsnotify event channel just stops delivering, no error, no exit.
+policy-monitor now watches in generations (Remove/Rename of the watch dir or a
+failed inode identity check re-establishes the watch and re-runs the seed
+scan). Any future in-guest component that watches a path kata-agent owns must
+handle the same replacement — watch liveness, not just watch existence, and
+rescan after re-watching.
+
+## kata guests: inbound TCP port 8443 bypasses the mesh (baked passthrough)
+
+`kata-guest-base/extra/etc/c8s/cloudinit.env` (`C8S_MESH_INBOUND_PASSTHROUGH`),
+`internal/cmds/ratlsmesh/in_guest_linux.go`
+
+The in-guest mesh redirects all inbound TCP to the mutual-RA-TLS proxy, which
+makes a guest that terminates its own TLS for external clients (tls-lb nginx
+on 8443, CDS on 8443) unreachable — certless clients get `certificate
+required`. The baked env therefore sets `C8S_MESH_INBOUND_PASSTHROUGH=tcp:8443`
+so those front doors work. Because the env file is a single baked default for
+EVERY guest, the flip side is: **a workload listening on 8443 inside a kata
+pod is reachable without mesh mTLS.** Don't serve plaintext or
+mesh-trust-assuming endpoints on 8443 in kata pods; rebuild the guest image
+with the variable emptied for a fully-meshed posture (front doors then need
+`kubectl port-forward` + a mesh client cert, i.e. are effectively internal).
 
 ## First `--kata` install can exceed helm's `--wait` window
 
@@ -447,16 +480,55 @@ advertising `0` until the plugin restarts:
 Check `kubectl get node -o jsonpath` allocatable before debugging anything
 deeper.
 
+The same applies after any GPU **re-enumeration** while the plugin is running
+— a CC-mode toggle, BAR-resize remove/rescan, or vfio unbind/rebind (the
+bare-metal `normalize-gpus.sh` does all three): the CDI spec the plugin wrote
+at startup (`/var/run/cdi/nvidia.com-<MODEL>.yaml`) keeps the old
+`/dev/vfio/devices/vfioN` paths and device IDs, and reset devices stay marked
+unhealthy. Sandboxes then fail at cold-plug against the stale spec until the
+DaemonSet is rolled. The plugin binary is NVIDIA's (no in-tree fix); roll it
+after any host-side GPU reconfiguration.
+
+## KubeVirt and the kata sandbox plugin must not both own a node's GPUs
+
+Nothing in-tree configures KubeVirt `permittedHostDevices` today, but adding
+one for GPUs in the vfio set creates a silent double-advertisement: kubelet
+sees two resource names for the same 8 cards, double-counts allocatable, and
+can hand one GPU to a KubeVirt VM and a kata pod at once. A kata pod
+requesting the KubeVirt resource name schedules but dies at CDI
+(`unresolvable CDI devices`) — the sandbox plugin only writes specs for its
+own per-model names. And the c8s webhook prefix-matches `nvidia.com/*` (see
+"A GPU request alone forces the confidential GPU class"), so virt-launcher
+pods requesting the passthrough resource get the kata GPU class injected
+unless their namespace is in `webhook.extraExcluded`. One owner per GPU node —
+see `bare-metal-infra-management/docs/nvidia-gpu-operator-comparison.md`
+"GPU ownership".
+
+## Symbolic image `USER` fails at pod start under guest-pull
+
+Under guest-pull the host never unpacks the image rootfs, so containerd's CRI
+cannot resolve a symbolic Dockerfile `USER` (e.g. `USER curl_user`) against
+the image's `/etc/passwd` — pod creation fails host-side before kata ever
+runs. Neither kata-runtime nor kata-agent has a name-resolution fallback (the
+runtime spec carries only a numeric uid). Fix: set a numeric
+`securityContext.runAsUser` in the pod spec (which skips the lookup), or bake
+a numeric `USER <uid>` into the image. Prefer non-root regardless — the
+in-guest mesh exempts UID-0 egress (GAPS.md "Mesh and certificates").
+
 ## kubelet's `runtime-request-timeout` (default 2m) caps kata pod creation
 
-kata runtime toml sets `create_container_timeout`/`dial_timeout` = 1200 s, but
+Per-shim kata timeouts differ: the GPU shims' base toml ships
+`create_container_timeout`/`dial_timeout` = 1200 s, while the stock CPU shims
+ship **60 s** — which large-memory TEE guests can exceed just booting to the
+agent (TDX page acceptance; observed intermittently at 128 GiB). The c8s
+drop-in (`pull-and-configure.sh`) raises the CPU shims to 600 s. Either way
 the **effective** ceiling is `min(kubelet runtime-request-timeout, kata
 timeout)` — kubelet cancels the CRI call at 2 m, containerd tears the sandbox
 down, and the pod loops in `ContainerCreating` with the cause hidden. A healthy
 c8s GPU guest boots to agent in <1 min so the default rarely bites now, but any
-slow path (cold registry, huge image) hits the 2 m wall first. RKE2:
-`kubelet-arg: runtime-request-timeout=20m` in `/etc/rancher/rke2/config.yaml`
-(matches the fleet ansible default).
+slow path (cold registry, huge image, big-memory guest) hits the 2 m wall
+first. RKE2: `kubelet-arg: runtime-request-timeout=20m` in
+`/etc/rancher/rke2/config.yaml` (matches the fleet ansible default).
 
 ## `kubectl logs` on locked-guest pods is empty by design
 

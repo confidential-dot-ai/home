@@ -554,11 +554,19 @@ func TestMonitorRun_AllowedContainerNotKilled(t *testing.T) {
 	}
 }
 
-func TestMonitorRun_WatchDirMissing(t *testing.T) {
+// run() creates a missing watch dir itself — it has to, to re-establish the
+// watch after kata-agent replaces the dir at sandbox creation — so "missing"
+// is not an error. "Uncreatable" still must be: a regular file where the
+// parent dir should be.
+func TestMonitorRun_WatchDirUncreatable(t *testing.T) {
 	m, _, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
-	m.cfg.WatchDir = filepath.Join(watchDir, "absent")
+	blocker := filepath.Join(watchDir, "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.cfg.WatchDir = filepath.Join(blocker, "absent")
 	if err := m.run(context.Background()); err == nil {
-		t.Fatal("expected error adding a missing dir to the watcher")
+		t.Fatal("expected error when the watch dir cannot be created")
 	}
 }
 

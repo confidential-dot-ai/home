@@ -219,9 +219,26 @@ never touches the seed. Consequences:
   guest) policy-monitor never opens the network and enforces the baked
   seed alone — still fully fail-closed.
 
-`C8S_CDS_MEASUREMENTS` pins CDS's RA-TLS serving-cert launch digest;
-leaving it empty accepts any attested CDS (logged as unsafe), the same
-posture and warning as `ratls-mesh`.
+`C8S_CDS_MEASUREMENTS` pins CDS's RA-TLS serving-cert launch digest.
+Leaving it empty **disables the refresh** (logged as an error at
+startup): policy-monitor deliberately refuses to pull unpinned. This is
+*stricter* than `ratls-mesh`, which warns and proceeds on an empty pin —
+the asymmetry is intentional. For the mesh, an unpinned peer still has
+to be *some* attested TEE; for the refresh, "any attested TEE" is not
+enough, because the host can boot its own CVM from this same guest
+image, run a CDS in it serving an attacker-chosen allowlist, and pass
+"attested" — and grow-only merging is no defence when *additions* are
+the attack. With the refresh disabled the guest enforces the measured
+seed alone, which is fail-closed.
+
+**Status:** no shipping path delivers this pin to guests today, so the
+refresh is disabled on every default install — operator additions reach
+the host-side enforcer but not running guests. Baking the pin is
+structurally impossible (under kata, CDS runs from this same guest
+image, so the pin's value would change the launch measurement it pins),
+and per-pod cloud-init injection is host-controlled, so a host-supplied
+pin could point at the host's own fake CDS. See GAPS.md ("in-guest CDS
+allowlist refresh") for the status and the candidate fix.
 
 ## Scenarios
 

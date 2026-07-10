@@ -191,9 +191,10 @@ jobs:
           # default branch / tag pushes.
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Enable GHA caching for Docker layers
+          # GHA layer caching. ignore-error: a cache-service blip during the
+          # export must not fail a build that already succeeded.
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true
 
       - name: Scan Docker image
         id: container-scan

@@ -218,6 +218,15 @@ CDS: its get-cert containers dial the in-guest attestation-api on loopback,
 which only exists inside a confidential guest, and it terminates TLS with
 mesh-issued keys, so its plaintext must stay inside the TEE boundary.
 
+Because tls-lb and CDS run inside guests, their public ports would normally
+be captured by the in-guest mesh's inbound mTLS redirect and be unreachable
+to external clients. The baked guest env exempts the front-door port
+(`C8S_MESH_INBOUND_PASSTHROUGH=tcp:8443`) so external TLS clients reach
+tls-lb, and `kubectl port-forward` / the host-side CLI reach CDS's RA-TLS
+listener. The trade-off (8443 is unmeshed inbound in every guest) is
+documented in [`docs/pitfalls.md`](pitfalls.md) — "kata guests: inbound TCP
+port 8443 bypasses the mesh".
+
 ### Host-namespace pods are exempt
 
 A Kata pod is a VM and cannot join the host's network, PID, or IPC namespace.

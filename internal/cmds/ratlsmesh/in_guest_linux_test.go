@@ -189,7 +189,7 @@ func TestInGuestResolver(t *testing.T) {
 }
 
 func TestBuildInGuestIptablesRules(t *testing.T) {
-	rules := buildInGuestIptablesRules(inGuestOutboundPort, inGuestInboundPort, inGuestHealthPort)
+	rules := buildInGuestIptablesRules(inGuestOutboundPort, inGuestInboundPort, inGuestHealthPort, nil)
 	if len(rules) == 0 {
 		t.Fatal("expected non-empty rule set")
 	}
@@ -250,6 +250,124 @@ func containsArg(args []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// The passthrough RETURN must sit on PREROUTING before the catch-all
+// REDIRECT, and must never appear when no ports are configured.
+func TestBuildInGuestIptablesRules_InboundPassthrough(t *testing.T) {
+	rules := buildInGuestIptablesRules(inGuestOutboundPort, inGuestInboundPort, inGuestHealthPort, []int{8443, 9000})
+
+	var sawPassthrough, sawRedirect bool
+	for _, r := range rules {
+		if r.chain != preroutingChainName {
+			continue
+		}
+		if containsArgPair(r.args, "--dports", "8443,9000") && containsArgPair(r.args, "-j", "RETURN") {
+			sawPassthrough = true
+			if sawRedirect {
+				t.Error("passthrough RETURN appears after the catch-all REDIRECT — it would never match")
+			}
+		}
+		if containsArgPair(r.args, "-j", "REDIRECT") && containsArgPair(r.args, "--to-port", "15006") {
+			sawRedirect = true
+		}
+	}
+	if !sawPassthrough {
+		t.Error("no PREROUTING passthrough RETURN for 8443,9000")
+	}
+	if !sawRedirect {
+		t.Error("no PREROUTING REDIRECT rule to 15006")
+	}
+
+	for _, r := range buildInGuestIptablesRules(inGuestOutboundPort, inGuestInboundPort, inGuestHealthPort, nil) {
+		if r.label == "in-guest-prerouting-passthrough" {
+			t.Error("passthrough rule rendered with no ports configured")
+		}
+	}
+}
+
+// iptables' multiport match caps at 15 ports; a longer passthrough list must
+// chunk across rules (all still ahead of the catch-all REDIRECT), not emit
+// one over-long rule that fails at install time.
+func TestBuildInGuestIptablesRules_PassthroughMultiportChunking(t *testing.T) {
+	ports := make([]int, 17)
+	for i := range ports {
+		ports[i] = 8000 + i
+	}
+	rules := buildInGuestIptablesRules(inGuestOutboundPort, inGuestInboundPort, inGuestHealthPort, ports)
+
+	var chunks []string
+	sawRedirect := false
+	for _, r := range rules {
+		if r.chain != preroutingChainName {
+			continue
+		}
+		if r.label == "in-guest-prerouting-passthrough" {
+			if sawRedirect {
+				t.Error("passthrough chunk appears after the catch-all REDIRECT — it would never match")
+			}
+			for i, a := range r.args {
+				if a == "--dports" {
+					chunks = append(chunks, r.args[i+1])
+				}
+			}
+		}
+		if containsArgPair(r.args, "-j", "REDIRECT") {
+			sawRedirect = true
+		}
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("got %d passthrough rules for 17 ports, want 2 (chunks: %v)", len(chunks), chunks)
+	}
+	if got := len(strings.Split(chunks[0], ",")); got != 15 {
+		t.Errorf("first chunk carries %d ports, want 15", got)
+	}
+	if got := len(strings.Split(chunks[1], ",")); got != 2 {
+		t.Errorf("second chunk carries %d ports, want 2", got)
+	}
+}
+
+func TestParseInboundPassthrough(t *testing.T) {
+	for _, tc := range []struct {
+		raw     string
+		want    []int
+		wantErr bool
+	}{
+		{raw: "", want: nil},
+		{raw: "tcp:8443", want: []int{8443}},
+		{raw: " tcp:8443 , tcp:9000 ", want: []int{8443, 9000}},
+		{raw: "tcp:8443,tcp:8443", want: []int{8443}}, // deduped
+		{raw: "udp:53", wantErr: true},                // redirect is tcp-only
+		{raw: "8443", wantErr: true},                  // missing proto
+		{raw: "tcp:0", wantErr: true},
+		{raw: "tcp:65536", wantErr: true},
+		{raw: "tcp:x", wantErr: true},
+		{raw: "tcp:15006", wantErr: true}, // mesh listener port
+		{raw: "tcp:15001", wantErr: true},
+		{raw: "tcp:15021", wantErr: true},
+	} {
+		got, err := parseInboundPassthrough(tc.raw)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parseInboundPassthrough(%q): want error, got %v", tc.raw, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseInboundPassthrough(%q): unexpected error %v", tc.raw, err)
+			continue
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("parseInboundPassthrough(%q) = %v, want %v", tc.raw, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("parseInboundPassthrough(%q) = %v, want %v", tc.raw, got, tc.want)
+				break
+			}
+		}
+	}
 }
 
 func containsArgPair(args []string, key, val string) bool {

@@ -794,19 +794,10 @@ func appendInstallCRDArgs(setArgs []string, installCRDs bool) []string {
 // uses; the unused one is inert. No enum guard: the value comes from
 // chooseDistro, and the chart re-validates anyway.
 func appendDistroInstallArgs(helmArgs []string, distro string) []string {
-	helmArgs = append(helmArgs,
+	return append(helmArgs,
 		"--set-string", "kata.distro="+distro,
 		"--set-string", "nriImagePolicy.distro="+distro,
 	)
-	// RKE2 has no kube-dns Service, so the chart's default tls-lb nginx
-	// resolver crashloops there; point it at RKE2's CoreDNS instead.
-	// Override via -f for a non-default DNS Service.
-	if distro == "rke2" {
-		helmArgs = append(helmArgs,
-			"--set-string", "tlsLb.nginx.resolver=rke2-coredns-rke2-coredns.kube-system.svc.cluster.local",
-		)
-	}
-	return helmArgs
 }
 
 // appendCvmModeInstallArgs translates --cvm-mode into the attestation-api

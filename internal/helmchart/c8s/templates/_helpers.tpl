@@ -559,6 +559,25 @@ cache_max_entries = 1024
 {{- or .Values.nriImagePolicy.enabled .Values.kata.enabled -}}
 {{- end -}}
 
+{{/*
+  c8s.tlsLb.resolver — the DNS server nginx re-resolves upstreams against.
+  An explicit tlsLb.nginx.resolver wins; empty derives from the host distro
+  (kata.distro / nriImagePolicy.distro, both set by `c8s install`'s kubelet
+  detection and required from GitOps installs anyway for the containerd
+  layout). RKE2 names its CoreDNS Service rke2-coredns-rke2-coredns, and
+  nginx exits at startup on a resolver name that does not resolve — the
+  wrong default is a tls-lb crash-loop, not a degraded mode.
+*/}}
+{{- define "c8s.tlsLb.resolver" -}}
+{{- if .Values.tlsLb.nginx.resolver -}}
+{{- .Values.tlsLb.nginx.resolver -}}
+{{- else if or (eq .Values.kata.distro "rke2") (eq .Values.nriImagePolicy.distro "rke2") -}}
+rke2-coredns-rke2-coredns.kube-system.svc.cluster.local
+{{- else -}}
+kube-dns.kube-system.svc.cluster.local
+{{- end -}}
+{{- end -}}
+
 {{- define "c8s.commonLabels" -}}
 app.kubernetes.io/name: c8s-operator
 app.kubernetes.io/instance: {{ .Release.Name }}

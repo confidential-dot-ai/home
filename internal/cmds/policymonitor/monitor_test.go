@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -269,4 +270,57 @@ func TestRun_DetectsCreatedContainer(t *testing.T) {
 
 func killSeen(k *fakeKiller) bool {
 	return len(k.snapshot()) > 0
+}
+
+// TestRun_SurvivesWatchDirReplacement reproduces what kata-agent's
+// create_sandbox does to the watch dir at every first sandbox:
+// remove_dir_all + create_dir_all (rpc.rs), which orphans an
+// inode-bound inotify watch. The monitor must notice, re-establish the
+// watch on the new inode, and still deny a non-allowlisted container
+// created afterwards — this was the "silently inert enforcement" field
+// failure.
+func TestRun_SurvivesWatchDirReplacement(t *testing.T) {
+	allowed := strings.Repeat("a", 64)
+	denied := strings.Repeat("b", 64)
+	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:" + allowed})
+	// Shrink the revalidation backstop so the test doesn't depend on
+	// the Remove event being delivered (either recovery path must work).
+	m.revalidateInterval = 25 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- m.run(ctx) }()
+
+	// Give the first watch generation time to install.
+	time.Sleep(50 * time.Millisecond)
+
+	// kata-agent create_sandbox equivalent: replace the dir wholesale,
+	// then immediately drop a bundle in — no pause, exactly like the
+	// agent writing bundles right after create_dir_all.
+	if err := os.RemoveAll(watchDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(watchDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeConfigJSON(t, watchDir, "post-replace-deny", map[string]string{
+		"io.kubernetes.cri.image-name": "ghcr.io/evil/badimage@sha256:" + denied,
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if killSeen(killer) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !killSeen(killer) {
+		t.Fatal("denied container created after watch-dir replacement was not killed — watch was not re-established")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run returned err: %v", err)
+	}
 }

@@ -60,7 +60,7 @@ data:
         # nginx re-resolves it here at request time per record TTL. A static
         # upstream block would pin the pod IPs a headless-Service name (an
         # adopted workload) resolved to at startup and 502 after pod churn.
-        resolver {{ .Values.tlsLb.nginx.resolver }};
+        resolver {{ include "c8s.tlsLb.resolver" . }};
 
         {{- range $i, $route := .Values.tlsLb.routes }}
         {{- if hasKey $route "upstream" }}

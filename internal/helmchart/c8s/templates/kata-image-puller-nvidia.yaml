@@ -18,7 +18,6 @@
 */}}
 {{- $pullerAuthSecret := .Values.kata.guestImage.pullerAuthSecret | default .Values.imagePullSecret -}}
 {{- $gpuShim := include "c8s.kataGpuShimName" . -}}
-{{- $gpuDropInPath := printf "/host/opt/kata/share/defaults/kata-containers/runtimes/%s/config.d/50-c8s.toml" $gpuShim -}}
 {{- /* GPU in-guest registry auth: "" inherits the non-GPU setting (the GPU
      guest bakes the same auth.json), "none" forces anonymous, anything else
      is used verbatim. See values.yaml kata.gpu.guestImage.registryAuth. */ -}}
@@ -68,12 +67,8 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              DROPIN={{ $gpuDropInPath }}
               while true; do
-                if [ ! -f "$DROPIN" ]; then
-                  echo "reconcile(nvidia): drop-in absent — (re)applying"
-                  sh /scripts/pull-and-configure.sh || echo "reconcile(nvidia): not ready (kata-deploy still installing, or <tag>-nvidia artifact unpublished?)" >&2
-                fi
+                sh /scripts/pull-and-configure.sh || echo "reconcile(nvidia): not ready (kata-deploy still installing, or <tag>-nvidia artifact unpublished?)" >&2
                 sleep 30
               done
           env:
@@ -105,13 +100,13 @@ spec:
           securityContext:
             privileged: true
           readinessProbe:
-            # Ready once the c8s config.d drop-in is present next to the GPU
-            # shim's config (same probe shape as the non-GPU puller).
+            # Ready only once the node matches THIS pod's config (script check
+            # mode — same probe shape as the non-GPU puller).
             exec:
               command:
                 - /bin/sh
-                - -c
-                - test -f {{ $gpuDropInPath }}
+                - /scripts/pull-and-configure.sh
+                - check
             periodSeconds: 10
             failureThreshold: 30
           volumeMounts:

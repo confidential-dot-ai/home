@@ -12,6 +12,20 @@ final security model. Each bullet links to the tracking issue.
 - Per-workload measurement allowlists are not enforced at `/attest` (tracked at [#57](https://github.com/confidential-dot-ai/c8s/issues/57)).
 - Allowlist writes are authorized by pinned, long-lived operator public keys (`cds.operatorKeys`), verified at the app layer. Revocation is coarse — no CRL/OCSP, so revoking one operator means removing its key and re-installing. Write tokens are bound to body, method, and path, with a server-enforced 5-minute maximum validity, but carry no `aud`/cluster binding: clusters that pin the **same** operator key accept each other's captured tokens within that window, so pin distinct keys per cluster. The pinned-key list is host-supplied config, read only at CDS start; `c8s cds verify` now reports the pinned-key fingerprints (fetched from `GET /operator-keys` over a connection bound to the attested serving cert), but the list is still not committed to CDS's attestation (HOST_DATA/initdata) — a verifier sees what CDS claims, not what was measured. Longer term: a CA + short-lived operator certificates (single-file cert+key credentials, CA-based revocation). See `docs/pitfalls.md` and `docs/decisions/2026-07-01-operator-cert-allowlist-write.md`.
 - The c8s infrastructure images are not pinned into NRI policy by default (tracked at [#51](https://github.com/confidential-dot-ai/c8s/issues/51)).
+- The in-guest CDS allowlist refresh is disabled on every default kata install:
+  it fail-closed-refuses to run without `C8S_CDS_MEASUREMENTS`, and no shipping
+  path can deliver that pin — baking it is self-referential (CDS runs from the
+  same guest image the pin would be baked into, so the value would change the
+  measurement it pins) and per-pod cloud-init is host-controlled (a host-chosen
+  pin defeats the point). Guests enforce the measured seed plus nothing; operator
+  `c8s allowlist add` reaches host-side enforcement and CDS but not running
+  guests. Also note the SNP launch digest covers the VMSA set, so even a correct
+  pin is per-VM-shape (vCPU count). Candidate fix is operator-signed allowlist
+  entries verified in-guest against a baked operator public key.
+- RA-TLS measurement pinning is SNP-only: the TDX verify path ignores
+  `policy.Measurements` (and `MinTCBVersion`) entirely — see the LIMITATION note
+  on `verifyTDXOnline` (`pkg/ratls/verify.go`). A TDX deployment relying on
+  `cds.measurements` gets signature + report-data + debug checks only.
 
 ## Mesh and certificates
 

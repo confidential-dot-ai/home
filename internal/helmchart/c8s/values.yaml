@@ -1154,9 +1154,12 @@ tlsLb:
     #    workload) resolve to pod IPs that change on pod churn; without
     #    runtime re-resolution nginx would pin the IPs it saw at startup and
     #    502 until the next config reload. This name is resolved once at nginx
-    #    startup through the pod's /etc/resolv.conf; override it on clusters
-    #    whose DNS Service is not named kube-dns.
-    resolver: kube-dns.kube-system.svc.cluster.local
+    #    startup through the pod's /etc/resolv.conf, and nginx exits (crash-
+    #    loops) if it does not resolve. Empty derives from the distro values
+    #    (kata.distro / nriImagePolicy.distro): rke2 ->
+    #    rke2-coredns-rke2-coredns.kube-system, else kube-dns.kube-system.
+    #    Set explicitly on clusters whose DNS Service is named differently.
+    resolver: ""
     # -- UID/GID used by nginx and the get-cert containers so both can access
     #    the in-memory CDS key material on the shared tls-certs volume.
     runAsUser: 101

@@ -15,7 +15,6 @@
 */}}
 {{- $pullerAuthSecret := .Values.kata.guestImage.pullerAuthSecret | default .Values.imagePullSecret -}}
 {{- $shim := include "c8s.kataShimName" . -}}
-{{- $shimDropInPath := printf "/host/opt/kata/share/defaults/kata-containers/runtimes/%s/config.d/50-c8s.toml" $shim -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -75,18 +74,19 @@ spec:
         {{- end }}
       tolerations:
         - operator: Exists
-      # Reconcile container: assert the c8s config.d drop-in exists next to
-      # kata-deploy's main shim toml.
+      # Reconcile container: keep the c8s config.d drop-in next to kata-deploy's
+      # main shim toml in sync with the current values.
       #
       # kata-deploy owns the main configuration-<shim>.toml — it rewrites it
       # on every DaemonSet restart. c8s writes ONLY a config.d/50-c8s.toml
       # drop-in that kata-runtime layers on top; kata-deploy never touches
       # config.d/, so the drop-in survives DS restarts by design (verified
-      # empirically). No race with kata-deploy anymore; a "reconcile" pass is
-      # only needed to (a) wait out the initial kata-deploy install
-      # (pull-and-configure.sh exits non-zero until the main toml exists), and
-      # (b) re-materialize the drop-in if an operator deletes it manually.
-      # The oras pull is content-addressed so re-runs are cheap.
+      # empirically). The script is level-triggered: it embeds a fingerprint of
+      # its inputs in the drop-in and exits early (no pull, no writes) when it
+      # matches, so calling it every tick is cheap and steady-state performs no
+      # writes that could race kata-deploy. A fingerprint mismatch (values
+      # change while the drop-in exists), a deleted drop-in, or a missing
+      # artifact triggers the full pull + rewrite.
       containers:
         - name: reconcile
           image: {{ if .Values.kata.guestImage.pullerImage.digest -}}
@@ -98,12 +98,8 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              DROPIN={{ $shimDropInPath }}
               while true; do
-                if [ ! -f "$DROPIN" ]; then
-                  echo "reconcile: drop-in absent — (re)applying"
-                  sh /scripts/pull-and-configure.sh || echo "reconcile: not ready (kata-deploy still installing?)" >&2
-                fi
+                sh /scripts/pull-and-configure.sh || echo "reconcile: not ready (kata-deploy still installing?)" >&2
                 sleep 30
               done
           # All puller config comes from the env (the script is pure POSIX shell
@@ -139,13 +135,15 @@ spec:
             # surprises.
             privileged: true
           readinessProbe:
-            # Ready once the c8s config.d drop-in is present next to the active
-            # shim's config (qemu-snp or qemu-tdx — see c8s.kataShimName).
+            # Ready only once the node matches THIS pod's config: the script's
+            # check mode revalidates the drop-in fingerprint and the pulled
+            # artifacts, so a stale drop-in from older values cannot mark a new
+            # rollout Ready (helm --wait gates on this).
             exec:
               command:
                 - /bin/sh
-                - -c
-                - test -f {{ $shimDropInPath }}
+                - /scripts/pull-and-configure.sh
+                - check
             periodSeconds: 10
             failureThreshold: 30
           volumeMounts:

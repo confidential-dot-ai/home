@@ -1821,6 +1821,49 @@ func TestChartTLSLBMeshWrappedUpstreamIsWorkloadDirect(t *testing.T) {
 	}
 }
 
+// nginx exits at startup on a resolver name that does not resolve, and RKE2
+// names its CoreDNS Service rke2-coredns-rke2-coredns — the kube-dns default
+// crash-loops tls-lb on every RKE2 cluster. The resolver therefore derives
+// from the distro values (which every RKE2 install already sets for the
+// containerd layout); an explicit tlsLb.nginx.resolver still wins.
+func TestChartTLSLBResolverDerivesFromDistro(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "rke2 via kata.distro",
+			args: []string{"--set-string", "kata.distro=rke2"},
+			want: "resolver rke2-coredns-rke2-coredns.kube-system.svc.cluster.local;",
+		},
+		{
+			name: "rke2 via nriImagePolicy.distro",
+			args: []string{"--set-string", "nriImagePolicy.distro=rke2"},
+			want: "resolver rke2-coredns-rke2-coredns.kube-system.svc.cluster.local;",
+		},
+		{
+			name: "explicit resolver wins over distro",
+			args: []string{
+				"--set-string", "kata.distro=rke2",
+				"--set-string", "tlsLb.nginx.resolver=my-dns.dns-ns.svc.cluster.local",
+			},
+			want: "resolver my-dns.dns-ns.svc.cluster.local;",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := helmTemplate(t, tc.args...)
+			if err != nil {
+				t.Fatalf("helm template: %v\n%s", err, out)
+			}
+			cfg := renderedTLSLBNginxConf(t, out)
+			if !strings.Contains(cfg, tc.want) {
+				t.Fatalf("tls-lb nginx config missing %q\n%s", tc.want, cfg)
+			}
+		})
+	}
+}
+
 func TestTLSLBVerifyDerivesProxySSLNameFromUpstream(t *testing.T) {
 	out, err := helmTemplateTLSLB(t,
 		"--set-string", "upstream.address=my-backend.other-ns.svc.cluster.local:443",

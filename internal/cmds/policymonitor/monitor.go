@@ -21,6 +21,20 @@ package policymonitor
 // We use filepath.Walk on startup to seed the watcher with any
 // directories already present (e.g. policy-monitor restarted by
 // systemd while containers were already up).
+//
+// Watch-generation caveat
+//
+// kata-agent's create_sandbox replaces the whole watch dir
+// (remove_dir_all + create_dir_all on CONTAINER_BASE, rpc.rs), and an
+// inotify watch binds to the inode, not the path — so a watch
+// installed at guest boot dies silently at the first sandbox, before
+// any workload bundle exists. run() therefore watches in generations:
+// a Remove/Rename event for the watch dir itself (with a periodic
+// inode revalidation as backstop for dropped events) ends the
+// generation, and the next one re-creates the dir if needed, re-Adds,
+// and re-runs the seed pass so bundles created in the gap still get a
+// decision. See docs/pitfalls.md — "kata-agent replaces
+// /run/kata-containers at sandbox creation".
 
 import (
 	"context"
@@ -65,10 +79,6 @@ func runMonitor(ctx context.Context, cfg *Config) error {
 	}
 	logger.Info("allowlist loaded", "entries", a.Size())
 
-	if err := os.MkdirAll(cfg.WatchDir, 0o755); err != nil {
-		return fmt.Errorf("create watch dir %s: %w", cfg.WatchDir, err)
-	}
-
 	m := &monitor{
 		cfg:        cfg,
 		logger:     logger,
@@ -81,6 +91,7 @@ func runMonitor(ctx context.Context, cfg *Config) error {
 		// pathological case.
 		configReadDeadline: 2 * time.Second,
 		configReadInterval: 25 * time.Millisecond,
+		revalidateInterval: 10 * time.Second,
 	}
 
 	// Hybrid refresh: when a CDS URL is configured (via the cloud-init
@@ -109,25 +120,56 @@ type monitor struct {
 	pidLocator         pidLocator
 	configReadDeadline time.Duration
 	configReadInterval time.Duration
+	revalidateInterval time.Duration
 }
 
 func (m *monitor) run(ctx context.Context) error {
+	for {
+		done, err := m.watch(ctx)
+		if done || err != nil {
+			return err
+		}
+		// Watch generation invalidated: the watch dir was replaced
+		// under us. Loop to re-establish; the next generation re-seeds,
+		// so bundles created in the gap still get a decision.
+	}
+}
+
+// watch runs one watch generation: create the dir if missing, install
+// the inotify watch, seed, then serve events until the context ends
+// (done=true), the watch dies in a way a fresh generation can fix
+// (done=false, err=nil), or an unrecoverable error occurs.
+func (m *monitor) watch(ctx context.Context) (done bool, err error) {
+	if err := os.MkdirAll(m.cfg.WatchDir, 0o755); err != nil {
+		return false, fmt.Errorf("create watch dir %s: %w", m.cfg.WatchDir, err)
+	}
+
+	// Record the watched inode's identity BEFORE Add: if kata-agent
+	// swaps the dir between the two calls, SameFile below fails on the
+	// first revalidation tick and we converge via one extra generation
+	// — the reverse order could record the new inode while watching the
+	// dead one, and never recover.
+	watchedFI, err := os.Stat(m.cfg.WatchDir)
+	if err != nil {
+		return false, fmt.Errorf("stat watch dir %s: %w", m.cfg.WatchDir, err)
+	}
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return fmt.Errorf("create inotify watcher: %w", err)
+		return false, fmt.Errorf("create inotify watcher: %w", err)
 	}
 	defer watcher.Close()
 
 	if err := watcher.Add(m.cfg.WatchDir); err != nil {
-		return fmt.Errorf("watch %s: %w", m.cfg.WatchDir, err)
+		return false, fmt.Errorf("watch %s: %w", m.cfg.WatchDir, err)
 	}
 
 	// Seed: process directories that already exist. Important when
 	// policy-monitor was restarted by systemd while containers were
-	// running — we shouldn't grandfather them in just because we
-	// missed their CREATE event. The fact that they're still around
-	// means kata-agent considers them live, so we should make a
-	// decision on each.
+	// running, and on every re-watch after the dir was replaced — we
+	// shouldn't grandfather containers in just because we missed their
+	// CREATE event. The fact that they're still around means kata-agent
+	// considers them live, so we should make a decision on each.
 	if err := m.seedExisting(); err != nil {
 		// Non-fatal: if we can't walk for some reason (permission,
 		// transient FS error), log and keep going. New containers
@@ -135,15 +177,39 @@ func (m *monitor) run(ctx context.Context) error {
 		m.logger.Warn("seed existing containers failed", "error", err)
 	}
 
+	// Backstop for the event path below: if the Remove/Rename for the
+	// watch dir itself is dropped (e.g. inside a queue overflow), a
+	// periodic inode identity check still notices the swap.
+	interval := m.revalidateInterval
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	revalidate := time.NewTicker(interval)
+	defer revalidate.Stop()
+
+	watchDirGone := func(reason string) (bool, error) {
+		m.logger.Warn("watch dir replaced; re-establishing watch and re-seeding",
+			"watch_dir", m.cfg.WatchDir, "reason", reason)
+		return false, nil
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			m.logger.Info("policy-monitor stopping", "reason", ctx.Err())
-			return nil
+			return true, nil
 
 		case evt, ok := <-watcher.Events:
 			if !ok {
-				return errors.New("watcher events channel closed")
+				return false, errors.New("watcher events channel closed")
+			}
+			// kata-agent's create_sandbox does remove_dir_all +
+			// create_dir_all on the watch dir; the Remove/Rename of the
+			// dir itself is the generation's death notice (inotify
+			// watches bind to the inode, so the recreated dir is
+			// unwatched).
+			if evt.Op.Has(fsnotify.Remove|fsnotify.Rename) && filepath.Clean(evt.Name) == filepath.Clean(m.cfg.WatchDir) {
+				return watchDirGone("inotify " + evt.Op.String())
 			}
 			// We only care about new entries appearing under the
 			// watched directory. IN_CREATE covers both dirs and
@@ -165,7 +231,7 @@ func (m *monitor) run(ctx context.Context) error {
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
-				return errors.New("watcher errors channel closed")
+				return false, errors.New("watcher errors channel closed")
 			}
 			// Fail closed on queue overflow. IN_Q_OVERFLOW means the
 			// kernel dropped CREATE events we never saw, so a container
@@ -174,15 +240,25 @@ func (m *monitor) run(ctx context.Context) error {
 			// dir and make a decision for everything currently present
 			// (idempotent — see seedExisting). If the rescan itself
 			// fails we exit non-zero and let systemd restart + reseed
-			// rather than continue half-blind.
+			// rather than continue half-blind. The dropped events may
+			// also include the watch dir's own Remove — check identity
+			// too rather than wait for the next tick.
 			if errors.Is(err, fsnotify.ErrEventOverflow) {
 				m.logger.Warn("inotify queue overflow; rescanning watch dir to recover dropped events")
 				if serr := m.seedExisting(); serr != nil {
-					return fmt.Errorf("rescan after inotify overflow: %w", serr)
+					return false, fmt.Errorf("rescan after inotify overflow: %w", serr)
+				}
+				if fi, serr := os.Stat(m.cfg.WatchDir); serr != nil || !os.SameFile(watchedFI, fi) {
+					return watchDirGone("identity check after overflow")
 				}
 				continue
 			}
 			m.logger.Warn("inotify error", "error", err)
+
+		case <-revalidate.C:
+			if fi, serr := os.Stat(m.cfg.WatchDir); serr != nil || !os.SameFile(watchedFI, fi) {
+				return watchDirGone("periodic identity check")
+			}
 		}
 	}
 }
