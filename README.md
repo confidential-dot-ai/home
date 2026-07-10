@@ -161,9 +161,12 @@ c8s allowlist export --url $CDS > allowlist.json
 c8s allowlist diff allowlist.json --url $CDS
 ```
 
-An `https://` URL is verified via CDS's RA-TLS attestation — pass
-`--measurements` (repeatable/comma-separated, or `--measurements-file`) to pin
-CDS's launch measurement; an empty set accepts any attested CDS (UNSAFE).
+An `https://` URL is verified via TEE attestation: a direct CDS endpoint
+through its RA-TLS serving cert, a tls-lb front door through its
+`/v1/discovery` document (the CLI detects which, and pins the attested serving
+cert for the LB case). Pass `--measurements` (repeatable/comma-separated, or
+`--measurements-file`) to pin the attested endpoint's launch measurement; an
+empty set accepts any attested endpoint (UNSAFE).
 Verification currently reaches the attestation-api at `--attestation-api-url`
 (forward it too, or run the CLI where it is reachable); local RA-TLS-cert
 verification like `c8s verify` is a planned improvement (see `docs/GAPS.md`).

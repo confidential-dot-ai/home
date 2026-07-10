@@ -5,6 +5,7 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -104,21 +105,20 @@ func (h AttestHandler) HandleAttest(w http.ResponseWriter, r *http.Request) {
 
 	reportData := types.NewBase64Bytes(expectedReportData[:sha512.Size384])
 	verifyReq := types.VerifyReportData(req.Evidence, reportData)
-	verifyResp, err := h.AttestationClient.Verify(ctx, verifyReq)
-	if err != nil {
-		slog.Warn("attestation-api error", "error", err)
-		attestation.WriteError(w, http.StatusBadGateway, types.ErrorCodeAttestationApiUnreachable,
-			fmt.Sprintf("failed to reach attestation-api: %s", err))
-		return
-	}
-	if !verifyResp.Result.SignatureValid {
+	verifyResp, err := h.AttestationClient.VerifyEnforced(ctx, verifyReq)
+	switch {
+	case errors.Is(err, attestationclient.ErrSignatureInvalid):
 		slog.Warn("attestation signature invalid")
 		attestation.WriteError(w, http.StatusUnauthorized, types.ErrorCodeVerificationFailed, "attestation signature invalid")
 		return
-	}
-	if verifyResp.Result.ReportDataMatch == nil || !*verifyResp.Result.ReportDataMatch {
+	case errors.Is(err, attestationclient.ErrReportDataMismatch):
 		slog.Warn("challenge did not match attestation evidence")
 		attestation.WriteError(w, http.StatusUnauthorized, types.ErrorCodeVerificationFailed, "challenge mismatch in attestation evidence")
+		return
+	case err != nil:
+		slog.Warn("attestation-api error", "error", err)
+		attestation.WriteError(w, http.StatusBadGateway, types.ErrorCodeAttestationApiUnreachable,
+			fmt.Sprintf("failed to reach attestation-api: %s", err))
 		return
 	}
 

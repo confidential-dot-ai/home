@@ -88,20 +88,18 @@ func (h Handler) HandleAttestKey(w http.ResponseWriter, r *http.Request) {
 
 	reportData := types.NewBase64Bytes(expectedReportData[:sha512.Size384])
 	verifyReq := types.VerifyReportData(req.Evidence, reportData)
-	verifyResp, err := h.AttestationClient.Verify(r.Context(), verifyReq)
-	if err != nil {
-		h.handleAttestationError(w, err)
-		return
-	}
-	if !verifyResp.Result.SignatureValid {
+	verifyResp, err := h.AttestationClient.VerifyEnforced(r.Context(), verifyReq)
+	switch {
+	case errors.Is(err, attestationclient.ErrSignatureInvalid):
 		slog.Warn("attest-key: attestation signature invalid")
 		WriteError(w, http.StatusUnauthorized, "verification_failed", "attestation signature invalid")
 		return
-	}
-	if verifyResp.Result.ReportDataMatch == nil || !*verifyResp.Result.ReportDataMatch {
-		slog.Warn("attest-key: challenge did not match attestation evidence",
-			"report_data_match", verifyResp.Result.ReportDataMatch)
+	case errors.Is(err, attestationclient.ErrReportDataMismatch):
+		slog.Warn("attest-key: challenge did not match attestation evidence")
 		WriteError(w, http.StatusUnauthorized, "verification_failed", "challenge mismatch in attestation evidence")
+		return
+	case err != nil:
+		h.handleAttestationError(w, err)
 		return
 	}
 

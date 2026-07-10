@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/sha512"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -130,35 +130,43 @@ func ExtractAttestation(cert *x509.Certificate) (*Attestation, error) {
 	return nil, fmt.Errorf("%w (OID %s)", ErrNotAttested, OIDRATLSAttestation)
 }
 
-// verifyReport dispatches the attestation to the per-platform verifier. All
-// verification is delegated to the attestation-api /verify endpoint.
+// verifyReport normalizes the attestation into an evidence envelope and hands
+// it to the attestation-api enforced verifier. The extension's TEE type must
+// match the envelope's platform family — fail closed rather than approve one
+// platform's evidence under another's rules.
 func verifyReport(att *Attestation, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
+	evidence := att.embedded
 	switch att.TEEType {
 	case TEETypeSEVSNP:
 		// Envelope platforms (az-snp) embed their evidence in the
 		// extension directly; bare-metal SNP carries the raw report,
 		// which is wrapped in the "snp" evidence envelope here.
-		evidence := att.embedded
 		if evidence == nil {
 			var err error
 			if evidence, err = snpEvidence(att.Report); err != nil {
 				return nil, err
 			}
 		}
-		return verifySEVSNPOnline(evidence, policy, expectedReportData)
+		switch evidence.Platform {
+		case string(types.PlatformSnp), string(types.PlatformAzSnp), string(types.PlatformGcpSnp):
+		default:
+			return nil, fmt.Errorf("%w: online verification not implemented for platform %q", ErrUnsupportedTEE, evidence.Platform)
+		}
 	case TEETypeTDX:
-		// TDX always carries a JSON envelope in the RA-TLS extension
-		// (see extension.go's UnmarshalExtension), so att.embedded is
-		// always populated. Delegate to the local attestation-api —
-		// see verifyTDXOnline's docstring for why we don't ship a
-		// second in-process TDX quote parser.
-		if att.embedded == nil {
+		// TDX always carries a JSON envelope in the RA-TLS extension (see
+		// extension.go's UnmarshalExtension). We do NOT ship an in-process
+		// TDX quote parser — delegating keeps the heavy Intel dependencies
+		// out of every c8s Go binary.
+		if evidence == nil {
 			return nil, fmt.Errorf("%w: TDX RA-TLS extension missing evidence envelope", ErrInvalidReport)
 		}
-		return verifyTDXOnline(att.embedded, policy, expectedReportData)
+		if evidence.Platform != string(types.PlatformTdx) {
+			return nil, fmt.Errorf("%w: online verification not implemented for platform %q", ErrUnsupportedTEE, evidence.Platform)
+		}
 	default:
 		return nil, fmt.Errorf("%w: TEE type %d", ErrUnsupportedTEE, att.TEEType)
 	}
+	return verifyEnvelopeOnline(evidence, policy, expectedReportData)
 }
 
 const defaultAttestationVerifyTimeout = 10 * time.Second
@@ -176,10 +184,11 @@ func unpackSNPMinTcb(packed uint64) types.MinTcb {
 	}
 }
 
-// callAttestationVerify posts evidence to the attestation-api /verify endpoint
-// and enforces the verdicts common to every platform: the hardware signature
-// must be valid and REPORTDATA must match the expected binding.
-func callAttestationVerify(evidence *types.AttestationEvidence, policy *VerifyPolicy, expectedReportData []byte, minTcb *types.MinTcb) (types.VerifyResponse, error) {
+// verifyEnvelopeOnline forwards the envelope to the attestation-api enforced
+// verifier ([attestationclient.Client.VerifyEvidence] — verdict gate,
+// platform-specific REPORTDATA wire form, measurement allowlist) and maps its
+// verdicts onto this package's sentinels.
+func verifyEnvelopeOnline(evidence *types.AttestationEvidence, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
 	timeout := policy.AttestationVerifyTimeout
 	if timeout <= 0 {
 		timeout = defaultAttestationVerifyTimeout
@@ -187,107 +196,55 @@ func callAttestationVerify(evidence *types.AttestationEvidence, policy *VerifyPo
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	expected := types.NewBase64Bytes(expectedReportData)
-	allowDebug := policy.AllowDebug
-	issueToken := false
-	params := &types.VerifyParams{
-		ExpectedReportData: &expected,
-		AllowDebug:         &allowDebug,
-		MinTcb:             minTcb,
-	}
-	resp, err := attestationclient.NewClient(policy.AttestationApiURL).Verify(ctx, types.NewVerifyRequest(*evidence, params, issueToken))
-	if err != nil {
-		return types.VerifyResponse{}, fmt.Errorf("ratls: online %s attestation verify: %w", evidence.Platform, err)
-	}
-	if !resp.Result.SignatureValid {
-		return types.VerifyResponse{}, ErrSignatureInvalid
-	}
-	if resp.Result.ReportDataMatch == nil || !*resp.Result.ReportDataMatch {
-		return types.VerifyResponse{}, fmt.Errorf("%w — key was not generated in this TEE", ErrKeyBinding)
-	}
-	return resp, nil
-}
-
-// verifyTDXOnline forwards a TDX evidence envelope to the local
-// attestation-api /verify endpoint. Analogous to verifySEVSNPOnline for
-// the SNP path — the attestation-api has all the Intel PCS collateral
-// (TDX Root CA, TCB info, QE identity) and the sgx-dcap-quoteverify
-// bindings needed to verify a TDX quote. We do NOT ship an in-process
-// TDX quote verifier here; delegating to attestation-api keeps the
-// heavy Intel dependencies out of every c8s Go binary and makes the
-// verifier upgradeable independently of the mesh binary.
-//
-// LIMITATION: unlike the SNP path, this does not enforce policy.MinTCBVersion
-// or policy.Measurements. The attestation-api's TDX verifier has no minimum-TCB
-// parameter (only the SNP verifier does), and the TDX launch measurement is not
-// pulled off the response for allowlist matching. A TDX peer therefore verifies
-// on signature + REPORTDATA binding + debug policy only; MinTCBVersion and
-// Measurements set on the policy are silently ignored for TDX. Wire both through
-// before relying on TDX in a measurement- or TCB-pinned deployment.
-func verifyTDXOnline(evidence *types.AttestationEvidence, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
-	if evidence.Platform != string(types.PlatformTdx) {
-		return nil, fmt.Errorf("%w: online verification not implemented for platform %q", ErrUnsupportedTEE, evidence.Platform)
-	}
-
-	if _, err := callAttestationVerify(evidence, policy, expectedReportData[:], nil); err != nil {
-		return nil, err
-	}
-	return &VerifyResult{TEEType: TEETypeTDX}, nil
-}
-
-func verifySEVSNPOnline(evidence *types.AttestationEvidence, policy *VerifyPolicy, expectedReportData [64]byte) (*VerifyResult, error) {
-	// az-snp, bare-metal snp, and gcp-snp share SNP measurement/result
-	// semantics and are wired end-to-end through this verifier. az-tdx and any
-	// future platform would need their own; fail closed rather than approve
-	// under SNP rules.
-	p := evidence.Platform
-	if p != string(types.PlatformAzSnp) && p != string(types.PlatformSnp) && p != string(types.PlatformGcpSnp) {
-		return nil, fmt.Errorf("%w: online verification not implemented for platform %q", ErrUnsupportedTEE, evidence.Platform)
-	}
-
 	var minTcb *types.MinTcb
 	if policy.MinTCBVersion != 0 {
 		m := unpackSNPMinTcb(policy.MinTCBVersion)
 		minTcb = &m
 	}
-	// The expected-REPORTDATA length is platform-specific. az-snp binds the key
-	// through a TPM quote whose nonce is the 48-byte SHA-384 digest, so it must
-	// receive exactly those 48 bytes — sending the zero-padded 64-byte form
-	// fails attestation-api's az-snp verify with "TPM nonce length mismatch".
-	// Bare-metal snp and gcp-snp carry a native 64-byte SNP REPORTDATA field
-	// (SHA-384 in bytes 0-47, zero-padded 48-63) and compare the full 64.
-	reportData := expectedReportData[:]
-	if evidence.Platform == string(types.PlatformAzSnp) {
-		reportData = expectedReportData[:sha512.Size384]
-	}
-	resp, err := callAttestationVerify(evidence, policy, reportData, minTcb)
+	resp, err := attestationclient.NewClient(policy.AttestationApiURL).VerifyEvidence(ctx, *evidence, attestationclient.EvidencePolicy{
+		ExpectedReportData: expectedReportData,
+		AllowDebug:         policy.AllowDebug,
+		MinTcb:             minTcb,
+		Measurements:       policy.Measurements,
+	})
 	if err != nil {
-		return nil, err
+		return nil, mapVerifyError(evidence.Platform, err)
 	}
 
+	if evidence.Platform == string(types.PlatformTdx) {
+		return &VerifyResult{TEEType: TEETypeTDX}, nil
+	}
 	result := &VerifyResult{TEEType: TEETypeSEVSNP}
 	if len(resp.Result.Claims.PlatformData) > 0 && !bytes.Equal(resp.Result.Claims.PlatformData, []byte("null")) {
 		result.PlatformInfo = resp.Result.Claims.PlatformData
 	}
 	copy(result.ReportData[:], expectedReportData[:])
-
 	if resp.Result.Claims.LaunchDigest != "" {
-		measurement, err := hex.DecodeString(resp.Result.Claims.LaunchDigest)
-		if err != nil {
-			return nil, fmt.Errorf("%w: launch digest is not hex: %w", ErrInvalidReport, err)
-		}
-		if len(measurement) != SNPMeasurementSize {
-			return nil, fmt.Errorf("%w: launch digest is %d bytes, expected %d", ErrInvalidReport, len(measurement), SNPMeasurementSize)
-		}
+		// Hex validity and length were enforced by VerifyEvidence.
+		measurement, _ := hex.DecodeString(resp.Result.Claims.LaunchDigest)
 		copy(result.Measurement[:], measurement)
-		if len(policy.Measurements) > 0 && !MeasurementAllowed(measurement, policy.Measurements) {
-			return nil, fmt.Errorf("%w: launch measurement not in allowed set", ErrPolicyViolation)
-		}
-	} else if len(policy.Measurements) > 0 {
-		return nil, fmt.Errorf("%w: launch measurement missing", ErrPolicyViolation)
 	}
-
 	return result, nil
+}
+
+// mapVerifyError translates attestationclient verdict sentinels onto this
+// package's error surface, preserving the pre-consolidation sentinels callers
+// match with errors.Is.
+func mapVerifyError(platform string, err error) error {
+	switch {
+	case errors.Is(err, attestationclient.ErrSignatureInvalid):
+		return ErrSignatureInvalid
+	case errors.Is(err, attestationclient.ErrReportDataMismatch):
+		return fmt.Errorf("%w — key was not generated in this TEE", ErrKeyBinding)
+	case errors.Is(err, attestationclient.ErrMeasurementNotAllowed):
+		return fmt.Errorf("%w: %v", ErrPolicyViolation, err)
+	case errors.Is(err, attestationclient.ErrInvalidLaunchDigest):
+		return fmt.Errorf("%w: %v", ErrInvalidReport, err)
+	case errors.Is(err, attestationclient.ErrUnsupportedPlatform):
+		return fmt.Errorf("%w: online verification not implemented for platform %q", ErrUnsupportedTEE, platform)
+	default:
+		return fmt.Errorf("ratls: online %s attestation verify: %w", platform, err)
+	}
 }
 
 // snpEvidence wraps a raw SEV-SNP attestation report in the attestation-api's

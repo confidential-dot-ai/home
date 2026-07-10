@@ -10,6 +10,7 @@ package allowlist
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/confidential-dot-ai/c8s/internal/lbdiscovery"
 	"github.com/confidential-dot-ai/c8s/pkg/allowlistclient"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
@@ -85,8 +87,8 @@ README ("Operator allowlist credentials").`,
 
 	pf := cmd.PersistentFlags()
 	pf.StringVar(&o.url, "url", "", "CDS base URL (required). CDS has no public ingress: reach it via 'kubectl port-forward svc/c8s-cds 8443:8443' then --url https://localhost:8443, or via the tls-lb")
-	pf.StringSliceVar(&o.measurements, "measurements", nil, "allowed SHA-384 hex CDS launch measurement(s) (repeatable/comma-separated); empty = no pinning (UNSAFE)")
-	pf.StringVar(&o.measurementsFile, "measurements-file", "", "file of allowed CDS launch measurements, one hex digest per line")
+	pf.StringSliceVar(&o.measurements, "measurements", nil, "allowed SHA-384 hex launch measurement(s) of the attested endpoint — CDS directly, or the tls-lb's discovery evidence when fronted (repeatable/comma-separated); empty = no pinning (UNSAFE)")
+	pf.StringVar(&o.measurementsFile, "measurements-file", "", "file of allowed launch measurements, one hex digest per line")
 	pf.StringVar(&o.attestationAPIURL, "attestation-api-url", "", "attestation-api URL used to verify CDS RA-TLS evidence (required for https unless measurements make it self-contained)")
 	pf.DurationVar(&o.timeout, "timeout", 15*time.Second, "per-request timeout")
 	pf.StringVar(&o.operatorKey, "operator-key", "", "operator EC private key PEM file, whose public key is pinned on CDS via --operator-keys (env "+envOperatorKey+"); required for writes")
@@ -119,7 +121,7 @@ func (o *options) validate() error {
 // (CDS proves its TEE attestation). Plaintext http is refused unless --insecure
 // is set, so a typo'd or downgraded URL never silently writes the allowlist to
 // an unauthenticated endpoint.
-func (o *options) client() (allowlistclient.Client, error) {
+func (o *options) client(ctx context.Context) (allowlistclient.Client, error) {
 	u, err := url.Parse(o.url)
 	if err != nil || u.Host == "" {
 		return allowlistclient.Client{}, fmt.Errorf("invalid --url %q", o.url)
@@ -140,14 +142,43 @@ func (o *options) client() (allowlistclient.Client, error) {
 		if len(measurements) == 0 {
 			fmt.Fprintln(os.Stderr, "warning: no --measurements set; accepting any RA-TLS-attested CDS (UNSAFE)")
 		}
-		hc, err := ratls.NewVerifyingHTTPClient(measurements, o.attestationAPIURL)
+		hc, err := o.httpsClient(ctx, measurements)
 		if err != nil {
-			return allowlistclient.Client{}, fmt.Errorf("build CDS RA-TLS client: %w", err)
+			return allowlistclient.Client{}, err
 		}
 		hc.Timeout = o.timeout
 		return allowlistclient.NewClientWithHTTP(o.url, hc), nil
 	default:
 		return allowlistclient.Client{}, fmt.Errorf("--url scheme must be http or https, got %q", u.Scheme)
+	}
+}
+
+// httpsClient builds the attestation-verifying HTTP client. A tls-lb front
+// door serves a CDS-issued cert with no RA-TLS extension; its trust path is
+// the discovery document, so probe for that first and fall back to direct
+// RA-TLS serving-cert verification (a port-forwarded CDS) when the target
+// serves none — the same routing `c8s verify` uses in auto mode (#285). A
+// discovery document that fails verification is a hard error, never a
+// fallback.
+func (o *options) httpsClient(ctx context.Context, measurements [][]byte) (*http.Client, error) {
+	if o.attestationAPIURL == "" {
+		return nil, fmt.Errorf("--attestation-api-url is required for an https --url (evidence verification is delegated to it)")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, o.timeout)
+	defer cancel()
+	hc, err := lbdiscovery.NewVerifiedHTTPClient(probeCtx, o.url, measurements, o.attestationAPIURL)
+	switch {
+	case err == nil:
+		fmt.Fprintln(os.Stderr, "note: target is a tls-lb front door; verified its discovery attestation and bound this session to the attested connection")
+		return hc, nil
+	case errors.Is(err, lbdiscovery.ErrNoDiscovery):
+		hc, err = ratls.NewVerifyingHTTPClient(measurements, o.attestationAPIURL)
+		if err != nil {
+			return nil, fmt.Errorf("build CDS RA-TLS client: %w", err)
+		}
+		return hc, nil
+	default:
+		return nil, err
 	}
 }
 

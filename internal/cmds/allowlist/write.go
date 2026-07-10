@@ -32,7 +32,7 @@ func newAddCmd(o *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			c, err := o.client()
+			c, err := o.client(ctx(cmd))
 			if err != nil {
 				return err
 			}
@@ -76,7 +76,7 @@ func newRemoveCmd(o *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			c, err := o.client()
+			c, err := o.client(ctx(cmd))
 			if err != nil {
 				return err
 			}
@@ -140,7 +140,7 @@ control plane. Override the required set with --require.`,
 				digests[d] = image
 			}
 
-			c, err := o.client()
+			c, err := o.client(ctx(cmd))
 			if err != nil {
 				return err
 			}

@@ -16,6 +16,7 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jws"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 
+	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
@@ -145,11 +146,12 @@ func (h *localHandoffBootstrap) RunRefresh(ctx context.Context, logger *slog.Log
 // signer pubkey to a report, verify the report's signature and report-data
 // match, then mint the EAR over the verified launch digest.
 //
-// INVARIANT: the EAR is minted only after the verifier confirms SignatureValid
-// and ReportDataMatch — the same gate the HTTP /attest-key handler enforces. We
-// verify even though CDS produced the evidence: the verifier supplies the
-// launch digest claim, and skipping verification would let a host-supplied
-// evidence blob set the EAR's launch digest.
+// INVARIANT: the EAR is minted only after attestationclient.EnforceVerdict
+// confirms SignatureValid and ReportDataMatch — the same gate the HTTP
+// /attest-key handler enforces. We verify even though CDS produced the
+// evidence: the verifier supplies the launch digest claim, and skipping
+// verification would let a host-supplied evidence blob set the EAR's launch
+// digest.
 func (h *localHandoffBootstrap) attestKey(ctx context.Context, pubDER []byte) (string, error) {
 	pub, err := x509.ParsePKIXPublicKey(pubDER)
 	if err != nil {
@@ -178,18 +180,16 @@ func (h *localHandoffBootstrap) attestKey(ctx context.Context, pubDER []byte) (s
 		return "", fmt.Errorf("generate evidence: %w", err)
 	}
 
-	verifyResp, err := h.attestation.Verify(ctx, types.VerifyReportData(
+	verifyReq := types.VerifyReportData(
 		types.AttestationEvidence(asResp),
 		types.NewBase64Bytes(reportDataDigest),
-	))
+	)
+	verifyResp, err := h.attestation.Verify(ctx, verifyReq)
 	if err != nil {
 		return "", fmt.Errorf("verify evidence: %w", err)
 	}
-	if !verifyResp.Result.SignatureValid {
-		return "", fmt.Errorf("attestation signature invalid")
-	}
-	if verifyResp.Result.ReportDataMatch == nil || !*verifyResp.Result.ReportDataMatch {
-		return "", fmt.Errorf("report-data mismatch in attestation evidence")
+	if err := attestationclient.EnforceVerdict(verifyReq, verifyResp); err != nil {
+		return "", fmt.Errorf("verify evidence: %w", err)
 	}
 
 	evidenceJSON, err := json.Marshal(asResp)

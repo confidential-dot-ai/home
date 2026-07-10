@@ -22,7 +22,7 @@ func newListCmd(o *options) *cobra.Command {
 			if err := o.validate(); err != nil {
 				return err
 			}
-			c, err := o.client()
+			c, err := o.client(ctx(cmd))
 			if err != nil {
 				return err
 			}
@@ -44,7 +44,7 @@ func newExportCmd(o *options) *cobra.Command {
 			if err := o.validate(); err != nil {
 				return err
 			}
-			c, err := o.client()
+			c, err := o.client(ctx(cmd))
 			if err != nil {
 				return err
 			}
@@ -86,7 +86,7 @@ func newDiffCmd(o *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			c, err := o.client()
+			c, err := o.client(ctx(cmd))
 			if err != nil {
 				return err
 			}
