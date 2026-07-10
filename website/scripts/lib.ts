@@ -61,6 +61,9 @@ export const C8S_COMMANDS: CommandSpec[] = [
   },
   { command: 'operator', files: ['cmd/c8s/operator.go'] },
   { command: 'cds', files: ['internal/cmds/cds/cmd.go'] },
+  // cds-attest is a separate top-level command (the tls-lb attestation +
+  // over-encryption sidecar), not a `cds` subcommand — its flags live in cdsattest.
+  { command: 'cds-attest', files: ['internal/cmds/cdsattest/cmd.go'] },
   // Persistent flags live in cmd.go; the write subcommands (add/remove/upload)
   // register their own flags in write.go. read.go registers none.
   {
