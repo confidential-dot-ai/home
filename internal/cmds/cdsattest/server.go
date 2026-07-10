@@ -222,6 +222,12 @@ func (s *Server) handleAttestationOverEncryption(w http.ResponseWriter, r *http.
 		}
 		version = "c8s-verify/v2"
 		certPEM = identity.bundlePEM
+	default:
+		// A binding routed here without a report_data case must not reach the
+		// evidence fetch.
+		s.log.Error("unhandled attestation binding", "binding", binding)
+		writeErr(w, http.StatusInternalServerError, "internal", "unhandled attestation binding")
+		return
 	}
 
 	evidence, platform, generation, err := s.cfg.Evidence.Evidence(r.Context(), reportData)

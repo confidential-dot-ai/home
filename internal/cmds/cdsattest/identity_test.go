@@ -288,3 +288,20 @@ func TestIdentityBoundAttestationRejectsUnknownBinding(t *testing.T) {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 }
+
+// A binding that reaches handleAttestationOverEncryption without a report_data
+// case must fail closed, not serve evidence bound to nothing.
+func TestAttestationOverEncryptionFailsClosedOnUnroutedBinding(t *testing.T) {
+	provider := &capturingProvider{}
+	srv := NewServer(Config{Evidence: provider})
+	nonce := make([]byte, 32)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/c8s/attestation", nil)
+	srv.handleAttestationOverEncryption(rec, req, b64url(nonce), nonce, "future-binding")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if provider.lastReportData != nil {
+		t.Fatal("evidence was fetched for an unrouted binding")
+	}
+}
