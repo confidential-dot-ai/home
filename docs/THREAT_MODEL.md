@@ -12,8 +12,8 @@
 > should answer: what we protect (§1 Assets), who from (§2 Adversaries), how the
 > assets connect (§3 Trust graph), what is enforced (§4 Gates), the threats and
 > their status (§5 Catalog — Prevented / Mitigated / Addressable / Open /
-> Accepted), what we assume (§6, including trust roots inherited from other
-> repos), and what we deliberately do **not** defend against (§7 Non-goals).
+> Accepted), what we assume (§6, including supply-chain and external trust
+> roots), and what we deliberately do **not** defend against (§7 Non-goals).
 > The detailed enforcement narrative — bootstrap mode, production direction,
 > browser verification — follows in §8–§10.
 
@@ -88,13 +88,13 @@ Think in dependencies, not a flat list. An edge means "trusts / is vouched for b
    browser client ──▶ tls-lb │ RA-TLS    │◀──mTLS──▶ │  workload  │  weights / prompts /
    (pins measurement         │ mesh      │            │   (CVM)   │  KV-cache / secrets
     AND mesh CA)             └───────────┘            └────────────┘
-                                   ▲ transitive trust: client verifies only the LB;
-                                   │ the mesh vouches for the backends it fronts
+                                   ▲ intended transitive trust; default PQ mode
+                                   │ does not yet bind the LB mesh identity (§5)
 
   SUPPLY CHAIN (entirely OUTSIDE the TEE, yet defines what the TEE will accept):
     CI / ghcr.io ─▶ image digests ─▶ bootstrap allowlist (BAKED INTO the measurement)
     c8s-fleet@main ─▶ measurement pins · NRI allowlist · operator keys · digests
-    steep build ─▶ cosign-signed reference measurement ─▶ pinned by every verifier
+    kata build ─▶ unsigned ORAS artifact + prediction inputs ─▶ operator derives / pins launch digest
 ```
 
 CRDs are not security inputs. `ConfidentialWorkload` is an operator UX/status
@@ -162,18 +162,19 @@ rather than restating it.
 | **Browser WASM verifier enforces fewer checks than the Go/Rust server verifiers** — `verify_snp` omits VMPL==0, debug-policy rejection, min-TCB, VEK validity, and CRL. A browser client would accept a DEBUG-enabled or non-VMPL-0 guest (host can read enclave memory) if its measurement is allow-listed. | LB operator / host | Bring the WASM `snp` path to parity with `verify_evidence`. | c8s-verify-js; attestation-wasm; #302 |
 | **SMT- and migration-enabled guests are accepted** (`GuestPolicy{SMT:true, MigrateMA:true}`). SMT exposes cross-thread side channels; MigrateMA accepts live-migratable encrypted VMs. | host | Pin the guest policy (reject SMT / MigrateMA) or record an explicit accept. | attestation-go `validateOptions`; attestation-rs `snp/verify.rs`; #301 |
 | Image policy gates the image *digest* only, not args/env/mounts/capabilities/pod-spec. | whoever controls the pod spec | Extend the NRI plugin to pod-spec fields. | GAPS §Image and pod spec; #49 |
-| No image signing / SLSA / provenance anywhere; trust is digest-pinning only. A compromised Actions run or ghcr.io push could inject a component that attestation accepts once its digest is promoted/baked. | CI / registry | cosign/notation signing + SBOM (named as future work in deployment-scripts T21). | §6 inherited assumptions; #307 |
+| No image signing / SLSA / provenance anywhere; trust is digest-pinning only. A compromised Actions run or ghcr.io push could inject a component that attestation accepts once its digest is promoted/baked. | CI / registry | cosign/notation signing + SBOM (named as future work in deployment-scripts T21). | §6 supply-chain assumptions; #307 |
 
 ### Open — threat now, no committed fix (posture decisions)
 
 | Threat | Adversary | Note |
 |---|---|---|
-| **An operator forgets to pin measurements.** `cds.measurements` and `ratlsMesh.measurements` ship empty, and the RA-TLS handshake then accepts *any* peer that produces a syntactically valid TEE attestation. An attacker who serves their own TEE attestation on the pod network can stand in for CDS at the bootstrap moment. | pod-network | **By design the operator must choose their measurements** — empty is not a bug, it is "pin nothing yet." **Mitigation**: both CDS and ratls-mesh log loud warnings when their allowlists are empty (`ratls-mesh` host mode `internal/cmds/ratlsmesh/main.go:207`; in-guest `in_guest_linux.go:263,266`), and ratls-mesh publishes `ratls_mesh_measurement_pinning=0` for alerting. **Real residual**: the shipped fleet overlays (`c8s-fleet` `hr.yaml`) leave these unset, so a GitOps "production" deploy runs accept-any unless the operator pins — an operational default, not a code gap. |
+| **An operator forgets to pin measurements.** `cds.measurements` and `ratlsMesh.measurements` ship empty, and the RA-TLS handshake then accepts *any* peer that produces a syntactically valid TEE attestation. An attacker who serves their own TEE attestation on the pod network can stand in for CDS at the bootstrap moment. | pod-network | **By design the operator must choose their measurements** — empty is not a bug, it is "pin nothing yet." **Mitigation**: both CDS and ratls-mesh log loud warnings when their allowlists are empty (including ratls-mesh host and in-guest modes), and ratls-mesh publishes `ratls_mesh_measurement_pinning=0` for alerting. **Real residual**: the shipped fleet overlays (`c8s-fleet` `hr.yaml`) leave these unset, so a GitOps "production" deploy runs accept-any unless the operator pins — an operational default, not a code gap. |
 | The c8s-fleet GitOps repo is a co-equal trust anchor outside the TEE: a merge to `main` rewrites measurement pins, the NRI allowlist, operator keys, and image digests for every cluster. | fleet committer / compromised GitHub App | Access control reduces to git branch protection + the Flux GitHub App. Not currently modeled; the allowlist and promotion pipelines (CI + bot PATs + tag→digest resolution) are additional attack surface. |
 | The default injected `kata-qemu` class (for un-annotated pods) provides VM isolation but **not** confidentiality — the host can read the pod's memory. Base install mode gives no per-pod confidentiality at all. | host | "Pod-as-CVM" is opt-in via `confidential.ai/cw` or a GPU request. Document so the "injection candidate" gate is not read as "everything is confidential." |
 | Namespace exemptions (release ns, `kube-system`, `kube-public`, `kube-node-lease`) bypass injection and kata enforcement; `kube-system` also skips image policy. Host-namespace pods are exempt with no PSA floor, so any user with create-pod RBAC opts out via `hostNetwork:true`. | tenant with pod-create RBAC | RuntimeClass enforcement is a guardrail, not a boundary; the actual boundary is per-pod attestation. A cluster-wide PodSecurityAdmission floor is required to close the host-namespace bypass (#311). |
 | `CopyFileRequest` is allowed by the guest OPA policy — the untrusted host can write files into a running guest (not path-scoped). | host | Deliberate deviation (`default-policy.rego`), but an in-guest attack surface worth stating. |
 | A running external service mesh (Istio/Linkerd) alongside c8s injects **un-attested** proxies into the confidential path and breaks the model. | operator misconfig | Do not run a second mesh (c8s-docs limitations). |
+| The default browser **PQ** flow does not bind the LB's mesh identity to its attested session key. `report_data` commits only to `x25519 \|\| mlkem768 \|\| nonce`; the mesh leaf and CA are public bytes fetched separately. A genuine attacker-operated LB with an allowed measurement can copy the target cluster's public leaf/CA chain, attest its own session key, and satisfy both pins without proving possession of a key issued by that CA. | allowed-measurement LB / out-of-cluster network attacker | The PQ tunnel authenticates an allowed image and protects the session, but does not yet identify “my cluster.” Bind the serving SPKI or another mesh identity to the PQ attestation transcript and verify proof of possession. Until then, do not treat the measurement + mesh-CA pins as sufficient cluster authentication. |
 
 ### Escape hatches to keep out of production (Open, gated by warnings only)
 
@@ -205,37 +206,40 @@ If any of these is false, the corresponding guarantee does not hold.
    the pinned-key ConfigMap is host-supplied and not yet attested.
 4. Guest RNG derives from the CPU (`RANDOM_TRUST_CPU`, no host virtio-rng); session
    keys, X25519/ML-KEM ephemerals, and the mesh CA key all draw from it.
-5. The browser client pins **both** a measurement allowlist **and** the mesh CA
-   (images are fungible — a measurement alone proves "audited code on real silicon",
-   not "*my* cluster"; an attacker can run a genuine-but-attacker-operated LB) and
-   inspects `warnings[]`.
+5. The browser client supplies **both** a measurement allowlist and the mesh CA
+   out of band and inspects `warnings[]`. These pins are necessary but not
+   sufficient for cluster authentication in the default PQ mode: its attestation
+   binds the session key and nonce, but not the separately fetched mesh identity
+   (§5 Open). The `pq=false` mode instead binds the serving-leaf SPKI, but does not
+   create the post-quantum over-encryption tunnel.
 
-**Inherited trust roots (owned by other repos, load-bearing here):**
+**Supply-chain and external trust roots (load-bearing here):**
 6. **Hardware root of trust** (AMD/Intel/NVIDIA) is sound — if the manufacturer is
    compromised the guarantees fail (not zero-trust). `attestation-{go,rs}` bundle the
    AMD ARK/ASK roots at build time; rotating a root means rebuilding every verifier
    (incl. the browser WASM).
 7. **AMD KDS / Intel PCS** are reachable and authentic; stale-cache windows and the
    CRL fail-open default (§5 Addressable) are the residual.
-8. **The reference measurement is honest** — `steep` publishes a cosign-signed
-   expected measurement that verifiers pin; whoever holds that signing key / controls
-   its distribution can pin a malicious image's digest as "expected" without touching
-   hardware. **Reduced, not eliminated:** the kata-guest-base build is bit-for-bit
-   reproducible (pinned FS UUID, dir-hash-seed, verity salt, `SOURCE_DATE_EPOCH`,
-   mtime normalisation, snapshot-pinned apt), so a third party can rebuild from
-   source and independently recompute the dm-verity root_hash — the signed reference
-   is verifiable rather than trusted-blindly, *provided someone actually rebuilds*.
-   What the measurement covers (OVMF + UKI + dm-verity roothash + cloud-init) and
-   excludes (runtime overlay tmpfs) is defined in steep, not here.
+8. **Kata reference measurements are operator-supplied, not signed or published by
+   the build.** The shipped path is measured direct-kernel boot: Steep compiles the
+   bare `vmlinuz`, Kata osbuilder produces the dm-verity rootfs, and the launch digest
+   covers OVMF + kernel + the exact Kata command line (including the verity root hash)
+   + the boot-time VMSA set. `manifest.json` carries artifact hashes and prediction
+   inputs, but no launch digest; the workflow publishes it with unsigned `oras push`.
+   An operator must derive the digest separately with `sev-snp-measure` and supply it
+   to the relevant verifier/chart allowlists, which default to empty. Reproducible
+   rootfs inputs permit an independent rebuild, but do not provide a signing,
+   publication, or pinning chain by themselves.
 9. **Host provisioning is correct and is not verified by c8s** — SNP enabled in
    BIOS/firmware, GPU CC mode on, vfio-pci binding clean, node labels honest
    (`--hardware-platform` is trusted, not probed). The node-level kata/containerd
    install (kata-deploy, sandbox-device-plugin) is privileged host-root and is
    **not** in the measured TCB — it is trusted operationally.
-10. **CI and the fleet GitOps repo are trusted** to produce and pin the measurements,
-    allowlists, and digests that make attestation meaningful (§5 Open). Kata is a fork
-    carrying an IGVM-for-QEMU patch (load-bearing for measured boot) built on the
-    confidential org's own runners.
+10. **CI and the fleet GitOps repo are trusted** to produce and distribute the guest
+    artifacts, allowlists, image digests, and operator-supplied measurement pins that
+    make attestation meaningful (§5 Open). The Kata runtime/fork, its selected OVMF,
+    and the confidential org's runners are supply-chain dependencies for the shipped
+    direct-kernel boot path; an IGVM-for-QEMU patch is not load-bearing on this path.
 
 ---
 
@@ -342,15 +346,17 @@ produces a syntactically valid TEE attestation. **The operator chooses these
 values — empty means "not pinned yet", not a defect.** An attacker who can serve
 their own TEE attestation on the cluster Pod network (compromised CNI,
 malicious sidecar, DNS hijack) can stand in for CDS at the bootstrap moment.
-The mitigation is a loud log warning: CDS logs a warning when its allowlist is
-empty; **ratls-mesh does not yet** (§5 Open). Pin both in production.
+Both CDS and ratls-mesh log loud warnings for empty measurement policies;
+ratls-mesh also publishes `ratls_mesh_measurement_pinning=0` for alerting. These
+signals do not make the accept-any policy safe: pin both values in production.
 
 The chart sets `cds.sanValidation=false` because under chart routing CSRs
 arrive without a matching TCP source IP, so CDS cannot compare the CSR node IP
 SAN to the workload's TCP source IP. DNS SAN and CN validation still run; DNS
-SANs are rejected unless explicitly allowed. CA rotation runs inside CDS; the
-replacement CA key is generated in process memory and only the public bundle
-is persisted.
+SANs are rejected unless explicitly allowed. Scheduled CA rotation is not wired:
+chart-managed CDS generates one CA in process memory at startup. A process restart
+generates an unrelated CA and requires mesh re-bootstrap; no `CARotator` production
+caller currently creates or publishes replacement bundles.
 
 This is acceptable for demos, development, and environments that deliberately
 place CDS inside the intended trust boundary. It is not the final whitepaper
@@ -414,21 +420,25 @@ freely.
 
 The `c8s cds-attest` sidecar (proxied by the tls-lb nginx front-end) exposes a browser-facing surface over plain HTTPS so an
 out-of-cluster client (the `c8s-verify-js` library, or `TEErminator`) can verify
-the Load Balancer and open a post-quantum over-encrypted channel to its enclave.
+the Load Balancer's TEE measurement and open a post-quantum over-encrypted
+channel to its enclave. Cluster identity has an additional gap described below.
 The wire contract is `c8s-verify-js/PROTOCOL.md`.
 
 - `GET /.well-known/c8s/cds-cert.pem` — the mesh CA / LB cert chain. Served
-  **unauthenticated by design** (same reasoning as in-cluster `GET /ca`): the
-  client MUST chain it through attested evidence before trusting it, never on the
-  strength of the TLS connection it arrived over.
+  **unauthenticated by design** (same reasoning as in-cluster `GET /ca`). The
+  default PQ attestation does not bind this chain to the attested session key, so
+  the client cannot yet use it to authenticate the PQ endpoint (§5 Open).
 - `GET /.well-known/c8s/attestation?nonce=` — raw SEV-SNP evidence whose
   `report_data = SHA-384(x25519 || mlkem768 || nonce)` binds the per-session
   over-encryption key and the client nonce. The client verifies the hardware
   signature, the launch measurement against its pinned allowlist, and this
-  binding before deriving the channel. A second binding mode exists
+  binding before deriving the channel. It does **not** bind the serving SPKI or
+  mesh identity. A second binding mode exists
   (`?pq=false`, `report_data = SHA-384(serving_leaf_spki || nonce)`) where the
-  client trusts the LB's outer TLS leaf instead of the over-encryption key — a
-  different, weaker trust decision; prefer the PQ binding.
+  attestation commits to the LB's outer TLS leaf instead of an over-encryption
+  key. This supplies the missing SPKI binding but does not create the PQ tunnel;
+  the modes currently provide different properties rather than one strictly
+  dominating the other.
 - `POST /.well-known/c8s/handshake` + over-encrypted application records —
   X25519 + ML-KEM-768 → HKDF-SHA256 → AES-256-GCM (`pkg/overenc`). The **entire**
   request is sealed — method, path, headers, and body — so a TLS-terminating proxy
@@ -438,12 +448,13 @@ The wire contract is `c8s-verify-js/PROTOCOL.md`.
 
 The tls-lb nginx serves the static `cds-cert.pem`/`mesh-ca.pem` and reverse-proxies the dynamic `/.well-known/c8s/` paths to the sidecar on loopback.
 
-Trust is transitive from this point: the user verifies only the LB (and, through
-the served cert, the mesh CA); the in-cluster RA-TLS mesh vouches for the backend
-pods the LB talks to. **The client must pin both the measurement allowlist and the
-mesh CA** — a measurement alone proves "genuine audited code on real silicon", not
-"*my* cluster"; without the mesh-CA pin an attacker can present a genuine-but-
-attacker-operated LB (§6(5)).
+The intended trust is transitive: after authenticating the LB's mesh identity,
+the client relies on the in-cluster RA-TLS mesh to vouch for the backend pods the
+LB talks to. That first identity edge is incomplete in the default PQ flow. A
+measurement pin proves an allowed image on genuine hardware, while a mesh-CA pin
+validates public certificate bytes; because the PQ attestation proves neither
+possession of the leaf key nor a binding to that chain, the two checks do not yet
+identify one cluster (§5 Open, §6(5)).
 
 **Client-side responsibilities and their downgrades** (all supplied out of band by
 the embedding app): the SDK **fails closed** with a typed error taxonomy

@@ -105,6 +105,12 @@ final security model. Each bullet links to the tracking issue.
 - The sidecar's live evidence path requires `--attestation-api-url`; per-session
   binding of the over-encryption key into a fresh hardware report is enforced
   there. The `--evidence-fixture` path is DEV ONLY (fixed `report_data`).
+- The default PQ binding commits `report_data` to the X25519/ML-KEM session keys
+  and nonce, but not to the serving SPKI or mesh identity. The public mesh leaf
+  and CA are fetched separately, so an allowed-measurement attacker can copy them
+  without proving possession of a CA-issued key. Bind the serving SPKI or another
+  mesh identity into the PQ transcript before treating measurement + CA pins as
+  cluster authentication.
 - An optional CDS-issued EAR over the bundle (`ear` field) is defined in the
   contract but not yet populated by the LB.
 - The over-encrypted tunnel is not streaming yet. The sidecar buffers each

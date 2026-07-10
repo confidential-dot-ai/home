@@ -122,7 +122,7 @@ chart aligned with it.
 
 | Layer | Measurement | Verifier |
 |---|---|---|
-| Kata guest image | SNP launch digest over OVMF + `vmlinuz` + the kata cmdline (which embeds the dm-verity `root_hash`), at 1 vCPU; predicted with `sev-snp-measure`, published in `manifest.json`. | Operator pre-attests this; the value is pinned in c8s's `kata.guestImage.tag`. |
+| Kata guest image | SNP launch digest over OVMF + `vmlinuz` + the kata cmdline (which embeds the dm-verity `root_hash`), at 1 vCPU; predicted separately with `sev-snp-measure`. `manifest.json` contains the artifact hashes and prediction inputs, not the launch digest. | The operator supplies the predicted digest to the relevant measurement allowlists. `kata.guestImage.tag` selects the artifact but is not a cryptographic measurement pin. |
 | Container image inside the VM (CDS / workload) | OCI image digest | Operator attests post-install via the existing `confidential.ai/cw` flow. The pod webhook injects `c8s-cert`, which obtains a leaf cert from CDS — CDS verifies the container's measurement and signs in one process. |
 | Workload identity (leaf cert) | RA-TLS cert with attestation evidence as a SAN extension | Peer pods in the mesh verify on the mTLS handshake. |
 
@@ -204,11 +204,19 @@ commit to `main` or `feat/**` branches that touches the recipe or the
 in-guest binaries. On a release tag (`v*`) the same image also gets the
 release version; `latest` moves only on `main`.
 
-Operators pin the tag by setting `kata.guestImage.tag` in a values file
-(`c8s install --kata -f values.yaml`). The
+Operators select the artifact tag by setting `kata.guestImage.tag` in a values
+file (`c8s install --kata -f values.yaml`). The
 `c8s-kata-image-puller` DaemonSet picks that up and pulls accordingly —
 see "How it's consumed in-cluster" in
 [`kata-guest-base/README.md`](../kata-guest-base/README.md).
+
+This is separate from measurement pinning. The build manifest records the
+kernel/rootfs hashes and verity parameters needed to reproduce the launch
+inputs, but it does not contain a launch digest, and the workflow currently
+publishes the ORAS artifact without a cosign signature. After predicting the
+digest from the exact OVMF, kernel, command line, and VM shape, operators must
+supply it to `cds.measurements`, `ratlsMesh.measurements`, or client-side
+`--measurements` policies as appropriate. Those policies default to empty.
 
 Every tag has a `-debug` sibling published from the same build whose guest
 policy allows the host log/exec stream RPCs (`kubectl logs`/`exec` work;
