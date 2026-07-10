@@ -143,7 +143,7 @@ kubectl get pods -n c8s-system
   kubectl get pods -A -w
   ```
 
-  The wait is bounded: `helm --wait` runs with a **5-minute timeout**. If a pod stays wedged in
+  The wait is bounded: `helm --wait` runs with a **5-minute timeout** (**10 minutes** for a `--kata` install). If a pod stays wedged in
   `ImagePullBackOff` or `CrashLoopBackOff` past it (a missing or wrong image pull secret is the
   usual culprit), `c8s install` **fails** when the timeout elapses rather than waiting forever. The
   resources it already applied remain, so fix the cause and **re-run** `c8s install` — it's
