@@ -36,9 +36,8 @@ registered with cobra/pflag.
 | `--image-tag` | string | `""` | No | component image tag to resolve digests at (default: the CLI build version, or `main` for an unstamped build); override to pin a specific branch/tag/release |
 | `--resolve-digests` | bool | `true` | No | resolve each component image tag to its registry digest (via crane), pin it, and add the resolved images to the NRI allowlist. Pass `--resolve-digests=false` when supplying digests via `-f` |
 | `--image-pull-secret` | string | `""` | No | name of an existing registry-credential Secret (kubernetes.io/dockerconfigjson) in the release namespace; appended to every component's imagePullSecrets |
-| `--engine` | string | `""` | No | inference engine preset deriving tls-lb's upstream (chart `engine.name`): `vllm` or `sglang`. Requires `--engine-workload-id`. Without this or a verified-https `tlsLb.upstream`, tls-lb renders no catch-all route until one is attached |
-| `--engine-workload-id` | string | `""` | No | `confidential.ai/cw` id of the engine workload (chart `engine.workloadId`); with `--engine`, derives the mesh-wrapped upstream `c8s-<id>.<ns>.svc.cluster.local:<port>` |
-| `--engine-namespace` | string | `""` | No | namespace the engine workload runs in (chart `engine.namespace`); empty = release namespace |
+| `--workload-ref` | string slice | `nil` | No | existing workload to adopt as a confidential workload, as `<cw-id>=<namespace>/<kind>/<name>[:<port>]`; repeatable. Kind is any resource exposing a pod template at `spec.template` (deployment, statefulset, daemonset, or an operator CRD such as `<kind>.<group>`); install patches the pod template with `confidential.ai/cw=<cw-id>` once c8s is ready. The optional `:<port>` is the tls-lb upstream port, required on the ref `--upstream` selects |
+| `--upstream` | string | `""` | No | `confidential.ai/cw` id of the adopted `--workload-ref` workload tls-lb routes its catch-all to; derives the mesh-wrapped upstream `c8s-<id>.<ns>.svc.cluster.local:<port>` from that ref's `:<port>`. Without this or a verified-https `tlsLb.upstream`, tls-lb renders no catch-all route until one is attached |
 | `--operator-keys` | string | `""` | No | path to a PEM bundle of operator EC public keys that authorize [`c8s allowlist`](#c8s-allowlist) writes; sets `cds.operatorKeys`. Without it, allowlist writes are disabled (reads still served) |
 | `--force` | bool | `false` | No | proceed past guarded prompts — currently: install without `--operator-keys` (allowlist writes disabled). Not needed when values are supplied via `-f` |
 
@@ -84,9 +83,8 @@ pass `--distro` to pin it. Still needs the registry reachable for the default di
 | `--image-pull-secret` | string | `""` | No | name of an existing dockerconfigjson Secret the chart wires into every component's imagePullSecrets |
 | `--operator-keys` | string | `""` | No | path to a PEM bundle of operator EC public keys that authorize [`c8s allowlist`](#c8s-allowlist) writes; the file's **content** is embedded as `cds.operatorKeys` in the emitted values (the chart value is PEM content, never a path) |
 | `--install-crds` | bool | `true` | No | emit values for chart CRDs (false sets `statusMirror.enabled=false`, matching `install --install-crds=false`) |
-| `--engine` | string | `""` | No | inference engine preset deriving tls-lb's upstream (chart `engine.name`): `vllm` or `sglang`. Requires `--engine-workload-id`. Without this or a verified-https `tlsLb.upstream`, tls-lb renders no catch-all route until one is attached |
-| `--engine-workload-id` | string | `""` | No | `confidential.ai/cw` id of the engine workload (chart `engine.workloadId`); with `--engine`, derives the mesh-wrapped upstream `c8s-<id>.<ns>.svc.cluster.local:<port>` |
-| `--engine-namespace` | string | `""` | No | namespace the engine workload runs in (chart `engine.namespace`); empty = release namespace |
+| `--workload-ref` | string slice | `nil` | No | adopted workload as `<cw-id>=<namespace>/<kind>/<name>[:<port>]`; repeatable. Used here only to derive `--upstream`'s address (render-values patches nothing) |
+| `--upstream` | string | `""` | No | `confidential.ai/cw` id of the adopted `--workload-ref` workload tls-lb routes its catch-all to; derives `tlsLb.upstream.address` `c8s-<id>.<ns>.svc.cluster.local:<port>` from that ref's `:<port>` |
 | `--operator-keys` | string | `""` | No | path to a PEM bundle of operator EC public keys that authorize [`c8s allowlist`](#c8s-allowlist) writes; the file's **content** is embedded as `cds.operatorKeys` in the emitted values (the chart value is PEM content, never a path) |
 
 {/* flags:operator */}

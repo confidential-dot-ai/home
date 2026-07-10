@@ -376,18 +376,14 @@ frontend → router → worker across attested, identity-bearing components.
 ### 5. Point the front door at the frontend
 
 External clients come in through the chart's front door — **tls-lb (public TLS +
-over-encryption) → your frontend**, dialed over the node mesh's attested mTLS. Point it at the
-frontend's container port (`8000`) with `engine.port`: it derives the minted headless Service
-`c8s-dynamo`, whose DNS returns pod IPs the node mesh wraps in attested mTLS — a Service VIP it
-cannot. `service.type: LoadBalancer` gives the front door a public IP on AKS:
+over-encryption) → your frontend**, dialed over the node mesh's attested mTLS. Point it there
+with `--workload-ref` + `--upstream`: the ref's `:8000` (the frontend's `--http-port`) derives
+the upstream `c8s-dynamo.workloads.svc.cluster.local:8000` — the minted headless Service, whose
+DNS returns pod IPs the node mesh wraps in attested mTLS; a Service VIP it cannot.
+`service.type: LoadBalancer` gives the front door a public IP on AKS:
 
 ```yaml
 # values.yaml
-engine:
-  port: "8000"        # the frontend's --http-port → headless Service c8s-dynamo
-  workloadId: dynamo  # the confidential.ai/cw value from Step 2
-  namespace: workloads
-
 tlsLb:
   attest:
     enabled: true    # serve the c8s-verify/v1 attestation endpoints
@@ -395,9 +391,10 @@ tlsLb:
     type: LoadBalancer
 ```
 
-Apply it by re-running the `c8s install` from the Azure tutorial with `-f values.yaml` added
-(the front door has one catch-all upstream — this repoints it if another tutorial's workload
-was wired first):
+Apply it by re-running the `c8s install` from the Azure tutorial with the two flags and
+`-f values.yaml` added (the front door has one catch-all upstream — this repoints it if another
+tutorial's workload was wired first). `--workload-ref` also stamps `confidential.ai/cw: dynamo`
+onto the Deployment's pod template — a no-op here, since Step 2's manifest already carries it:
 
 ```bash
 c8s install \
@@ -405,6 +402,8 @@ c8s install \
   --cvm-mode aks \
   --image-pull-secret ghcr-secret \
   --operator-keys operator.pub \
+  --workload-ref dynamo=workloads/deployment/dynamo-frontend:8000 \
+  --upstream dynamo \
   -f values.yaml
 ```
 

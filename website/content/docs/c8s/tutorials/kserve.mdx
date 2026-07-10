@@ -240,19 +240,14 @@ kubectl get cwl -n workloads
 ### 4. Point the front door at the predictor
 
 External clients reach the model through the chart's front door — **tls-lb (public TLS +
-over-encryption) → your predictor**, dialed over the node mesh's attested mTLS. The `engine`
-preset knows vLLM's and SGLang's ports; KServe's predictor serves on `8080`, so point the front
-door there with `engine.port` (the explicit-port form of the preset — it derives the same
-mesh-wrapped headless Service `c8s-iris`, so the hop is attested, not a Service VIP the mesh
-can't intercept):
+over-encryption) → your predictor**, dialed over the node mesh's attested mTLS. KServe's
+predictor serves on `8080`, so point the front door there with `--workload-ref` + `--upstream`:
+the ref's `:8080` derives the upstream `c8s-iris.workloads.svc.cluster.local:8080` — the
+mesh-wrapped headless Service, so the hop is attested, not a Service VIP the mesh can't
+intercept:
 
 ```yaml
 # values.yaml
-engine:
-  port: "8080"        # KServe's kserve-container port → headless Service c8s-iris
-  workloadId: iris    # the confidential.ai/cw value from Step 3
-  namespace: workloads
-
 tlsLb:
   attest:
     enabled: true    # serve the c8s-verify/v1 attestation endpoints
@@ -261,9 +256,11 @@ tlsLb:
 ```
 
 `service.type: LoadBalancer` gives the front door a public IP on AKS. Apply it all by
-re-running the `c8s install` from the Azure tutorial with `-f values.yaml` added (the front
-door has one catch-all upstream — this repoints it if another tutorial's workload was wired
-first):
+re-running the `c8s install` from the Azure tutorial with the two flags and `-f values.yaml`
+added (the front door has one catch-all upstream — this repoints it if another tutorial's
+workload was wired first). The ref names the Deployment KServe manages; the
+`confidential.ai/cw: iris` stamp it applies is a no-op here, since Step 3's predictor
+annotation already landed it on the pods:
 
 ```bash
 c8s install \
@@ -271,6 +268,8 @@ c8s install \
   --cvm-mode aks \
   --image-pull-secret ghcr-secret \
   --operator-keys operator.pub \
+  --workload-ref iris=workloads/deployment/iris-predictor:8080 \
+  --upstream iris \
   -f values.yaml
 ```
 

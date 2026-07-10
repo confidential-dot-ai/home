@@ -239,8 +239,9 @@ spec:
   derives a managed headless Service named `c8s-<value>` from it and the workload's certificate
   SAN is `c8s-<value>.<namespace>.svc` (overridable with `confidential.ai/c8s-san`). So
   `confidential.ai/cw: my-inference` yields the Service `c8s-my-inference` — which is what the
-  front door (tls-lb's upstream, derived via `engine.name`/`engine.port` + `engine.workloadId`)
-  dials to reach the workload over the RA-TLS mesh. Use a stable, DNS-label-safe name; a value
+  front door (tls-lb's upstream, derived via `--workload-ref my-inference=<ns>/<kind>/<name>:<port>`
+  plus `--upstream my-inference`) dials to reach the workload over the RA-TLS mesh. Use a
+  stable, DNS-label-safe name; a value
   like `"true"` would only produce a Service named `c8s-true`.
 </Callout>
 

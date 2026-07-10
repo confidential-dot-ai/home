@@ -148,30 +148,31 @@ kubectl get pods -n workloads -w
 
 You don't hand-edit nginx. The chart wires the front door —
 **tls-lb (public TLS + over-encryption) → your engine**, over the node mesh's attested mTLS — and
-you aim it at your vLLM workload with the inference-engine preset, in a small values file:
+you aim it at your vLLM workload with `--workload-ref` + `--upstream`, plus a small values file
+for the attestation endpoints:
 
 ```yaml
 # values.yaml
-engine:
-  name: vllm          # preset for vLLM's default port (8000)
-  workloadId: vllm    # the confidential.ai/cw id from Step 1
-  namespace: workloads
-
 tlsLb:
   attest:
     enabled: true     # serve the c8s-verify/v1 attestation + over-encryption endpoints
 ```
 
-Apply the routing with one upgrade — re-run your original `c8s install` with `-f values.yaml`
-added:
+Apply the routing with one upgrade — re-run your original `c8s install` with the two flags and
+`-f values.yaml` added:
 
 ```bash
-c8s install -f values.yaml   # plus the flags you first installed with (e.g. --single-node --operator-keys operator.pub)
+c8s install \
+  --workload-ref vllm=workloads/deployment/vllm:8000 \
+  --upstream vllm \
+  -f values.yaml   # plus the flags you first installed with (e.g. --single-node --operator-keys operator.pub)
 ```
 
-The preset derives `tlsLb.upstream = c8s-vllm.workloads.svc.cluster.local:8000`, so tls-lb dials
-vLLM's headless Service directly and that hop rides the node mesh's attested mTLS — hence no nginx
-surgery. A request your client sends over the over-encryption tunnel (Step 6) is decrypted
+The ref's `:8000` (vLLM's default port) derives
+`tlsLb.upstream = c8s-vllm.workloads.svc.cluster.local:8000`, so tls-lb dials vLLM's headless
+Service directly and that hop rides the node mesh's attested mTLS — hence no nginx surgery. The
+`confidential.ai/cw: vllm` stamp the ref applies is a no-op — Step 1's manifest already carries
+it. A request your client sends over the over-encryption tunnel (Step 6) is decrypted
 **inside the LB enclave** and forwarded over the mesh to vLLM's OpenAI-compatible
 `/v1/chat/completions`.
 
