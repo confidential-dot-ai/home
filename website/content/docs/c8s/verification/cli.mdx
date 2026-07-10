@@ -71,6 +71,7 @@ document directly. You can also skip the network entirely and verify saved evide
 ## Verify the CDS
 
 `c8s cds verify` is a shorthand for `c8s verify --kind cds --mode auto` (default port
+`8443`). `mode` auto-resolves to `ratls-cert` from `kind`.
 `8443`) `. `mode` auto-resolves to `ratls-cert` from `kind`. The CDS serves [RA-TLS](/docs/c8s/attestation/cds#verifying-the-cds-itself-ra-tls): its
 serving certificate carries the TEE report (SEV-SNP or TDX) in an X.509 extension, and `verify` trusts *that*
 attestation, not the certificate chain.
