@@ -417,18 +417,25 @@ out-of-cluster client (the `c8s-verify-js` library, or `TEErminator`) can verify
 the Load Balancer and open a post-quantum over-encrypted channel to its enclave.
 The wire contract is `c8s-verify-js/PROTOCOL.md`.
 
-- `GET /.well-known/c8s/cds-cert.pem` — the mesh CA / LB cert chain. Served
-  **unauthenticated by design** (same reasoning as in-cluster `GET /ca`): the
-  client MUST chain it through attested evidence before trusting it, never on the
-  strength of the TLS connection it arrived over.
-- `GET /.well-known/c8s/attestation?nonce=` — raw SEV-SNP evidence whose
-  `report_data = SHA-384(x25519 || mlkem768 || nonce)` binds the per-session
-  over-encryption key and the client nonce. The client verifies the hardware
-  signature, the launch measurement against its pinned allowlist, and this
-  binding before deriving the channel. A second binding mode exists
+- `GET /.well-known/c8s/cds-cert.pem` — legacy discovery for the mesh CA / LB
+  cert chain, served unauthenticated. An identity-bound v2 verifier does not
+  trust this standalone response; it verifies the exact chain committed by the
+  attestation bundle. The v1 compatibility flow only checks the discovered
+  chain separately and therefore does not establish cluster identity.
+- `GET /.well-known/c8s/attestation?nonce=&binding=over-encryption+mesh-identity-v2`
+  — raw SEV-SNP evidence whose domain-separated `report_data` transcript commits
+  the X25519 and ML-KEM-768 session keys, 32-byte client nonce, exact mesh leaf,
+  and issuing mesh CA. The leaf also signs the transcript, proving possession
+  of the corresponding private key. The client verifies the hardware signature,
+  a non-empty launch-measurement allowlist, the transcript, the leaf chain to a
+  pinned mesh CA, and the proof signature before deriving the channel. Copying
+  a victim cluster's public certificate chain is insufficient without its leaf
+  private key. The omitted/`over-encryption` binding remains v1-compatible and
+  binds only `SHA-384(x25519 || mlkem768 || nonce)`; it does not identify a
+  cluster. A separate binding mode exists
   (`?pq=false`, `report_data = SHA-384(serving_leaf_spki || nonce)`) where the
   client trusts the LB's outer TLS leaf instead of the over-encryption key — a
-  different, weaker trust decision; prefer the PQ binding.
+  different trust decision.
 - `POST /.well-known/c8s/handshake` + over-encrypted application records —
   X25519 + ML-KEM-768 → HKDF-SHA256 → AES-256-GCM (`pkg/overenc`). The **entire**
   request is sealed — method, path, headers, and body — so a TLS-terminating proxy
@@ -438,20 +445,23 @@ The wire contract is `c8s-verify-js/PROTOCOL.md`.
 
 The tls-lb nginx serves the static `cds-cert.pem`/`mesh-ca.pem` and reverse-proxies the dynamic `/.well-known/c8s/` paths to the sidecar on loopback.
 
-Trust is transitive from this point: the user verifies only the LB (and, through
-the served cert, the mesh CA); the in-cluster RA-TLS mesh vouches for the backend
-pods the LB talks to. **The client must pin both the measurement allowlist and the
-mesh CA** — a measurement alone proves "genuine audited code on real silicon", not
-"*my* cluster"; without the mesh-CA pin an attacker can present a genuine-but-
-attacker-operated LB (§6(5)).
+Under v2, trust is transitive from the identity-bound LB: the user verifies the
+LB measurement and pinned cluster identity; the verified LB implementation uses
+the in-cluster RA-TLS mesh for backend pods. **The client must pin both a non-empty
+measurement allowlist and the mesh CA** — a measurement alone proves "genuine
+audited code on real silicon", not "*my* cluster". The proof uses ECDSA, so cluster
+authentication is classical. X25519 + ML-KEM-768 provides hybrid session-key
+confidentiality; this path does not claim post-quantum authentication.
 
 **Client-side responsibilities and their downgrades** (all supplied out of band by
 the embedding app): the SDK **fails closed** with a typed error taxonomy
 (`nonce_mismatch`, `report_data_mismatch`, `measurement_denied`, `invalid_cert`,
-`key_binding`, …) — *unless* a downgrade is set. `requireFreshness=false`, empty
-`measurements`, or a missing `meshCaPem` each reduce the check to a **warning** and
-return `ok:true` with `warnings[]`; the relying app MUST inspect `warnings[]` or the
-guarantee is void. The WASM verifier's bare-`snp` path also omits several checks the
+`identity_binding`, …). Its default `requireClusterIdentity=true` policy rejects
+v1, an empty measurement allowlist, a missing `meshCaPem`, and disabled freshness.
+Setting `requireClusterIdentity=false` is an explicit legacy downgrade; in that
+mode `requireFreshness=false`, empty `measurements`, or a missing `meshCaPem` can
+reduce checks to warnings, and the result does not carry a cluster-identity
+guarantee. The WASM verifier's bare-`snp` path also omits several checks the
 Go/Rust verifiers enforce (§5 Addressable). Distributing a JS/WASM verifier over
 npm/CDN means the origin that ships the SPA also ships the verifier, and the PQ half
 rides a pre-1.0 `mlkem-wasm` dependency — supply-chain trust roots for this path.

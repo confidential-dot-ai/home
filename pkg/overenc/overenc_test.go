@@ -3,6 +3,7 @@ package overenc
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha512"
 	"testing"
 )
 
@@ -49,6 +50,57 @@ func TestHybridChannelRoundTrip(t *testing.T) {
 	got2, err := clientCh.Open(rec2, ResponseAAD())
 	if err != nil || string(got2) != "pong" {
 		t.Fatalf("reverse round-trip failed: %v %q", err, got2)
+	}
+}
+
+func TestIdentityChannelRoundTrip(t *testing.T) {
+	srv, err := GenerateServerKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcriptHash := bytes.Repeat([]byte{0xA5}, sha512.Size384)
+	clientCh, hs, err := ClientAgreeIdentity(srv.Public(), transcriptHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCh, err := srv.AgreeIdentity(hs, transcriptHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := clientCh.Seal([]byte("identity-bound"), RequestAAD())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := serverCh.Open(rec, RequestAAD())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "identity-bound" {
+		t.Fatalf("opened %q", got)
+	}
+}
+
+func TestIdentityChannelRejectsMismatchedTranscript(t *testing.T) {
+	srv, err := GenerateServerKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientHash := bytes.Repeat([]byte{0xA5}, sha512.Size384)
+	serverHash := bytes.Repeat([]byte{0x5A}, sha512.Size384)
+	clientCh, hs, err := ClientAgreeIdentity(srv.Public(), clientHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCh, err := srv.AgreeIdentity(hs, serverHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := clientCh.Seal([]byte("secret"), RequestAAD())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := serverCh.Open(rec, RequestAAD()); err == nil {
+		t.Fatal("mismatched identity transcript derived the same channel")
 	}
 }
 

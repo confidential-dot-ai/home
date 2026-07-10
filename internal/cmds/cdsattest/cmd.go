@@ -19,17 +19,20 @@ import (
 )
 
 type config struct {
-	host              string
-	port              int
-	logLevel          string
-	cdsCertFile       string
-	servingCertFile   string
-	evidenceFixture   string
-	attestationAPIURL string
-	platform          string
-	generation        string
-	sessionTTL        time.Duration
-	readHeaderTimeout time.Duration
+	host                 string
+	port                 int
+	logLevel             string
+	cdsCertFile          string
+	servingCertFile      string
+	meshIdentityCertFile string
+	meshIdentityKeyFile  string
+	meshIdentityCAFile   string
+	evidenceFixture      string
+	attestationAPIURL    string
+	platform             string
+	generation           string
+	sessionTTL           time.Duration
+	readHeaderTimeout    time.Duration
 
 	// over-encryption backend
 	upstream           string
@@ -58,6 +61,9 @@ func NewCmd() *cobra.Command {
 	f.StringVar(&cfg.logLevel, "log-level", "info", "log level: debug, info, warn, error")
 	f.StringVar(&cfg.cdsCertFile, "cds-cert-file", "", "optional PEM (LB leaf + mesh CA): also serve /.well-known/c8s/cds-cert.pem from the sidecar. Normally nginx serves this statically; leave empty.")
 	f.StringVar(&cfg.servingCertFile, "serving-cert-file", "", "path to the LB serving-leaf PEM (the cert nginx presents). Enables the tls-cert attestation binding (GET /.well-known/c8s/attestation?pq=false): report_data binds this leaf's SPKI. Re-read per request to follow get-cert rotation.")
+	f.StringVar(&cfg.meshIdentityCertFile, "mesh-identity-cert-file", "", "TEE-held mesh leaf PEM for identity-bound PQ v2 (re-read per request)")
+	f.StringVar(&cfg.meshIdentityKeyFile, "mesh-identity-key-file", "", "TEE-held mesh leaf private key for identity-bound PQ v2 (re-read per request)")
+	f.StringVar(&cfg.meshIdentityCAFile, "mesh-identity-ca-file", "", "mesh CA bundle that issued the v2 identity leaf (re-read per request)")
 	f.StringVar(&cfg.evidenceFixture, "evidence-fixture", "", "DEV ONLY: serve recorded SNP evidence from this file instead of the attestation-api")
 	f.StringVar(&cfg.attestationAPIURL, "attestation-api-url", "", "attestation-api URL (production evidence source)")
 	f.StringVar(&cfg.platform, "platform", "snp", "TEE platform")
@@ -123,12 +129,15 @@ func run(cfg config) error {
 	}
 
 	srv := NewServer(Config{
-		Logger:          logger,
-		Evidence:        provider,
-		CDSCertPEM:      cdsCertPEM,
-		ServingCertFile: cfg.servingCertFile,
-		Backend:         backend,
-		SessionTTL:      cfg.sessionTTL,
+		Logger:               logger,
+		Evidence:             provider,
+		CDSCertPEM:           cdsCertPEM,
+		ServingCertFile:      cfg.servingCertFile,
+		MeshIdentityCertFile: cfg.meshIdentityCertFile,
+		MeshIdentityKeyFile:  cfg.meshIdentityKeyFile,
+		MeshIdentityCAFile:   cfg.meshIdentityCAFile,
+		Backend:              backend,
+		SessionTTL:           cfg.sessionTTL,
 	})
 
 	addr := cfg.host + ":" + strconv.Itoa(cfg.port)

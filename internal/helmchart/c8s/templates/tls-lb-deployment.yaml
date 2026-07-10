@@ -156,12 +156,20 @@ spec:
             # publicTLS secret it is that cert (mounted below). Re-read per request, so
             # get-cert renewals are picked up.
             - --serving-cert-file={{ include "tls-lb.publicCertPath" . }}
+            # The identity-bound PQ v2 flow must use the TEE-held mesh
+            # credential, never the optional publicTLS Secret: report_data
+            # commits the hybrid session key to this leaf and the sidecar
+            # proves possession with its matching private key.
+            - --mesh-identity-cert-file={{ .Values.tlsLb.tlsMountPath }}/cert.pem
+            - --mesh-identity-key-file={{ .Values.tlsLb.tlsMountPath }}/key.pem
+            - --mesh-identity-ca-file={{ .Values.tlsLb.tlsMountPath }}/ca.pem
             # --cds-cert-file is intentionally NOT set: nginx serves the same cert
             # statically at /.well-known/c8s/cds-cert.pem from the shared cert volume
             # and hot-reloads it on get-cert renewal (SIGHUP), whereas cds-attest
             # would read it once at startup and embed a stale copy in every bundle.
-            # The cds_cert_pem is not bound to the attestation (report_data binds the
-            # session key), so the client pins the mesh CA out of band instead.
+            # Legacy v1 does not bind cds_cert_pem to attestation. The v2 PQ
+            # response re-reads and embeds the exact mesh leaf + issuing CA
+            # committed by report_data and its proof-of-possession signature.
             # Terminate over-encryption here and forward to the same workload
             # backend nginx proxies to. An http upstream is plaintext at the
             # app layer; pointed at a headless Service (an adopted workload),

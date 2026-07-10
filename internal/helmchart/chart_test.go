@@ -1623,6 +1623,9 @@ func TestChartRendersTLSLBAttestSidecar(t *testing.T) {
 		"--port=8800",
 		"--generation=milan",
 		"--attestation-api-url=http://",
+		"--mesh-identity-cert-file=/tls/cert.pem",
+		"--mesh-identity-key-file=/tls/key.pem",
+		"--mesh-identity-ca-file=/tls/ca.pem",
 		// The baseline mesh-wrapped upstream is a plain-HTTP workload upstream;
 		// the mTLS args render only for an https upstream.
 		"--upstream=http://c8s-infer.c8s-system.svc.cluster.local:8000",

@@ -1,5 +1,5 @@
 // Package cdsattest implements the tls-lb attestation + over-encryption sidecar:
-// the *dynamic* browser-facing endpoints of the c8s-verify/v1 protocol. The
+// the *dynamic* browser-facing endpoints of the c8s-verify v1/v2 protocol. The
 // tls-lb nginx front-end terminates public TLS, serves the static CDS/mesh-CA
 // certs, and reverse-proxies the attestation challenge, the handshake, and the
 // over-encrypted application paths to this sidecar on loopback. It lets an
@@ -56,16 +56,24 @@ type Config struct {
 	// report_data to this leaf's SPKI instead of a per-session over-encryption
 	// key. Empty disables the tls-cert binding.
 	ServingCertFile string
-	Backend         Backend // over-encrypted application backend (nil => EchoBackend)
-	SessionTTL      time.Duration
+	// MeshIdentity* are the TEE-held mesh leaf, matching private key, and CA
+	// bundle used by the identity-bound PQ v2 flow. They are deliberately
+	// separate from ServingCertFile, which may name a host-visible public TLS
+	// credential. All three files are re-read for each v2 attestation request.
+	MeshIdentityCertFile string
+	MeshIdentityKeyFile  string
+	MeshIdentityCAFile   string
+	Backend              Backend // over-encrypted application backend (nil => EchoBackend)
+	SessionTTL           time.Duration
 	// NonceTTL bounds how long a pending handshake nonce stays valid between
 	// the attestation fetch and the handshake POST. Defaults to SessionTTL.
 	NonceTTL time.Duration
 }
 
 type pendingSession struct {
-	key       *overenc.ServerKey
-	createdAt time.Time
+	key                *overenc.ServerKey
+	identityTranscript []byte
+	createdAt          time.Time
 }
 
 type establishedSession struct {
@@ -73,7 +81,7 @@ type establishedSession struct {
 	lastUsed time.Time
 }
 
-// Server serves the c8s-verify/v1 endpoints.
+// Server serves the c8s-verify v1 and v2 endpoints.
 type Server struct {
 	cfg     Config
 	log     *slog.Logger
@@ -155,11 +163,26 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 	// serving-leaf SPKI instead of a per-session over-encryption key. It is for
 	// clients that ride the validated upstream TLS (e.g. TEErminator Flow B)
 	// rather than the post-quantum tunnel. pq=true (or absent) is the default.
+	binding := r.URL.Query().Get("binding")
 	if r.URL.Query().Get("pq") == "false" {
+		if binding != "" {
+			writeErr(w, http.StatusBadRequest, "invalid_request", "pq=false cannot be combined with a PQ binding")
+			return
+		}
 		s.handleAttestationTLSCert(w, r, nonceB64, nonce)
 		return
 	}
+	switch binding {
+	case "", types.BindingOverEncryption:
+		s.handleAttestationOverEncryption(w, r, nonceB64, nonce, types.BindingOverEncryption)
+	case types.BindingOverEncryptionMeshIdentityV2:
+		s.handleAttestationOverEncryption(w, r, nonceB64, nonce, types.BindingOverEncryptionMeshIdentityV2)
+	default:
+		writeErr(w, http.StatusBadRequest, "invalid_request", "unsupported attestation binding")
+	}
+}
 
+func (s *Server) handleAttestationOverEncryption(w http.ResponseWriter, r *http.Request, nonceB64 string, nonce []byte, binding string) {
 	key, err := overenc.GenerateServerKey()
 	if err != nil {
 		s.log.Error("generate session key", "error", err)
@@ -168,9 +191,38 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 	}
 	pub := key.Public()
 
-	// report_data = SHA-384(x25519 || mlkem768 || nonce): binds the session key
-	// and the client nonce into the hardware report the verifier checks.
-	reportData := reportDataFor(pub, nonce)
+	version := "c8s-verify/v1"
+	certPEM := s.cfg.CDSCertPEM
+	var proof *types.MeshIdentityProof
+	var reportData []byte
+	switch binding {
+	case types.BindingOverEncryption:
+		// report_data = SHA-384(x25519 || mlkem768 || nonce).
+		reportData = reportDataFor(pub, nonce)
+	case types.BindingOverEncryptionMeshIdentityV2:
+		if len(nonce) != 32 {
+			writeErr(w, http.StatusBadRequest, "invalid_request", "identity-bound PQ requires a 32-byte nonce")
+			return
+		}
+		if s.cfg.MeshIdentityCertFile == "" || s.cfg.MeshIdentityKeyFile == "" || s.cfg.MeshIdentityCAFile == "" {
+			writeErr(w, http.StatusNotImplemented, "binding_unavailable", "identity-bound PQ is not configured on this LB")
+			return
+		}
+		identity, err := loadMeshIdentity(s.cfg.MeshIdentityCertFile, s.cfg.MeshIdentityKeyFile, s.cfg.MeshIdentityCAFile)
+		if err != nil {
+			s.log.Error("mesh identity binding unavailable", "error", err)
+			writeErr(w, http.StatusServiceUnavailable, "binding_unavailable", "identity-bound PQ credentials are temporarily unavailable")
+			return
+		}
+		reportData, proof, err = identity.bind(pub, nonce)
+		if err != nil {
+			s.log.Error("bind mesh identity", "error", err)
+			writeErr(w, http.StatusInternalServerError, "internal", "mesh identity binding failed")
+			return
+		}
+		version = "c8s-verify/v2"
+		certPEM = identity.bundlePEM
+	}
 
 	evidence, platform, generation, err := s.cfg.Evidence.Evidence(r.Context(), reportData)
 	if err != nil {
@@ -181,21 +233,26 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 
 	s.sweep()
 	s.mu.Lock()
-	s.pending[nonceB64] = pendingSession{key: key, createdAt: time.Now()}
+	pending := pendingSession{key: key, createdAt: time.Now()}
+	if binding == types.BindingOverEncryptionMeshIdentityV2 {
+		pending.identityTranscript = append([]byte(nil), reportData...)
+	}
+	s.pending[nonceB64] = pending
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, types.AttestationBundle{
-		Version:    "c8s-verify/v1",
+		Version:    version,
 		Platform:   platform,
 		Generation: generation,
 		Nonce:      nonceB64,
 		Evidence:   evidence,
-		CDSCertPEM: string(s.cfg.CDSCertPEM),
-		Binding:    types.BindingOverEncryption,
+		CDSCertPEM: string(certPEM),
+		Binding:    binding,
 		SessionPubKey: &types.SessionPublicKey{
 			X25519:   base64.RawURLEncoding.EncodeToString(pub.X25519),
 			MLKEM768: base64.RawURLEncoding.EncodeToString(pub.MLKEM768),
 		},
+		IdentityProof: proof,
 	})
 }
 
@@ -289,7 +346,13 @@ func (s *Server) handleHandshake(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	channel, err := entry.key.Agree(overenc.Handshake{ClientX25519: clientX, MLKEMCiphertext: ct}, nonce)
+	handshake := overenc.Handshake{ClientX25519: clientX, MLKEMCiphertext: ct}
+	var channel *overenc.Channel
+	if len(entry.identityTranscript) > 0 {
+		channel, err = entry.key.AgreeIdentity(handshake, entry.identityTranscript)
+	} else {
+		channel, err = entry.key.Agree(handshake, nonce)
+	}
 	if err != nil {
 		s.log.Warn("handshake agree failed", "error", err)
 		writeErr(w, http.StatusBadRequest, "channel_error", "key agreement failed")

@@ -105,6 +105,11 @@ final security model. Each bullet links to the tracking issue.
 - The sidecar's live evidence path requires `--attestation-api-url`; per-session
   binding of the over-encryption key into a fresh hardware report is enforced
   there. The `--evidence-fixture` path is DEV ONLY (fixed `report_data`).
+- The v1 compatibility binding commits only the session keys and nonce. Its
+  separately served certificate-chain check does not prove that the attested
+  session belongs to the pinned cluster. Browser clients should require the v2
+  `over-encryption+mesh-identity-v2` binding; v2 authentication currently uses
+  ECDSA and is not post-quantum.
 - An optional CDS-issued EAR over the bundle (`ear` field) is defined in the
   contract but not yet populated by the LB.
 - The over-encrypted tunnel is not streaming yet. The sidecar buffers each

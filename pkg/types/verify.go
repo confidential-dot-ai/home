@@ -2,15 +2,16 @@ package types
 
 import "encoding/json"
 
-// Browser-facing attestation + over-encryption wire types for the c8s-verify/v1
-// protocol served by the Load Balancer. These mirror c8s-verify-js/PROTOCOL.md
+// Browser-facing attestation + over-encryption wire types for the c8s-verify
+// v1 and v2 protocols served by the Load Balancer. These mirror
+// c8s-verify-js/PROTOCOL.md
 // and are consumed by the JavaScript client (c8s-verify-js) and any other
 // out-of-cluster verifier. All *_pubkey / handshake byte fields are base64url
 // (unpadded); the SNP evidence sub-fields use standard base64 (attestation-rs
 // SnpEvidence shape).
 
 // SessionPublicKey is the LB's per-session hybrid (X25519 + ML-KEM-768) public
-// key, bound into the hardware report_data as SHA-384(x25519 || mlkem768 || nonce).
+// key. The selected Binding defines the report_data transcript that commits it.
 type SessionPublicKey struct {
 	X25519   string `json:"x25519"`   // base64url, 32 bytes
 	MLKEM768 string `json:"mlkem768"` // base64url, 1184 bytes
@@ -25,16 +26,33 @@ const (
 	// BindingOverEncryption: report_data = SHA-384(x25519 || mlkem768 || nonce).
 	// The session key is bound, enabling the over-encryption handshake/tunnel.
 	BindingOverEncryption = "over-encryption"
+	// BindingOverEncryptionMeshIdentityV2 commits report_data to the hybrid
+	// session key, nonce, mesh leaf, and issuing mesh CA. IdentityProof then
+	// proves possession of that exact leaf's private key.
+	BindingOverEncryptionMeshIdentityV2 = "over-encryption+mesh-identity-v2"
 	// BindingTLSCert: report_data = SHA-384(serving_leaf_spki || nonce). The
 	// attestation is bound to the LB's TLS leaf, so a client verifies it against
 	// the certificate it already sees on the (mesh-CA-validated) connection.
 	BindingTLSCert = "tls-cert"
+
+	// MeshIdentityProofECDSASHA384 is the v2 proof-of-possession algorithm.
+	MeshIdentityProofECDSASHA384 = "ecdsa-sha384"
 )
 
+// MeshIdentityProof authenticates the PQ session transcript with the private
+// key corresponding to the mesh leaf in AttestationBundle.CDSCertPEM. Hashes
+// are base64url SHA-256; Signature is base64url ASN.1 DER ECDSA.
+type MeshIdentityProof struct {
+	Algorithm    string `json:"algorithm"`      // MeshIdentityProofECDSASHA384
+	LeafSHA256   string `json:"leaf_sha256"`    // base64url; exact leaf DER committed by report_data
+	MeshCASHA256 string `json:"mesh_ca_sha256"` // base64url; issuing CA DER committed by report_data
+	Signature    string `json:"signature"`      // base64url ASN.1 DER ECDSA signature
+}
+
 // AttestationBundle is the response body of
-// GET /.well-known/c8s/attestation?nonce=<b64url>[&pq=false].
+// GET /.well-known/c8s/attestation?nonce=<b64url>[&binding=...|&pq=false].
 type AttestationBundle struct {
-	Version    string          `json:"version"`      // "c8s-verify/v1"
+	Version    string          `json:"version"`      // "c8s-verify/v1" or "c8s-verify/v2"
 	Platform   string          `json:"platform"`     // "snp" today
 	Generation string          `json:"generation"`   // AMD gen: milan|genoa|turin
 	Nonce      string          `json:"nonce"`        // echoed client nonce (b64url)
@@ -46,6 +64,8 @@ type AttestationBundle struct {
 	// SessionPubKey is the per-session over-encryption key, present only for the
 	// over-encryption binding; omitted (nil) for the tls-cert binding.
 	SessionPubKey *SessionPublicKey `json:"session_pubkey,omitempty"`
+	// IdentityProof is present only for BindingOverEncryptionMeshIdentityV2.
+	IdentityProof *MeshIdentityProof `json:"identity_proof,omitempty"`
 }
 
 // HandshakeRequest is the body of POST /.well-known/c8s/handshake: the client
