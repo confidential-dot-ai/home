@@ -162,6 +162,9 @@ func buildValueArgs(ctx context.Context, cmd *cobra.Command, components []c8sCom
 	// (e.g. 0640 -> 640).
 	if !installResolveDigests {
 		for _, c := range components {
+			if c.externalImage {
+				continue
+			}
 			setArgs = append(setArgs, "--set-string", c.valuePrefix+".tag="+imageTag)
 		}
 	}

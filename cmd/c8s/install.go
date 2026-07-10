@@ -80,6 +80,12 @@ const (
 type c8sComponent struct {
 	valuePrefix string // values path, e.g. "cds.image" (renders {repository}@{digest})
 	repository  string // values.yaml default repository resolved against
+	// externalImage is true for images built outside the c8s repo (their tag /
+	// digest come from an upstream stream, e.g. ghcr.io/openbao/openbao:2.5.5).
+	// `c8s install` does NOT rewrite their tag from --image-tag and does NOT
+	// resolve their digest against the c8s CI tag — the chart's own default
+	// (or an operator's -f override) stands.
+	externalImage bool
 }
 
 // chartComponents reads the component set from the chart at chartPath via
@@ -118,7 +124,8 @@ func chartComponents(ctx context.Context, chartPath string) ([]c8sComponent, err
 		if err != nil {
 			return nil, fmt.Errorf("component %q: %w", valuePath, err)
 		}
-		comps = append(comps, c8sComponent{valuePrefix: valuePath, repository: repo})
+		external, _ := m["externalImage"].(bool)
+		comps = append(comps, c8sComponent{valuePrefix: valuePath, repository: repo, externalImage: external})
 	}
 	return comps, nil
 }
@@ -1621,6 +1628,9 @@ func appendResolvedDigestArgs(ctx context.Context, helmArgs []string, tag string
 // assembly is testable without a registry.
 func buildDigestArgs(helmArgs []string, tag string, components []c8sComponent, resolve func(ref string) (string, error)) ([]string, error) {
 	for _, c := range components {
+		if c.externalImage {
+			continue
+		}
 		repo := c.repository
 		digest, err := resolve(repo + ":" + tag)
 		if err != nil {

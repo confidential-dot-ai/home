@@ -577,15 +577,9 @@ func writeOutputs(cfg config, keyPEM []byte, result attestclient.CertificateResu
 		slog.Warn("ephemeral key used but --key-out not set, private key will be lost")
 	}
 
-	if cfg.OutPath != "" {
-		if err := fileutil.WriteAtomic(cfg.OutPath, []byte(result.Certificate), 0644); err != nil {
-			return fmt.Errorf("failed to write cert to %s: %w", cfg.OutPath, err)
-		}
-		slog.Info("certificate written", "path", cfg.OutPath)
-	} else {
-		fmt.Print(result.Certificate)
-	}
-
+	// The CA bundle lands before the cert: the cert file is the readiness
+	// sentinel c8s-cert-wait probes, so consumers gated on it (the injected
+	// secrets agent) must find the CA already on disk.
 	if cfg.CAOutPath != "" {
 		caPEM, err := caBundleFromChain([]byte(result.Certificate))
 		if err != nil {
@@ -595,6 +589,15 @@ func writeOutputs(cfg config, keyPEM []byte, result attestclient.CertificateResu
 			return fmt.Errorf("failed to write mesh CA to %s: %w", cfg.CAOutPath, err)
 		}
 		slog.Info("mesh CA bundle written", "path", cfg.CAOutPath)
+	}
+
+	if cfg.OutPath != "" {
+		if err := fileutil.WriteAtomic(cfg.OutPath, []byte(result.Certificate), 0644); err != nil {
+			return fmt.Errorf("failed to write cert to %s: %w", cfg.OutPath, err)
+		}
+		slog.Info("certificate written", "path", cfg.OutPath)
+	} else {
+		fmt.Print(result.Certificate)
 	}
 
 	if cfg.DiscoveryOutPath != "" {

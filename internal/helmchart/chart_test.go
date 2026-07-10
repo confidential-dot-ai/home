@@ -1294,6 +1294,142 @@ func TestChartRejectsInvalidAttestationApiNodePortWithNRI(t *testing.T) {
 	assertHelmFailMessage(t, out, "attestationApi.service.nodePort must be within the Kubernetes NodePort range 30000-32767 when nriImagePolicy.enabled=true (got 0)")
 }
 
+// secretBrokerArgs enables the secret-broker with its minimum required values.
+func secretBrokerArgs(args ...string) []string {
+	return append([]string{
+		"--set", "secretBroker.enabled=true",
+		"--set-string", "secretBroker.openbao.address=https://c8s-openbao.c8s-system.svc:8200",
+	}, args...)
+}
+
+// TestChartSecretBrokerRendersMeshComponent pins the broker's integration with
+// the shared getCertContainers pattern (c8s-cert sidecar + c8s-cert-wait gate)
+// and the operator flags that arm webhook-side secrets/LUKS injection.
+// nri is disabled: the digest-pinned agent image would otherwise trip the
+// uncovered_component_digest guard (covered by its own test below).
+func TestChartSecretBrokerRendersMeshComponent(t *testing.T) {
+	out, err := helmTemplate(t, secretBrokerArgs("--set", "nriImagePolicy.enabled=false")...)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	init := renderedDeploymentInitContainers(t, out, "c8s-secret-broker")
+	for _, name := range []string{"c8s-cert", "c8s-cert-wait"} {
+		if _, ok := findContainer(init, name); !ok {
+			t.Fatalf("secret-broker init container %q missing; have %v", name, containerNames(init))
+		}
+	}
+	dep := renderedDeployment(t, out, "c8s-secret-broker")
+	broker, ok := findContainer(dep.Spec.Template.Spec.Containers, "secret-broker")
+	if !ok {
+		t.Fatalf("secret-broker container missing; have %v", containerNames(dep.Spec.Template.Spec.Containers))
+	}
+	assertContainerArgs(t, broker,
+		"--peer-verify=ratls",
+		"--openbao-addr=https://c8s-openbao.c8s-system.svc:8200",
+		"--openbao-attested=true",
+	)
+	operatorArgs := renderedOperatorArgs(t, out)
+	for _, want := range []string{
+		"--secret-agent-command=bao",
+		"--secret-broker-url=https://c8s-secret-broker.c8s-system.svc:8443",
+	} {
+		if !slices.Contains(operatorArgs, want) {
+			t.Fatalf("operator args missing %q\n%v", want, operatorArgs)
+		}
+	}
+}
+
+// The injected OpenBao agent image is external (not tag-locked to the c8s
+// release) and ships digest-pinned in values, so image-policy enforcement can
+// admit the injected container: the derive path must seed it whenever the
+// broker is enabled, and the fail-closed floor guard must flag it when
+// derivation is off and the floor does not cover it.
+func TestChartAllowlistsSecretAgentImage(t *testing.T) {
+	const (
+		agentDigest = "sha256:00000000000000000000000000000000000000000000000000000000000000d1"
+		agentRepo   = "example.test/openbao"
+	)
+	t.Run("derived seed covers the agent image", func(t *testing.T) {
+		out, err := helmTemplate(t, secretBrokerArgs(
+			"--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true",
+			"--set-string", "secretAgent.image.repository="+agentRepo,
+			"--set-string", "secretAgent.image.digest="+agentDigest,
+		)...)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+		seed, err := pkgallowlist.ParseJSON([]byte(cm.Data["allowlist-seed.json"]))
+		if err != nil {
+			t.Fatalf("seed JSON does not parse: %v", err)
+		}
+		if got, want := seed.Digests[agentDigest], agentRepo+"@"+agentDigest; got != want {
+			t.Errorf("secret-agent seed entry = %q, want %q\nseed: %v", got, want, seed.Digests)
+		}
+	})
+
+	t.Run("fail-closed floor guard flags the uncovered agent digest", func(t *testing.T) {
+		out, err := helmTemplate(t, secretBrokerArgs()...)
+		if err == nil {
+			t.Fatalf("helm template succeeded, want uncovered_component_digest failure\n%s", out)
+		}
+		if got := parseValidationErrorKind(out); got != "uncovered_component_digest" {
+			t.Fatalf("validation kind = %q, want uncovered_component_digest\n%s", got, out)
+		}
+	})
+
+	// enabledPath gating: with the broker disabled (chart default) the pinned
+	// agent digest must be excluded from derivation and the floor guard — a
+	// disabled component's image must never be admitted or demanded.
+	t.Run("disabled broker: agent image neither derived nor guarded", func(t *testing.T) {
+		out, err := helmTemplate(t,
+			"--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true",
+			"--set-string", "secretAgent.image.repository="+agentRepo,
+			"--set-string", "secretAgent.image.digest="+agentDigest,
+		)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+		seed, err := pkgallowlist.ParseJSON([]byte(cm.Data["allowlist-seed.json"]))
+		if err != nil {
+			t.Fatalf("seed JSON does not parse: %v", err)
+		}
+		if _, ok := seed.Digests[agentDigest]; ok {
+			t.Errorf("secret-agent seed entry present with secretBroker disabled: %v", seed.Digests)
+		}
+	})
+}
+
+// TestChartRejectsBrokerRatlsUnderKata: under kata the in-guest mesh already
+// terminates and attests the broker's inbound TLS, so peerVerify=ratls is inert
+// — the chart must refuse it (see validations.yaml).
+func TestChartRejectsBrokerRatlsUnderKata(t *testing.T) {
+	out, err := helmTemplateKata(t, secretBrokerArgs()...)
+	if err == nil {
+		t.Fatalf("helm template succeeded, want broker_ratls_under_kata failure\n%s", out)
+	}
+	if got := parseValidationErrorKind(out); got != "broker_ratls_under_kata" {
+		t.Fatalf("validation kind = %q, want broker_ratls_under_kata\n%s", got, out)
+	}
+}
+
+// TestChartRejectsLUKSWithoutTEEShape: the injected c8s-luks-open container is
+// privileged; without per-pod kata CVMs or a node-as-CVM shape that privilege
+// would land on the real host, so the chart must refuse to arm the webhook.
+func TestChartRejectsLUKSWithoutTEEShape(t *testing.T) {
+	out, err := helmTemplate(t, secretBrokerArgs(
+		"--set", "attestationApi.enabled=false",
+		"--set", "nriImagePolicy.enabled=false",
+	)...)
+	if err == nil {
+		t.Fatalf("helm template succeeded, want luks_plain_baremetal failure\n%s", out)
+	}
+	if got := parseValidationErrorKind(out); got != "luks_plain_baremetal" {
+		t.Fatalf("validation kind = %q, want luks_plain_baremetal\n%s", got, out)
+	}
+}
+
 // parseValidationErrorKind extracts kind=<id> from helm's stderr when the
 // chart's `fail` message starts with `VALIDATION_ERROR kind=<id>:`. Returns
 // empty string if the marker is absent.

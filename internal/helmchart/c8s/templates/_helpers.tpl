@@ -490,7 +490,10 @@ cache_max_entries = 1024
 {{- range $c := .Values.c8sComponents -}}
 {{- $img := include "c8s.valueAtPath" (dict "root" $root.Values "path" $c.valuePath) | fromJson -}}
 {{- $enabled := true -}}
-{{- if $c.enabledPath -}}{{- $enabled = include "c8s.valueAtPath" (dict "root" $root.Values "path" $c.enabledPath) | fromJson -}}{{- end -}}
+{{- /* String compare, not fromJson: helm's fromJson decodes into a map, so a
+       bare boolean yields a truthy error-map and every enabledPath component
+       would count as enabled (over-allowlisting disabled components). */ -}}
+{{- if $c.enabledPath -}}{{- $enabled = eq (include "c8s.valueAtPath" (dict "root" $root.Values "path" $c.enabledPath)) "true" -}}{{- end -}}
 {{- $out = append $out (dict "name" $c.valuePath "image" $img "enabled" $enabled "cdsExempt" $c.cdsExempt) -}}
 {{- end -}}
 {{ $out | toJson }}

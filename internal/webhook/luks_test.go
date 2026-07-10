@@ -1,0 +1,242 @@
+package webhook
+
+import (
+	"strings"
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+func TestParseLUKSValueDefaults(t *testing.T) {
+	lv, err := parseLUKSValue("data", "dev=/dev/vdb,mount=/data,secret=secret/data/api/luks#passphrase")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// name is passthrough to volume name and default secretName
+	if lv.Name != "data" || lv.SecretName != "data" {
+		t.Errorf("name/secretName = %q/%q, want data/data", lv.Name, lv.SecretName)
+	}
+	if lv.Dev != "/dev/vdb" || lv.Mount != "/data" {
+		t.Errorf("dev/mount = %q/%q", lv.Dev, lv.Mount)
+	}
+	if lv.SecretPath != "secret/data/api/luks" || lv.SecretKey != "passphrase" {
+		t.Errorf("secretPath/secretKey = %q/%q", lv.SecretPath, lv.SecretKey)
+	}
+	// defaults
+	if lv.FSType != "ext4" || lv.Mode != "open" {
+		t.Errorf("fstype/mode defaults = %q/%q, want ext4/open", lv.FSType, lv.Mode)
+	}
+}
+
+func TestParseLUKSValueOverrides(t *testing.T) {
+	lv, err := parseLUKSValue("scratch",
+		"dev=/dev/vdc,mount=/scratch,secret=secret/data/api/scratch,fstype=xfs,mode=format-if-empty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lv.FSType != "xfs" || lv.Mode != "format-if-empty" {
+		t.Errorf("overrides not applied: fstype=%q mode=%q", lv.FSType, lv.Mode)
+	}
+	// secret without #field: SecretKey empty (agent templates whole KV JSON — but
+	// luks-open just wants the passphrase string, so an empty field is legal
+	// here only if the caller knows what they're doing; validation happens at
+	// c8s luks-open runtime, not at admission).
+	if lv.SecretKey != "" {
+		t.Errorf("expected empty SecretKey when no #field, got %q", lv.SecretKey)
+	}
+}
+
+func TestParseLUKSValueErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"missing dev", "mount=/data,secret=secret/data/api/luks#p", "dev= is required"},
+		{"missing mount", "dev=/dev/vdb,secret=secret/data/api/luks#p", "mount= must be an absolute path"},
+		{"relative mount", "dev=/dev/vdb,mount=data,secret=secret/data/api/luks#p", "mount= must be an absolute path"},
+		{"missing secret", "dev=/dev/vdb,mount=/data", "secret= is required"},
+		{"empty secret path", "dev=/dev/vdb,mount=/data,secret=#p", "secret= has an empty path"},
+		{"unknown key", "dev=/dev/vdb,mount=/data,secret=secret/data/x,zzz=abc", `unknown key "zzz"`},
+		{"unknown mode", "dev=/dev/vdb,mount=/data,secret=secret/data/x,mode=maybe", "unknown mode"},
+		{"not kv pair", "dev=/dev/vdb,justaword,mount=/data,secret=secret/data/x", "is not a key=value pair"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseLUKSValue("data", tc.value)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseLUKSValueInvalidName(t *testing.T) {
+	if _, err := parseLUKSValue("Bad_Name", "dev=/dev/vdb,mount=/data,secret=secret/data/api/luks"); err == nil {
+		t.Error("expected DNS-1123 name error")
+	}
+}
+
+func TestParseLUKSVolumesNilWhenAbsent(t *testing.T) {
+	vols, err := parseLUKSVolumes(map[string]string{"unrelated": "true"}, nil)
+	if err != nil || vols != nil {
+		t.Errorf("no luks-* → (nil,nil), got (%v, %v)", vols, err)
+	}
+}
+
+func TestParseLUKSVolumesRequiresSecretsInject(t *testing.T) {
+	_, err := parseLUKSVolumes(map[string]string{
+		luksAnnotationPrefix + "data": "dev=/dev/vdb,mount=/data,secret=secret/data/api/luks#p",
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), AnnotationSecretsInject) {
+		t.Errorf("want error mentioning secrets-inject, got %v", err)
+	}
+}
+
+func TestParseLUKSVolumesRequiresMatchingSecretsEntry(t *testing.T) {
+	secrets := &secretsInjection{Entries: []secretEntry{{Name: "other", Path: "secret/data/x"}}}
+	_, err := parseLUKSVolumes(map[string]string{
+		luksAnnotationPrefix + "data": "dev=/dev/vdb,mount=/data,secret=secret/data/api/luks#p",
+	}, secrets)
+	if err == nil || !strings.Contains(err.Error(), "not declared by a matching") {
+		t.Errorf("want error about missing matching secret entry, got %v", err)
+	}
+}
+
+func TestParseLUKSVolumesSortsByName(t *testing.T) {
+	secrets := &secretsInjection{Entries: []secretEntry{
+		{Name: "alpha", Path: "secret/data/x"}, {Name: "zulu", Path: "secret/data/y"},
+	}}
+	vols, err := parseLUKSVolumes(map[string]string{
+		luksAnnotationPrefix + "zulu":  "dev=/dev/vdc,mount=/z,secret=secret/data/y#p",
+		luksAnnotationPrefix + "alpha": "dev=/dev/vdb,mount=/a,secret=secret/data/x#p",
+	}, secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vols) != 2 || vols[0].Name != "alpha" || vols[1].Name != "zulu" {
+		t.Errorf("volumes not sorted: %+v", vols)
+	}
+}
+
+func luksTestConfig() Config {
+	c := secretsTestConfig()
+	c.LUKSOpenImage = "ghcr.io/confidential-dot-ai/c8s-operator:test"
+	return c
+}
+
+func TestMutatePodInjectsLUKSContainer(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+	inj := &injection{
+		WorkloadID: "api",
+		Secrets: &secretsInjection{
+			Entries: []secretEntry{{Name: "data", Path: "secret/data/api/luks", Field: "passphrase"}},
+		},
+		LUKS: []luksVolume{{
+			Name: "data", Dev: "/dev/vdb", Mount: "/data",
+			SecretName: "data", SecretPath: "secret/data/api/luks", SecretKey: "passphrase",
+			FSType: "ext4", Mode: "open",
+		}},
+	}
+	mutatePod(pod, inj, luksTestConfig())
+
+	// c8s-luks-open init container present, positioned after c8s-secrets-agent-init
+	openIdx, agentInitIdx := -1, -1
+	for i, c := range pod.Spec.InitContainers {
+		switch c.Name {
+		case "c8s-luks-open":
+			openIdx = i
+		case "c8s-secrets-agent-init":
+			agentInitIdx = i
+		}
+	}
+	if openIdx < 0 {
+		t.Fatal("c8s-luks-open init container not injected")
+	}
+	if agentInitIdx < 0 || openIdx < agentInitIdx {
+		t.Errorf("c8s-luks-open at %d must come after c8s-secrets-agent-init at %d", openIdx, agentInitIdx)
+	}
+	openC := pod.Spec.InitContainers[openIdx]
+	if openC.SecurityContext == nil || openC.SecurityContext.Privileged == nil || !*openC.SecurityContext.Privileged {
+		t.Errorf("c8s-luks-open must be privileged (found %+v)", openC.SecurityContext)
+	}
+	// --volume=data=/dev/vdb:data:ext4:open should be in args
+	joined := strings.Join(openC.Args, " ")
+	if !strings.Contains(joined, "--volume=data=/dev/vdb:data:ext4:open") {
+		t.Errorf("volume spec missing from args: %v", openC.Args)
+	}
+	// App container gets a volume mount at /data
+	found := false
+	for _, vm := range pod.Spec.Containers[0].VolumeMounts {
+		if vm.MountPath == "/data" && vm.Name == luksDataVolume {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("app container missing volume mount at /data (%+v)", pod.Spec.Containers[0].VolumeMounts)
+	}
+	// host-dev volume declared
+	hostDev := false
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "host-dev" && v.HostPath != nil && v.HostPath.Path == "/dev" {
+			hostDev = true
+		}
+	}
+	if !hostDev {
+		t.Error("host-dev hostPath volume not declared on pod")
+	}
+}
+
+// TestMutatePodInjectsMultipleLUKSVolumes proves every LUKS volume lands in the
+// app container (the shared c8s-luks-data volume is mounted once per subPath,
+// not deduped by volume name) and that a webhook reinvocation converges.
+func TestMutatePodInjectsMultipleLUKSVolumes(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+	inj := &injection{
+		WorkloadID: "api",
+		Secrets: &secretsInjection{Entries: []secretEntry{
+			{Name: "alpha", Path: "secret/data/api/a", Field: "p"},
+			{Name: "zulu", Path: "secret/data/api/z", Field: "p"},
+		}},
+		LUKS: []luksVolume{
+			{Name: "alpha", Dev: "/dev/vdb", Mount: "/a", SecretName: "alpha",
+				SecretPath: "secret/data/api/a", SecretKey: "p", FSType: "ext4", Mode: "open"},
+			{Name: "zulu", Dev: "/dev/vdc", Mount: "/z", SecretName: "zulu",
+				SecretPath: "secret/data/api/z", SecretKey: "p", FSType: "ext4", Mode: "open"},
+		},
+	}
+	mutatePod(pod, inj, luksTestConfig())
+	mutatePod(pod, inj, luksTestConfig())
+
+	app := pod.Spec.Containers[0]
+	for _, want := range []struct{ path, subPath string }{{"/a", "alpha"}, {"/z", "zulu"}} {
+		n := 0
+		for _, vm := range app.VolumeMounts {
+			if vm.Name == luksDataVolume && vm.MountPath == want.path && vm.SubPath == want.subPath {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("app mounts of %s at %s = %d, want 1 (%+v)", luksDataVolume, want.path, n, app.VolumeMounts)
+		}
+	}
+	open := 0
+	for _, c := range pod.Spec.InitContainers {
+		if c.Name == "c8s-luks-open" {
+			open++
+		}
+	}
+	if open != 1 {
+		t.Errorf("c8s-luks-open containers after two injections = %d, want 1", open)
+	}
+}

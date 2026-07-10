@@ -1049,11 +1049,11 @@ func TestAppendCvmModeInstallArgsRejectsAksWithTdx(t *testing.T) {
 // which exercise buildDigestArgs without reading a real chart. The chart-read
 // path (chartComponents) is covered separately by TestChartComponentsFromValues.
 var testComponents = []c8sComponent{
-	{"image", "ghcr.io/confidential-dot-ai/c8s-operator"},
-	{"attestationApi.image", "ghcr.io/confidential-dot-ai/attestation-api"},
-	{"cds.image", "ghcr.io/confidential-dot-ai/cds"},
-	{"ratlsMesh.image", "ghcr.io/confidential-dot-ai/ratls-mesh"},
-	{"nriImagePolicy.image", "ghcr.io/confidential-dot-ai/nri-image-policy"},
+	{valuePrefix: "image", repository: "ghcr.io/confidential-dot-ai/c8s-operator"},
+	{valuePrefix: "attestationApi.image", repository: "ghcr.io/confidential-dot-ai/attestation-api"},
+	{valuePrefix: "cds.image", repository: "ghcr.io/confidential-dot-ai/cds"},
+	{valuePrefix: "ratlsMesh.image", repository: "ghcr.io/confidential-dot-ai/ratls-mesh"},
+	{valuePrefix: "nriImagePolicy.image", repository: "ghcr.io/confidential-dot-ai/nri-image-policy"},
 }
 
 func TestBuildDigestArgsPinsEveryComponent(t *testing.T) {
@@ -1223,6 +1223,7 @@ func TestChartComponentsFromValues(t *testing.T) {
 		"cds.image":            "ghcr.io/confidential-dot-ai/cds",
 		"ratlsMesh.image":      "ghcr.io/confidential-dot-ai/ratls-mesh",
 		"nriImagePolicy.image": "ghcr.io/confidential-dot-ai/nri-image-policy",
+		"secretAgent.image":    "ghcr.io/openbao/openbao",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("chart components = %v, want %v", got, want)
