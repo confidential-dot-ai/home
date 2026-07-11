@@ -304,7 +304,8 @@ binary:
   established from the authenticated certificate issuance response.
   Chart-managed ratls-mesh accepts CA bundle updates only when each new CA is
   signed by an already trusted CA, so unauthenticated bundle reads cannot add
-  unrelated trust roots.
+  unrelated trust roots. This is an acceptance path only: nothing currently
+  produces such replacement bundles (§9).
 - CDS's allowlist writes (`POST`/`PUT`/`DELETE /allowlist`) are authorized by an
   operator key whose public half is pinned in `cds.operatorKeys`, verified at the
   application layer (not TLS mTLS — the listener stays RA-TLS). The `c8s
