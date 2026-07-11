@@ -289,6 +289,70 @@ func TestIdentityBoundAttestationRejectsUnknownBinding(t *testing.T) {
 	}
 }
 
+// PROTOCOL.md requires clients to percent-encode the binding value because its
+// literal "+" decodes as a space. A naive client that sends it unescaped must
+// get a loud 400, never a silent v1 downgrade.
+func TestIdentityBoundAttestationRejectsUnescapedBindingParam(t *testing.T) {
+	identity := writeTestMeshIdentity(t)
+	srv := NewServer(Config{
+		Evidence:             &capturingProvider{},
+		MeshIdentityCertFile: identity.certFile,
+		MeshIdentityKeyFile:  identity.keyFile,
+		MeshIdentityCAFile:   identity.caFile,
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	// Literal "+" in the raw query — the server decodes it as a space.
+	endpoint := ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 32)) +
+		"&binding=" + types.BindingOverEncryptionMeshIdentityV2
+	resp, err := http.Get(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (unescaped binding must not silently downgrade)", resp.StatusCode)
+	}
+}
+
+func TestIdentityBoundAttestationRejectsShortNonce(t *testing.T) {
+	identity := writeTestMeshIdentity(t)
+	srv := NewServer(Config{
+		Evidence:             &capturingProvider{},
+		MeshIdentityCertFile: identity.certFile,
+		MeshIdentityKeyFile:  identity.keyFile,
+		MeshIdentityCAFile:   identity.caFile,
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	// 16 bytes passes the generic minNonceBytes gate but not the v2 transcript's
+	// exact 32-byte requirement.
+	resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 16)) +
+		"&binding=" + url.QueryEscape(types.BindingOverEncryptionMeshIdentityV2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestAttestationRejectsPQFalseCombinedWithBinding(t *testing.T) {
+	srv := NewServer(Config{Evidence: &capturingProvider{}})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 32)) +
+		"&pq=false&binding=" + url.QueryEscape(types.BindingOverEncryptionMeshIdentityV2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
 // A binding that reaches handleAttestationOverEncryption without a report_data
 // case must fail closed, not serve evidence bound to nothing.
 func TestAttestationOverEncryptionFailsClosedOnUnroutedBinding(t *testing.T) {

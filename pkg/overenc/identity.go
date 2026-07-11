@@ -33,7 +33,7 @@ func IdentityTranscriptHash(pub PublicKey, nonce, leafDER, caDER []byte) ([]byte
 
 	leafHash := sha256.Sum256(leafDER)
 	caHash := sha256.Sum256(caDER)
-	h := sha512.New384()
+	var encoded []byte
 	for _, field := range [][]byte{
 		[]byte(identityTranscriptDomain),
 		pub.X25519,
@@ -42,11 +42,13 @@ func IdentityTranscriptHash(pub PublicKey, nonce, leafDER, caDER []byte) ([]byte
 		leafHash[:],
 		caHash[:],
 	} {
-		if err := writeTranscriptField(h, field); err != nil {
+		var err error
+		if encoded, err = appendLengthPrefixed(encoded, field); err != nil {
 			return nil, err
 		}
 	}
-	return h.Sum(nil), nil
+	sum := sha512.Sum384(encoded)
+	return sum[:], nil
 }
 
 // IdentityProofMessage returns the domain-separated message signed by the
@@ -57,33 +59,21 @@ func IdentityProofMessage(transcriptHash []byte) ([]byte, error) {
 		return nil, fmt.Errorf("overenc: identity transcript hash must be %d bytes, got %d", sha512.Size384, len(transcriptHash))
 	}
 	message := make([]byte, 0, 8+len(identityProofDomain)+len(transcriptHash))
-	message = appendLengthPrefixed(message, []byte(identityProofDomain))
-	message = appendLengthPrefixed(message, transcriptHash)
-	return message, nil
+	message, err := appendLengthPrefixed(message, []byte(identityProofDomain))
+	if err != nil {
+		return nil, err
+	}
+	return appendLengthPrefixed(message, transcriptHash)
 }
 
-type transcriptWriter interface {
-	Write([]byte) (int, error)
-}
-
-func writeTranscriptField(w transcriptWriter, field []byte) error {
+// appendLengthPrefixed is the single owner of the LP(field) wire encoding
+// shared by the transcript and the proof message (uint32_be length || field).
+func appendLengthPrefixed(dst, field []byte) ([]byte, error) {
 	if uint64(len(field)) > uint64(^uint32(0)) {
-		return fmt.Errorf("overenc: identity transcript field is too large")
+		return nil, fmt.Errorf("overenc: identity transcript field is too large")
 	}
-	var size [4]byte
-	binary.BigEndian.PutUint32(size[:], uint32(len(field)))
-	if _, err := w.Write(size[:]); err != nil {
-		return fmt.Errorf("overenc: hash identity transcript length: %w", err)
-	}
-	if _, err := w.Write(field); err != nil {
-		return fmt.Errorf("overenc: hash identity transcript field: %w", err)
-	}
-	return nil
-}
-
-func appendLengthPrefixed(dst, field []byte) []byte {
 	var size [4]byte
 	binary.BigEndian.PutUint32(size[:], uint32(len(field)))
 	dst = append(dst, size[:]...)
-	return append(dst, field...)
+	return append(dst, field...), nil
 }

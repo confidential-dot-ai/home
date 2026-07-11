@@ -41,7 +41,9 @@ const (
 
 // MeshIdentityProof authenticates the PQ session transcript with the private
 // key corresponding to the mesh leaf in AttestationBundle.CDSCertPEM. Hashes
-// are base64url SHA-256; Signature is base64url ASN.1 DER ECDSA.
+// are unpadded base64url SHA-256; Signature is unpadded base64url ASN.1 DER
+// ECDSA (minimal DER, as emitted by ecdsa.SignASN1 — the JS verifier rejects
+// redundant integer padding).
 type MeshIdentityProof struct {
 	Algorithm    string `json:"algorithm"`      // MeshIdentityProofECDSASHA384
 	LeafSHA256   string `json:"leaf_sha256"`    // base64url; exact leaf DER committed by report_data
