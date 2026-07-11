@@ -364,8 +364,8 @@ arrive without a matching TCP source IP, so CDS cannot compare the CSR node IP
 SAN to the workload's TCP source IP. DNS SAN and CN validation still run; DNS
 SANs are rejected unless explicitly allowed. Scheduled CA rotation is not wired:
 chart-managed CDS generates one CA in process memory at startup. A process restart
-generates an unrelated CA and requires mesh re-bootstrap; no `CARotator` production
-caller currently creates or publishes replacement bundles.
+generates an unrelated CA and requires mesh re-bootstrap; no `internal/issuer.CARotator`
+production caller currently creates or publishes replacement bundles.
 
 This is acceptable for demos, development, and environments that deliberately
 place CDS inside the intended trust boundary. It is not the final whitepaper
