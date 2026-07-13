@@ -96,7 +96,7 @@ func evidenceFromDiscovery(data []byte, source string) (*evidence, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode challenge: %w", err)
 	}
-	erd, err := ratls.ReportDataForKey(cert.PublicKey, challenge)
+	rd, err := ratls.ReportDataForKey(cert.PublicKey, challenge)
 	if err != nil {
 		return nil, fmt.Errorf("compute expected REPORTDATA: %w", err)
 	}
@@ -104,7 +104,7 @@ func evidenceFromDiscovery(data []byte, source string) (*evidence, error) {
 	return &evidence{
 		platform:    platformOrDefault(d.Attestation.Platform),
 		rawEvidence: d.Attestation.Evidence,
-		erd:         erd,
+		erd:         keyAnchor(rd),
 		fresh:       false,
 		source:      source,
 		certSHA256:  hex.EncodeToString(sum[:]),

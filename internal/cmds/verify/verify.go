@@ -165,7 +165,7 @@ unavailable (unreachable / unparseable).`,
 	f.UintVar(&cfg.minTCBTEE, "min-tcb-tee", 0, "minimum TEE TCB component")
 	f.UintVar(&cfg.minTCBSNP, "min-tcb-snp", 0, "minimum SNP firmware TCB component")
 	f.UintVar(&cfg.minTCBMicrocode, "min-tcb-microcode", 0, "minimum microcode TCB component")
-	f.StringVar(&cfg.expectedRDHex, "expected-report-data", "", "hex REPORTDATA override for bare evidence files (up to 64 bytes, zero-padded)")
+	f.StringVar(&cfg.expectedRDHex, "expected-report-data", "", "hex REPORTDATA / TPM-nonce anchor override for bare evidence files (1–64 bytes, exactly as bound by the producer)")
 
 	f.StringVarP(&cfg.output, "output", "o", "text", "output format: text or json")
 	f.BoolVar(&cfg.showEvidence, "show-evidence", false, "print the raw report fields")
@@ -198,7 +198,7 @@ func run(ctx context.Context, cfg config, out, errOut io.Writer) int {
 	// cluster runs. It auto-detects the platform and AMD product (incl. Siena)
 	// and fetches the VCEK from AMD KDS itself, so a bare RA-TLS report, a
 	// discovery doc, and an endpoint response all verify through one path.
-	var overrideERD *[64]byte
+	var overrideERD []byte
 	if cfg.expectedRDHex != "" {
 		erd, perr := parseExpectedReportData(cfg.expectedRDHex)
 		if perr != nil {
@@ -299,7 +299,7 @@ func buildPolicy(cfg config) (*ratls.VerifyPolicy, error) {
 	}, nil
 }
 
-func gatherEvidence(ctx context.Context, cfg config, overrideERD *[64]byte) (*evidence, error) {
+func gatherEvidence(ctx context.Context, cfg config, overrideERD []byte) (*evidence, error) {
 	if cfg.fromFile != "" {
 		data, err := os.ReadFile(cfg.fromFile)
 		if err != nil {

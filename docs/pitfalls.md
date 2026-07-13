@@ -2,6 +2,24 @@
 
 Gotchas for humans and agents working on c8s. Each cites the relevant code.
 
+## Attestation freshness anchor: pass it unpadded, never as the 64-byte field
+
+`internal/cmds/verify/evidence.go` (`evidence.erd`), `pkg/attestationclient/verify.go` (`verifySNPEvidence`)
+
+The expected REPORTDATA exists in two shapes that are not interchangeable:
+producers bind the **unpadded** anchor (48-byte SHA-384;
+`attestclient.MakeSNPRATLSAttestFunc` truncates to 48 before asking the
+attestation-api), while the SNP/TDX hardware `report_data` field is that anchor
+zero-padded to 64. The hardware-report verifiers zero-pad the expected value to
+the field size, but the Azure vTPM verifiers (az-snp, az-tdx) compare it **raw**
+against the quote's extraData — a pre-padded 64-byte value fails with
+`TPM nonce length mismatch: quote has 48 bytes, expected 64`. This broke
+`c8s verify` / `c8s cds verify` against every az-snp target while
+cluster-internal pinning (which shapes per platform in
+`attestationclient.verifySNPEvidence`) kept working. Carry the anchor unpadded
+and let each platform verifier do its own shaping; `c8s-verify-js/PROTOCOL.md`
+("az-snp") is the contract.
+
 ## Allowlist operator token: the body-binding must hash the exact bytes sent
 
 `pkg/operatorauth/operatorauth.go`, `pkg/allowlistclient/client.go`

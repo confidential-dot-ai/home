@@ -95,8 +95,8 @@ func TestEvidenceFromDiscovery(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ev.erd != want {
-			t.Error("erd must equal ReportDataForKey(cert.pubkey, challenge) — the issuance binding")
+		if !bytes.Equal(ev.erd, keyAnchor(want)) {
+			t.Error("erd must equal the unpadded ReportDataForKey(cert.pubkey, challenge) — the issuance binding")
 		}
 	})
 
@@ -158,10 +158,10 @@ func TestParseExpectedReportData(t *testing.T) {
 	if _, err := parseExpectedReportData(strings.Repeat("cd", 48)); err != nil {
 		t.Errorf("48-byte hex should parse: %v", err)
 	}
-	// Any 1–64 bytes is accepted and zero-padded — the binding digest length
+	// Any 1–64 bytes is accepted, kept unpadded — the binding digest length
 	// isn't fixed across platforms/schemes.
-	if _, err := parseExpectedReportData(strings.Repeat("ab", 10)); err != nil {
-		t.Errorf("10-byte hex should parse (zero-padded): %v", err)
+	if got, err := parseExpectedReportData(strings.Repeat("ab", 10)); err != nil || len(got) != 10 {
+		t.Errorf("10-byte hex should parse unpadded: %v (len %d)", err, len(got))
 	}
 	if _, err := parseExpectedReportData("zzzz"); err == nil {
 		t.Error("non-hex should fail")
@@ -182,11 +182,17 @@ func TestEndpointReportData_KnownVector(t *testing.T) {
 	h.Write(x)
 	h.Write(m)
 	h.Write(n)
-	var want [64]byte
-	copy(want[:], h.Sum(nil))
+	want := h.Sum(nil)
 
-	if got := endpointReportData(x, m, n); got != want {
+	got := endpointReportData(x, m, n)
+	if !bytes.Equal(got, want) {
 		t.Errorf("endpointReportData mismatch")
+	}
+	// Azure vTPM verifiers compare the anchor raw against the quote's 48-byte
+	// extraData — a zero-padded 64-byte anchor fails there (the az-snp CDS
+	// verify regression).
+	if len(got) != sha512.Size384 {
+		t.Errorf("anchor is %d bytes, want unpadded SHA-384 (%d)", len(got), sha512.Size384)
 	}
 }
 
@@ -225,7 +231,7 @@ func TestEvidenceFromEndpointJSON(t *testing.T) {
 		if !ev.fresh {
 			t.Error("expected fresh=true when challenge echoes")
 		}
-		if ev.erd != endpointReportData(x, m, nonce) {
+		if !bytes.Equal(ev.erd, endpointReportData(x, m, nonce)) {
 			t.Error("erd does not match expected report_data binding")
 		}
 	})
@@ -258,7 +264,7 @@ func TestEvidenceFromEndpointJSON(t *testing.T) {
 		if err != nil {
 			t.Fatalf("non-canonical key length should be accepted: %v", err)
 		}
-		if ev.erd != endpointReportData(shortX16, m, nonce) {
+		if !bytes.Equal(ev.erd, endpointReportData(shortX16, m, nonce)) {
 			t.Error("erd must bind the session-key bytes as provided")
 		}
 	})
@@ -315,7 +321,7 @@ func TestEvidenceFromEndpointJSON_RealShape(t *testing.T) {
 	if ev.platform != "snp" {
 		t.Errorf("platform = %q, want snp", ev.platform)
 	}
-	if ev.erd != endpointReportData(x, m, nonce) {
+	if !bytes.Equal(ev.erd, endpointReportData(x, m, nonce)) {
 		t.Error("erd does not match SHA-384(x25519‖mlkem768‖nonce)")
 	}
 	// The platform-specific evidence object is forwarded verbatim.
@@ -335,8 +341,7 @@ func TestParseRealSNPEvidence(t *testing.T) {
 	}
 
 	// The bare {platform, evidence} path consumes it directly.
-	var zeroERD [64]byte
-	bare, err := evidenceFromBareJSON(fixture, zeroERD, "fixture")
+	bare, err := evidenceFromBareJSON(fixture, make([]byte, 48), "fixture")
 	if err != nil {
 		t.Fatalf("evidenceFromBareJSON on the real fixture: %v", err)
 	}
@@ -372,8 +377,44 @@ func TestParseRealSNPEvidence(t *testing.T) {
 	if !bytes.Equal(ev.rawEvidence, env.Evidence) {
 		t.Error("real evidence object should round-trip verbatim through the endpoint parser")
 	}
-	if ev.erd != endpointReportData(x, m, nonce) {
+	if !bytes.Equal(ev.erd, endpointReportData(x, m, nonce)) {
 		t.Error("erd binding mismatch")
+	}
+}
+
+// TestVerifyRealAzSnpEvidence_UnpaddedAnchor drives real az-snp evidence (vTPM
+// quote extraData = ASCII "challenge", VCEK inline; vendored from
+// attestation-go's azsnp testdata) through the --from-file override path. The
+// anchor must reach the verifier unpadded: the Azure vTPM verifiers compare it
+// raw against the quote's extraData, so the historical zero-padding to 64
+// bytes failed every az-snp target with "TPM nonce length mismatch".
+func TestVerifyRealAzSnpEvidence_UnpaddedAnchor(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/azsnp-evidence-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, err := gatherFromFile(fixture, []byte("challenge"), "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.platform != "az-snp" {
+		t.Fatalf("platform = %q, want az-snp", ev.platform)
+	}
+	res, err := verifyInProcess(ev, &ratls.VerifyPolicy{}, nil)
+	// The pinned attestation-go cannot yet verify this v2 HCL report's hardware
+	// layer (VCEK product resolution + provisional firmware; fixed upstream), so
+	// until the next bump only the nonce gate is asserted. See docs/roadmap.md.
+	if err != nil && strings.Contains(err.Error(), "nonce") {
+		t.Fatalf("the unpadded anchor must clear the vTPM nonce check: %v", err)
+	}
+	if err == nil && (res.ReportDataMatch == nil || !*res.ReportDataMatch) {
+		t.Fatal("report_data_match must be affirmatively true")
+	}
+
+	// A different anchor still fails closed, at the nonce gate specifically.
+	ev.erd = []byte("not-the-nonce")
+	if _, err := verifyInProcess(ev, &ratls.VerifyPolicy{}, nil); err == nil || !strings.Contains(err.Error(), "nonce") {
+		t.Fatalf("wrong nonce must fail closed at the nonce check, got: %v", err)
 	}
 }
 
@@ -504,8 +545,7 @@ func TestGatherFromFile_RejectsExpectedReportDataOnCert(t *testing.T) {
 	// A certificate's binding is its key; an override would silently replace a
 	// real binding while still reporting "binds the certificate public key".
 	pemCert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("does-not-matter")})
-	var erd [64]byte
-	if _, err := gatherFromFile(pemCert, &erd, "file"); err == nil {
+	if _, err := gatherFromFile(pemCert, make([]byte, 48), "file"); err == nil {
 		t.Fatal("expected --expected-report-data to be rejected for a certificate file")
 	}
 }

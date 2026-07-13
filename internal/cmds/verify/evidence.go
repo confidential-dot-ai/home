@@ -49,8 +49,12 @@ type evidence struct {
 	platform string
 	// rawEvidence is the platform-specific evidence object, forwarded verbatim.
 	rawEvidence json.RawMessage
-	// erd is the expected REPORTDATA the verifier must find in the report.
-	erd [64]byte
+	// erd is the expected freshness anchor — the exact bytes the producer bound,
+	// unpadded (48-byte SHA-384 for c8s bindings). Hardware-report verifiers
+	// zero-pad it to the 64-byte REPORTDATA field; the Azure vTPM verifiers
+	// compare it raw against the quote's extraData, so a pre-padded value fails
+	// there (PROTOCOL.md "az-snp").
+	erd []byte
 	// fresh is true when erd binds a caller-supplied nonce, so a passing
 	// verification proves the evidence was produced for THIS check (not replayed).
 	fresh bool
@@ -122,7 +126,7 @@ func evidenceFromCert(cert *x509.Certificate, source string) (*evidence, error) 
 	if err != nil {
 		return nil, err
 	}
-	erd, err := ratls.ReportDataForKey(cert.PublicKey, nil)
+	rd, err := ratls.ReportDataForKey(cert.PublicKey, nil)
 	if err != nil {
 		return nil, fmt.Errorf("compute expected REPORTDATA: %w", err)
 	}
@@ -130,7 +134,7 @@ func evidenceFromCert(cert *x509.Certificate, source string) (*evidence, error) 
 	return &evidence{
 		platform:    platform,
 		rawEvidence: raw,
-		erd:         erd,
+		erd:         keyAnchor(rd),
 		fresh:       false,
 		source:      source,
 		certSHA256:  hex.EncodeToString(sum[:]),
@@ -258,22 +262,25 @@ func evidenceFromEndpointJSON(data, expectNonce []byte, source string) (*evidenc
 	}, nil
 }
 
-// endpointReportData computes REPORTDATA = SHA-384(x25519 ‖ mlkem768 ‖ nonce),
-// zero-padded from 48 to 64 bytes, per c8s-verify-js PROTOCOL.md.
-func endpointReportData(x25519, mlkem, nonce []byte) [64]byte {
+// endpointReportData computes the freshness anchor SHA-384(x25519 ‖ mlkem768 ‖
+// nonce) per c8s-verify-js PROTOCOL.md — unpadded (see evidence.erd).
+func endpointReportData(x25519, mlkem, nonce []byte) []byte {
 	h := sha512.New384()
 	h.Write(x25519)
 	h.Write(mlkem)
 	h.Write(nonce)
-	var erd [64]byte
-	copy(erd[:], h.Sum(nil))
-	return erd
+	return h.Sum(nil)
 }
 
+// keyAnchor extracts the unpadded SHA-384 anchor from ReportDataForKey's
+// zero-padded 64-byte REPORTDATA — the form producers bind (see
+// attestclient.MakeSNPRATLSAttestFunc) and Azure vTPM quotes carry raw.
+func keyAnchor(rd [64]byte) []byte { return rd[:sha512.Size384] }
+
 // gatherFromFile loads evidence from a saved PEM certificate or attestation
-// response JSON. overrideERD, when set, replaces the computed REPORTDATA — used
-// to inspect bare evidence that carries no key/session binding.
-func gatherFromFile(data []byte, overrideERD *[64]byte, source string) (*evidence, error) {
+// response JSON. overrideERD, when non-nil, replaces the computed REPORTDATA —
+// used to inspect bare evidence that carries no key/session binding.
+func gatherFromFile(data []byte, overrideERD []byte, source string) (*evidence, error) {
 	if block, _ := pem.Decode(data); block != nil && block.Type == "CERTIFICATE" {
 		if overrideERD != nil {
 			// A certificate's REPORTDATA binding is the certificate key; an
@@ -288,7 +295,7 @@ func gatherFromFile(data []byte, overrideERD *[64]byte, source string) (*evidenc
 		return evidenceFromCert(cert, source)
 	}
 	if overrideERD != nil {
-		ev, err := evidenceFromBareJSON(data, *overrideERD, source)
+		ev, err := evidenceFromBareJSON(data, overrideERD, source)
 		if err == nil {
 			return ev, nil
 		}
@@ -300,7 +307,7 @@ func gatherFromFile(data []byte, overrideERD *[64]byte, source string) (*evidenc
 // evidenceFromBareJSON parses a bare {platform, evidence:{attestation_report,
 // cert_chain:{vcek}}} object (no session keys) and binds the caller-supplied
 // REPORTDATA.
-func evidenceFromBareJSON(data []byte, erd [64]byte, source string) (*evidence, error) {
+func evidenceFromBareJSON(data []byte, erd []byte, source string) (*evidence, error) {
 	var r attestationResponse
 	if err := json.Unmarshal(data, &r); err != nil {
 		return nil, err
@@ -330,20 +337,18 @@ func joinAttestationURL(base string, nonce []byte) (string, error) {
 	return u.String(), nil
 }
 
-// parseExpectedReportData decodes a 64-byte (or 48-byte, zero-padded)
-// hex REPORTDATA override.
-func parseExpectedReportData(s string) (*[64]byte, error) {
+// parseExpectedReportData decodes the hex REPORTDATA / TPM-nonce anchor
+// override, keeping the caller's exact bytes (verifiers pad per platform —
+// see evidence.erd).
+func parseExpectedReportData(s string) ([]byte, error) {
 	raw, err := hex.DecodeString(strings.TrimSpace(s))
 	if err != nil {
 		return nil, fmt.Errorf("--expected-report-data is not hex: %w", err)
 	}
-	// REPORTDATA is a 64-byte field; the binding digest length isn't fixed across
-	// platforms/schemes (SHA-384 = 48, a raw nonce, etc.), so accept anything that
-	// fits and zero-pad. The only hard constraint is 1–64 bytes.
+	// The binding digest length isn't fixed across platforms/schemes (SHA-384 =
+	// 48, a raw nonce, etc.). The only hard constraint is 1–64 bytes.
 	if len(raw) == 0 || len(raw) > 64 {
 		return nil, fmt.Errorf("--expected-report-data is %d bytes, want 1–64", len(raw))
 	}
-	var erd [64]byte
-	copy(erd[:], raw)
-	return &erd, nil
+	return raw, nil
 }

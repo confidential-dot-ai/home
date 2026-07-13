@@ -22,7 +22,7 @@ import (
 // launched.
 func verifyInProcess(ev *evidence, policy *ratls.VerifyPolicy, minTCB *teetypes.SnpTcb) (*teetypes.VerificationResult, error) {
 	params := teetypes.VerifyParams{
-		ExpectedReportData: ev.erd[:],
+		ExpectedReportData: ev.erd,
 		AllowDebug:         policy.AllowDebug,
 		MinTCB:             minTCB,
 	}
