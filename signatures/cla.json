@@ -1,3 +1,12 @@
 {
-   "signedContributors": []
+  "signedContributors": [
+    {
+      "name": "CluEleSsUK",
+      "id": 3749956,
+      "comment_id": 4958583653,
+      "created_at": "2026-07-13T13:42:48Z",
+      "repoId": 1040957973,
+      "pullRequestNo": 64
+    }
+  ]
 }
