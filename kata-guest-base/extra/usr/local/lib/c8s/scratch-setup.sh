@@ -30,13 +30,11 @@ if [ -z "$SCRATCH" ]; then
 fi
 
 echo "scratch-setup: backing $MOUNT with dm-crypt on $SCRATCH"
-KEY=/run/confai-scratch.key
-( umask 077; head -c 64 /dev/urandom > "$KEY" )
-if ! cryptsetup open --batch-mode --type plain --cipher aes-xts-plain64 \
-        --key-size 512 --key-file "$KEY" "$SCRATCH" "$MAPPER"; then
-    echo "scratch-setup: cryptsetup failed; image store stays on tmpfs"; rm -f "$KEY"; exit 0
+# Key piped via stdin: never materialized as a file, held only in kernel RAM.
+if ! head -c 64 /dev/urandom | cryptsetup open --batch-mode --type plain \
+        --cipher aes-xts-plain64 --key-size 512 --key-file - "$SCRATCH" "$MAPPER"; then
+    echo "scratch-setup: cryptsetup failed; image store stays on tmpfs"; exit 0
 fi
-rm -f "$KEY"   # only needed to open; the mapping now holds the key in kernel RAM
 if ! mkfs.ext4 -q -F -m 0 "/dev/mapper/$MAPPER"; then
     echo "scratch-setup: mkfs failed; falling back to tmpfs"; cryptsetup close "$MAPPER"; exit 0
 fi

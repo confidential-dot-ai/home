@@ -185,6 +185,12 @@ jobs:
         working-directory: c8s
         run: make build-policy-monitor
 
+      # fetch.sh hard-fails without build/rtmr3-measurer; `make build` does
+      # not cover it (build: only depends on build-c8s).
+      - name: Build rtmr3-measurer binary
+        working-directory: c8s
+        run: make build-rtmr3-measurer
+
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.12.0
 
@@ -500,6 +506,13 @@ jobs:
           # an in-flight kernel change can still publish a branch-* image before
           # the snapshot is committed.
           CHECK_SNAPSHOT: ${{ (github.event.workflow_run.head_branch == 'main' || startsWith(github.event.workflow_run.head_branch, 'v')) && '1' || '0' }}
+          # Re-lay toolchain gate: root_hash is reproducible only for a
+          # matching host e2fsprogs/cryptsetup (build.sh logs the runner's
+          # versions as "re-lay toolchain:" and records them in
+          # manifest.json). Uncomment with the runner's confirmed versions to
+          # make drift fatal on the publish path.
+          # REPRO_E2FSPROGS_VERSION: "1.47.0"
+          # REPRO_CRYPTSETUP_VERSION: "2.7.0"
           # GPU variants are mandatory in CI. build.sh Step 6 grafts the
           # NVIDIA payload from the staged kata-static artifacts
           # (KATA_NVIDIA_CONFIDENTIAL_IMG / KATA_NVIDIA_VMLINUZ, exported by

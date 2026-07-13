@@ -1,152 +1,299 @@
 //go:build linux
 
-// Package rtmr3measurer is the in-VM workload measurer: it binds *which*
-// container a kata-qemu-tdx sandbox runs into the guest's attestation by
-// extending TDX RTMR[3] with the deployed image digest — dynamically, for any
-// image, with no baked allowlist.
+// Package rtmr3measurer is the in-VM workload measurer: it scans kata-agent's
+// container bundles under /run/kata-containers and extends TDX RTMR[3] with
+// each deployed workload's image digest, binding WHICH container ran into the
+// guest's attestation — dynamically, for any image, with no baked allowlist.
+// It is the measurement-only counterpart to policy-monitor (allowlist
+// enforcement); either or both may run.
 //
-// It is the measurement counterpart to policy-monitor (which enforces a baked
-// allowlist), and deliberately a SEPARATE component so the allowlist use case
-// stays untouched — a node can run either or both. kata-agent writes
-// /run/kata-containers/<cid>/config.json before it forks the container's init;
-// we read the digest from io.kubernetes.cri.image-name there and extend
-// RTMR[3]. As a baked systemd daemon (not a guest hook) it runs fine under the
-// locked agent policy.
-//
-// Requires a guest kernel that exposes the TDX RTMR-extend sysfs
-// (/sys/devices/virtual/misc/tdx_guest/measurements/, mainline >= 6.16).
-//
-// Extend convention (MUST match `tdx-measure rtmr3-from-images` and the
-// rtmr3-hook): event = SHA384("sha256:"+hex); RTMR[3] = extend(RTMR3, event).
-// RTMR[3] is hardware-append-only and the measurer is part of the dm-verity
-// root, so a workload can neither forge nor suppress its own measurement.
-//
-// Determinism: in the common one-workload-per-sandbox case (agent-sandbox runs
-// a single workload container plus the pause container), RTMR[3] is a single
-// deterministic extend. Each DISTINCT image is measured exactly once — restarts
-// and replicas (same image, different container id) are collapsed, since a
-// double-extend of an append-only register yields a value that matches no
-// golden and makes the pod unverifiable. A pod with multiple distinct workload
-// images extends them in first-seen (scan) order, which is not guaranteed
-// stable across runs; a verifier for such pods must account for ordering (or the
-// deployment should keep one workload image per sandbox).
+// The extend convention is pinned by pkg/rtmr3 — verifiers MUST build on that
+// package. Each distinct image is extended exactly once; the dedup log is
+// persisted to tmpfs so a daemon restart cannot re-extend the append-only
+// register. Design and rationale: docs/kata-guest-base.md
+// "Per-workload RTMR[3] measurement".
 package rtmr3measurer
 
 import (
-	"crypto/sha512"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/confidential-dot-ai/c8s/pkg/rtmr3"
 )
 
 const (
 	watchDir   = "/run/kata-containers"
 	rtmr3Sysfs = "/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384"
+	// statePath is the measured-digest log. /run is tmpfs: it survives a
+	// process restart and is wiped with the VM — the same lifetime as
+	// RTMR[3] itself. The /run/c8s dir is created by tmpfiles.d/c8s.conf.
+	statePath = "/run/c8s/rtmr3-measured"
+
+	scanInterval     = 1 * time.Second
+	readDirWarnEvery = 60 // scans between repeated cannot-read-watch-dir warns
 )
 
-// Kata names each container directory by its 64-hex container id; the
-// "shared"/"sandbox"/"image" entries never match and are ignored.
-var (
-	cidRe   = regexp.MustCompile(`^[a-f0-9]{64}$`)
-	hex64Re = regexp.MustCompile(`^[a-f0-9]{64}$`)
-)
-
-// Dedup state, both touched only from the single Run() scan loop (no lock):
-//
-//	seenCids        — cids we've already decided on, so we don't re-read
-//	                  config.json on every scan.
-//	measuredDigests — image digests already extended into RTMR[3]. THIS is the
-//	                  correctness-critical dedup: keyed on the digest (not the
-//	                  cid) so a container restart (same image, new cid) or a
-//	                  second replica of the same image does not double-extend
-//	                  the append-only register.
-var (
-	seenCids        = map[string]struct{}{}
-	measuredDigests = map[string]struct{}{}
-)
+// Kata names each container directory by its 64-hex container id ("shared"/
+// "sandbox"/"image" never match); the same pattern validates sha256 hex.
+var hex64Re = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 type ociSpec struct {
 	Annotations map[string]string `json:"annotations"`
 }
 
-// Run is the cobra-driven entry point (mirrors policymonitor.Run's shape).
-func Run(_ []string) error {
-	logger := slog.Default()
-	logger.Info("rtmr3-measurer starting", "watch_dir", watchDir, "sysfs", rtmr3Sysfs)
+// measurer holds the scan state. All fields are touched only from the single
+// run loop (no lock).
+type measurer struct {
+	logger    *slog.Logger
+	watchDir  string
+	statePath string
 
-	// Poll, don't inotify. kata-agent sets up /run/kata-containers as its own
-	// mount after this daemon starts at boot; an inotify watch added early binds
-	// the pre-mount inode and never sees the <cid> dirs created on the mounted
-	// fs. A 1s scan is immune to that (and to dropped events); the dedup in
-	// handle() (measuredDigests) makes each distinct image extend RTMR[3]
-	// exactly once — mandatory, since the register is append-only and a
-	// double-extend would corrupt it.
-	for {
-		if entries, err := os.ReadDir(watchDir); err == nil {
-			for _, e := range entries {
-				if e.IsDir() {
-					handle(logger, filepath.Join(watchDir, e.Name()))
-				}
-			}
-		}
-		time.Sleep(1 * time.Second)
+	extend       func(event [rtmr3.Size]byte) error // TDX sysfs write
+	readRegister func() ([rtmr3.Size]byte, error)   // TDX sysfs read
+
+	// seenCids: cids already decided, so config.json isn't re-read every
+	// scan; pruned as container dirs disappear. measuredDigests is the
+	// correctness-critical dedup — digests already extended, keyed on digest
+	// (not cid) so restarts/replicas of one image extend exactly once — and
+	// mirrors the statePath log (measuredOrder is its line order).
+	seenCids        map[string]struct{}
+	measuredDigests map[string]struct{}
+	measuredOrder   []string
+
+	configReadDeadline time.Duration
+	configReadInterval time.Duration
+	readDirFails       int
+}
+
+func newMeasurer(logger *slog.Logger) *measurer {
+	return &measurer{
+		logger:             logger,
+		watchDir:           watchDir,
+		statePath:          statePath,
+		extend:             extendSysfs,
+		readRegister:       readRegisterSysfs,
+		seenCids:           map[string]struct{}{},
+		measuredDigests:    map[string]struct{}{},
+		configReadDeadline: 2 * time.Second,
+		configReadInterval: 50 * time.Millisecond,
 	}
 }
 
-func handle(logger *slog.Logger, dir string) {
-	cid := filepath.Base(dir)
-	if !cidRe.MatchString(cid) {
-		return // "shared"/"sandbox"/"image" and other non-container entries
+// Run is the cobra-driven entry point (mirrors policymonitor.Run's shape).
+func Run(_ []string) error {
+	m := newMeasurer(slog.Default())
+	m.logger.Info("rtmr3-measurer starting",
+		"watch_dir", m.watchDir, "state", m.statePath, "sysfs", rtmr3Sysfs)
+	if err := m.loadState(); err != nil {
+		return err
 	}
-	if _, done := seenCids[cid]; done {
+	// Poll, don't inotify: kata-agent mounts /run/kata-containers after this
+	// daemon starts, so an early inotify watch binds the pre-mount inode and
+	// never fires. See docs/kata-guest-base.md — rtmr3-measurer.
+	for {
+		m.scanOnce()
+		time.Sleep(scanInterval)
+	}
+}
+
+// loadState reloads the measured-digest log after a daemon restart (RTMR[3]
+// keeps its extends; a fresh in-memory dedup would re-extend and corrupt it)
+// and repairs the one legal divergence: a crash after record() but before the
+// extend landed. The register is readable from the extend sysfs, so it
+// arbitrates which of the two happened.
+func (m *measurer) loadState() error {
+	if err := os.MkdirAll(filepath.Dir(m.statePath), 0o755); err != nil {
+		return fmt.Errorf("create state dir: %w", err)
+	}
+	b, err := os.ReadFile(m.statePath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil // first start this boot
+	}
+	if err != nil {
+		return fmt.Errorf("read measured-digest log %s: %w", m.statePath, err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "sha256:") || !hex64Re.MatchString(strings.TrimPrefix(line, "sha256:")) {
+			m.logger.Warn("ignoring malformed measured-digest log line", "line", line)
+			continue
+		}
+		if _, dup := m.measuredDigests[line]; dup {
+			continue
+		}
+		m.measuredDigests[line] = struct{}{}
+		m.measuredOrder = append(m.measuredOrder, line)
+	}
+	if len(m.measuredOrder) == 0 {
+		return nil
+	}
+	m.logger.Info("restart: reloaded measured-digest log", "count", len(m.measuredOrder))
+
+	reg, err := m.readRegister()
+	if err != nil {
+		m.logger.Warn("cannot read RTMR[3] to cross-check the reloaded log; keeping the log as dedup truth",
+			"error", err)
+		return nil
+	}
+	if reg == rtmr3.FromDigests(m.measuredOrder) {
+		return nil // register and log agree — clean restart
+	}
+	last := m.measuredOrder[len(m.measuredOrder)-1]
+	if reg == rtmr3.FromDigests(m.measuredOrder[:len(m.measuredOrder)-1]) {
+		// Crashed between record and extend: finish the recorded extend.
+		if err := m.extend(rtmr3.Event(last)); err != nil {
+			return fmt.Errorf("repair extend of recorded digest %s: %w", last, err)
+		}
+		m.logger.Info("repaired interrupted measurement", "digest", last)
+		return nil
+	}
+	// Matches neither fold: something else extended RTMR[3]. Never re-extend
+	// recorded digests — an extra extend is unrecoverable — just surface it.
+	m.logger.Error("RTMR[3] does not match the measured-digest log; this VM's workload attestation will not verify")
+	return nil
+}
+
+func (m *measurer) scanOnce() {
+	entries, err := os.ReadDir(m.watchDir)
+	if err != nil {
+		// Throttled: a permanently unreadable watch dir must not spin silently.
+		if m.readDirFails%readDirWarnEvery == 0 {
+			m.logger.Warn("cannot read watch dir",
+				"dir", m.watchDir, "error", err, "consecutive_failures", m.readDirFails+1)
+		}
+		m.readDirFails++
 		return
 	}
-	spec, err := readConfig(filepath.Join(dir, "config.json"))
+	m.readDirFails = 0
+	present := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		present[e.Name()] = struct{}{}
+		m.handle(filepath.Join(m.watchDir, e.Name()))
+	}
+	// Prune decided cids whose dirs are gone (container removed) so the map
+	// cannot grow unbounded in a container-churning guest. Cids are never
+	// reused; measuredDigests intentionally mirrors the register instead.
+	for cid := range m.seenCids {
+		if _, ok := present[cid]; !ok {
+			delete(m.seenCids, cid)
+		}
+	}
+}
+
+func (m *measurer) handle(dir string) {
+	cid := filepath.Base(dir)
+	if !hex64Re.MatchString(cid) {
+		return // "shared"/"sandbox"/"image" and other non-container entries
+	}
+	if _, done := m.seenCids[cid]; done {
+		return
+	}
+	spec, err := m.readConfig(filepath.Join(dir, "config.json"))
 	if err != nil {
 		return // config.json not written yet; retry next scan (do NOT mark seen)
 	}
-	seenCids[cid] = struct{}{} // decided this cid — don't re-read it every scan
+	m.seenCids[cid] = struct{}{} // decided this cid — don't re-read it every scan
 
-	// Skip the pause/sandbox container — it's the measured rootfs, not a
-	// workload, and carries no image-name annotation.
+	// The pause/sandbox container is the measured rootfs, not a workload,
+	// and carries no image-name annotation.
 	if spec.Annotations["io.kubernetes.cri.container-type"] == "sandbox" {
 		return
 	}
 	digest, ok := extractDigest(spec.Annotations)
 	if !ok {
-		// Measure-only: unlike policy-monitor we do not kill; an unpinned image
-		// simply isn't reflected in RTMR[3], so its quote won't match any
-		// expected digest and a relying party rejects it there.
-		logger.Warn("no image digest annotation; not measurable (pin the image by digest)", "cid", cid)
+		// Measure-only: unlike policy-monitor we do not kill; an unpinned
+		// image simply isn't reflected in RTMR[3], so a relying party
+		// rejects its quote there.
+		m.logger.Warn("no image digest annotation; not measurable (pin the image by digest)", "cid", cid)
 		return
 	}
-	// Correctness dedup: extend each distinct image exactly once. A restart of
-	// this container (new cid, same digest) or a second replica of the same
-	// image must NOT extend again — RTMR[3] is append-only and a double-extend
-	// corrupts the attested value.
-	if _, done := measuredDigests[digest]; done {
-		logger.Info("image already measured into RTMR[3]; skipping duplicate (restart or replica)", "cid", cid, "digest", digest)
+	if _, done := m.measuredDigests[digest]; done {
+		m.logger.Info("image already measured into RTMR[3]; skipping duplicate (restart or replica)",
+			"cid", cid, "digest", digest)
 		return
 	}
-	if err := extendRTMR3(digest); err != nil {
-		// Not marked measured, so a later cid with this digest can retry.
-		logger.Error("extend RTMR[3] failed", "cid", cid, "digest", digest, "error", err)
+	m.measure(cid, digest)
+}
+
+// measure records the digest in the log, then extends. Record-first means a
+// crash between the two can only UNDER-extend — repaired from the register
+// readback at next start — never double-extend, which the append-only
+// register cannot recover from.
+func (m *measurer) measure(cid, digest string) {
+	if err := m.record(digest); err != nil {
+		m.logger.Error("record measured digest failed; not extending",
+			"cid", cid, "digest", digest, "error", err)
 		return
 	}
-	measuredDigests[digest] = struct{}{}
-	logger.Info("measured workload into RTMR[3]", "cid", cid, "digest", digest)
+	if err := m.extend(rtmr3.Event(digest)); err != nil {
+		// Roll the log back so it keeps matching the register and a later
+		// cid with this digest can retry.
+		m.unrecordLast(digest)
+		m.logger.Error("extend RTMR[3] failed", "cid", cid, "digest", digest, "error", err)
+		return
+	}
+	m.measuredDigests[digest] = struct{}{}
+	m.logger.Info("measured workload into RTMR[3]", "cid", cid, "digest", digest)
+}
+
+func (m *measurer) record(digest string) error {
+	f, err := os.OpenFile(m.statePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	_, werr := f.WriteString(digest + "\n")
+	cerr := f.Close()
+	if werr != nil {
+		return werr
+	}
+	if cerr != nil {
+		return cerr
+	}
+	m.measuredOrder = append(m.measuredOrder, digest)
+	return nil
+}
+
+// unrecordLast rewrites the log without the just-appended digest (atomic via
+// rename; a crash mid-rewrite leaves the recorded-but-not-extended shape the
+// startup repair resolves).
+func (m *measurer) unrecordLast(digest string) {
+	if n := len(m.measuredOrder); n > 0 && m.measuredOrder[n-1] == digest {
+		m.measuredOrder = m.measuredOrder[:n-1]
+	}
+	var sb strings.Builder
+	for _, d := range m.measuredOrder {
+		sb.WriteString(d)
+		sb.WriteByte('\n')
+	}
+	tmp := m.statePath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(sb.String()), 0o600); err == nil {
+		err = os.Rename(tmp, m.statePath)
+		if err != nil {
+			m.logger.Error("rewrite measured-digest log failed", "error", err)
+		}
+	} else {
+		m.logger.Error("rewrite measured-digest log failed", "error", err)
+	}
 }
 
 // readConfig reads config.json with a short retry, since a scan can catch the
 // <cid> dir a moment before kata-agent has written the file.
-func readConfig(path string) (*ociSpec, error) {
-	deadline := time.Now().Add(2 * time.Second)
+func (m *measurer) readConfig(path string) (*ociSpec, error) {
+	deadline := time.Now().Add(m.configReadDeadline)
 	var lastErr error
 	for {
 		b, err := os.ReadFile(path)
@@ -163,7 +310,7 @@ func readConfig(path string) (*ociSpec, error) {
 		if time.Now().After(deadline) {
 			return nil, lastErr
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(m.configReadInterval)
 	}
 }
 
@@ -199,12 +346,25 @@ func normalizeDigest(s string) (string, error) {
 	return s, nil
 }
 
-// extendRTMR3 extends RTMR[3] with SHA384(canonical digest). The kernel TSM
-// sysfs write performs TDG.MR.RTMR.EXTEND: RTMR3 = SHA384(RTMR3 ‖ event).
-func extendRTMR3(canonicalDigest string) error {
-	event := sha512.Sum384([]byte(canonicalDigest))
+// extendSysfs performs TDG.MR.RTMR.EXTEND via the kernel TSM sysfs write:
+// RTMR3 = SHA384(RTMR3 ‖ event). Needs mainline >= 6.16.
+func extendSysfs(event [rtmr3.Size]byte) error {
 	if err := os.WriteFile(rtmr3Sysfs, event[:], 0); err != nil {
 		return fmt.Errorf("write %s: %w", rtmr3Sysfs, err)
 	}
 	return nil
+}
+
+// readRegisterSysfs reads the current RTMR[3] value from the same node.
+func readRegisterSysfs() ([rtmr3.Size]byte, error) {
+	var reg [rtmr3.Size]byte
+	b, err := os.ReadFile(rtmr3Sysfs)
+	if err != nil {
+		return reg, err
+	}
+	if len(b) != rtmr3.Size {
+		return reg, fmt.Errorf("read %s: got %d bytes, want %d", rtmr3Sysfs, len(b), rtmr3.Size)
+	}
+	copy(reg[:], b)
+	return reg, nil
 }
