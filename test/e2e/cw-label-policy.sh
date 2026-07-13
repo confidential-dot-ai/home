@@ -63,4 +63,38 @@ expect_deny "pod created with cw label but no annotation" \
   kubectl run spoof --namespace "$ns" --image=registry.k8s.io/pause:3.9 \
     --restart=Never --labels=confidential.ai/cw=spoof --dry-run=server
 
+# An opted-in pod that smuggles its own container under the reserved c8s-cert
+# name to shadow the injected sidecar is denied by the webhook's reserved-name
+# guard (rejectReservedCertContainer). The webhook runs on CREATE and denies
+# before the pod is ever mutated, so this holds independent of the VAP.
+reserved_manifest=$(mktemp)
+cat >"$reserved_manifest" <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: reserved-name
+  namespace: $ns
+  annotations:
+    confidential.ai/cw: spoof
+spec:
+  containers:
+    - name: app
+      image: registry.k8s.io/pause:3.9
+    - name: c8s-cert
+      image: registry.k8s.io/pause:3.9
+YAML
+expect_deny "cw pod smuggling a reserved c8s-cert container" \
+  "reserved" -- \
+  kubectl apply --dry-run=server -f "$reserved_manifest"
+rm -f "$reserved_manifest"
+
+# Canary: a legitimate cw pod created through the webhook is admitted — the
+# webhook injects the c8s-cert sidecar and the matching label, satisfying the
+# sidecar-presence VAP rule. A broken hasCertSidecar CEL would deny every cw
+# pod, so this proves the new rule does not over-deny.
+kubectl run cw-ok --namespace "$ns" --image=registry.k8s.io/pause:3.9 \
+  --restart=Never --annotations=confidential.ai/cw=cwok --dry-run=server >/dev/null \
+  || fail "a webhook-injected cw pod was denied; the sidecar-presence VAP or webhook is misfiring"
+echo "ok: webhook-injected cw pod admitted"
+
 echo "PASS: cw-label integrity policy enforced"

@@ -2972,6 +2972,19 @@ func TestChartCwLabelIntegrityPolicyRendersByDefault(t *testing.T) {
 	}) {
 		t.Fatalf("policy has no oldObject immutability validation: %+v", policy.Spec.Validations)
 	}
+	// The cw label must not exist without the injected c8s-cert sidecar, or a
+	// pod could keep workload identity while shedding attestation-bound
+	// injection (webhook pod_mutator.go, replaceInitContainer / VAP backstop).
+	if !slices.ContainsFunc(policy.Spec.Variables, func(v admissionregv1.Variable) bool {
+		return v.Name == "hasCertSidecar" && strings.Contains(v.Expression, "initContainers")
+	}) {
+		t.Fatalf("policy missing hasCertSidecar variable: %+v", policy.Spec.Variables)
+	}
+	if !slices.ContainsFunc(policy.Spec.Validations, func(v admissionregv1.Validation) bool {
+		return strings.Contains(v.Expression, "hasCertSidecar")
+	}) {
+		t.Fatalf("policy has no c8s-cert sidecar-presence validation: %+v", policy.Spec.Validations)
+	}
 	var binding admissionregv1.ValidatingAdmissionPolicyBinding
 	if !findDoc(t, out, "ValidatingAdmissionPolicyBinding", "c8s-cw-label-integrity", &binding) {
 		t.Fatalf("missing cw-label-integrity ValidatingAdmissionPolicyBinding\n%s", out)

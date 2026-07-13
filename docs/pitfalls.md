@@ -20,6 +20,35 @@ cluster-internal pinning (which shapes per platform in
 and let each platform verifier do its own shaping; `c8s-verify-js/PROTOCOL.md`
 ("az-snp") is the contract.
 
+## get-cert injection integrity is name-based — reserve the name, don't trust it
+
+`internal/webhook/pod_mutator.go`, `internal/helmchart/c8s/templates/cw-label-integrity-policy.yaml`
+
+The injected mesh-cert sidecar is named `c8s-cert`, and the webhook stamps the
+`confidential.ai/cw` label (workload Service membership) only when it injects.
+So the identity and the sidecar are meant to be inseparable — but the name and
+the `confidential.ai/c8s-injected` marker are just pod fields an author can
+also set. The original idempotency check skipped injection when a container of
+that name already existed and gated injection on the marker, so a pod could
+pre-declare its own `c8s-cert` (or preset the marker) to keep the cw identity
+while shedding the real, attestation-bound sidecar — no VAP checked sidecar
+presence, only `label == annotation`.
+
+Injection is now idempotent **by reconstruction**, not by trust:
+`replaceInitContainer` drops any pre-existing `c8s-cert` init container and
+prepends the operator-built one (so a decoy is overwritten, and a reinvocation
+converges), `rejectReservedCertContainer` denies a `c8s-cert` in the
+regular/ephemeral lists (which the init-slot rebuild cannot reach), and the
+marker no longer gates injection. The `cw-label-integrity` VAP backstops it in
+the API server: a pod carrying the `confidential.ai/cw` label must declare a
+`c8s-cert` init container with `restartPolicy: Always`, so the label cannot
+exist without the sidecar even on paths the CREATE-only webhook misses. The VAP
+check is structural (name + native-sidecar restartPolicy), matching
+kata-enforcement's "pin the contract, not the digest"; the webhook owns the
+exact image/args. The reinject sweep (`internal/controller/reinject_sweep.go`)
+still keys on the marker, but it keys on the cw *annotation*, not the label, so
+a spoofed marker there yields no Service membership.
+
 ## Allowlist operator token: the body-binding must hash the exact bytes sent
 
 `pkg/operatorauth/operatorauth.go`, `pkg/allowlistclient/client.go`

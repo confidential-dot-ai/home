@@ -810,3 +810,174 @@ func TestHandleSANOverrideWinsOverDerivation(t *testing.T) {
 		t.Fatalf("%s args %v missing --san=api.default.svc", initContainers[0].Name, initContainers[0].Args)
 	}
 }
+
+// TestMutatePodReplacesPreexistingCertContainer proves injection is by
+// reconstruction: a pod that pre-declares its own c8s-cert init container to
+// shed the real one does not win — the operator-built sidecar replaces the
+// decoy rather than being skipped.
+func TestMutatePodReplacesPreexistingCertContainer(t *testing.T) {
+	decoy := int64(0)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{{
+				Name:            "c8s-cert",
+				Image:           "attacker/pause:latest",
+				Command:         []string{"sleep", "infinity"},
+				SecurityContext: &corev1.SecurityContext{RunAsUser: &decoy},
+			}},
+			Containers: []corev1.Container{{Name: "app"}},
+		},
+	}
+
+	mutatePod(pod, &injection{WorkloadID: "api"}, Config{
+		GetCertImage:      "ghcr.io/confidential-dot-ai/c8s-operator:test",
+		CDSURL:            "http://cds.c8s-system.svc:8443",
+		AttestationApiURL: "http://attestation-api.c8s-system.svc:8400",
+		CertDir:           "/etc/c8s/certs",
+	})
+
+	certs := 0
+	for _, c := range pod.Spec.InitContainers {
+		if c.Name == "c8s-cert" {
+			certs++
+		}
+	}
+	if certs != 1 {
+		t.Fatalf("c8s-cert init containers = %d, want exactly 1 (real sidecar replaces the decoy)", certs)
+	}
+	got := pod.Spec.InitContainers[0]
+	if got.Name != "c8s-cert" {
+		t.Fatalf("init[0] = %q, want c8s-cert leading the list", got.Name)
+	}
+	if got.Image != "ghcr.io/confidential-dot-ai/c8s-operator:test" {
+		t.Fatalf("c8s-cert image = %q, want the operator get-cert image (decoy survived)", got.Image)
+	}
+	if !hasArg(got.Args, "--cds-url=http://cds.c8s-system.svc:8443") {
+		t.Fatalf("c8s-cert args %v are not operator-built (decoy survived)", got.Args)
+	}
+	if got.RestartPolicy == nil || *got.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Fatalf("c8s-cert restartPolicy = %#v, want Always", got.RestartPolicy)
+	}
+}
+
+// TestMutatePodInjectionIsIdempotent proves a reinvocation (mutatePod applied
+// twice, as reinvocationPolicy: IfNeeded can trigger) converges: one sidecar,
+// one cert volume, one mount per container.
+func TestMutatePodInjectionIsIdempotent(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+	cfg := Config{
+		GetCertImage:      "img",
+		CDSURL:            "http://cds",
+		AttestationApiURL: "http://attestation-api",
+		CertDir:           "/etc/c8s/certs",
+	}
+	mutatePod(pod, &injection{WorkloadID: "api"}, cfg)
+	mutatePod(pod, &injection{WorkloadID: "api"}, cfg)
+
+	if got := len(pod.Spec.InitContainers); got != 1 {
+		t.Fatalf("init containers = %d after two injections, want 1", got)
+	}
+	volumes := 0
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "c8s-certs" {
+			volumes++
+		}
+	}
+	if volumes != 1 {
+		t.Fatalf("c8s-certs volumes = %d after two injections, want 1", volumes)
+	}
+	for _, c := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
+		mounts := 0
+		for _, mnt := range c.VolumeMounts {
+			if mnt.Name == "c8s-certs" {
+				mounts++
+			}
+		}
+		if mounts != 1 {
+			t.Fatalf("container %s c8s-certs mounts = %d, want 1", c.Name, mounts)
+		}
+	}
+}
+
+// TestHandleRejectsReservedCertContainerName proves an opted-in pod cannot park
+// its own container under the reserved c8s-cert name (in the regular list) to
+// shadow the injected sidecar — the collision is rejected at admission.
+func TestHandleRejectsReservedCertContainerName(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	m := &podMutator{
+		decoder: admission.NewDecoder(scheme),
+		cfg: Config{
+			GetCertImage: "ghcr.io/confidential-dot-ai/c8s-operator:test",
+			CDSURL:       "http://cds.c8s-system.svc:8443",
+			CertDir:      "/etc/c8s/certs",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "app"},
+			{Name: "c8s-cert", Image: "attacker/pause"},
+		}},
+	}
+	raw, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := m.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{Namespace: "default", Object: runtime.RawExtension{Raw: raw}},
+	})
+	if resp.Allowed {
+		t.Fatal("Handle admitted a cw pod with a reserved c8s-cert container; want denial")
+	}
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "reserved") {
+		t.Fatalf("denial message = %+v, want it to mention the reserved name", resp.Result)
+	}
+}
+
+// TestHandleInjectsDespitePresetInjectedMarker proves the
+// confidential.ai/c8s-injected marker no longer suppresses injection: a pod
+// that presets it (with no real sidecar) is still given the c8s-cert sidecar,
+// so the marker cannot be used to skip attestation-bound injection.
+func TestHandleInjectsDespitePresetInjectedMarker(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	m := &podMutator{
+		decoder: admission.NewDecoder(scheme),
+		cfg: Config{
+			GetCertImage:      "ghcr.io/confidential-dot-ai/c8s-operator:test",
+			CDSURL:            "http://cds.c8s-system.svc:8443",
+			AttestationApiURL: "http://attestation-api.c8s-system.svc:8400",
+			CertDir:           "/etc/c8s/certs",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			AnnotationWorkload: "api",
+			AnnotationInjected: "true",
+		}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+	raw, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := m.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{Namespace: "default", Object: runtime.RawExtension{Raw: raw}},
+	})
+	if !resp.Allowed {
+		t.Fatalf("Handle denied: %v", resp.Result)
+	}
+	inits := initContainersPatch(t, resp)
+	if len(inits) != 1 || inits[0].Name != "c8s-cert" {
+		t.Fatalf("initContainers patch = %+v, want a single injected c8s-cert despite the preset marker", inits)
+	}
+}

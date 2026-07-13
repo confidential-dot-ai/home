@@ -88,6 +88,13 @@ const defaultGetCertRunAsNonRoot = true
 const discoveryPublicTLSModeCDS = "cds"
 const discoveryPublicTLSModeWebPKI = "webpki"
 
+// reservedCertContainerName is the injected mesh-cert sidecar's name. It is
+// operator-reserved: a pod may not declare its own container under it. The
+// webhook rebuilds the sidecar every call (replaceInitContainer) and rejects
+// the name in the regular/ephemeral lists (rejectReservedCertContainer); the
+// cw-label-integrity VAP enforces its presence in the API server.
+const reservedCertContainerName = "c8s-cert"
+
 // runtimeClassName values injected by kata enforcement. kata-qemu is a
 // VM-isolated (non-confidential) pod; the confidential classes come in a
 // (CPU, GPU) pair per hardware platform, selected by Config.HardwarePlatform.
@@ -501,18 +508,24 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 	// confidential class without the annotation runs as a confidential VM
 	// without c8s identity (the bring-your-own-attestation path; see
 	// docs/kata.md).
-	_, alreadyInjected := pod.Annotations[AnnotationInjected]
-	getCertNeeded := inj != nil && m.cfg.GetCertImage != "" && !alreadyInjected
+	// Injection is idempotent by reconstruction (mutatePod rebuilds the sidecar
+	// every call), so it no longer keys off the confidential.ai/c8s-injected
+	// marker: an author cannot skip injection by pre-setting it.
+	getCertNeeded := inj != nil && m.cfg.GetCertImage != ""
 	kataClass := kataRuntimeClassFor(pod, m.cfg)
 
 	if inj == nil && kataClass == "" {
 		return admission.Allowed("no c8s annotation — passthrough")
 	}
-	if !getCertNeeded && kataClass == "" {
-		if alreadyInjected {
-			return admission.Allowed("already injected")
+
+	// Only the webhook may place a container under the reserved c8s-cert name.
+	// The init sidecar is rebuilt below (replaceInitContainer), but a
+	// regular/ephemeral collision cannot be, so reject it. See docs/pitfalls.md —
+	// "get-cert injection integrity is name-based".
+	if inj != nil {
+		if err := rejectReservedCertContainer(pod); err != nil {
+			return admission.Errored(http.StatusBadRequest, err)
 		}
-		return admission.Allowed("nothing to inject")
 	}
 
 	if getCertNeeded {
@@ -710,7 +723,7 @@ func mutatePod(pod *corev1.Pod, inj *injection, cfg Config) {
 		pod.Spec.ShareProcessNamespace = boolPtr(true)
 	}
 
-	pod.Spec.InitContainers = ensureInitContainer(pod.Spec.InitContainers,
+	pod.Spec.InitContainers = replaceInitContainer(pod.Spec.InitContainers,
 		certContainer(&effective, cfg))
 
 	if pod.Annotations == nil {
@@ -763,7 +776,7 @@ func certContainer(inj *injection, cfg Config) corev1.Container {
 
 	always := corev1.ContainerRestartPolicyAlways
 	return corev1.Container{
-		Name:            "c8s-cert",
+		Name:            reservedCertContainerName,
 		Image:           cfg.GetCertImage,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		RestartPolicy:   &always,
@@ -958,13 +971,42 @@ func ensureFSGroup(pod *corev1.Pod, fsGroup int64) {
 	}
 }
 
-func ensureInitContainer(existing []corev1.Container, c corev1.Container) []corev1.Container {
+// replaceInitContainer prepends c and drops any existing init container of the
+// same name. Injection is therefore idempotent (a reinvocation rebuilds the
+// same list) and a pre-declared c8s-cert cannot shed or shadow the real
+// sidecar — the operator-built container always wins. c8s-cert must lead the
+// list: it anchors shareProcessNamespace under kata (see certContainer).
+func replaceInitContainer(existing []corev1.Container, c corev1.Container) []corev1.Container {
+	out := make([]corev1.Container, 0, len(existing)+1)
+	out = append(out, c)
 	for _, ec := range existing {
-		if ec.Name == c.Name {
-			return existing
+		if ec.Name != c.Name {
+			out = append(out, ec)
 		}
 	}
-	return append([]corev1.Container{c}, existing...)
+	return out
+}
+
+// rejectReservedCertContainer denies an opted-in pod that parks a container
+// under the reserved c8s-cert name outside the init-container slot the webhook
+// rebuilds. Such a container would survive injection and collide with the
+// injected init sidecar (names are unique across all three lists), so it can
+// only be an attempt to shed or impersonate it; init-container collisions are
+// handled by replaceInitContainer instead.
+func rejectReservedCertContainer(pod *corev1.Pod) error {
+	for _, c := range pod.Spec.Containers {
+		if c.Name == reservedCertContainerName {
+			return fmt.Errorf("%w: container name %q is reserved for the injected c8s cert sidecar",
+				errInvalidInjectionAnnotation, reservedCertContainerName)
+		}
+	}
+	for _, c := range pod.Spec.EphemeralContainers {
+		if c.Name == reservedCertContainerName {
+			return fmt.Errorf("%w: ephemeral container name %q is reserved for the injected c8s cert sidecar",
+				errInvalidInjectionAnnotation, reservedCertContainerName)
+		}
+	}
+	return nil
 }
 
 func mountAll(pod *corev1.Pod, mount corev1.VolumeMount) {

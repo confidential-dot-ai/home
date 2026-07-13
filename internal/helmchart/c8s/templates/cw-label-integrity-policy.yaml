@@ -8,9 +8,10 @@ internal/webhook/pod_mutator.go) cannot defend it alone: the webhook runs on
 CREATE only, and labels are mutable, so a post-create `kubectl label` would
 add an un-injected pod to a confidential workload's Service endpoints. This
 policy denies out-of-band writes in the API server itself: at CREATE the
-label must match the opt-in annotation, and on UPDATE both keys are
-immutable. Scope (namespace exclusions) lives on the binding, like kata
-enforcement.
+label must match the opt-in annotation, a pod carrying the label must also
+carry the injected c8s-cert sidecar (so the identity cannot be kept while the
+sidecar is shed), and on UPDATE both keys are immutable. Scope (namespace
+exclusions) lives on the binding, like kata enforcement.
 
 ValidatingAdmissionPolicy is v1/GA from Kubernetes 1.30, the chart's
 kubeVersion floor.
@@ -53,6 +54,18 @@ spec:
         oldObject == null ? '' :
         (has(oldObject.metadata.annotations) && 'confidential.ai/cw' in oldObject.metadata.annotations ?
         oldObject.metadata.annotations['confidential.ai/cw'] : '')
+    # The injected mesh-cert sidecar: a native init container (restartPolicy
+    # Always) named c8s-cert. The webhook stamps the cw label and injects this
+    # sidecar together, so the label without it means the sidecar was shed or
+    # the webhook bypassed. Structural check only (name + native-sidecar
+    # restartPolicy); the webhook owns the exact image/args and rebuilds them on
+    # CREATE (pod_mutator.go, replaceInitContainer).
+    - name: hasCertSidecar
+      expression: >-
+        has(object.spec.initContainers) &&
+        object.spec.initContainers.exists(c,
+        c.name == 'c8s-cert' &&
+        has(c.restartPolicy) && c.restartPolicy == 'Always')
   validations:
     - expression: >-
         variables.cwLabel == '' || variables.cwLabel == variables.cwAnnotation
@@ -68,6 +81,14 @@ spec:
       message: >-
         The confidential.ai/cw pod label and annotation are immutable after
         admission; recreate the pod to change its workload identity.
+      reason: Forbidden
+    - expression: >-
+        variables.cwLabel == '' || variables.hasCertSidecar
+      message: >-
+        A confidential.ai/cw pod must carry the injected c8s-cert sidecar (a
+        native init container with restartPolicy Always); the c8s injection
+        webhook adds it alongside the label. A pod bearing the workload label
+        without the sidecar has shed attestation-bound injection.
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
