@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/cenkalti/backoff/v5 v5.0.3
-	github.com/confidential-dot-ai/attestation-go v0.1.0
+	github.com/confidential-dot-ai/attestation-go v0.2.0
 	github.com/containerd/containerd/v2 v2.2.5
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/nri v0.11.0

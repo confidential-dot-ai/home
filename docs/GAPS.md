@@ -26,12 +26,6 @@ final security model. Each bullet links to the tracking issue.
   `policy.Measurements` (and `MinTCBVersion`) entirely — see the LIMITATION note
   on `verifyTDXOnline` (`pkg/ratls/verify.go`). A TDX deployment relying on
   `cds.measurements` gets signature + report-data + debug checks only.
-- `c8s verify` against az-snp targets needs an attestation-go newer than the
-  pinned v0.1.0: that version cannot verify Azure's v2 HCL SNP reports (VCEK
-  product resolution fails on the CPUID-less report, and committed<current
-  firmware is rejected). Both are fixed in attestation-go; after the release +
-  go.mod bump, tighten `TestVerifyRealAzSnpEvidence_UnpaddedAnchor`
-  (`internal/cmds/verify/verify_test.go`) to require full-verify success.
 
 ## Mesh and certificates
 

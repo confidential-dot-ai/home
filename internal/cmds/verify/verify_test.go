@@ -401,17 +401,14 @@ func TestVerifyRealAzSnpEvidence_UnpaddedAnchor(t *testing.T) {
 		t.Fatalf("platform = %q, want az-snp", ev.platform)
 	}
 	res, err := verifyInProcess(ev, &ratls.VerifyPolicy{}, nil)
-	// The pinned attestation-go cannot yet verify this v2 HCL report's hardware
-	// layer (VCEK product resolution + provisional firmware; fixed upstream), so
-	// until the next bump only the nonce gate is asserted. See docs/roadmap.md.
-	if err != nil && strings.Contains(err.Error(), "nonce") {
-		t.Fatalf("the unpadded anchor must clear the vTPM nonce check: %v", err)
+	if err != nil {
+		t.Fatalf("az-snp evidence with its bound nonce must verify: %v", err)
 	}
-	if err == nil && (res.ReportDataMatch == nil || !*res.ReportDataMatch) {
+	if res.ReportDataMatch == nil || !*res.ReportDataMatch {
 		t.Fatal("report_data_match must be affirmatively true")
 	}
 
-	// A different anchor still fails closed, at the nonce gate specifically.
+	// A different anchor fails closed, at the nonce gate specifically.
 	ev.erd = []byte("not-the-nonce")
 	if _, err := verifyInProcess(ev, &ratls.VerifyPolicy{}, nil); err == nil || !strings.Contains(err.Error(), "nonce") {
 		t.Fatalf("wrong nonce must fail closed at the nonce check, got: %v", err)
