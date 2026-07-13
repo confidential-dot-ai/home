@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # CI-only: stage the kata guest artifacts build.sh needs from the kata-static
-# release — the confidential rootfs image (the source of the CoCo
+# release — the confidential rootfs image (the source of the confidential
 # guest-components — confidential-data-hub, attestation-agent, api-server-rest
 # — that osbuilder bakes into the measured rootfs), plus the stock NVIDIA
 # confidential rootfs and NVIDIA guest kernel that Step 6 grafts into the GPU
@@ -87,5 +87,5 @@ fi
     echo "KATA_NVIDIA_CONFIDENTIAL_IMG=${nvidia_img}"
     echo "KATA_NVIDIA_VMLINUZ=${nvidia_vmlinuz}"
 } >> "${GITHUB_ENV}"
-echo "CoCo guest-components source: ${img}"
+echo "confidential guest-components source: ${img}"
 echo "NVIDIA graft sources: ${nvidia_img}, ${nvidia_vmlinuz}"

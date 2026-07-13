@@ -87,15 +87,42 @@ KATA_SRC_COMMIT="${KATA_SRC_COMMIT:-86e5975ad6a20f091ed686e492672c70496d0400}"
 # measured-rootfs path for ext4 (create_rootfs_image). Its erofs path
 # (create_erofs_rootfs_image) loop-attaches the image before creating it
 # AND never runs veritysetup — so erofs + MEASURED_ROOTFS is broken there.
-# ext4 is kata's standard measured-rootfs fs. (Caveat: mkfs.ext4 writes a
-# random UUID/timestamps, so the verity root hash isn't bit-for-bit
-# reproducible across builds yet — see docs; pin the per-build digest.)
+# ext4 is kata's standard measured-rootfs fs. mkfs.ext4 would otherwise write
+# a random UUID/hash-seed/timestamps; the reproducibility knobs below
+# (SOURCE_DATE_EPOCH + mtime normalisation + fixed VERITY_SALT) pin all of it
+# so the verity root_hash is bit-for-bit reproducible across builds.
 FS_TYPE="${FS_TYPE:-ext4}"
 BUILD_VARIANT="${BUILD_VARIANT:-c8s}"
 DISTRO="${DISTRO:-ubuntu}"
 # osbuilder's ubuntu rootfs requires the release codename. kata 3.30's
 # agent ships from the ubuntu-noble confidential rootfs, so match it.
 OS_VERSION="${OS_VERSION:-noble}"
+
+# --- Reproducibility knobs -------------------------------------------------
+# Fixed so two builds from the same inputs produce the same dm-verity
+# root_hash (which rides in the launch measurement, so verifiers can recompute
+# it). Three independent sources of per-build randomness are pinned:
+#   SOURCE_DATE_EPOCH  mke2fs derives a deterministic FS UUID + dir-hash-seed +
+#                      created-time from it (e2fsprogs >= 1.45.7); we also stamp
+#                      every rootfs file's mtime to it before sealing (image_
+#                      builder's `cp -a` preserves those into the ext4 inodes).
+#   VERITY_SALT        veritysetup would otherwise pick a random salt, changing
+#                      root_hash even for byte-identical content. Public value
+#                      (rides in the cmdline and is measured) — fixed, not secret.
+#   UBUNTU_REPO_URL    pins the apt archive. Empty -> osbuilder's default
+#                      archive.ubuntu.com (drifts over time). Set to
+#                      https://snapshot.ubuntu.com/ubuntu/<YYYYMMDDTHHMMSSZ> to
+#                      time-pin the base (old snapshots also need apt
+#                      Check-Valid-Until=false in osbuilder's mmdebstrap call).
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1704067200}"   # 2024-01-01T00:00:00Z
+VERITY_SALT="${VERITY_SALT:-c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8}"
+UBUNTU_REPO_URL="${UBUNTU_REPO_URL:-}"
+# mkfs.ext4 randomises the FS UUID and directory hash-seed regardless of
+# SOURCE_DATE_EPOCH (which only pins timestamps), and tune2fs can only reset the
+# UUID, not the hash-seed. Both live in the superblock that dm-verity hashes, so
+# we inject fixed values at mkfs time (see the image_builder patch below).
+FIXED_FS_UUID="${FIXED_FS_UUID:-c8c8c8c8-c8c8-c8c8-c8c8-c8c8c8c8c8c8}"
+FIXED_HASH_SEED="${FIXED_HASH_SEED:-d8d8d8d8-d8d8-d8d8-d8d8-d8d8d8d8d8d8}"
 
 STEEP_DIR="${STEEP_DIR:-${WORKSPACE}/steep}"
 OUTPUT_DIR="${OUTPUT_DIR:-${IMAGE_DIR}/output}"
@@ -148,8 +175,8 @@ command -v jq     >/dev/null 2>&1 || die "jq not found — needed to emit manife
 # compute the rootfs-builder Docker build-args; without it RUST_TOOLCHAIN
 # comes back empty and the rustup install fails with a cryptic
 # '--default-toolchain <...> required' error.
-command -v yq >/dev/null 2>&1 || die "yq not found — osbuilder needs it to read kata's versions.yaml. Install mikefarah yq:
-       sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq"
+command -v yq >/dev/null 2>&1 || die "yq not found — osbuilder needs it to read kata's versions.yaml. Install mikefarah yq (pinned + checksummed; it shapes the measured guest rootfs build-args):
+       sudo curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64 && echo '0c2b24e645b57d8e7c0566d18643a6d4f5580feeea3878127354a46f2a1e4598  /usr/local/bin/yq' | sha256sum -c - && sudo chmod +x /usr/local/bin/yq"
 
 # Guest-pull sandboxes need a pause image baked into the rootfs at
 # /pause_bundle — the kata-agent unpacks it for the sandbox (pause) container
@@ -184,7 +211,7 @@ sudo modprobe loop 2>/dev/null || true
 
 # The overlay binaries must be staged before we build the rootfs image,
 # because they end up in the dm-verity root (and thus the measurement).
-for bin in ratls-mesh policy-monitor attestation-service; do
+for bin in ratls-mesh policy-monitor attestation-service rtmr3-measurer; do
     [[ -x "${EXTRA_DIR}/usr/local/bin/${bin}" ]] || die "${EXTRA_DIR}/usr/local/bin/${bin} missing — run scripts/fetch.sh first."
 done
 [[ -f "${EXTRA_DIR}/etc/c8s/bootstrap-allowlist.json" ]] || die "bootstrap-allowlist.json not staged — run scripts/fetch.sh (with IMAGE_TAG or *_DIGEST env vars) first."
@@ -317,6 +344,8 @@ mkdir -p "${ROOTFS_BUILD_DEST}" "${IMAGES_BUILD_DEST}" "${GO_PATH_DIR}"
 # bundle to validate those TLS connections (osbuilder's `required`-variant
 # rootfs ships none). The boot path (/attest) is network-free, so a missing
 # bundle would only degrade verification — but it is cheap and in `main`.
+# cryptsetup-bin: scratch-setup.service opens the ephemeral image-store scratch
+# disk under dm-crypt (see extra/usr/local/lib/c8s/scratch-setup.sh). In noble main.
 # Only `main`-component packages are installable (osbuilder sets
 # REPO_COMPONENTS=main); universe packages (e.g. traceroute, mtr-tiny) fail the
 # rootfs build with "no installation candidate".
@@ -324,8 +353,8 @@ mkdir -p "${ROOTFS_BUILD_DEST}" "${IMAGES_BUILD_DEST}" "${GO_PATH_DIR}"
 # nvidia-uvm load; udev's builtin libkmod only auto-loads nvidia via PCI
 # modalias — nvidia-uvm has no modalias). Without it the unit exits 127,
 # kata-agent never starts, and every GPU pod hangs in ContainerCreating.
-KATA_EXTRA_PKGS="libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-sys1t64 libtss2-tctildr0t64 ca-certificates kmod"
-# --- Step 1b/5: stage the CoCo guest-components ------------------------
+KATA_EXTRA_PKGS="libtss2-esys-3.0.2-0t64 libtss2-mu-4.0.1-0t64 libtss2-sys1t64 libtss2-tctildr0t64 ca-certificates kmod cryptsetup-bin"
+# --- Step 1b/5: stage the confidential guest-components ------------------------
 # confidential-data-hub (CDH), attestation-agent (AA), api-server-rest. The
 # kata-agent SPAWNS these at boot (its guest_components_procs default is
 # ApiServerRest, which implies CDH + AA) and performs in-guest image guest-pull
@@ -345,8 +374,8 @@ need_gc=0
 for gc in "${GUEST_COMPONENTS[@]}"; do [[ -x "${GC_BIN_DIR}/${gc}" ]] || need_gc=1; done
 if [[ "${need_gc}" == "1" ]]; then
     KATA_CONFIDENTIAL_IMG="${KATA_CONFIDENTIAL_IMG:-/opt/kata/share/kata-containers/kata-ubuntu-noble-confidential.image}"
-    [[ -f "${KATA_CONFIDENTIAL_IMG}" ]] || die "CoCo guest-components missing from ${GC_BIN_DIR} and KATA_CONFIDENTIAL_IMG=${KATA_CONFIDENTIAL_IMG} not found. Stage confidential-data-hub/attestation-agent/api-server-rest there, or point KATA_CONFIDENTIAL_IMG at a kata confidential rootfs image, or set COCO_GUEST_COMPONENTS_TARBALL."
-    log "Step 1b/5: staging CoCo guest-components from ${KATA_CONFIDENTIAL_IMG}"
+    [[ -f "${KATA_CONFIDENTIAL_IMG}" ]] || die "confidential guest-components missing from ${GC_BIN_DIR} and KATA_CONFIDENTIAL_IMG=${KATA_CONFIDENTIAL_IMG} not found. Stage confidential-data-hub/attestation-agent/api-server-rest there, or point KATA_CONFIDENTIAL_IMG at a kata confidential rootfs image, or set COCO_GUEST_COMPONENTS_TARBALL."
+    log "Step 1b/5: staging confidential guest-components from ${KATA_CONFIDENTIAL_IMG}"
     gc_loop="$(sudo losetup -fP --show "${KATA_CONFIDENTIAL_IMG}")"
     gc_mnt="$(mktemp -d)"
     sudo mount -o ro "${gc_loop}p1" "${gc_mnt}"
@@ -356,7 +385,7 @@ if [[ "${need_gc}" == "1" ]]; then
     done
     sudo umount "${gc_mnt}"; sudo losetup -d "${gc_loop}"; rmdir "${gc_mnt}"
 else
-    log "Step 1b/5: CoCo guest-components already staged in ${GC_BIN_DIR}"
+    log "Step 1b/5: confidential guest-components already staged in ${GC_BIN_DIR}"
 fi
 for gc in "${GUEST_COMPONENTS[@]}"; do log "  guest-component: ${gc} ($(stat -c%s "${GC_BIN_DIR}/${gc}") bytes)"; done
 
@@ -392,6 +421,7 @@ else
         AGENT_POLICY=yes \
         USE_DOCKER=1 \
         EXTRA_PKGS="${KATA_EXTRA_PKGS}" \
+        REPO_URL_X86_64="${UBUNTU_REPO_URL}" \
         ROOTFS_BUILD_DEST="${ROOTFS_BUILD_DEST}" \
         rootfs
     [[ -d "${TARGET_ROOTFS}" ]] || die "osbuilder did not produce a rootfs at ${TARGET_ROOTFS}"
@@ -419,6 +449,8 @@ C8S_UNITS=(
     attestation-service.service
     ratls-mesh.service
     policy-monitor.service
+    rtmr3-measurer.service
+    scratch-setup.service
     c8s-cloudinit-env.service
 )
 # kata boots the guest with `systemd.unit=kata-containers.target` on the kernel
@@ -454,8 +486,27 @@ rm -rf "${WORK_DIR}/pause-oci" "${WORK_DIR}/pause_bundle"
 skopeo copy "${PAUSE_REPO}:${PAUSE_VER}" "oci:${WORK_DIR}/pause-oci:${PAUSE_VER}"
 umoci unpack --rootless --image "${WORK_DIR}/pause-oci:${PAUSE_VER}" "${WORK_DIR}/pause_bundle"
 [[ -f "${WORK_DIR}/pause_bundle/config.json" ]] || die "umoci did not produce pause_bundle/config.json"
+# Reproducibility: umoci emits the OCI runtime config.json with mount `options`
+# arrays in Go-map (non-deterministic) order — the only field that varies
+# build-to-build. Canonicalise by sorting each options array (order is
+# semantically irrelevant for mount flags).
+jq '(.mounts // []) |= map(if has("options") then .options |= sort else . end)' \
+    "${WORK_DIR}/pause_bundle/config.json" > "${WORK_DIR}/pause_bundle/config.json.tmp"
+mv "${WORK_DIR}/pause_bundle/config.json.tmp" "${WORK_DIR}/pause_bundle/config.json"
 sudo rm -rf "${TARGET_ROOTFS}/pause_bundle"
 sudo cp -a "${WORK_DIR}/pause_bundle" "${TARGET_ROOTFS}/pause_bundle"
+
+# --- Reproducibility normalisation (must be the LAST rootfs mutation) ------
+# 1. umoci writes a *.mtree metadata manifest into the pause bundle whose bytes
+#    embed timestamps — the ONLY file that differs between two builds. It is
+#    unused at runtime (kata reads config.json + rootfs/), so drop it.
+# 2. Stamp every file's mtime to SOURCE_DATE_EPOCH so the sealed ext4's inode
+#    timestamps are deterministic (image_builder's `cp -a` preserves them).
+# Together with SOURCE_DATE_EPOCH-driven mke2fs (deterministic UUID/hash-seed/
+# created-time) and the fixed VERITY_SALT in seal_and_assemble, this makes the
+# dm-verity root_hash bit-for-bit reproducible.
+sudo find "${TARGET_ROOTFS}/pause_bundle" -name '*.mtree' -delete
+sudo find "${TARGET_ROOTFS}" -exec touch --no-dereference --date="@${SOURCE_DATE_EPOCH}" {} +
 
 # --- Steps 4-5: seal each variant into a verity image ------------------
 # seal_and_assemble <variant> <outdir>: seals the CURRENT state of
@@ -483,6 +534,7 @@ seal_and_assemble() {
         MEASURED_ROOTFS=yes \
         BUILD_VARIANT="${variant}" \
         AGENT_INIT=no \
+        SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
         "${OSBUILDER}/image-builder/image_builder.sh" \
         -o "${img}" \
         -f "${FS_TYPE}" \
@@ -493,6 +545,44 @@ seal_and_assemble() {
     local hash_file
     hash_file="$(dirname "${img}")/root_hash_${variant}.txt"
     [[ -f "${hash_file}" ]] || die "verity params file ${hash_file} not produced — was MEASURED_ROOTFS honoured?"
+
+    # Reproducibility: image_builder builds p1 by mounting an empty ext4 and
+    # `cp -a`-ing files in, which leaves the block allocation, journal and mount
+    # metadata non-deterministic (identical content, different physical layout —
+    # ~114MB of the image differs build-to-build), and veritysetup then picks a
+    # random salt. Re-lay p1 deterministically: extract its final content (which
+    # includes image_builder's selinux/systemd setup), restamp mtimes to
+    # SOURCE_DATE_EPOCH, and repopulate the SAME partition with `mkfs.ext4 -d`
+    # (offline, deterministic order, no mount) with pinned UUID/hash-seed and
+    # fully-initialised inode tables/journal. Then verity-seal with the fixed
+    # salt. Same inputs -> identical root_hash. Reuse image_builder's block
+    # geometry so data_blocks/verity layout are unchanged.
+    local db dbs hbs loopdev newroot mnt tree
+    db="$(grep -oE 'data_blocks=[0-9]+' "${hash_file}" | cut -d= -f2)"
+    dbs="$(grep -oE 'data_block_size=[0-9]+' "${hash_file}" | cut -d= -f2)"
+    hbs="$(grep -oE 'hash_block_size=[0-9]+' "${hash_file}" | cut -d= -f2)"
+    loopdev="$(sudo losetup -fP --show "${img}")"
+    mnt="$(mktemp -d)"; tree="$(mktemp -d)"
+    sudo mount -o ro "${loopdev}p1" "${mnt}"
+    sudo cp -a "${mnt}/." "${tree}/"
+    sudo umount "${mnt}"; rmdir "${mnt}"
+    sudo find "${tree}" -exec touch --no-dereference --date="@${SOURCE_DATE_EPOCH}" {} +
+    # `sudo env SOURCE_DATE_EPOCH=...`: sudo's env_reset strips the exported
+    # value, and without it mke2fs stamps the superblock + every inode
+    # (crtime/ctime) with the build clock — the residual metadata difference.
+    sudo env SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" mkfs.ext4 -q -F -b "${dbs}" -m 0 \
+        -U "${FIXED_FS_UUID}" \
+        -E "hash_seed=${FIXED_HASH_SEED},lazy_itable_init=0,lazy_journal_init=0" \
+        -d "${tree}" "${loopdev}p1"
+    sudo rm -rf "${tree}"
+    newroot="$(sudo veritysetup format --no-superblock --hash=sha256 --salt="${VERITY_SALT}" \
+        --data-block-size="${dbs}" --hash-block-size="${hbs}" --data-blocks="${db}" \
+        "${loopdev}p1" "${loopdev}p2" 2>&1 | grep -i 'Root hash:' | awk '{print $NF}')"
+    sudo losetup -d "${loopdev}"
+    [[ -n "${newroot}" ]] || die "deterministic re-seal produced no root hash for ${variant}"
+    printf 'root_hash=%s,salt=%s,data_blocks=%s,data_block_size=%s,hash_block_size=%s' \
+        "${newroot}" "${VERITY_SALT}" "${db}" "${dbs}" "${hbs}" | sudo tee "${hash_file}" >/dev/null
+
     local kvp
     kvp="$(tr -d '\n' < "${hash_file}")"
     [[ "${kvp}" == root_hash=* ]] || die "unexpected verity params: ${kvp}"
