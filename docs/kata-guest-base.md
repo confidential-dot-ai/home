@@ -194,6 +194,110 @@ scenarios, and the known gaps — is its own document:
 [`kata-image-policy.md`](kata-image-policy.md). It builds directly on
 the boot order and the dm-verity measurement described above.
 
+## Per-workload RTMR[3] measurement (TDX)
+
+`rtmr3-measurer` (`internal/cmds/rtmr3measurer`, unit
+`rtmr3-measurer.service`) is the in-VM workload measurer on
+`kata-qemu-tdx`: it scans kata-agent's container bundles under
+`/run/kata-containers` and extends TDX RTMR[3] with each deployed
+workload's image digest, so the guest's attestation quote binds *which*
+container ran — dynamically, for any image, with no baked allowlist. It
+is the measurement-only counterpart to `policy-monitor` (allowlist
+enforcement); the two are independent and either or both may run.
+Requires a guest kernel exposing the TDX RTMR-extend sysfs
+(`/sys/devices/virtual/misc/tdx_guest/measurements/`, mainline ≥ 6.16).
+
+**Convention.** Pinned by [`pkg/rtmr3`](../pkg/rtmr3/rtmr3.go), the
+single source of truth for both sides:
+`event = SHA384("sha256:"+hex)`, `RTMR3' = SHA384(RTMR3 ‖ event)`,
+folded from the boot value (all zeros). Golden vectors in
+`pkg/rtmr3/rtmr3_test.go` freeze it; a client-side verifier is a
+tracked follow-up and MUST build on `pkg/rtmr3`, never re-derive the
+convention.
+
+**Dedup and restart safety.** RTMR[3] is hardware-append-only, so each
+DISTINCT image must extend exactly once: restarts and replicas (same
+image, new container id) are collapsed, else the register matches no
+golden value and the pod is unverifiable. The dedup log lives at
+`/run/c8s/rtmr3-measured` — tmpfs, so it survives a daemon restart
+(`Restart=always`) but is wiped with the VM, exactly RTMR[3]'s
+lifetime. The daemon records a digest to the log *before* extending: a
+crash between the two can only under-extend, which startup repairs by
+reading the register back and comparing it against the log's fold
+(never the reverse — an extra extend is unrecoverable).
+
+**Scan, not inotify.** kata-agent sets up `/run/kata-containers` as its
+own mount after the daemon starts at boot; an inotify watch added early
+binds the pre-mount inode and never sees the `<cid>` dirs created on
+the mounted fs. A 1 s poll is immune to that (and to dropped events).
+
+**Ordering caveat.** In the common one-workload-per-sandbox case
+RTMR[3] is a single deterministic extend. A pod with multiple distinct
+workload images extends them in first-seen (scan) order, which is not
+guaranteed stable across runs; a verifier for such pods must account
+for ordering, or the deployment should keep one workload image per
+sandbox.
+
+## Encrypted scratch disk for large images
+
+Guest-pull unpacks workload images to a RAM tmpfs, which caps image
+size at guest memory. When the VM is launched with an ephemeral disk
+tagged `serial=confai-scratch` (see
+`kata-guest-base/scripts/kata-qemu-scratch-wrapper.sh`),
+`scratch-setup.service` backs the image store
+(`/run/kata-containers/image`) with dm-crypt on that disk instead:
+random per-boot key generated in-guest, piped straight into
+`cryptsetup` (never written anywhere), held only in TDX-encrypted guest
+RAM — the host never sees plaintext and never holds a key. The volume
+is reformatted every boot (pure scratch). No scratch disk → no-op, the
+tmpfs default stands.
+
+Integrity status and the qemu wrapper's shim nature are tracked in
+[`GAPS.md`](GAPS.md) ("Confidential kata guest (TDX)").
+
+## Reproducible root_hash
+
+Two builds from the same inputs produce a bit-for-bit identical
+dm-verity `root_hash` — the property that lets a verifier rebuild the
+image from source and recompute the launch measurement instead of
+taking the build on trust. `build.sh` pins every source of per-build
+randomness:
+
+- `SOURCE_DATE_EPOCH` — mke2fs derives a deterministic FS UUID,
+  dir-hash-seed and created-time from it (e2fsprogs ≥ 1.45.7); every
+  rootfs file's mtime is stamped to it before sealing (`cp -a`
+  preserves those into the ext4 inodes).
+- `VERITY_SALT` — veritysetup would otherwise pick a random salt,
+  changing `root_hash` even for byte-identical content. Public value
+  (it rides in the measured cmdline), fixed, not secret.
+- `FIXED_FS_UUID` / `FIXED_HASH_SEED` — mkfs.ext4 randomises both
+  regardless of `SOURCE_DATE_EPOCH` (which only pins timestamps), and
+  tune2fs can only reset the UUID, not the hash-seed; both live in the
+  superblock that dm-verity hashes, so they are injected at mkfs time.
+- `UBUNTU_REPO_URL` — pins the apt archive; empty means osbuilder's
+  default `archive.ubuntu.com`, which drifts over time. Set it to
+  `https://snapshot.ubuntu.com/ubuntu/<YYYYMMDDTHHMMSSZ>` to time-pin
+  the base (old snapshots also need apt `Check-Valid-Until=false` in
+  osbuilder's mmdebstrap call).
+
+Additionally, `image_builder.sh` populates the partition by mounting an
+empty ext4 and `cp -a`-ing files in, which leaves block allocation,
+journal and mount metadata non-deterministic (~114 MB of the image
+differed build-to-build). `seal_and_assemble` re-lays the partition
+offline with `mkfs.ext4 -d` (deterministic order, no mount, pinned
+UUID/hash-seed, fully-initialised inode tables/journal) and then
+verity-seals with the fixed salt, reusing image_builder's block
+geometry.
+
+**Toolchain caveat.** The re-lay runs `mkfs.ext4` and `veritysetup` on
+the build host, so the `root_hash` is reproducible only across builds
+using the same e2fsprogs and cryptsetup versions. The build records the
+versions it used in `manifest.json` (`relay_toolchain`) so a verifier
+knows exactly what to install; set `REPRO_E2FSPROGS_VERSION` /
+`REPRO_CRYPTSETUP_VERSION` to make a version mismatch fatal (the CI
+publish path should pin both). Running the re-lay inside a
+version-pinned container is the tracked longer-term fix.
+
 ## Releasing and pinning
 
 The [`kata-guest-base.yml`](../.github/workflows/kata-guest-base.yml)

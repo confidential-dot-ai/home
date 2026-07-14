@@ -82,6 +82,40 @@ final security model. Each bullet links to the tracking issue.
 - Node-as-CVM GPU is a separate mechanism (drivers baked into the node guest OS,
   measured into the node launch digest); this puller/runtime is pod-as-CVM only.
 
+## Confidential kata guest (TDX)
+
+- **Scratch-disk integrity.** The encrypted image store
+  (`scratch-setup.service`) is dm-crypt with no integrity layer. Not an
+  app-swap/code-injection vector: the host holds no key so it cannot forge
+  chosen plaintext (AES-XTS), a fresh per-boot key plus reformat kills
+  cross-boot replay, and the image is digest-verified in-guest before unpack
+  (the digest that lands in RTMR[3]). What remains: the host can corrupt
+  scratch blocks (a DoS), and unlike the dm-verity root fs the image store is
+  verified only at unpack, not continuously at execution — attestation covers
+  which image was *deployed*, not that every byte later served off scratch
+  still matches it. Close with dm-integrity (authenticated dm-crypt) before
+  asserting continuous workload integrity in customer-facing claims or a
+  security audit.
+- **qemu scratch wrapper is a shim.** Kata has no per-sandbox scratch-disk
+  knob, so `kata-guest-base/scripts/kata-qemu-scratch-wrapper.sh` wraps the
+  qemu launch to attach the disk (host-config helper, deliberately not wired
+  into the build). Follow-up: a first-class attach (kata runtime or a CDI
+  device) so disk lifecycle and GC are managed, not wrapper-owned.
+- **RTMR[3] workload measurement is write-only today.** The measurer extends
+  the register, but no client-side verifier consumes it yet. The extend
+  convention is pinned by `pkg/rtmr3` (golden vectors in its tests); the
+  eventual verifier MUST build on that package. Multi-image pods extend in
+  first-seen order — see `docs/kata-guest-base.md` "Per-workload RTMR[3]
+  measurement".
+- **Reproducible `root_hash` assumes the host re-lay toolchain.** The
+  versions used are recorded in `manifest.json` (`relay_toolchain`) and can
+  be pinned fatal via `REPRO_E2FSPROGS_VERSION`/`REPRO_CRYPTSETUP_VERSION`,
+  but CI does not pin them yet and the re-lay is not containerized.
+- **Attestation trust-model follow-ups** for the TDX workload path:
+  client-side DCAP verification, RA-TLS binding of the app channel to the
+  attested VM, `/attest` eventlog trim, and the non-public `/verify`
+  endpoint.
+
 ## Operations
 
 - Chart-managed CDS is not highly available by default (broker side tracked at [#75](https://github.com/confidential-dot-ai/c8s/issues/75)).

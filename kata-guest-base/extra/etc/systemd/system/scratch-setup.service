@@ -1,10 +1,7 @@
 [Unit]
-# Backs /run/kata-containers/image (the guest-pull image store) with a
-# dm-crypt-encrypted scratch disk, so large workload images unpack to disk
-# instead of the RAM tmpfs (which caps image size at guest memory). Runs BEFORE
-# kata-agent so the mount is in place before any CreateContainer/guest-pull.
-# No-op when the VM has no confai-scratch disk. See extra/usr/local/bin/
-# scratch-setup.sh and scripts/kata-qemu-scratch-wrapper.sh.
+# Backs the guest-pull image store with a dm-crypt scratch disk; no-op
+# without a confai-scratch disk. Must run before kata-agent's first
+# guest-pull. See docs/kata-guest-base.md "Encrypted scratch disk".
 Description=c8s confidential image-store scratch disk (dm-crypt)
 Documentation=https://github.com/confidential-dot-ai/c8s/tree/main/kata-guest-base
 DefaultDependencies=no

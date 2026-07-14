@@ -99,30 +99,20 @@ DISTRO="${DISTRO:-ubuntu}"
 OS_VERSION="${OS_VERSION:-noble}"
 
 # --- Reproducibility knobs -------------------------------------------------
-# Fixed so two builds from the same inputs produce the same dm-verity
-# root_hash (which rides in the launch measurement, so verifiers can recompute
-# it). Three independent sources of per-build randomness are pinned:
-#   SOURCE_DATE_EPOCH  mke2fs derives a deterministic FS UUID + dir-hash-seed +
-#                      created-time from it (e2fsprogs >= 1.45.7); we also stamp
-#                      every rootfs file's mtime to it before sealing (image_
-#                      builder's `cp -a` preserves those into the ext4 inodes).
-#   VERITY_SALT        veritysetup would otherwise pick a random salt, changing
-#                      root_hash even for byte-identical content. Public value
-#                      (rides in the cmdline and is measured) — fixed, not secret.
-#   UBUNTU_REPO_URL    pins the apt archive. Empty -> osbuilder's default
-#                      archive.ubuntu.com (drifts over time). Set to
-#                      https://snapshot.ubuntu.com/ubuntu/<YYYYMMDDTHHMMSSZ> to
-#                      time-pin the base (old snapshots also need apt
-#                      Check-Valid-Until=false in osbuilder's mmdebstrap call).
+# Pinned sources of per-build randomness so two builds from the same inputs
+# produce a bit-for-bit identical dm-verity root_hash. What each knob pins and
+# why: docs/kata-guest-base.md "Reproducible root_hash".
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1704067200}"   # 2024-01-01T00:00:00Z
-VERITY_SALT="${VERITY_SALT:-c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8}"
-UBUNTU_REPO_URL="${UBUNTU_REPO_URL:-}"
-# mkfs.ext4 randomises the FS UUID and directory hash-seed regardless of
-# SOURCE_DATE_EPOCH (which only pins timestamps), and tune2fs can only reset the
-# UUID, not the hash-seed. Both live in the superblock that dm-verity hashes, so
-# we inject fixed values at mkfs time (see the image_builder patch below).
+VERITY_SALT="${VERITY_SALT:-c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8}"   # public; measured via the cmdline
+UBUNTU_REPO_URL="${UBUNTU_REPO_URL:-}"   # empty -> osbuilder's default archive
 FIXED_FS_UUID="${FIXED_FS_UUID:-c8c8c8c8-c8c8-c8c8-c8c8-c8c8c8c8c8c8}"
 FIXED_HASH_SEED="${FIXED_HASH_SEED:-d8d8d8d8-d8d8-d8d8-d8d8-d8d8d8d8d8d8}"
+# The deterministic re-lay (seal_and_assemble) runs mkfs.ext4 + veritysetup on
+# the HOST, so root_hash is reproducible only for a matching toolchain. The
+# versions found are recorded in manifest.json; set these to make a mismatch
+# fatal (the CI publish path should pin both).
+REPRO_E2FSPROGS_VERSION="${REPRO_E2FSPROGS_VERSION:-}"
+REPRO_CRYPTSETUP_VERSION="${REPRO_CRYPTSETUP_VERSION:-}"
 
 STEEP_DIR="${STEEP_DIR:-${WORKSPACE}/steep}"
 OUTPUT_DIR="${OUTPUT_DIR:-${IMAGE_DIR}/output}"
@@ -202,6 +192,18 @@ for t in "mkfs.${FS_TYPE}" veritysetup parted qemu-img; do
         || die "${t} not found — needed to build the verity image on the host. Install: sudo apt-get install -y erofs-utils cryptsetup-bin parted gdisk e2fsprogs qemu-utils"
 done
 
+# Re-lay toolchain versions: recorded in manifest.json, enforced when pinned
+# (see the reproducibility knobs above).
+MKE2FS_VERSION="$(PATH="${PATH}:/usr/sbin:/sbin" mkfs.ext4 -V 2>&1 | awk 'NR==1{print $2}')"
+VERITYSETUP_VERSION="$(PATH="${PATH}:/usr/sbin:/sbin" veritysetup --version 2>/dev/null | awk 'NR==1{print $2}')"
+echo "    re-lay toolchain: mke2fs ${MKE2FS_VERSION} (e2fsprogs), veritysetup ${VERITYSETUP_VERSION} (cryptsetup)"
+if [[ -n "${REPRO_E2FSPROGS_VERSION}" && "${MKE2FS_VERSION}" != "${REPRO_E2FSPROGS_VERSION}" ]]; then
+    die "host e2fsprogs ${MKE2FS_VERSION} != pinned ${REPRO_E2FSPROGS_VERSION} — the re-lay toolchain shapes root_hash; install the pinned version or update the pin."
+fi
+if [[ -n "${REPRO_CRYPTSETUP_VERSION}" && "${VERITYSETUP_VERSION}" != "${REPRO_CRYPTSETUP_VERSION}" ]]; then
+    die "host cryptsetup ${VERITYSETUP_VERSION} != pinned ${REPRO_CRYPTSETUP_VERSION} — the re-lay toolchain shapes root_hash; install the pinned version or update the pin."
+fi
+
 # image_builder uses `losetup -P` to partition the image. On hosts where
 # the loop module isn't auto-loaded, losetup fails with `failed to set up
 # loop device: No such file or directory`. Load it best-effort up front.
@@ -217,10 +219,12 @@ done
 [[ -f "${EXTRA_DIR}/etc/c8s/bootstrap-allowlist.json" ]] || die "bootstrap-allowlist.json not staged — run scripts/fetch.sh (with IMAGE_TAG or *_DIGEST env vars) first."
 [[ -f "${EXTRA_DIR}/etc/kata-opa/default-policy.rego" ]] || die "default-policy.rego missing from overlay."
 
-# In-guest registry auth for guest-pull (staged by fetch.sh, empty unless a
-# developer pre-staged private-mirror creds). If build.sh runs standalone
-# without fetch.sh, bake an empty auth set so the file:// path the kata
-# cmdline names (agent.image_registry_auth) still resolves — anonymous pulls.
+# In-guest GHCR registry auth for private guest-pull. fetch.sh bakes this
+# from READ_PRIVATE_GHCR_TOKEN; tmpfiles copies it to
+# /run/image-security/auth.json, the file:// path the kata cmdline names
+# (agent.image_registry_auth, set by the puller). If build.sh is run
+# standalone without fetch.sh, bake an empty auth set so that path still
+# resolves — anonymous pulls, no credential in the measured rootfs.
 GHCR_AUTH_FILE="${EXTRA_DIR}/etc/c8s/ghcr-auth.json"
 if [[ ! -s "${GHCR_AUTH_FILE}" ]]; then
     echo "    NOTE: ${GHCR_AUTH_FILE} not staged by fetch.sh — baking empty auths (anonymous guest-pull)." >&2
@@ -546,17 +550,11 @@ seal_and_assemble() {
     hash_file="$(dirname "${img}")/root_hash_${variant}.txt"
     [[ -f "${hash_file}" ]] || die "verity params file ${hash_file} not produced — was MEASURED_ROOTFS honoured?"
 
-    # Reproducibility: image_builder builds p1 by mounting an empty ext4 and
-    # `cp -a`-ing files in, which leaves the block allocation, journal and mount
-    # metadata non-deterministic (identical content, different physical layout —
-    # ~114MB of the image differs build-to-build), and veritysetup then picks a
-    # random salt. Re-lay p1 deterministically: extract its final content (which
-    # includes image_builder's selinux/systemd setup), restamp mtimes to
-    # SOURCE_DATE_EPOCH, and repopulate the SAME partition with `mkfs.ext4 -d`
-    # (offline, deterministic order, no mount) with pinned UUID/hash-seed and
-    # fully-initialised inode tables/journal. Then verity-seal with the fixed
-    # salt. Same inputs -> identical root_hash. Reuse image_builder's block
-    # geometry so data_blocks/verity layout are unchanged.
+    # Deterministic re-lay: repopulate p1 offline with `mkfs.ext4 -d` (pinned
+    # UUID/hash-seed, restamped mtimes, image_builder's block geometry) and
+    # verity-seal with the fixed salt, replacing image_builder's
+    # non-deterministic mount + `cp -a` layout and random salt. Rationale:
+    # docs/kata-guest-base.md "Reproducible root_hash".
     local db dbs hbs loopdev newroot mnt tree
     db="$(grep -oE 'data_blocks=[0-9]+' "${hash_file}" | cut -d= -f2)"
     dbs="$(grep -oE 'data_block_size=[0-9]+' "${hash_file}" | cut -d= -f2)"
@@ -614,6 +612,8 @@ seal_and_assemble() {
         --arg vmlinuz_sha "${vmlinuz_sha}" \
         --arg image_sha "${image_sha}" \
         --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg e2fsprogs_ver "${MKE2FS_VERSION}" \
+        --arg cryptsetup_ver "${VERITYSETUP_VERSION}" \
         '{
            version: ($version|tonumber),
            boot_model: "kata-direct-kernel",
@@ -622,6 +622,7 @@ seal_and_assemble() {
            rootfs_type: $fs_type,
            build_variant: $build_variant,
            kernel_verity_params: $kvp,
+           relay_toolchain: { e2fsprogs: $e2fsprogs_ver, cryptsetup: $cryptsetup_ver },
            outputs: {
              kernel:        { path: "vmlinuz",         sha256: $vmlinuz_sha },
              rootfs_image:  { path: "kata-rootfs.img", sha256: $image_sha }
