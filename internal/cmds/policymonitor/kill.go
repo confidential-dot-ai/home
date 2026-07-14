@@ -54,6 +54,9 @@ type containerKiller interface {
 
 // cgroupKiller searches the configured cgroup root and terminates the
 // matching cgroup as a unit by writing the kernel's cgroup.kill interface.
+// The supported Kata guest kernels provide this interface; no best-effort
+// PID fallback is permitted because a failed kill must never be reported as
+// successful.
 type cgroupKiller struct {
 	cgroupRoot string
 	// waitTimeout caps how long we re-scan for the cgroup directory
