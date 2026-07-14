@@ -12,6 +12,10 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
+// maxErrorBodyBytes caps how much of a non-2xx response body is read into
+// APIError/UnexpectedError.
+const maxErrorBodyBytes = 8 << 10
+
 // Client is an HTTP client for the external attestation-api.
 type Client struct {
 	baseURL    string
@@ -94,7 +98,9 @@ func (c Client) doAndDecode(req *http.Request, out any) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		// Cap the error body: it can come from an unhealthy or untrusted
+		// endpoint and flows into error strings and logs.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		var errResp types.ErrorResponse
 		if json.Unmarshal(body, &errResp) == nil {
 			return &APIError{Status: resp.StatusCode, Response: errResp}

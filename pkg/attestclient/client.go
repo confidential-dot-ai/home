@@ -18,6 +18,10 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
+// maxErrorBodyBytes caps how much of an untrusted peer's non-2xx response
+// body is read into StatusError.
+const maxErrorBodyBytes = 8 << 10
+
 // Client is a high-level client for the CDS attestation flow.
 // It handles the full challenge-attest-certify flow in a single call.
 type Client struct {
@@ -214,7 +218,7 @@ func (c Client) AttestKey(ctx context.Context, attestationApiURL string, pubKeyD
 	defer httpResp.Body.Close()
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(httpResp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, maxErrorBodyBytes))
 		return "", &StatusError{Status: httpResp.StatusCode, Body: string(respBody)}
 	}
 
@@ -249,7 +253,7 @@ func (c Client) AuthenticateContext(ctx context.Context) (types.ChallengeRespons
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		return types.ChallengeResponse{}, &StatusError{Status: resp.StatusCode, Body: string(body)}
 	}
 
@@ -299,7 +303,7 @@ func (c Client) AttestContext(ctx context.Context, req attestRequest) (string, e
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		return "", &StatusError{Status: resp.StatusCode, Body: string(body)}
 	}
 
