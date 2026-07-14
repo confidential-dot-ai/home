@@ -255,3 +255,19 @@ func TestCgroupKiller_PropagatesMalformedProcs(t *testing.T) {
 		t.Fatalf("kill = (%v, %v), want permanent parse error", ok, err)
 	}
 }
+
+func TestCgroupKiller_PropagatesMissingKillInterface(t *testing.T) {
+	root := t.TempDir()
+	cid := "missing-kill"
+	dir := filepath.Join(root, cid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte("1234\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	killer := &cgroupKiller{cgroupRoot: root, waitTimeout: time.Second, pollInterval: time.Millisecond}
+	if ok, err := killer.kill(cid); err == nil || ok {
+		t.Fatalf("kill = (%v, %v), want missing cgroup.kill error", ok, err)
+	}
+}

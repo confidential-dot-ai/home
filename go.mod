@@ -5,7 +5,6 @@ go 1.26
 require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/confidential-dot-ai/attestation-go v0.3.0
-	github.com/containerd/cgroups/v3 v3.1.2
 	github.com/containerd/containerd/v2 v2.2.5
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/nri v0.11.0
@@ -41,6 +40,7 @@ require (
 	github.com/Microsoft/hcsshim v0.14.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/containerd/cgroups/v3 v3.1.2 // indirect
 	github.com/containerd/containerd/api v1.10.0 // indirect
 	github.com/containerd/continuity v0.4.5 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect

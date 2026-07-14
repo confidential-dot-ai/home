@@ -37,12 +37,12 @@ package policymonitor
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
-
-	"github.com/containerd/cgroups/v3/cgroup2"
 )
 
 // containerKiller is the dependency-injection surface used by the monitor.
@@ -53,9 +53,7 @@ type containerKiller interface {
 }
 
 // cgroupKiller searches the configured cgroup root and terminates the
-// matching cgroup as a unit. It uses the existing containerd cgroups library,
-// which writes cgroup.kill on modern kernels and has a compatibility fallback
-// for older unified cgroup kernels.
+// matching cgroup as a unit by writing the kernel's cgroup.kill interface.
 type cgroupKiller struct {
 	cgroupRoot string
 	// waitTimeout caps how long we re-scan for the cgroup directory
@@ -92,19 +90,15 @@ func (c *cgroupKiller) kill(containerID string) (bool, error) {
 			if err != nil {
 				return false, fmt.Errorf("resolve cgroup path: %w", err)
 			}
-			manager, err := cgroup2.Load("/"+filepath.ToSlash(group), cgroup2.WithMountpoint(c.cgroupRoot))
-			if err != nil {
-				return false, fmt.Errorf("load cgroup: %w", err)
-			}
 			// Include descendants: cgroup.kill terminates the entire subtree,
 			// so a child cgroup must also make the group eligible for killing.
-			procs, err := manager.Procs(true)
+			procs, err := readCgroupProcs(c.cgroupRoot, group)
 			if err != nil {
 				if !errors.Is(err, os.ErrNotExist) {
 					return false, fmt.Errorf("read cgroup processes: %w", err)
 				}
 			} else if len(procs) > 0 {
-				if err := manager.Kill(); err != nil {
+				if err := writeCgroupKill(dir); err != nil {
 					return false, fmt.Errorf("kill cgroup: %w", err)
 				}
 				return true, nil
@@ -115,6 +109,46 @@ func (c *cgroupKiller) kill(containerID string) (bool, error) {
 		}
 		time.Sleep(c.pollInterval)
 	}
+}
+
+func readCgroupProcs(root, group string) ([]string, error) {
+	var procs []string
+	err := filepath.WalkDir(filepath.Join(root, filepath.FromSlash(group)), func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || d.Name() != "cgroup.procs" {
+			return nil
+		}
+		entries, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, proc := range strings.Fields(string(entries)) {
+			if _, err := strconv.ParseUint(proc, 10, 64); err != nil {
+				return fmt.Errorf("parse pid %q: %w", proc, err)
+			}
+			procs = append(procs, proc)
+		}
+		return nil
+	})
+	return procs, err
+}
+
+func writeCgroupKill(dir string) error {
+	f, err := os.OpenFile(filepath.Join(dir, "cgroup.kill"), os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	n, writeErr := io.WriteString(f, "1")
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if n != 1 {
+		return io.ErrShortWrite
+	}
+	return closeErr
 }
 
 // findCgroupDir walks root looking for a directory that identifies
