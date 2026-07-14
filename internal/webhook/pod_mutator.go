@@ -90,10 +90,16 @@ const discoveryPublicTLSModeWebPKI = "webpki"
 
 // reservedCertContainerName is the injected mesh-cert sidecar's name. It is
 // operator-reserved: a pod may not declare its own container under it. The
-// webhook rebuilds the sidecar every call (replaceInitContainer) and rejects
+// webhook rebuilds the sidecar every call (injectInitContainers) and rejects
 // the name in the regular/ephemeral lists (rejectReservedCertContainer); the
 // cw-label-integrity VAP enforces its presence in the API server.
 const reservedCertContainerName = "c8s-cert"
+
+// reservedCertWaitContainerName is the injected gate init container that blocks
+// the workload until c8s-cert has written the initial cert (see
+// certWaitContainer). Operator-reserved like c8s-cert: a pod may not declare
+// its own container under it.
+const reservedCertWaitContainerName = "c8s-cert-wait"
 
 // runtimeClassName values injected by kata enforcement. kata-qemu is a
 // VM-isolated (non-confidential) pod; the confidential classes come in a
@@ -519,7 +525,7 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 	}
 
 	// Only the webhook may place a container under the reserved c8s-cert name.
-	// The init sidecar is rebuilt below (replaceInitContainer), but a
+	// The init sidecar is rebuilt below (injectInitContainers), but a
 	// regular/ephemeral collision cannot be, so reject it. See docs/pitfalls.md —
 	// "get-cert injection integrity is name-based".
 	if inj != nil {
@@ -723,8 +729,8 @@ func mutatePod(pod *corev1.Pod, inj *injection, cfg Config) {
 		pod.Spec.ShareProcessNamespace = boolPtr(true)
 	}
 
-	pod.Spec.InitContainers = replaceInitContainer(pod.Spec.InitContainers,
-		certContainer(&effective, cfg))
+	pod.Spec.InitContainers = injectInitContainers(pod.Spec.InitContainers,
+		certContainer(&effective, cfg), certWaitContainer(&effective, cfg))
 
 	if pod.Annotations == nil {
 		pod.Annotations = map[string]string{}
@@ -784,23 +790,43 @@ func certContainer(inj *injection, cfg Config) corev1.Container {
 		Env:             getCertEnv(inj),
 		VolumeMounts:    getCertVolumeMounts(inj, true),
 		SecurityContext: getCertSecurityContext(inj),
-		// Gate the workload on the initial cert being written. Without
-		// this, native-sidecar semantics consider c8s-cert "started" as
-		// soon as the process launches, so the workload would race the
-		// initial fetch. The probe uses `c8s probe-file` because the
-		// image is gcr.io/distroless/static and has no `test`.
-		StartupProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{
-				Exec: &corev1.ExecAction{
-					Command: []string{
-						"/c8s", "probe-file",
-						certPath(inj.Cert.Dir, inj.Cert.CertFile),
-					},
-				},
-			},
-			PeriodSeconds:    1,
-			FailureThreshold: 180,
+		// The workload is gated on the initial cert by the c8s-cert-wait
+		// init container (certWaitContainer), not a startupProbe here: a
+		// native sidecar is "started" the moment its process launches, and
+		// an exec startupProbe is denied by the locked kata-qemu-snp guest
+		// (ExecProcessRequest := false), so it could never pass there and
+		// the workload would hang in Init forever. See certWaitContainer.
+	}
+}
+
+// certWaitTimeout bounds how long c8s-cert-wait blocks before failing (and
+// being restarted by the kubelet, which re-waits). Comfortably exceeds
+// get-cert's own initial-fetch retry so a slow CDS cold start is absorbed in
+// one wait, while a genuinely stuck bootstrap surfaces as Init:Error/CrashLoop
+// rather than a silent Init hang.
+const certWaitTimeout = 3 * time.Minute
+
+// certWaitContainer gates the workload on the initial cert being written by the
+// c8s-cert sidecar. It is a plain (run-once) init container that blocks on the
+// cert file and exits 0 once it appears, so normal init-completion ordering
+// holds the workload until the attested cert exists — fail-closed. It replaces
+// the exec startupProbe that used to sit on the sidecar: the locked
+// kata-qemu-snp guest denies ExecProcessRequest, so an exec probe can never
+// pass there, whereas a container running its own entrypoint is a
+// CreateContainerRequest the guest allows. It must be ordered after c8s-cert
+// (the pidns anchor) and before the workload; injectInitContainers does that.
+func certWaitContainer(inj *injection, cfg Config) corev1.Container {
+	return corev1.Container{
+		Name:            reservedCertWaitContainerName,
+		Image:           cfg.GetCertImage,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command: []string{
+			"/c8s", "probe-file", "--wait",
+			"--timeout=" + certWaitTimeout.String(),
+			certPath(inj.Cert.Dir, inj.Cert.CertFile),
 		},
+		VolumeMounts:    getCertVolumeMounts(inj, false),
+		SecurityContext: getCertSecurityContext(inj),
 	}
 }
 
@@ -971,16 +997,23 @@ func ensureFSGroup(pod *corev1.Pod, fsGroup int64) {
 	}
 }
 
-// replaceInitContainer prepends c and drops any existing init container of the
-// same name. Injection is therefore idempotent (a reinvocation rebuilds the
-// same list) and a pre-declared c8s-cert cannot shed or shadow the real
-// sidecar — the operator-built container always wins. c8s-cert must lead the
-// list: it anchors shareProcessNamespace under kata (see certContainer).
-func replaceInitContainer(existing []corev1.Container, c corev1.Container) []corev1.Container {
-	out := make([]corev1.Container, 0, len(existing)+1)
-	out = append(out, c)
+// injectInitContainers prepends the c8s-managed init containers, in the given
+// order, and drops any existing init container that collides with an injected
+// name. Injection is therefore idempotent (a reinvocation rebuilds the same
+// list) and a pre-declared c8s-cert/c8s-cert-wait cannot shed or shadow the
+// real ones — the operator-built containers always win. Order matters:
+// c8s-cert leads (it anchors shareProcessNamespace under kata — see
+// certContainer), then c8s-cert-wait gates the workload on the initial cert
+// (see certWaitContainer), then the pod's own init containers.
+func injectInitContainers(existing []corev1.Container, injected ...corev1.Container) []corev1.Container {
+	reserved := make(map[string]struct{}, len(injected))
+	for _, c := range injected {
+		reserved[c.Name] = struct{}{}
+	}
+	out := make([]corev1.Container, 0, len(existing)+len(injected))
+	out = append(out, injected...)
 	for _, ec := range existing {
-		if ec.Name != c.Name {
+		if _, ok := reserved[ec.Name]; !ok {
 			out = append(out, ec)
 		}
 	}
@@ -992,21 +1025,25 @@ func replaceInitContainer(existing []corev1.Container, c corev1.Container) []cor
 // rebuilds. Such a container would survive injection and collide with the
 // injected init sidecar (names are unique across all three lists), so it can
 // only be an attempt to shed or impersonate it; init-container collisions are
-// handled by replaceInitContainer instead.
+// handled by injectInitContainers instead.
 func rejectReservedCertContainer(pod *corev1.Pod) error {
 	for _, c := range pod.Spec.Containers {
-		if c.Name == reservedCertContainerName {
-			return fmt.Errorf("%w: container name %q is reserved for the injected c8s cert sidecar",
-				errInvalidInjectionAnnotation, reservedCertContainerName)
+		if isReservedCertName(c.Name) {
+			return fmt.Errorf("%w: container name %q is reserved for the injected c8s cert containers",
+				errInvalidInjectionAnnotation, c.Name)
 		}
 	}
 	for _, c := range pod.Spec.EphemeralContainers {
-		if c.Name == reservedCertContainerName {
-			return fmt.Errorf("%w: ephemeral container name %q is reserved for the injected c8s cert sidecar",
-				errInvalidInjectionAnnotation, reservedCertContainerName)
+		if isReservedCertName(c.Name) {
+			return fmt.Errorf("%w: ephemeral container name %q is reserved for the injected c8s cert containers",
+				errInvalidInjectionAnnotation, c.Name)
 		}
 	}
 	return nil
+}
+
+func isReservedCertName(name string) bool {
+	return name == reservedCertContainerName || name == reservedCertWaitContainerName
 }
 
 func mountAll(pod *corev1.Pod, mount corev1.VolumeMount) {

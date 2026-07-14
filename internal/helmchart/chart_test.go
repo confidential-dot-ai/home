@@ -186,11 +186,14 @@ func TestChartDefaultRendersReplacementStack(t *testing.T) {
 	if cert.RestartPolicy == nil || *cert.RestartPolicy != corev1.ContainerRestartPolicyAlways {
 		t.Fatalf("c8s-cert restartPolicy = %v, want Always (single long-lived sidecar so its pidns anchors shareProcessNamespace under kata)", cert.RestartPolicy)
 	}
-	if cert.StartupProbe == nil || cert.StartupProbe.Exec == nil {
-		t.Fatalf("c8s-cert must expose a startupProbe so nginx waits for the initial cert; got %+v", cert.StartupProbe)
+	// nginx is gated by the c8s-cert-wait init container, not an exec
+	// startupProbe on the sidecar — the locked kata guest denies exec.
+	if cert.StartupProbe != nil {
+		t.Fatalf("c8s-cert must NOT carry a startupProbe (exec is denied on locked kata guests); got %+v", cert.StartupProbe)
 	}
-	if got := strings.Join(cert.StartupProbe.Exec.Command, " "); !strings.Contains(got, "probe-file") || !strings.Contains(got, "/tls/cert.pem") {
-		t.Fatalf("c8s-cert startupProbe command = %q, want `/c8s probe-file /tls/cert.pem` (distroless: no /bin/test available)", got)
+	wait := tlsLBGetCertContainer(t, out, "c8s-cert-wait")
+	if got := strings.Join(wait.Command, " "); !strings.Contains(got, "probe-file") || !strings.Contains(got, "--wait") || !strings.Contains(got, "/tls/cert.pem") {
+		t.Fatalf("c8s-cert-wait command = %q, want `/c8s probe-file --wait --timeout=... /tls/cert.pem`", got)
 	}
 	if got := cert.SecurityContext.RunAsUser; got == nil || *got != 101 {
 		t.Fatalf("c8s-cert runAsUser = %v, want 101", got)
@@ -2974,7 +2977,7 @@ func TestChartCwLabelIntegrityPolicyRendersByDefault(t *testing.T) {
 	}
 	// The cw label must not exist without the injected c8s-cert sidecar, or a
 	// pod could keep workload identity while shedding attestation-bound
-	// injection (webhook pod_mutator.go, replaceInitContainer / VAP backstop).
+	// injection (webhook pod_mutator.go, injectInitContainers / VAP backstop).
 	if !slices.ContainsFunc(policy.Spec.Variables, func(v admissionregv1.Variable) bool {
 		return v.Name == "hasCertSidecar" && strings.Contains(v.Expression, "initContainers")
 	}) {

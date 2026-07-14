@@ -31,8 +31,8 @@ func TestMutatePodInjectsCertSidecar(t *testing.T) {
 		CertDir:           "/etc/c8s/certs",
 	})
 
-	if len(pod.Spec.InitContainers) != 1 {
-		t.Fatalf("init containers = %d, want a single c8s-cert sidecar", len(pod.Spec.InitContainers))
+	if len(pod.Spec.InitContainers) != 2 {
+		t.Fatalf("init containers = %d, want c8s-cert sidecar + c8s-cert-wait gate", len(pod.Spec.InitContainers))
 	}
 	if len(pod.Spec.Containers) != 1 {
 		t.Fatalf("containers = %d, want app container only", len(pod.Spec.Containers))
@@ -65,11 +65,23 @@ func TestMutatePodInjectsCertSidecar(t *testing.T) {
 	if cert.RestartPolicy == nil || *cert.RestartPolicy != corev1.ContainerRestartPolicyAlways {
 		t.Fatalf("c8s-cert restartPolicy = %#v, want Always (native sidecar so the pidns anchor stays alive under kata)", cert.RestartPolicy)
 	}
-	if cert.StartupProbe == nil || cert.StartupProbe.Exec == nil {
-		t.Fatalf("c8s-cert must expose a startupProbe so the workload waits for the initial cert; got %#v", cert.StartupProbe)
+	// The workload is gated by the c8s-cert-wait init container, not an exec
+	// startupProbe on the sidecar — the locked kata guest denies exec, so a
+	// probe could never pass there. The sidecar must carry no startupProbe.
+	if cert.StartupProbe != nil {
+		t.Fatalf("c8s-cert must NOT carry a startupProbe (exec is denied on locked kata guests); got %#v", cert.StartupProbe)
 	}
-	if got := cert.StartupProbe.Exec.Command; len(got) != 3 || got[0] != "/c8s" || got[1] != "probe-file" || got[2] != "/etc/c8s/certs/tls.crt" {
-		t.Fatalf("c8s-cert startupProbe command = %v, want [/c8s probe-file /etc/c8s/certs/tls.crt]", got)
+	wait := pod.Spec.InitContainers[1]
+	if wait.Name != reservedCertWaitContainerName {
+		t.Fatalf("init container[1] name = %q, want %s (the exec-free cert gate)", wait.Name, reservedCertWaitContainerName)
+	}
+	if wait.RestartPolicy != nil {
+		t.Fatalf("c8s-cert-wait must be a run-once init container (nil restartPolicy), got %#v", wait.RestartPolicy)
+	}
+	for _, want := range []string{"/c8s", "probe-file", "--wait", "/etc/c8s/certs/tls.crt"} {
+		if !hasArg(wait.Command, want) {
+			t.Fatalf("c8s-cert-wait command %v missing %s", wait.Command, want)
+		}
 	}
 	if cert.SecurityContext == nil {
 		t.Fatalf("missing c8s-cert security context")
@@ -145,8 +157,8 @@ func TestMutatePodUsesConfiguredCertAndInitSecurity(t *testing.T) {
 	if got := *pod.Spec.SecurityContext.FSGroup; got != 4242 {
 		t.Fatalf("fsGroup = %d, want 4242", got)
 	}
-	if len(pod.Spec.InitContainers) != 1 {
-		t.Fatalf("init containers = %d, want a single c8s-cert sidecar", len(pod.Spec.InitContainers))
+	if len(pod.Spec.InitContainers) != 2 {
+		t.Fatalf("init containers = %d, want c8s-cert sidecar + c8s-cert-wait gate", len(pod.Spec.InitContainers))
 	}
 	cert := pod.Spec.InitContainers[0]
 	if !hasArg(cert.Args, "--key-mode=0440") {
@@ -220,8 +232,8 @@ func TestMutatePodSupportsTLSLBProfile(t *testing.T) {
 	if len(pod.Spec.Volumes) != 3 {
 		t.Fatalf("volumes = %#v, want existing tls-lb volumes only", pod.Spec.Volumes)
 	}
-	if len(pod.Spec.InitContainers) != 1 {
-		t.Fatalf("init containers = %d, want a single c8s-cert sidecar", len(pod.Spec.InitContainers))
+	if len(pod.Spec.InitContainers) != 2 {
+		t.Fatalf("init containers = %d, want c8s-cert sidecar + c8s-cert-wait gate", len(pod.Spec.InitContainers))
 	}
 	cert := pod.Spec.InitContainers[0]
 	for _, want := range []string{
@@ -662,8 +674,8 @@ func TestHandleDerivesServiceSAN(t *testing.T) {
 	}
 
 	initContainers := initContainersPatch(t, resp)
-	if len(initContainers) != 1 {
-		t.Fatalf("initContainers patch = %d containers, want a single c8s-cert sidecar", len(initContainers))
+	if len(initContainers) != 2 {
+		t.Fatalf("initContainers patch = %d containers, want c8s-cert sidecar + c8s-cert-wait gate", len(initContainers))
 	}
 	if !hasArg(initContainers[0].Args, "--san=c8s-api.default.svc") {
 		t.Fatalf("%s args %v missing --san=c8s-api.default.svc", initContainers[0].Name, initContainers[0].Args)
@@ -803,8 +815,8 @@ func TestHandleSANOverrideWinsOverDerivation(t *testing.T) {
 		t.Fatalf("Handle denied: %v", resp.Result)
 	}
 	initContainers := initContainersPatch(t, resp)
-	if len(initContainers) != 1 {
-		t.Fatalf("initContainers patch = %d containers, want a single c8s-cert sidecar", len(initContainers))
+	if len(initContainers) != 2 {
+		t.Fatalf("initContainers patch = %d containers, want c8s-cert sidecar + c8s-cert-wait gate", len(initContainers))
 	}
 	if !hasArg(initContainers[0].Args, "--san=api.default.svc") {
 		t.Fatalf("%s args %v missing --san=api.default.svc", initContainers[0].Name, initContainers[0].Args)
@@ -878,8 +890,8 @@ func TestMutatePodInjectionIsIdempotent(t *testing.T) {
 	mutatePod(pod, &injection{WorkloadID: "api"}, cfg)
 	mutatePod(pod, &injection{WorkloadID: "api"}, cfg)
 
-	if got := len(pod.Spec.InitContainers); got != 1 {
-		t.Fatalf("init containers = %d after two injections, want 1", got)
+	if got := len(pod.Spec.InitContainers); got != 2 {
+		t.Fatalf("init containers = %d after two injections, want 2 (c8s-cert + c8s-cert-wait, deduped)", got)
 	}
 	volumes := 0
 	for _, v := range pod.Spec.Volumes {
@@ -977,7 +989,7 @@ func TestHandleInjectsDespitePresetInjectedMarker(t *testing.T) {
 		t.Fatalf("Handle denied: %v", resp.Result)
 	}
 	inits := initContainersPatch(t, resp)
-	if len(inits) != 1 || inits[0].Name != "c8s-cert" {
-		t.Fatalf("initContainers patch = %+v, want a single injected c8s-cert despite the preset marker", inits)
+	if len(inits) != 2 || inits[0].Name != "c8s-cert" || inits[1].Name != "c8s-cert-wait" {
+		t.Fatalf("initContainers patch = %+v, want injected c8s-cert + c8s-cert-wait despite the preset marker", inits)
 	}
 }

@@ -81,6 +81,49 @@ func TestFindCgroupDir_NestedUnderSlice(t *testing.T) {
 	}
 }
 
+// TestFindCgroupDir_SystemdScope covers the real-world layout a systemd-PID-1
+// kata guest produces: the container's cgroup is a systemd scope
+// (cri-containerd-<cid>.scope) nested under the pod's kubepods*.slice, not a
+// bare <cid> directory. Matching only the bare basename was a silent
+// enforcement hole — a denied container's SIGKILL never landed.
+func TestFindCgroupDir_SystemdScope(t *testing.T) {
+	root := t.TempDir()
+	cid := "b790433fdb4f223a51940bae06c1cd54d73377fc3ea45c4fa5c7ea3bd4b6c829"
+	scope := filepath.Join(root, "kubepods.slice", "kubepods-besteffort.slice",
+		"kubepods-besteffort-podabc.slice", "cri-containerd-"+cid+".scope")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := findCgroupDir(root, cid)
+	if err != nil {
+		t.Fatalf("findCgroupDir: %v", err)
+	}
+	if got != scope {
+		t.Errorf("got %q, want %q", got, scope)
+	}
+}
+
+func TestCgroupDirMatchesCID(t *testing.T) {
+	cid := "b790433fdb4f223a51940bae06c1cd54d73377fc3ea45c4fa5c7ea3bd4b6c829"
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{
+		{cid, true},            // flat fs driver
+		{cid + ".scope", true}, // bare systemd scope
+		{"cri-containerd-" + cid + ".scope", true},  // containerd systemd driver
+		{"crio-" + cid + ".scope", true},            // CRI-O systemd driver
+		{"kubepods-besteffort-podabc.slice", false}, // a pod slice, not the container
+		{"other-" + cid[:20], false},                // partial id must not match
+		{"deadbeef", false},
+		{"", false},
+	} {
+		if got := cgroupDirMatchesCID(tc.name, cid); got != tc.want {
+			t.Errorf("cgroupDirMatchesCID(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestFindCgroupDir_NotFound(t *testing.T) {
 	root := t.TempDir()
 	got, err := findCgroupDir(root, "missing")

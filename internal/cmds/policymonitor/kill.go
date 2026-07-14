@@ -23,12 +23,20 @@ package policymonitor
 // higher PIDs because they're descendants of init). So `head -1
 // cgroup.procs` is the init PID.
 //
-// We try a few candidate locations because kata-agent's cgroup naming
-// is configurable (some kata builds use a sandbox-then-container
-// nesting like /sys/fs/cgroup/kata_<sandbox>/<cid>, some use a flat
-// /sys/fs/cgroup/<cid>, some inherit a systemd slice). We walk the
-// hierarchy to find any subdirectory whose basename matches the
-// container id.
+// We walk the hierarchy to find the subdirectory that identifies the
+// container, because kata-agent's cgroup naming depends on the guest's
+// cgroup driver:
+//   - fs driver:      a flat /sys/fs/cgroup/<cid>, or a sandbox-then-
+//                     container nesting like /sys/fs/cgroup/kata_<sandbox>/<cid>
+//   - systemd driver: a systemd scope, cri-containerd-<cid>.scope (containerd)
+//                     or crio-<cid>.scope (CRI-O), nested under the pod's
+//                     kubepods*.slice — this is what a systemd-PID-1 kata
+//                     guest actually uses, so it is the common case in the
+//                     field. Matching only the bare <cid> basename here was a
+//                     silent enforcement hole: policy-monitor denied a
+//                     non-allowlisted container but then could not find its
+//                     cgroup, so the SIGKILL never landed and the container
+//                     ran. cgroupDirMatchesCID recognises both shapes.
 
 import (
 	"bufio"
@@ -130,11 +138,12 @@ func (c *cgroupLocator) findInitPID(containerID string) (int, bool, error) {
 	}
 }
 
-// findCgroupDir walks root looking for a directory whose basename
-// equals containerID. Returns the first match (depth-first) or an
-// empty string. We don't bother with finer disambiguation — the kata
-// container id is a 64-hex-char SHA-256 (or similar high-entropy
-// string) and collisions in the cgroup tree are not credible.
+// findCgroupDir walks root looking for a directory that identifies
+// containerID (see cgroupDirMatchesCID for the naming schemes). Returns
+// the first match (depth-first) or an empty string. We don't bother with
+// finer disambiguation — the kata container id is a 64-hex-char SHA-256
+// (or similar high-entropy string) and collisions in the cgroup tree are
+// not credible.
 //
 // Implementation note: we use filepath.WalkDir rather than recursing
 // manually because the cgroup v2 hierarchy can be arbitrarily deep
@@ -167,7 +176,7 @@ func findCgroupDir(root, containerID string) (string, error) {
 		if !d.IsDir() {
 			return nil
 		}
-		if d.Name() == containerID {
+		if cgroupDirMatchesCID(d.Name(), containerID) {
 			found = path
 			return filepath.SkipAll
 		}
@@ -177,6 +186,20 @@ func findCgroupDir(root, containerID string) (string, error) {
 		return "", walkErr
 	}
 	return found, nil
+}
+
+// cgroupDirMatchesCID reports whether a cgroup directory basename identifies
+// containerID, across the cgroup-driver naming schemes kata-agent produces:
+//   - flat / nested fs driver:  <cid>
+//   - systemd scope:            cri-containerd-<cid>.scope, crio-<cid>.scope,
+//     or <cid>.scope
+//
+// containerID is a 64-hex (or similarly high-entropy) kata container id, so a
+// suffix match cannot credibly collide with an unrelated cgroup — the same
+// argument findCgroupDir already relies on for the exact-match case.
+func cgroupDirMatchesCID(basename, containerID string) bool {
+	name := strings.TrimSuffix(basename, ".scope")
+	return name == containerID || strings.HasSuffix(name, "-"+containerID)
 }
 
 // readFirstPID reads the first line of path and returns it as an int.

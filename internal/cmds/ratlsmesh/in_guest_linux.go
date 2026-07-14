@@ -699,10 +699,11 @@ CreateContainerError rather than a "started but broken" pod.
 
 A workload pod whose CDS is unreachable still fails closed: its
 injected c8s-cert sidecar dials CDS to mint its leaf and that call
-returns an error, so the sidecar's startupProbe never passes and
-kubelet reports the workload pod stuck at Init. The fail-closed
-property moves from ratls-mesh's startup gate to the c8s-cert
-sidecar, one container later in the boot, with the same end state.`,
+returns an error, so the cert is never written and the c8s-cert-wait
+gate init container never exits, so kubelet reports the workload pod
+stuck at Init. The fail-closed property moves from ratls-mesh's startup
+gate to the c8s-cert path, one container later in the boot, with the
+same end state.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {

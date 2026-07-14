@@ -35,9 +35,10 @@ while shedding the real, attestation-bound sidecar — no VAP checked sidecar
 presence, only `label == annotation`.
 
 Injection is now idempotent **by reconstruction**, not by trust:
-`replaceInitContainer` drops any pre-existing `c8s-cert` init container and
-prepends the operator-built one (so a decoy is overwritten, and a reinvocation
-converges), `rejectReservedCertContainer` denies a `c8s-cert` in the
+`injectInitContainers` drops any pre-existing `c8s-cert` / `c8s-cert-wait` init
+container and prepends the operator-built `c8s-cert` sidecar and `c8s-cert-wait`
+gate (so a decoy is overwritten, and a reinvocation converges),
+`rejectReservedCertContainer` denies either reserved name in the
 regular/ephemeral lists (which the init-slot rebuild cannot reach), and the
 marker no longer gates injection. The `cw-label-integrity` VAP backstops it in
 the API server: a pod carrying the `confidential.ai/cw` label must declare a
@@ -455,6 +456,27 @@ scan). Any future in-guest component that watches a path kata-agent owns must
 handle the same replacement — watch liveness, not just watch existence, and
 rescan after re-watching.
 
+## policy-monitor's cgroup lookup must match the systemd-scope name, or the SIGKILL silently misses
+
+`internal/cmds/policymonitor/kill.go` (`findCgroupDir` / `cgroupDirMatchesCID`)
+
+policy-monitor denies a non-allowlisted container correctly, then locates its
+init PID by walking `/sys/fs/cgroup` for the container's cgroup and reading
+`cgroup.procs`. The lookup used to match a directory whose basename equals
+`<cid>` **exactly**. But a systemd-PID-1 kata guest (our case) uses the systemd
+cgroup driver, so the container's cgroup is a **scope**:
+`cri-containerd-<cid>.scope` (containerd) or `crio-<cid>.scope`, nested under
+`kubepods.slice/.../kubepods-*-pod<uid>.slice/`. The exact-basename match never
+found it, `findInitPID` returned not-found, and the kill was a **silent no-op**
+— the denied image ran fully unenforced (worse than the bounded post-start
+window: unbounded). Same failure family as the inotify-watch death above:
+policy-monitor *decides* correctly but the *enforcement action* silently
+misses, with no error surfaced. `cgroupDirMatchesCID` now matches `<cid>`,
+`<cid>.scope`, and `<prefix>-<cid>.scope`. Any change to the kill path must be
+validated against a real systemd-PID-1 guest's cgroup layout (verify with
+`find /sys/fs/cgroup -name '*<cid>*'` in a guest debug console), not just the
+fs-driver `<cid>` shape the unit tests fabricate.
+
 ## kata guests: inbound TCP port 8443 bypasses the mesh (baked passthrough)
 
 `kata-guest-base/extra/etc/c8s/cloudinit.env` (`C8S_MESH_INBOUND_PASSTHROUGH`),
@@ -563,6 +585,34 @@ c8s GPU guest boots to agent in <1 min so the default rarely bites now, but any
 slow path (cold registry, huge image, big-memory guest) hits the 2 m wall
 first. RKE2: `kubelet-arg: runtime-request-timeout=20m` in
 `/etc/rancher/rke2/config.yaml` (matches the fleet ansible default).
+
+## Injected/chart probes on kata-guest containers must not use `exec`
+
+`internal/webhook/pod_mutator.go` (`certContainer` / `certWaitContainer`),
+`internal/helmchart/c8s/templates/_helpers.tpl` (`c8s.getCertContainers`)
+
+The locked `kata-qemu-snp` guest denies `ExecProcessRequest`
+(`kata-guest-base/extra/etc/kata-opa/default-policy.rego`, intentional — it is
+what blocks `kubectl exec` into a confidential pod). kubelet cannot distinguish
+an exec **probe** from a host exec, so **any `exec` probe on a container that
+runs inside a locked guest never passes**, and the pod hangs in `Init`
+(`Startup probe errored … ExecProcessRequest is blocked by policy`). This bit
+the get-cert readiness gate: a `startupProbe: exec [/c8s probe-file tls.crt]`
+on the `c8s-cert` native sidecar meant **every confidential workload pod was
+stuck in Init on the locked guest** — masked for a while because the published
+`kata-guest-base:main` was briefly a `c8s-debug` build (exec allowed), so it
+only surfaced on the real locked guest.
+
+Fix pattern: gate the workload with a plain **run-once init container**
+(`c8s-cert-wait`, running `c8s probe-file --wait`) that blocks on the cert file
+and exits 0 — running a container is `CreateContainerRequest`, which the guest
+allows, and normal init-completion ordering fails closed. The `c8s-cert`
+sidecar stays the long-lived first init container (it anchors
+`shareProcessNamespace` under kata), just without a probe. Any future readiness
+signal for a kata-guest container must be non-exec: a run-once gate container,
+or `httpGet`/`tcpSocket`/`grpc` (CDS's own probes are `tcpSocket`/`httpGet` for
+this reason). Never add an `exec` probe to CDS, tls-lb, or an injected
+workload container.
 
 ## `kubectl logs` on locked-guest pods is empty by design
 

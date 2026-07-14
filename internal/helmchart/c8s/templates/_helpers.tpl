@@ -368,23 +368,31 @@ Caller passes a dict:
     {{- with .extraMounts }}
     {{- . | nindent 4 }}
     {{- end }}
-  # Gate the workload on the initial cert being written. Native sidecars
-  # are considered "started" as soon as the process launches, so without
-  # this probe the workload would race the initial fetch. `c8s probe-file`
-  # is used because the image is gcr.io/distroless/static and has no `test`.
-  #
-  # The `/c8s` path is the binary location set by cmd/c8s/Dockerfile
-  # (`COPY build/c8s /c8s`). If that COPY target or the ENTRYPOINT changes,
-  # update this command — startupProbe.exec bypasses the ENTRYPOINT so the
-  # full path must match.
-  startupProbe:
-    exec:
-      command:
-        - /c8s
-        - probe-file
-        - {{ .certOut }}
-    periodSeconds: 1
-    failureThreshold: 180
+  # The workload is gated on the initial cert by the c8s-cert-wait init
+  # container below, not a startupProbe here: a native sidecar is "started"
+  # the moment its process launches, and an exec startupProbe is denied by the
+  # locked kata-qemu-snp guest (ExecProcessRequest := false), so it could never
+  # pass there and the workload would hang in Init forever.
+  securityContext:
+    {{- include "c8s.getCertSecurityContext" . | nindent 4 }}
+# c8s-cert-wait gates the workload on the initial cert without an exec probe.
+# A plain (run-once) init container that blocks on the cert file is a
+# CreateContainerRequest the locked guest allows, and normal init-completion
+# ordering holds the workload until the attested cert exists — fail-closed.
+# The `/c8s` path is the binary location from cmd/c8s/Dockerfile; command
+# bypasses the ENTRYPOINT so the full path must match.
+- name: c8s-cert-wait
+  image: {{ include "c8s.image" $root }}
+  imagePullPolicy: IfNotPresent
+  command:
+    - /c8s
+    - probe-file
+    - --wait
+    - --timeout=3m
+    - {{ .certOut }}
+  volumeMounts:
+    - name: {{ .volume }}
+      mountPath: {{ .mountPath }}
   securityContext:
     {{- include "c8s.getCertSecurityContext" . | nindent 4 }}
 {{- end -}}

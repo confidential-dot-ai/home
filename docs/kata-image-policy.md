@@ -148,6 +148,17 @@ configured yet, no `execve` to user code yet). The
 [BPF-LSM upgrade path](#bpf-lsm-upgrade-path) below describes how to
 close the gap by hooking `security_bprm_check_security` in the kernel.
 
+**The bound holds only if the kill actually lands.** Step 2's `cgroup.procs`
+read depends on locating the container's cgroup, and on a systemd-PID-1 guest
+that cgroup is a systemd *scope* — `cri-containerd-<cid>.scope` nested under
+`kubepods*.slice` — not a bare `<cid>` directory. A cgroup matcher that only
+recognizes the bare `<cid>` silently misses the kill on the common (systemd)
+guest: policy-monitor *denies* the container but `findInitPID` returns
+not-found, so the SIGKILL never fires and the denied image runs **unenforced**
+(this was a 2026-07 field bug, fixed). The matcher must handle the
+systemd-scope naming — see `internal/cmds/policymonitor/kill.go`
+(`cgroupDirMatchesCID`).
+
 ## Why the OPA policy is permissive
 
 kata-agent's bootstrap OPA policy in this image is
@@ -534,9 +545,13 @@ policy-monitor enforces *after* kata-agent has forked the container
 init, not before — the mechanics and bounds are in
 [Post-start kill window](#post-start-kill-window) above.
 
-**Severity: low.** The TCB protection (SEV-SNP-encrypted memory)
-holds for the duration of the gap; the denied init cannot
-exfiltrate. But the gap is honest and called out for completeness.
+**Severity: low** — *provided the kill lands*. The TCB protection
+(SEV-SNP-encrypted memory) holds for the duration of the gap; the denied
+init cannot exfiltrate. But the gap is honest and called out for
+completeness. Note the bound is only "low severity" once the kill path
+matches the guest's systemd-scope cgroup naming (see the reliability caveat
+in [Post-start kill window](#post-start-kill-window) above); a matcher that
+missed it turned this bounded gap into unbounded non-enforcement.
 
 **Mitigation.** The [BPF-LSM upgrade path](#bpf-lsm-upgrade-path)
 hooks `security_bprm_check_security` to make the decision

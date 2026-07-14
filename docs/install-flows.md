@@ -214,9 +214,12 @@ flowchart TD
 Two independent injections, both keyed off the pod (not a CR):
 
 1. **get-cert** — driven by the `confidential.ai/cw=<id>` annotation, in
-   **any** mode. Injects a single `c8s-cert` native sidecar that fetches the
-   leaf cert from CDS on startup and renews it on a ticker; downstream
-   containers wait for its startupProbe before launching.
+   **any** mode. Injects a `c8s-cert` native sidecar that fetches the
+   leaf cert from CDS on startup and renews it on a ticker, plus a
+   `c8s-cert-wait` run-once init container (`/c8s probe-file --wait`) that
+   blocks until the initial cert is written so downstream containers wait for
+   it before launching. (An exec startupProbe cannot gate here: the locked
+   kata guest denies `ExecProcessRequest`.)
 2. **runtimeClass** — only under `--kata` (which is enforcing).
    `kata-qemu-snp` for `cw`-annotated pods (confidential), `kata-qemu`
    otherwise.

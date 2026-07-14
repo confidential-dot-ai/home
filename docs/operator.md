@@ -397,6 +397,8 @@ For opted-in pods, the webhook:
   `restartPolicy: Always`) that fetches the first cert before application
   containers start and then renews `tls.crt` every
   `webhook.getCert.renewInterval`;
+- prepends a `c8s-cert-wait` run-once init container after it that gates the
+  application containers on the initial cert (see below);
 - stamps `confidential.ai/c8s-injected=true` to make reinvocation a no-op.
 
 The sidecar runs:
@@ -416,10 +418,16 @@ get-cert \
 
 `--key-out` is idempotent: on a kubelet restart of the sidecar it reuses the
 key that's already on disk, so the previously-issued cert chain stays valid.
-A `startupProbe` (`/c8s probe-file /etc/c8s/certs/tls.crt`) gates the
-application containers on the initial cert being written. Renewals rewrite
-the file on disk; application-level TLS reload remains the workload's
-responsibility unless the pod opts into one of the c8s reload annotations.
+The `c8s-cert-wait` init container (`/c8s probe-file --wait /etc/c8s/certs/tls.crt`)
+gates the application containers on the initial cert being written: it blocks
+until the cert exists, then exits, and normal init-completion ordering holds the
+workload until then — fail-closed. It is a plain init container rather than a
+`startupProbe` on the sidecar because the locked `kata-qemu-snp` guest denies
+`ExecProcessRequest` by design, so an exec probe could never pass there and the
+workload would hang in `Init`; a container blocking on its own is a
+`CreateContainerRequest` the guest allows. Renewals rewrite the file on disk;
+application-level TLS reload remains the workload's responsibility unless the
+pod opts into one of the c8s reload annotations.
 
 The sidecar is long-lived rather than a run-once init container because under
 kata it doubles as the pidns anchor for `shareProcessNamespace` — see
