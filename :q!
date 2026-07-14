@@ -1,0 +1,263 @@
+feat(kms): openbao-gated secrets manager + LUKS volumes for confidential workloads
+
+Ship the c8s Secrets Manager Proxy (whitepaper §4.3, §5.6.4) as an
+attestation-gated broker in front of a vanilla OpenBao/Vault, plus a
+c8s-native LUKS volume path so a confidential workload can attach a
+persistent encrypted disk without ever handing a passphrase to the host.
+
+`internal/cmds/secretbroker/` — a subset of the Vault HTTP API (health,
+cert/login, token/lookup-self, KV v2 read). Every request is
+authenticated at TLS: `ratls` (default) verifies the caller's TEE
+attestation report against `--measurements`; `ca` verifies the CDS
+mesh-issued client cert and identifies the caller by SAN. Both modes
+pass the peer identity to a deny-by-default JSON release policy that
+maps `(workloadId, measurement) → allowed KV paths`. On `cert/login`
+the broker mints a short-TTL token bound to the caller's client cert
+(a stolen token cannot be replayed on another cert). The broker
+authenticates to the store with its own token / AppRole. Store
+attestation is required by default (RA-TLS to OpenBao); `attested=false`
+is documented as the trust edge for external stores.
+
+Stock `bao` and `vault` agents work against the broker unchanged — it
+IS the Vault HTTP API. Chart wires the release policy in via values,
+mounts the broker's credential as a file (kept out of argv), and pins
+the broker as a mesh component under kata.
+
+`internal/webhook/secrets.go`, `luks.go` — two annotation families for
+confidential workloads:
+
+    confidential.ai/secrets-inject: "true"
+    confidential.ai/secret-<name>: <kv-path>[#<field>]
+    confidential.ai/luks-<name>: dev=<path>,mount=<mount>,secret=<kv-path>#<field>[,fstype=ext4][,mode=open|format-if-empty]
+
+When set, the webhook injects (after the existing c8s-cert init):
+
+  * c8s-secrets-config — renders the Vault Agent config in-image (in
+    the measured c8s binary), never through a ConfigMap.
+  * c8s-secrets-agent-init — the unmodified OpenBao/Vault Agent as a
+    one-shot: auth via mesh cert → template each secret to
+    /vault/secrets/<name> → exit and gate the next init.
+  * c8s-secrets-agent — optional renewal sidecar (Renew: true).
+  * c8s-luks-open — reads passphrase files the agent templated,
+    cryptsetup-formats (if mode=format-if-empty) / opens the
+    referenced block device, mkfs on first use, mounts the mapper for
+    the app container. Runs privileged as root (block-device ops
+    require CAP_DAC_OVERRIDE / mount).
+
+Fail-closed guards land at admission:
+  * secrets-inject without a matching --secret-agent-image on the
+    operator → 400 (an app that comes up missing its secret files
+    should never be admitted).
+  * luks-<name> without a matching secret-<name> or without
+    secrets-inject: true → 400 (the passphrase must exist as a file
+    before luks-open runs, or luks-open would race and crash).
+  * secretBroker.peerVerify=ratls under kata.enabled=true → chart
+    render fails with kind=broker_ratls_under_kata — see the design
+    doc below for the underlying architectural gap.
+
+`internal/cmds/luksopen/` — the runtime driver the webhook injects.
+Reads passphrase files from --secrets-dir; for each --volume spec
+runs `cryptsetup isLuks` → `luksFormat --batch-mode` (mode=
+format-if-empty only) → `luksOpen` → blkid → `mkfs.<fstype>` if the
+mapper is empty → mount at --mount-root/<name>. Idempotent on pod
+restart: skips volumes whose mount is already present in
+/proc/self/mountinfo. Passphrase files with trailing newlines are
+handled correctly (cryptsetup takes the whole file including the
+newline; we strip it).
+
+`internal/cmds/luks/` — operator-facing management of encrypted
+volumes:
+
+    c8s luks create --workload <cw-id> --name <n> --size <qty>
+                    [--driver local|pvc|csi] [--fstype ext4]
+                    [--defer-format] [--passphrase-entropy 32]
+    c8s luks list    --workload <cw-id>
+    c8s luks show    --workload <cw-id> --name <n>   # no passphrase disclosure
+    c8s luks destroy --workload <cw-id> --name <n> [--force]
+
+Passphrases are 32-byte crypto/rand, hex-encoded, never printed to
+stdout (only openbao sees them). KV write happens BEFORE any host
+mutation so a failed openbao doesn't leave a formatted disk with an
+unknown passphrase; host-mutation failures roll back the KV entry so
+a retry starts fresh. The `local` driver is implemented end-to-end
+(dd + losetup + luksFormat + mkfs + luksClose, and matching
+detach/delete on destroy). `pvc` and `csi` return "not yet
+implemented" so the flag surface is stable when they're added.
+
+The CLI emits pod annotations + a volume snippet matching Stage 5's
+parser exactly — the intended workflow is
+`c8s luks create ... | yaml → kubectl edit / helm / gitops`, never
+"apply to a workload" magic.
+
+`internal/issuer/sign.go`, `internal/cmds/cds/attest.go` — every mesh
+leaf CDS mints now carries the workload's already-verified TEE report
+as OID 1.3.6.1.4.1.59888.1.1 (SNP: raw report; TDX: /verify envelope,
+via the existing attestclient.RATLSEvidence helper). Downstream
+ratls-mode verifiers (ratls.VerifyCert, `c8s cds verify`) see the
+same measurement CDS accepted, without a second attestation round-trip.
+Server-supplied evidence takes precedence over any client-supplied
+.1.1 in the CSR (the issuer's just-verified evidence is authoritative).
+
+Non-fatal if extraction fails — the mesh cert still issues without
+.1.1 so no regression for existing CA-chain-only verifiers.
+
+Two independent E2E paths:
+
+**Hardware-free (`scratchpad/broker-openbao-e2e.sh`)** — spins the
+broker as a local process, points it at the deployed openbao via
+port-forward, drives cert/login → token → KV read via curl+mTLS.
+Returns the expected password. Proves the broker + release policy +
+KV brokering + token binding all work as a unit.
+
+**In-cluster on Azure SEV-SNP CVM (`--cvm-mode=aks`, vTPM path)** —
+c8s-cert obtains the mesh cert through vTPM attestation; the injected
+Vault Agent authenticates to the broker (release policy matches on
+the mesh SAN); c8s-luks-open reads the templated passphrase and
+cryptsetup-formats /dev/loop0; the app container writes a marker to a
+LUKS-mounted /data. Confirms every stage on the golden path.
+
+* 2026-07-09-broker-peer-verify-under-kata.md — records that
+  `secretBroker.peerVerify=ratls` under `--kata` is inert (the
+  in-guest ratls-mesh sidecar terminates TLS in front of the broker
+  with its OWN bootstrap cert, so the broker never sees the peer's
+  measurement). Option A step 1 (this branch) fixes the mesh-leaves-
+  lack-.1.1 half; step 2 (identity forwarding OR out-of-mesh port)
+  is tracked. The chart validation `kind=broker_ratls_under_kata`
+  guards until step 2 lands.
+
+* 2026-07-10-openbao-luks.md — the LUKS design: annotation grammar,
+  fail-closed guards, threat model (host doesn't see the passphrase
+  at any point; the block device is dm-crypt-encrypted so the host
+  sees only ciphertext), seam with PR #295 (PR #295's kata-guest
+  scratch disk uses per-boot random key + guest never persists;
+  ours uses openbao-issued key + persists across reboots — they
+  coexist as separate disks with separate threat models), and the
+  deferrals (rotation, dm-integrity under dm-crypt, RWX, and the
+  PVC controller).
+
+* 2026-07-10-luks-cli.md — the Stage 6 CLI shape, driver interface,
+  passphrase entropy defaults, the deliberate "no auto-apply" UX.
+
+* `attestation-api` is built in a sibling repo, so a branch install
+  pinned to a c8s CI tag hits 404 on that image. Fix: pin
+  `attestationApi.image.tag=main` via `-f` or `--resolve-digests=false`.
+* CDH inside the guest sends the baked ghcr-auth.json unconditionally
+  and hard-fails 401 if it's stale — not falls back to anonymous. Fix
+  is to rebuild kata-guest-base with a fresh READ_PRIVATE_GHCR_TOKEN;
+  break-glass is `kata.guestImage.registryAuth=""`.
+* Under `--cvm-mode=baremetal` + `--kata` the workload-pod get-cert
+  path is not currently functional — mesh interaction detail we could
+  not root-cause on the test box. `--cvm-mode=aks` (Azure CVM, vTPM
+  path) works end-to-end.
+
+`internal/helmchart/c8s/values.yaml` gets `secretBroker`, `secretAgent`,
+and `luks` blocks. Broker deploys as a mesh component under
+`kata.enabled` (its plaintext egress from ratls-mesh must stay inside
+the TEE). Broker port defaults to 8443, credential mounts as a file.
+
+`secretAgent.image` and `luks.image` are external-image entries in
+`c8sComponents` (new `externalImage: true` flag) — the CLI doesn't
+rewrite --image-tag over them (openbao/openbao has its own version
+stream; the LUKS image defaults to the c8s image which needs
+cryptsetup baked in — the current c8s Dockerfile is debian:12-slim
+with `cryptsetup + util-linux + e2fsprogs + xfsprogs + ca-certificates`
+for exactly this reason).
+
+Unit-tested throughout — 44 packages, 5.9k LOC added. Highlights:
+
+* internal/webhook: parseSecretsInjection matrix (name validation,
+  sorting, opt-in required), parseLUKSVolumes matrix (all fields
+  including sort determinism, opt-in required, matching secret-<name>
+  required), mutatePod end-to-end (injects the four init containers in
+  the correct order + volumes + privileged securityContext on
+  luks-open).
+* internal/cmds/luksopen: ParseVolumeSpecs (name=dev:secretName:fstype:mode
+  form; error path for bad shapes), trimTrailingNewline.
+* internal/cmds/luks: generatePassphrase (entropy bounds), KV path
+  shape, validateCreate matrix, luksMode helper, full mock openbao
+  HTTP round-trip (put / list / show / delete).
+* internal/issuer: two new tests exercising the .1.1 embed round-trip
+  (SNP report unmarshal via ratls.UnmarshalExtension; server-supplied
+  Attestation wins over any client-supplied .1.1 in the CSR — exactly
+  one .1.1 extension on the leaf).
+* internal/cmds/cds: attest.go regression harness picks up the new
+  Attestation field automatically via existing verifier fixtures.
+* internal/helmchart: full chart render suite exercises every values
+  toggle (secretBroker.enabled / peerVerify / kata combinations,
+  luks.enabled, the fail-render validations kind=broker_ratls_under_kata
+  and the LUKS admission guards).
+
+Full `go test ./...` green.
+
+Follow-ups (tracked in the decision docs, not blocking):
+* Option A step 2 — identity forwarding via ratls-mesh OR out-of-mesh
+  broker port, to close the kata-inbound gap.
+* Label secret-broker as a mesh peer so outbound from CW pods rides
+  the mesh mTLS path.
+* `c8s luks` `--driver pvc` (controller for first-bind LUKS format)
+  and `--driver csi`.
+* Rotation: `c8s luks rotate` via cryptsetup luksAddKey/luksRemoveKey.
+* dm-integrity under dm-crypt for the block-device integrity story.
+
+# Please enter the commit message for your changes. Lines starting
+# with '#' will be ignored, and an empty message aborts the commit.
+#
+# Date:      Fri Jul 10 15:58:33 2026 +0000
+#
+# On branch feat/openbao-integration
+# Your branch is up to date with 'origin/feat/openbao-integration'.
+#
+# Changes to be committed:
+#	new file:   .github/workflows/kms-test-images.yml
+#	modified:   cmd/c8s/Dockerfile
+#	modified:   cmd/c8s/install.go
+#	modified:   cmd/c8s/install_test.go
+#	new file:   cmd/c8s/luks.go
+#	new file:   cmd/c8s/luks_open.go
+#	modified:   cmd/c8s/operator.go
+#	modified:   cmd/c8s/render_values.go
+#	new file:   cmd/c8s/secret_broker.go
+#	new file:   docs/decisions/2026-07-09-broker-peer-verify-under-kata.md
+#	new file:   docs/decisions/2026-07-10-luks-cli.md
+#	new file:   docs/decisions/2026-07-10-openbao-luks.md
+#	modified:   docs/pitfalls.md
+#	modified:   internal/cmds/cds/attest.go
+#	new file:   internal/cmds/luks/cmd.go
+#	new file:   internal/cmds/luks/cmd_test.go
+#	new file:   internal/cmds/luks/create.go
+#	new file:   internal/cmds/luks/destroy.go
+#	new file:   internal/cmds/luks/list.go
+#	new file:   internal/cmds/luks/openbao.go
+#	new file:   internal/cmds/luks/show.go
+#	new file:   internal/cmds/luks/util.go
+#	new file:   internal/cmds/luksopen/cmd.go
+#	new file:   internal/cmds/luksopen/cmd_test.go
+#	new file:   internal/cmds/secretbroker/README.md
+#	new file:   internal/cmds/secretbroker/agentcfg.go
+#	new file:   internal/cmds/secretbroker/agentcfg_test.go
+#	new file:   internal/cmds/secretbroker/cmd.go
+#	new file:   internal/cmds/secretbroker/integration_test.go
+#	new file:   internal/cmds/secretbroker/openbao.go
+#	new file:   internal/cmds/secretbroker/peer.go
+#	new file:   internal/cmds/secretbroker/policy.go
+#	new file:   internal/cmds/secretbroker/policy_test.go
+#	new file:   internal/cmds/secretbroker/routes.go
+#	new file:   internal/cmds/secretbroker/run.go
+#	new file:   internal/cmds/secretbroker/token.go
+#	new file:   internal/cmds/secretbroker/token_test.go
+#	new file:   internal/cmds/secretbroker/vault.go
+#	modified:   internal/controller/runner.go
+#	modified:   internal/helmchart/c8s/templates/operator.yaml
+#	new file:   internal/helmchart/c8s/templates/secret-broker-helpers.tpl
+#	new file:   internal/helmchart/c8s/templates/secret-broker.yaml
+#	modified:   internal/helmchart/c8s/templates/validations.yaml
+#	modified:   internal/helmchart/c8s/values.yaml
+#	modified:   internal/issuer/sign.go
+#	modified:   internal/issuer/sign_test.go
+#	new file:   internal/webhook/luks.go
+#	new file:   internal/webhook/luks_test.go
+#	modified:   internal/webhook/pod_mutator.go
+#	new file:   internal/webhook/secrets.go
+#	new file:   internal/webhook/secrets_test.go
+#	new file:   scripts/secret-broker-demo.sh
+#

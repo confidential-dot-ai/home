@@ -518,4 +518,4 @@ Contributions are accepted under the terms in
 
 - [`confidential-dot-ai/c8s-verify-js`](https://github.com/confidential-dot-ai/c8s-verify-js) - browser-side cluster verification library (npm: `c8s-verify`)
 - [`confidential-dot-ai/attestation-rs`](https://github.com/confidential-dot-ai/attestation-rs) - TEE attestation evidence verification service (publishes the `attestation-api` image)
-- [`confidential-dot-ai/deployment-scripts`](https://github.com/confidential-dot-ai/deployment-scripts) - Ansible roles for deploying these components
+- [`confidential-dot-ai/attestation-go`](https://github.com/confidential-dot-ai/attestation-go) - TEE attestation evidence verification library for go
