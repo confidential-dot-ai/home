@@ -19,8 +19,6 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
-const fakeCDSCert = "-----BEGIN CERTIFICATE-----\nMIIBfakefakefake\n-----END CERTIFICATE-----\n"
-
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	identity := writeTestMeshIdentity(t)
@@ -30,7 +28,6 @@ func newTestServer(t *testing.T) *httptest.Server {
 			Platform:   "snp",
 			Generation: "genoa",
 		},
-		CDSCertPEM:           []byte(fakeCDSCert),
 		MeshIdentityCertFile: identity.certFile,
 		MeshIdentityKeyFile:  identity.keyFile,
 		MeshIdentityCAFile:   identity.caFile,
@@ -64,23 +61,6 @@ func clientChannelFromBundle(t *testing.T, bundle types.AttestationBundle, nonce
 		t.Fatal(err)
 	}
 	return channel, hs
-}
-
-func TestServesCDSCert(t *testing.T) {
-	ts := newTestServer(t)
-	defer ts.Close()
-	resp, err := http.Get(ts.URL + "/.well-known/c8s/cds-cert.pem")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != fakeCDSCert {
-		t.Fatalf("unexpected cert body: %q", body)
-	}
-	if ct := resp.Header.Get("Content-Type"); ct != "application/x-pem-file" {
-		t.Fatalf("content-type = %q", ct)
-	}
 }
 
 func fetchBundle(t *testing.T, base string, nonce []byte) types.AttestationBundle {
@@ -257,7 +237,6 @@ func TestTunnelForwardsToUpstream(t *testing.T) {
 	identity := writeTestMeshIdentity(t)
 	srv := NewServer(Config{
 		Evidence:             FixtureEvidenceProvider{Raw: json.RawMessage(`{"attestation_report":"AAAA","cert_chain":{"vcek":"BBBB"}}`), Platform: "snp", Generation: "genoa"},
-		CDSCertPEM:           []byte(fakeCDSCert),
 		MeshIdentityCertFile: identity.certFile,
 		MeshIdentityKeyFile:  identity.keyFile,
 		MeshIdentityCAFile:   identity.caFile,
@@ -318,7 +297,6 @@ func TestHandshakeRejectsExpiredNonce(t *testing.T) {
 	identity := writeTestMeshIdentity(t)
 	srv := NewServer(Config{
 		Evidence:             FixtureEvidenceProvider{Raw: json.RawMessage(`{"attestation_report":"AAAA","cert_chain":{"vcek":"BBBB"}}`), Platform: "snp", Generation: "genoa"},
-		CDSCertPEM:           []byte(fakeCDSCert),
 		MeshIdentityCertFile: identity.certFile,
 		MeshIdentityKeyFile:  identity.keyFile,
 		MeshIdentityCAFile:   identity.caFile,
@@ -352,7 +330,6 @@ func TestTunnelRejectsExpiredSession(t *testing.T) {
 	identity := writeTestMeshIdentity(t)
 	srv := NewServer(Config{
 		Evidence:             FixtureEvidenceProvider{Raw: json.RawMessage(`{"attestation_report":"AAAA","cert_chain":{"vcek":"BBBB"}}`), Platform: "snp", Generation: "genoa"},
-		CDSCertPEM:           []byte(fakeCDSCert),
 		MeshIdentityCertFile: identity.certFile,
 		MeshIdentityKeyFile:  identity.keyFile,
 		MeshIdentityCAFile:   identity.caFile,

@@ -163,13 +163,6 @@ spec:
             - --mesh-identity-cert-file={{ .Values.tlsLb.tlsMountPath }}/cert.pem
             - --mesh-identity-key-file={{ .Values.tlsLb.tlsMountPath }}/key.pem
             - --mesh-identity-ca-file={{ .Values.tlsLb.tlsMountPath }}/ca.pem
-            # --cds-cert-file is intentionally NOT set: nginx serves the same cert
-            # statically at /.well-known/c8s/cds-cert.pem from the shared cert volume
-            # and hot-reloads it on get-cert renewal (SIGHUP), whereas cds-attest
-            # would read it once at startup and embed a stale copy in every bundle.
-            # Legacy v1 does not bind cds_cert_pem to attestation. The v2 PQ
-            # response re-reads and embeds the exact mesh leaf + issuing CA
-            # committed by report_data and its proof-of-possession signature.
             # Terminate over-encryption here and forward to the same workload
             # backend nginx proxies to. An http upstream is plaintext at the
             # app layer; pointed at a headless Service (an adopted workload),

@@ -58,7 +58,7 @@ type AttestationBundle struct {
 	Generation string          `json:"generation"`   // AMD gen: milan|genoa|turin
 	Nonce      string          `json:"nonce"`        // echoed client nonce (b64url)
 	Evidence   json.RawMessage `json:"evidence"`     // attestation-rs SnpEvidence
-	CDSCertPEM string          `json:"cds_cert_pem"` // LB leaf + mesh CA chain (PEM)
+	CDSCertPEM string          `json:"cds_cert_pem"` // exact mesh leaf + issuing CA committed by report_data; empty for tls-cert
 	// Binding names what report_data commits to.
 	Binding string `json:"binding"`
 	// SessionPubKey is the per-session over-encryption key, present only for the

@@ -48,9 +48,8 @@ type Backend interface {
 
 // Config configures the sidecar server.
 type Config struct {
-	Logger     *slog.Logger
-	Evidence   EvidenceProvider
-	CDSCertPEM []byte // optional LB leaf + mesh CA chain, served at /cds-cert.pem
+	Logger   *slog.Logger
+	Evidence EvidenceProvider
 	// ServingCertFile is the path to the LB serving-leaf PEM (the cert nginx
 	// presents on the wire). When set, GET .../attestation?pq=false binds
 	// report_data to this leaf's SPKI instead of a per-session over-encryption
@@ -122,11 +121,6 @@ func (s *Server) Handler() http.Handler {
 	r.Use(server.RequestLogger)
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	// The tls-lb nginx front-end normally serves cds-cert.pem statically; only
-	// expose it from the sidecar when a cert was explicitly supplied (dev/standalone).
-	if len(s.cfg.CDSCertPEM) > 0 {
-		r.Get(wellKnownPrefix+"/cds-cert.pem", s.handleCDSCert)
-	}
 	r.Get(wellKnownPrefix+"/attestation", s.handleAttestation)
 	r.Post(wellKnownPrefix+"/handshake", s.handleHandshake)
 	// Over-encrypted application traffic: a single tunnel endpoint. The real
@@ -134,11 +128,6 @@ func (s *Server) Handler() http.Handler {
 	// only needs to route this one fixed path to the sidecar.
 	r.Post(wellKnownPrefix+"/tunnel", s.handleTunnel)
 	return r
-}
-
-func (s *Server) handleCDSCert(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/x-pem-file")
-	w.Write(s.cfg.CDSCertPEM)
 }
 
 func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
@@ -248,7 +237,8 @@ func (s *Server) handleAttestationOverEncryption(w http.ResponseWriter, r *http.
 // handleAttestationTLSCert serves the tls-cert binding: report_data =
 // SHA-384(serving_leaf_spki || nonce). No over-encryption keypair is minted and
 // no pending session is stored — the client verifies the binding against the LB
-// leaf it already sees on the connection, then rides that TLS.
+// leaf it already sees on the connection, then rides that TLS. The bundle
+// carries no chain: the client validates that leaf against its own anchor.
 func (s *Server) handleAttestationTLSCert(w http.ResponseWriter, r *http.Request, nonceB64 string, nonce []byte) {
 	spki, err := s.servingLeafSPKI()
 	if err != nil {
@@ -275,7 +265,6 @@ func (s *Server) handleAttestationTLSCert(w http.ResponseWriter, r *http.Request
 		Generation: generation,
 		Nonce:      nonceB64,
 		Evidence:   evidence,
-		CDSCertPEM: string(s.cfg.CDSCertPEM),
 		Binding:    types.BindingTLSCert,
 	})
 }

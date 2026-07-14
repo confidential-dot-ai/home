@@ -98,7 +98,7 @@ final security model. Each bullet links to the tracking issue.
 ## Browser / out-of-cluster verification
 
 - The `c8s cds-attest` sidecar browser-facing endpoints (`/.well-known/c8s/attestation`,
-  `cds-cert.pem`, `handshake`) and the post-quantum over-encryption channel
+  `handshake`, `tunnel`) and the post-quantum over-encryption channel
   (`pkg/overenc`) are implemented behind the tls-lb nginx front-end (chart flag
   `tlsLb.attest.enabled`); the matching browser client is
   `c8s-verify-js` (contract in `c8s-verify-js/PROTOCOL.md`).

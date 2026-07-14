@@ -433,9 +433,6 @@ the Load Balancer's TEE measurement and cluster identity, and open a
 post-quantum over-encrypted channel to its enclave.
 The wire contract is `c8s-verify-js/PROTOCOL.md`.
 
-- `GET /.well-known/c8s/cds-cert.pem` — unauthenticated discovery for the mesh
-  CA / LB cert chain. The verifier does not trust this standalone response; it
-  verifies the exact chain committed by the attestation bundle.
 - `GET /.well-known/c8s/attestation?nonce=`
   — raw SEV-SNP evidence whose domain-separated `report_data` transcript commits
   the X25519 and ML-KEM-768 session keys, 32-byte client nonce, exact mesh leaf,
@@ -458,7 +455,11 @@ The wire contract is `c8s-verify-js/PROTOCOL.md`.
   forge application traffic even though it terminates the outer TLS. The channel
   terminates inside the LB CVM.
 
-The tls-lb nginx serves the static `cds-cert.pem`/`mesh-ca.pem` and reverse-proxies the dynamic `/.well-known/c8s/` paths to the sidecar on loopback.
+The tls-lb nginx reverse-proxies the `/.well-known/c8s/` paths to the sidecar on
+loopback. There is no standalone certificate-discovery endpoint in this
+protocol: the bundle embeds the exact chain committed by `report_data` (the
+static `/.well-known/cds-cert.pem`/`mesh-ca.pem` files nginx serves are the
+in-cluster get-cert discovery, a different consumer).
 
 Trust is transitive from the identity-bound LB: the user verifies the
 LB measurement and pinned cluster identity; the verified LB implementation uses

@@ -22,7 +22,6 @@ type config struct {
 	host                 string
 	port                 int
 	logLevel             string
-	cdsCertFile          string
 	servingCertFile      string
 	meshIdentityCertFile string
 	meshIdentityKeyFile  string
@@ -59,7 +58,6 @@ func NewCmd() *cobra.Command {
 	f.StringVar(&cfg.host, "host", "127.0.0.1", "listen host (loopback: nginx proxies to it)")
 	f.IntVarP(&cfg.port, "port", "p", 8800, "listen port")
 	f.StringVar(&cfg.logLevel, "log-level", "info", "log level: debug, info, warn, error")
-	f.StringVar(&cfg.cdsCertFile, "cds-cert-file", "", "optional PEM (LB leaf + mesh CA): also serve /.well-known/c8s/cds-cert.pem from the sidecar. Normally nginx serves this statically; leave empty.")
 	f.StringVar(&cfg.servingCertFile, "serving-cert-file", "", "path to the LB serving-leaf PEM (the cert nginx presents). Enables the tls-cert attestation binding (GET /.well-known/c8s/attestation?pq=false): report_data binds this leaf's SPKI. Re-read per request to follow get-cert rotation.")
 	f.StringVar(&cfg.meshIdentityCertFile, "mesh-identity-cert-file", "", "TEE-held mesh leaf PEM for the identity-bound PQ binding (re-read per request)")
 	f.StringVar(&cfg.meshIdentityKeyFile, "mesh-identity-key-file", "", "TEE-held mesh leaf private key for the identity-bound PQ binding (re-read per request)")
@@ -80,15 +78,6 @@ func NewCmd() *cobra.Command {
 
 func run(cfg config) error {
 	logger := newLogger(cfg.logLevel)
-
-	var cdsCertPEM []byte
-	if cfg.cdsCertFile != "" {
-		b, err := os.ReadFile(cfg.cdsCertFile)
-		if err != nil {
-			return fmt.Errorf("read --cds-cert-file: %w", err)
-		}
-		cdsCertPEM = b
-	}
 
 	var provider EvidenceProvider
 	switch {
@@ -131,7 +120,6 @@ func run(cfg config) error {
 	srv := NewServer(Config{
 		Logger:               logger,
 		Evidence:             provider,
-		CDSCertPEM:           cdsCertPEM,
 		ServingCertFile:      cfg.servingCertFile,
 		MeshIdentityCertFile: cfg.meshIdentityCertFile,
 		MeshIdentityKeyFile:  cfg.meshIdentityKeyFile,

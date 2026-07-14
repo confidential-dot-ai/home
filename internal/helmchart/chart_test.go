@@ -1639,11 +1639,6 @@ func TestChartRendersTLSLBAttestSidecar(t *testing.T) {
 			t.Fatalf("cds-attest must not set %s for the default http upstream: %v", banned, sidecar.Args)
 		}
 	}
-	// --cds-cert-file must NOT be set: nginx serves /.well-known/c8s/cds-cert.pem
-	// statically (hot-reloaded), while the sidecar would embed a stale copy.
-	if strings.Contains(joined, "--cds-cert-file") {
-		t.Fatalf("cds-attest must not set --cds-cert-file (nginx serves it statically): %v", sidecar.Args)
-	}
 	// The sidecar must not mount the mesh-CA for the default cert.pem trust path.
 	if _, ok := containerVolumeMount(sidecar, "mesh-ca"); ok {
 		t.Fatalf("cds-attest should not mount mesh-ca with the default /tls/cert.pem trust; mounts=%v", sidecar.VolumeMounts)
