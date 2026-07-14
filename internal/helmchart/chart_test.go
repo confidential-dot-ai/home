@@ -3882,6 +3882,61 @@ func TestChartCDSHandoffEnabledFailsWithoutMeasurements(t *testing.T) {
 	}
 }
 
+// TestChartCDSHandoffPeerURLWiresFlag confirms cds.handoff.peerUrl renders the
+// requester-side --handoff-peer-url flag (pull-on-startup adoption).
+func TestChartCDSHandoffPeerURLWiresFlag(t *testing.T) {
+	const measurement = "0011223344556677889900112233445566778899001122334455667788990011223344556677889900112233445566ff"
+	const peer = "https://c8s-cds-peer.c8s-system.svc:8443"
+	out, err := helmTemplate(t,
+		"--set", "cds.handoff.peerUrl="+peer,
+		"--set", "cds.measurements[0]="+measurement,
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	args := renderedDeploymentContainer(t, out, "c8s-cds", "cds").Args
+	assertContainerHasArg(t, "cds", args, "--handoff-peer-url="+peer)
+}
+
+// TestChartCDSHandoffPeerURLOmittedByDefault is the negative: without peerUrl
+// the flag MUST be absent so cds self-generates (cold start).
+func TestChartCDSHandoffPeerURLOmittedByDefault(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	args := renderedDeploymentContainer(t, out, "c8s-cds", "cds").Args
+	assertContainerNoArgPrefix(t, "cds", args, "--handoff-peer-url=")
+}
+
+// TestChartCDSHandoffPeerURLFailsWithoutMeasurements locks the chart-time
+// guard: a peer URL without a pinned measurement would fail cds startup.
+func TestChartCDSHandoffPeerURLFailsWithoutMeasurements(t *testing.T) {
+	out, err := helmTemplate(t, "--set", "cds.handoff.peerUrl=https://peer:8443")
+	if err == nil {
+		t.Fatalf("helm template succeeded with peerUrl but no cds.measurements; output=%s", out)
+	}
+	if got := parseValidationErrorKind(out); got != "cds_handoff_peer_measurements" {
+		t.Fatalf("validation kind = %q, want cds_handoff_peer_measurements; output=%s", got, out)
+	}
+}
+
+// TestChartCDSHandoffPeerURLFailsOnNonHTTPS locks the https guard: an http peer
+// URL would let cds adopt a CA over an unattested channel.
+func TestChartCDSHandoffPeerURLFailsOnNonHTTPS(t *testing.T) {
+	const measurement = "0011223344556677889900112233445566778899001122334455667788990011223344556677889900112233445566ff"
+	out, err := helmTemplate(t,
+		"--set", "cds.handoff.peerUrl=http://peer:8443",
+		"--set", "cds.measurements[0]="+measurement,
+	)
+	if err == nil {
+		t.Fatalf("helm template succeeded with an http peerUrl; output=%s", out)
+	}
+	if got := parseValidationErrorKind(out); got != "cds_handoff_peer_scheme" {
+		t.Fatalf("validation kind = %q, want cds_handoff_peer_scheme; output=%s", got, out)
+	}
+}
+
 func renderedDeployment(t *testing.T, manifest, name string) appsv1.Deployment {
 	t.Helper()
 	var dep appsv1.Deployment

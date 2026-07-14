@@ -252,6 +252,14 @@ cds:
   ## it, a cds pod restart triggers a full mesh re-bootstrap.
   handoff:
     enabled: false
+    ## peerUrl: a surviving cds peer's https URL. When set, cds adopts that
+    ## peer's mesh CA over /handoff on startup instead of generating a fresh
+    ## one, and fails closed if the peer is unreachable or denies the handoff
+    ## (so a partition never mints a divergent trust root). Leave empty for the
+    ## first/only cds (cold start). Requires cds.measurements to pin the peer.
+    ## Only useful once a topology keeps a peer alive across the restart; the
+    ## default single-replica Recreate deployment has no surviving peer.
+    peerUrl: ""
   persistence:
     enabled: false
     size: 1Gi

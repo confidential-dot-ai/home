@@ -67,6 +67,8 @@ func NewCmd() *cobra.Command {
 	flags.StringVar(&cfg.allowlistSeed, "allowlist-seed", "", "Path to a JSON allowlist (version + digests map) seeded into the store at startup before serving; missing digests are added, existing entries are left untouched (empty disables seeding)")
 	flags.StringVar(&cfg.operatorKeys, "operator-keys", "", "Path to a PEM bundle of pinned operator EC public keys; /allowlist writes (POST/PUT/DELETE) require an operator token signed by one of them (empty = writes disabled, reads still served)")
 	flags.StringSliceVar(&cfg.handoffMeasurements, "handoff-measurements", nil, "SHA-384 hex launch measurements allowed to pull the mesh CA via /handoff (empty = /handoff disabled)")
+	flags.StringVar(&cfg.handoffPeerURL, "handoff-peer-url", "", "https URL of a surviving CDS peer to adopt the mesh CA from on startup via attested /handoff (empty = generate a fresh CA). When set, startup fails closed if the peer cannot be reached or denies the handoff, so a partition never mints a divergent trust root. Pins the peer with --handoff-measurements.")
+	flags.DurationVar(&cfg.handoffPeerTimeout, "handoff-peer-timeout", 2*time.Minute, "deadline for adopting the CA from --handoff-peer-url before failing startup")
 
 	flags.Float64Var(&cfg.rateLimit, "rate-limit", 10, "max requests per second per source IP on attestation endpoints")
 	flags.IntVar(&cfg.rateBurst, "rate-burst", 20, "max burst size per source IP")
@@ -137,6 +139,8 @@ type config struct {
 	allowlistSeed       string
 	operatorKeys        string
 	handoffMeasurements []string
+	handoffPeerURL      string
+	handoffPeerTimeout  time.Duration
 	rotationInterval    time.Duration
 	rotationOverlap     time.Duration
 	rotationJitter      float64

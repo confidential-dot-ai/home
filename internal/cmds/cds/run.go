@@ -57,14 +57,26 @@ func run(cfg config) error {
 		return fmt.Errorf("init rate limiter: %w", err)
 	}
 
-	// CDS generates its mesh CA in process; the private key never touches a
-	// Kubernetes Secret. Rotation and public-bundle write-back land with the
-	// in-memory CA machinery in a later stack PR.
-	mesh, err := issuer.NewCAWithCurve(cfg.caCommonName, cfg.caCertValidity, elliptic.P384())
+	// CDS obtains its mesh CA in process; the private key never touches a
+	// Kubernetes Secret. With no --handoff-peer-url it generates a fresh
+	// self-signed CA (cold start); with a peer set it adopts that peer's CA
+	// via attested /handoff, failing closed if the peer cannot be reached or
+	// denies the handoff so a partition never mints a divergent trust root.
+	mesh, adopted, err := issuer.ProvisionCA(ctx, issuer.CAProvisionConfig{
+		CommonName:        cfg.caCommonName,
+		Validity:          cfg.caCertValidity,
+		Curve:             elliptic.P384(),
+		PeerURL:           strings.TrimRight(cfg.handoffPeerURL, "/"),
+		AttestationApiURL: cfg.attestationApiURL,
+		Measurements:      cfg.handoffMeasurements,
+		ExpectedIssuer:    cfg.earIssuerName,
+		Timeout:           cfg.handoffPeerTimeout,
+	}, slog.Default())
 	if err != nil {
-		return fmt.Errorf("generate mesh CA: %w", err)
+		return fmt.Errorf("provision mesh CA: %w", err)
 	}
-	slog.Info("generated in-memory mesh CA",
+	slog.Info("loaded in-memory mesh CA",
+		"source", map[bool]string{true: "adopted-from-peer", false: "self-generated"}[adopted],
 		"fingerprint", certutil.CertFingerprint(mesh.Cert.Raw),
 		"not_after", mesh.Cert.NotAfter.Format(time.RFC3339),
 	)
@@ -356,6 +368,17 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.readinessInterval <= 0 {
 		return fmt.Errorf("--readiness-interval must be positive")
+	}
+	if cfg.handoffPeerURL != "" {
+		if !strings.HasPrefix(cfg.handoffPeerURL, "https://") {
+			return fmt.Errorf("--handoff-peer-url must use https (RA-TLS)")
+		}
+		if len(cfg.handoffMeasurements) == 0 {
+			return fmt.Errorf("--handoff-peer-url requires --handoff-measurements to pin the peer")
+		}
+		if cfg.handoffPeerTimeout <= 0 {
+			return fmt.Errorf("--handoff-peer-timeout must be positive")
+		}
 	}
 	return nil
 }

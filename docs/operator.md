@@ -313,6 +313,24 @@ off. To keep dynamic entries across restarts set `cds.persistence.enabled=true`
 Component/floor digests are unaffected — they are re-seeded and, unlike dynamic
 entries, are also enforced from the baked floor.
 
+### Adopting a peer's CA on startup (`cds.handoff.peerUrl`)
+
+Setting `cds.handoff.peerUrl` to a surviving CDS peer's `https` URL makes a
+starting CDS **adopt** that peer's mesh CA over `/handoff` instead of generating
+a fresh one — the same attested pull the probe performs, run in process at
+startup. It pins the peer with `cds.measurements` (same launch digest), and it
+**fails closed**: if the peer is unreachable within `--handoff-peer-timeout` or
+denies the handoff, CDS refuses to start rather than mint a divergent trust
+root. Leave `peerUrl` empty for the first/only CDS (cold start), which
+generates as before. The startup log line reports
+`source=adopted-from-peer` or `source=self-generated`.
+
+Adoption only helps when a peer is actually alive when the new pod starts. The
+default single-replica `Recreate` deployment tears the old pod down first, so
+there is no peer to adopt from across a restart; a topology that keeps one CDS
+serving during the rollover is required to close the restart-rebootstrap window
+end to end (tracked at #18).
+
 ## Verifying attestation after install
 
 `c8s verify` (and `c8s cds verify`, shorthand for `c8s verify --kind cds`) fetches

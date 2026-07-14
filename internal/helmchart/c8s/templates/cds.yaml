@@ -13,6 +13,14 @@
     {{- fail "VALIDATION_ERROR kind=cds_handoff_measurements: cds.handoff.enabled requires cds.measurements to be set (the joining replica's launch digest). See docs/operator.md." -}}
   {{- end -}}
 {{- end -}}
+{{- if .Values.cds.handoff.peerUrl -}}
+  {{- if not .Values.cds.measurements -}}
+    {{- fail "VALIDATION_ERROR kind=cds_handoff_peer_measurements: cds.handoff.peerUrl requires cds.measurements to pin the peer. See docs/operator.md." -}}
+  {{- end -}}
+  {{- if not (hasPrefix "https://" .Values.cds.handoff.peerUrl) -}}
+    {{- fail "VALIDATION_ERROR kind=cds_handoff_peer_scheme: cds.handoff.peerUrl must use https (RA-TLS)." -}}
+  {{- end -}}
+{{- end -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -192,6 +200,9 @@ spec:
             {{- end }}
             {{- if .Values.cds.handoff.enabled }}
             - --handoff-measurements={{ join "," .Values.cds.measurements }}
+            {{- end }}
+            {{- with .Values.cds.handoff.peerUrl }}
+            - --handoff-peer-url={{ . }}
             {{- end }}
             - --token-signer-rotation-interval={{ .Values.cds.tokenSignerRotationInterval }}
             - --token-signer-overlap={{ .Values.cds.tokenSignerOverlap }}
