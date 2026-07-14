@@ -1,5 +1,5 @@
 // Package cdsattest implements the tls-lb attestation + over-encryption sidecar:
-// the *dynamic* browser-facing endpoints of the c8s-verify v1/v2 protocol. The
+// the *dynamic* browser-facing endpoints of the c8s-verify protocol. The
 // tls-lb nginx front-end terminates public TLS, serves the static CDS/mesh-CA
 // certs, and reverse-proxies the attestation challenge, the handshake, and the
 // over-encrypted application paths to this sidecar on loopback. It lets an
@@ -57,9 +57,9 @@ type Config struct {
 	// key. Empty disables the tls-cert binding.
 	ServingCertFile string
 	// MeshIdentity* are the TEE-held mesh leaf, matching private key, and CA
-	// bundle used by the identity-bound PQ v2 flow. They are deliberately
+	// bundle used by the identity-bound PQ flow. They are deliberately
 	// separate from ServingCertFile, which may name a host-visible public TLS
-	// credential. All three files are re-read for each v2 attestation request.
+	// credential. All three files are re-read for each attestation request.
 	MeshIdentityCertFile string
 	MeshIdentityKeyFile  string
 	MeshIdentityCAFile   string
@@ -71,9 +71,9 @@ type Config struct {
 }
 
 type pendingSession struct {
-	key                *overenc.ServerKey
-	identityTranscript []byte
-	createdAt          time.Time
+	key        *overenc.ServerKey
+	transcript []byte // identity transcript hash, the channel's HKDF salt
+	createdAt  time.Time
 }
 
 type establishedSession struct {
@@ -81,7 +81,7 @@ type establishedSession struct {
 	lastUsed time.Time
 }
 
-// Server serves the c8s-verify v1 and v2 endpoints.
+// Server serves the c8s-verify endpoints.
 type Server struct {
 	cfg     Config
 	log     *slog.Logger
@@ -159,30 +159,45 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The endpoint takes no binding parameter: the identity-bound PQ binding is
+	// the only over-encryption binding, so there is nothing to negotiate. A
+	// stale client asking for one must get a loud 400, never something else
+	// than it expects.
+	if r.URL.Query().Get("binding") != "" {
+		writeErr(w, http.StatusBadRequest, "invalid_request", "the attestation endpoint takes no binding parameter")
+		return
+	}
 	// pq=false selects the tls-cert binding: report_data commits to the LB's
 	// serving-leaf SPKI instead of a per-session over-encryption key. It is for
 	// clients that ride the validated upstream TLS (e.g. TEErminator Flow B)
 	// rather than the post-quantum tunnel. pq=true (or absent) is the default.
-	binding := r.URL.Query().Get("binding")
 	if r.URL.Query().Get("pq") == "false" {
-		if binding != "" {
-			writeErr(w, http.StatusBadRequest, "invalid_request", "pq=false cannot be combined with a PQ binding")
-			return
-		}
 		s.handleAttestationTLSCert(w, r, nonceB64, nonce)
 		return
 	}
-	switch binding {
-	case "", types.BindingOverEncryption:
-		s.handleAttestationOverEncryption(w, r, nonceB64, nonce, types.BindingOverEncryption)
-	case types.BindingOverEncryptionMeshIdentityV2:
-		s.handleAttestationOverEncryption(w, r, nonceB64, nonce, types.BindingOverEncryptionMeshIdentityV2)
-	default:
-		writeErr(w, http.StatusBadRequest, "invalid_request", "unsupported attestation binding")
-	}
+	s.handleAttestationOverEncryption(w, r, nonceB64, nonce)
 }
 
-func (s *Server) handleAttestationOverEncryption(w http.ResponseWriter, r *http.Request, nonceB64 string, nonce []byte, binding string) {
+// handleAttestationOverEncryption serves the identity-bound over-encryption
+// binding: report_data commits the hybrid session key, nonce, exact mesh leaf,
+// and issuing mesh CA to one domain-separated transcript, and the leaf signs
+// that transcript to prove possession of its private key.
+func (s *Server) handleAttestationOverEncryption(w http.ResponseWriter, r *http.Request, nonceB64 string, nonce []byte) {
+	if len(nonce) != 32 {
+		writeErr(w, http.StatusBadRequest, "invalid_request", "identity-bound PQ requires a 32-byte nonce")
+		return
+	}
+	if s.cfg.MeshIdentityCertFile == "" || s.cfg.MeshIdentityKeyFile == "" || s.cfg.MeshIdentityCAFile == "" {
+		writeErr(w, http.StatusNotImplemented, "binding_unavailable", "identity-bound PQ is not configured on this LB")
+		return
+	}
+	identity, err := loadMeshIdentity(s.cfg.MeshIdentityCertFile, s.cfg.MeshIdentityKeyFile, s.cfg.MeshIdentityCAFile)
+	if err != nil {
+		s.log.Error("mesh identity binding unavailable", "error", err)
+		writeErr(w, http.StatusServiceUnavailable, "binding_unavailable", "identity-bound PQ credentials are temporarily unavailable")
+		return
+	}
+
 	key, err := overenc.GenerateServerKey()
 	if err != nil {
 		s.log.Error("generate session key", "error", err)
@@ -191,42 +206,10 @@ func (s *Server) handleAttestationOverEncryption(w http.ResponseWriter, r *http.
 	}
 	pub := key.Public()
 
-	version := "c8s-verify/v1"
-	certPEM := s.cfg.CDSCertPEM
-	var proof *types.MeshIdentityProof
-	var reportData []byte
-	switch binding {
-	case types.BindingOverEncryption:
-		// report_data = SHA-384(x25519 || mlkem768 || nonce).
-		reportData = reportDataFor(pub, nonce)
-	case types.BindingOverEncryptionMeshIdentityV2:
-		if len(nonce) != 32 {
-			writeErr(w, http.StatusBadRequest, "invalid_request", "identity-bound PQ requires a 32-byte nonce")
-			return
-		}
-		if s.cfg.MeshIdentityCertFile == "" || s.cfg.MeshIdentityKeyFile == "" || s.cfg.MeshIdentityCAFile == "" {
-			writeErr(w, http.StatusNotImplemented, "binding_unavailable", "identity-bound PQ is not configured on this LB")
-			return
-		}
-		identity, err := loadMeshIdentity(s.cfg.MeshIdentityCertFile, s.cfg.MeshIdentityKeyFile, s.cfg.MeshIdentityCAFile)
-		if err != nil {
-			s.log.Error("mesh identity binding unavailable", "error", err)
-			writeErr(w, http.StatusServiceUnavailable, "binding_unavailable", "identity-bound PQ credentials are temporarily unavailable")
-			return
-		}
-		reportData, proof, err = identity.bind(pub, nonce)
-		if err != nil {
-			s.log.Error("bind mesh identity", "error", err)
-			writeErr(w, http.StatusInternalServerError, "internal", "mesh identity binding failed")
-			return
-		}
-		version = "c8s-verify/v2"
-		certPEM = identity.bundlePEM
-	default:
-		// A binding routed here without a report_data case must not reach the
-		// evidence fetch.
-		s.log.Error("unhandled attestation binding", "binding", binding)
-		writeErr(w, http.StatusInternalServerError, "internal", "unhandled attestation binding")
+	reportData, proof, err := identity.bind(pub, nonce)
+	if err != nil {
+		s.log.Error("bind mesh identity", "error", err)
+		writeErr(w, http.StatusInternalServerError, "internal", "mesh identity binding failed")
 		return
 	}
 
@@ -239,21 +222,21 @@ func (s *Server) handleAttestationOverEncryption(w http.ResponseWriter, r *http.
 
 	s.sweep()
 	s.mu.Lock()
-	pending := pendingSession{key: key, createdAt: time.Now()}
-	if binding == types.BindingOverEncryptionMeshIdentityV2 {
-		pending.identityTranscript = append([]byte(nil), reportData...)
+	s.pending[nonceB64] = pendingSession{
+		key:        key,
+		transcript: append([]byte(nil), reportData...),
+		createdAt:  time.Now(),
 	}
-	s.pending[nonceB64] = pending
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, types.AttestationBundle{
-		Version:    version,
+		Version:    types.ProtocolVersion,
 		Platform:   platform,
 		Generation: generation,
 		Nonce:      nonceB64,
 		Evidence:   evidence,
-		CDSCertPEM: string(certPEM),
-		Binding:    binding,
+		CDSCertPEM: string(identity.bundlePEM),
+		Binding:    types.BindingOverEncryption,
 		SessionPubKey: &types.SessionPublicKey{
 			X25519:   base64.RawURLEncoding.EncodeToString(pub.X25519),
 			MLKEM768: base64.RawURLEncoding.EncodeToString(pub.MLKEM768),
@@ -287,7 +270,7 @@ func (s *Server) handleAttestationTLSCert(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusOK, types.AttestationBundle{
-		Version:    "c8s-verify/v1",
+		Version:    types.ProtocolVersion,
 		Platform:   platform,
 		Generation: generation,
 		Nonce:      nonceB64,
@@ -340,11 +323,6 @@ func (s *Server) handleHandshake(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nonce, err := base64.RawURLEncoding.DecodeString(req.Nonce)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_request", "nonce must be base64url")
-		return
-	}
 	clientX, err1 := base64.RawURLEncoding.DecodeString(req.ClientX25519)
 	ct, err2 := base64.RawURLEncoding.DecodeString(req.MLKEMCt)
 	if err1 != nil || err2 != nil {
@@ -353,12 +331,7 @@ func (s *Server) handleHandshake(w http.ResponseWriter, r *http.Request) {
 	}
 
 	handshake := overenc.Handshake{ClientX25519: clientX, MLKEMCiphertext: ct}
-	var channel *overenc.Channel
-	if len(entry.identityTranscript) > 0 {
-		channel, err = entry.key.AgreeIdentity(handshake, entry.identityTranscript)
-	} else {
-		channel, err = entry.key.Agree(handshake, nonce)
-	}
+	channel, err := entry.key.Agree(handshake, entry.transcript)
 	if err != nil {
 		s.log.Warn("handshake agree failed", "error", err)
 		writeErr(w, http.StatusBadRequest, "channel_error", "key agreement failed")
@@ -462,15 +435,6 @@ func (s *Server) sweep() {
 		}
 	}
 	s.mu.Unlock()
-}
-
-func reportDataFor(pub overenc.PublicKey, nonce []byte) []byte {
-	buf := make([]byte, 0, len(pub.X25519)+len(pub.MLKEM768)+len(nonce))
-	buf = append(buf, pub.X25519...)
-	buf = append(buf, pub.MLKEM768...)
-	buf = append(buf, nonce...)
-	sum := sha512.Sum384(buf)
-	return sum[:]
 }
 
 // reportDataForCert is the tls-cert binding: SHA-384(serving_leaf_spki || nonce).

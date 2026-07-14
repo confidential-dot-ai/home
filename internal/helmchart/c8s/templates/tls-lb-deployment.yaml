@@ -156,7 +156,7 @@ spec:
             # publicTLS secret it is that cert (mounted below). Re-read per request, so
             # get-cert renewals are picked up.
             - --serving-cert-file={{ include "tls-lb.publicCertPath" . }}
-            # The identity-bound PQ v2 flow must use the TEE-held mesh
+            # The identity-bound PQ flow must use the TEE-held mesh
             # credential, never the optional publicTLS Secret: report_data
             # commits the hybrid session key to this leaf and the sidecar
             # proves possession with its matching private key.

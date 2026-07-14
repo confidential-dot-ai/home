@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	identityTranscriptDomain = "c8s-verify/pq-mesh-identity/v2"
-	identityProofDomain      = "c8s-verify/pq-mesh-identity-proof/v2"
+	identityTranscriptDomain = "c8s-verify/pq-mesh-identity/v1"
+	identityProofDomain      = "c8s-verify/pq-mesh-identity-proof/v1"
 	identityNonceBytes       = 32
 )
 

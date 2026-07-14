@@ -88,8 +88,8 @@ Think in dependencies, not a flat list. An edge means "trusts / is vouched for b
    browser client ──▶ tls-lb │ RA-TLS    │◀──mTLS──▶ │  workload  │  weights / prompts /
    (pins measurement         │ mesh      │            │   (CVM)   │  KV-cache / secrets
     AND mesh CA)             └───────────┘            └────────────┘
-                                   ▲ transitive trust: the client verifies the LB (v2 binds its
-                                   │ mesh identity); the mesh vouches for the backends it fronts
+                                   ▲ transitive trust: the client verifies the LB (attestation
+                                   │ binds its mesh identity); the mesh vouches for its backends
 
   SUPPLY CHAIN (entirely OUTSIDE the TEE, yet defines what the TEE will accept):
     CI / ghcr.io ─▶ image digests ─▶ bootstrap allowlist (BAKED INTO the measurement)
@@ -111,7 +111,7 @@ surface; a workload can be injected without a CR.
 | Image digest is allowed | nri-image-policy | CDS-served allowlist |
 | Mesh peer cert chains to the mesh CA | ratls-mesh | mesh CA bundle (chain only; peer measurement **not** pinned — §5) |
 | Workload is injection candidate | admission webhook | pod annotation `confidential.ai/cw` |
-| LB attestation + session key are TEE-bound | `c8s cds-attest` sidecar | SNP report; the v2 `report_data` transcript commits the session keys, nonce, mesh leaf and issuing CA, with per-session proof of possession of the leaf key (§10). The v1 compat binding `SHA-384(x25519 \|\| mlkem768 \|\| nonce)` does not bind the mesh identity; `SHA-384(serving_leaf_spki \|\| nonce)` (`pq=false`, no PQ tunnel) |
+| LB attestation + session key are TEE-bound | `c8s cds-attest` sidecar | SNP report; the `report_data` transcript commits the session keys, nonce, mesh leaf and issuing CA, with per-session proof of possession of the leaf key (§10). Alternative `SHA-384(serving_leaf_spki \|\| nonce)` (`pq=false`, no PQ tunnel) |
 | Inbound traffic to `confidential.ai/cw` pods is mesh-delivered only (**conditional defense-in-depth, not an invariant**) | ratls-mesh (always-on cw inbound guard) | `RATLS-MESH-CW` chain jumped from `FORWARD` position 1 drops all-protocol traffic to cw pod IPs; catches Service-VIP DNAT and excluded-ns sources on the paths where they cross FORWARD. **Preconditions**: kube-proxy in iptables mode (VIP DNAT'd *before* FORWARD), FORWARD hook traversed, `bridge-nf-call-iptables=1`. **Known bypasses**: kube-proxy IPVS/nftables (VIP rewrite in LOCAL_IN/LOCAL_OUT skips FORWARD); CNIs whose datapath skips FORWARD; same-node host-root delivery via `OUTPUT` — the last is inside our host-adversarial scope (§2). Verified paths: iptables-mode kube-proxy with Azure CNI and kubenet. See `cmd/ratls-mesh/README.md` §"Confidential-workload inbound guard". |
 | Injection integrity survives webhook downtime | `failurePolicy: Fail` + `cw` label-integrity VAP | API-server-enforced; a pod cannot be admitted unmutated as plain runc |
 
@@ -141,7 +141,7 @@ rather than restating it.
 | MITM the CA-bundle read to inject a trust root | pod-network | Mitigated | `GET /ca` is unauthenticated by design; ratls-mesh accepts a new CA only if signed by an already-trusted CA. Client must chain it through attested evidence, never trust the TLS it arrived over. |
 | Host reads container stdout on a locked guest | host | Prevented | locked OPA policy denies `ReadStreamRequest`/`ExecProcessRequest` (`kubectl logs` is empty by design). |
 | Compromise CDS ⇒ decrypt past / in-flight traffic | whoever compromises CDS | Mitigated | a CDS-key compromise forges *forward* certs only; it does not decrypt past/in-flight traffic or CVM memory (whitepaper §5.6.3). |
-| Impersonate the cluster to a browser client by copying its public mesh leaf / CA chain | allowed-measurement LB / out-of-cluster network | Mitigated | the v2 binding commits the exact mesh leaf and issuing CA into the attested `report_data` transcript and proves possession of the leaf key per session; the default client policy rejects v1 (§10). Residual: the explicit v1 legacy downgrade, and the proof is ECDSA (classical). |
+| Impersonate the cluster to a browser client by copying its public mesh leaf / CA chain | allowed-measurement LB / out-of-cluster network | Mitigated | the attestation binding commits the exact mesh leaf and issuing CA into the `report_data` transcript and proves possession of the leaf key per session; there is no legacy or downgrade binding (§10). Residual: the proof is ECDSA (classical). |
 
 ### Addressable — threat now, fix planned
 
@@ -181,12 +181,12 @@ rather than restating it.
 `--evidence-fixture` (cds-attest serves fixed `report_data`, DEV ONLY), the `-debug`
 guest variant (host `Exec`/`ReadStream`/`WriteStream` RPCs allowed), `--ratls-platform
 ""` (plaintext CDS), attestation-service `allow_debug=true` and empty `api_keys`
-(unauthenticated `/verify`,`/attest`), and the c8s-verify client legacy mode
-(`requireClusterIdentity=false`, under which `requireFreshness=false`, empty
-`measurements`, or a missing `meshCaPem` reduce checks to warnings; the default
-policy rejects all four, §10). Each is warned but not gated out of release builds;
-the browser legacy mode returns `ok:true` with `warnings[]`, so **the embedding
-app must inspect `warnings[]`** or the guarantee is void. Stock kata-guest-base builds now bake an empty `ghcr-auth.json`
+(unauthenticated `/verify`,`/attest`), and the c8s-verify client freshness
+downgrade (`requireFreshness=false`, for recorded-evidence demos; the policy
+always requires a non-empty measurement allowlist and a mesh-CA pin, §10). Each
+is warned but not gated out of release builds; the freshness downgrade returns
+`ok:true` with `warnings[]`, so **the embedding app must inspect `warnings[]`**
+or the guarantee is void. Stock kata-guest-base builds now bake an empty `ghcr-auth.json`
 (`{"auths":{}}`) — the c8s images are public, so anonymous guest-pull is the
 default; a private-mirror build (pre-staged file) still bakes credentials into
 the dm-verity root, so rotating them moves the launch measurement.
@@ -208,10 +208,9 @@ If any of these is false, the corresponding guarantee does not hold.
 4. Guest RNG derives from the CPU (`RANDOM_TRUST_CPU`, no host virtio-rng); session
    keys, X25519/ML-KEM ephemerals, and the mesh CA key all draw from it.
 5. The browser client supplies **both** a non-empty measurement allowlist and the
-   mesh CA out of band. Under the default v2 policy these pins plus the
-   identity-bound attestation transcript authenticate the cluster; under the
-   explicit v1 legacy downgrade they are necessary but not sufficient, and the
-   client must inspect `warnings[]` (§10).
+   mesh CA out of band; these pins plus the identity-bound attestation transcript
+   authenticate the cluster. The only downgrade is `requireFreshness=false`
+   (recorded-evidence demos), reported in `warnings[]` (§10).
 
 **Supply-chain and external trust roots (load-bearing here):**
 6. **Hardware root of trust** (AMD/Intel/NVIDIA) is sound — if the manufacturer is
@@ -430,16 +429,14 @@ freely.
 
 The `c8s cds-attest` sidecar (proxied by the tls-lb nginx front-end) exposes a browser-facing surface over plain HTTPS so an
 out-of-cluster client (the `c8s-verify-js` library, or `TEErminator`) can verify
-the Load Balancer's TEE measurement and, under the v2 binding, its cluster
-identity, and open a post-quantum over-encrypted channel to its enclave.
+the Load Balancer's TEE measurement and cluster identity, and open a
+post-quantum over-encrypted channel to its enclave.
 The wire contract is `c8s-verify-js/PROTOCOL.md`.
 
-- `GET /.well-known/c8s/cds-cert.pem` — legacy discovery for the mesh CA / LB
-  cert chain, served unauthenticated. An identity-bound v2 verifier does not
-  trust this standalone response; it verifies the exact chain committed by the
-  attestation bundle. The v1 compatibility flow only checks the discovered
-  chain separately and therefore does not establish cluster identity.
-- `GET /.well-known/c8s/attestation?nonce=&binding=over-encryption+mesh-identity-v2`
+- `GET /.well-known/c8s/cds-cert.pem` — unauthenticated discovery for the mesh
+  CA / LB cert chain. The verifier does not trust this standalone response; it
+  verifies the exact chain committed by the attestation bundle.
+- `GET /.well-known/c8s/attestation?nonce=`
   — raw SEV-SNP evidence whose domain-separated `report_data` transcript commits
   the X25519 and ML-KEM-768 session keys, 32-byte client nonce, exact mesh leaf,
   and issuing mesh CA. The leaf also signs the transcript, proving possession
@@ -447,9 +444,8 @@ The wire contract is `c8s-verify-js/PROTOCOL.md`.
   a non-empty launch-measurement allowlist, the transcript, the leaf chain to a
   pinned mesh CA, and the proof signature before deriving the channel. Copying
   a victim cluster's public certificate chain is insufficient without its leaf
-  private key. The omitted/`over-encryption` binding remains v1-compatible and
-  binds only `SHA-384(x25519 || mlkem768 || nonce)`; it does not identify a
-  cluster. A separate binding mode exists
+  private key. There is no legacy or downgrade binding. A separate binding mode
+  exists
   (`?pq=false`, `report_data = SHA-384(serving_leaf_spki || nonce)`) where the
   attestation commits to the LB's outer TLS leaf instead of an over-encryption
   key, supplying the SPKI binding but no PQ tunnel — a different trust decision.
@@ -464,7 +460,7 @@ The wire contract is `c8s-verify-js/PROTOCOL.md`.
 
 The tls-lb nginx serves the static `cds-cert.pem`/`mesh-ca.pem` and reverse-proxies the dynamic `/.well-known/c8s/` paths to the sidecar on loopback.
 
-Under v2, trust is transitive from the identity-bound LB: the user verifies the
+Trust is transitive from the identity-bound LB: the user verifies the
 LB measurement and pinned cluster identity; the verified LB implementation uses
 the in-cluster RA-TLS mesh for backend pods. **The client must pin both a non-empty
 measurement allowlist and the mesh CA** — a measurement alone proves "genuine
@@ -472,15 +468,14 @@ audited code on real silicon", not "*my* cluster". The proof uses ECDSA, so clus
 authentication is classical. X25519 + ML-KEM-768 provides hybrid session-key
 confidentiality; this path does not claim post-quantum authentication.
 
-**Client-side responsibilities and their downgrades** (all supplied out of band by
+**Client-side responsibilities** (all supplied out of band by
 the embedding app): the SDK **fails closed** with a typed error taxonomy
 (`nonce_mismatch`, `report_data_mismatch`, `measurement_denied`, `invalid_cert`,
-`identity_binding`, …). Its default `requireClusterIdentity=true` policy rejects
-v1, an empty measurement allowlist, a missing `meshCaPem`, and disabled freshness.
-Setting `requireClusterIdentity=false` is an explicit legacy downgrade; in that
-mode `requireFreshness=false`, empty `measurements`, or a missing `meshCaPem` can
-reduce checks to warnings, and the result does not carry a cluster-identity
-guarantee. The WASM verifier's bare-`snp` path also omits several checks the
+`identity_binding`, …). The policy rejects an empty measurement allowlist, a
+missing `meshCaPem`, and any version or binding other than the identity-bound
+ones above. The only downgrade is `requireFreshness=false` (recorded-evidence
+demos), which reduces the freshness check to a `warnings[]` entry the embedding
+app must inspect. The WASM verifier's bare-`snp` path also omits several checks the
 Go/Rust verifiers enforce (§5 Addressable). Distributing a JS/WASM verifier over
 npm/CDN means the origin that ships the SPA also ships the verifier, and the PQ half
 rides a pre-1.0 `mlkem-wasm` dependency — supply-chain trust roots for this path.

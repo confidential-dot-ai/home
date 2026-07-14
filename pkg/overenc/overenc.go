@@ -22,9 +22,8 @@ import (
 )
 
 const (
-	hkdfInfoV1       = "c8s-verify/over-encryption/v1"
-	hkdfInfoIdentity = "c8s-verify/over-encryption/pq-mesh-identity/v2"
-	ivBytes          = 12
+	hkdfInfo = "c8s-verify/over-encryption/pq-mesh-identity/v1"
+	ivBytes  = 12
 
 	// X25519PubBytes is the raw X25519 public key length.
 	X25519PubBytes = 32
@@ -80,21 +79,16 @@ func (s *ServerKey) Public() PublicKey { return s.pub }
 
 // Agree completes the handshake on the LB side: decapsulate the client's
 // ML-KEM ciphertext, ECDH against the client's X25519 key, and derive the
-// AES-256-GCM channel keyed to nonce.
-func (s *ServerKey) Agree(hs Handshake, nonce []byte) (*Channel, error) {
-	return s.agree(hs, nonce, hkdfInfoV1)
-}
-
-// AgreeIdentity completes the identity-bound v2 handshake. transcriptHash is
-// the SHA-384 value committed to report_data and verified by the client.
-func (s *ServerKey) AgreeIdentity(hs Handshake, transcriptHash []byte) (*Channel, error) {
+// AES-256-GCM channel keyed to the identity transcript. transcriptHash is the
+// SHA-384 value committed to report_data and verified by the client.
+func (s *ServerKey) Agree(hs Handshake, transcriptHash []byte) (*Channel, error) {
 	if len(transcriptHash) != sha512.Size384 {
 		return nil, fmt.Errorf("overenc: identity transcript hash must be %d bytes, got %d", sha512.Size384, len(transcriptHash))
 	}
-	return s.agree(hs, transcriptHash, hkdfInfoIdentity)
+	return s.agree(hs, transcriptHash)
 }
 
-func (s *ServerKey) agree(hs Handshake, salt []byte, info string) (*Channel, error) {
+func (s *ServerKey) agree(hs Handshake, salt []byte) (*Channel, error) {
 	if len(hs.MLKEMCiphertext) != MLKEM768CTBytes {
 		return nil, fmt.Errorf("overenc: ML-KEM ciphertext must be %d bytes, got %d", MLKEM768CTBytes, len(hs.MLKEMCiphertext))
 	}
@@ -113,24 +107,20 @@ func (s *ServerKey) agree(hs Handshake, salt []byte, info string) (*Channel, err
 	if err != nil {
 		return nil, fmt.Errorf("overenc: X25519 ECDH: %w", err)
 	}
-	return deriveChannel(mlkemSS, x25519SS, salt, info)
+	return deriveChannel(mlkemSS, x25519SS, salt)
 }
 
 // ClientAgree is the client side, provided for Go clients and interop tests:
-// encapsulate against the LB's hybrid public key and derive the same channel.
-func ClientAgree(pub PublicKey, nonce []byte) (*Channel, Handshake, error) {
-	return clientAgree(pub, nonce, hkdfInfoV1)
-}
-
-// ClientAgreeIdentity is the client half of the identity-bound v2 handshake.
-func ClientAgreeIdentity(pub PublicKey, transcriptHash []byte) (*Channel, Handshake, error) {
+// encapsulate against the LB's hybrid public key and derive the same channel
+// from the verified identity transcript.
+func ClientAgree(pub PublicKey, transcriptHash []byte) (*Channel, Handshake, error) {
 	if len(transcriptHash) != sha512.Size384 {
 		return nil, Handshake{}, fmt.Errorf("overenc: identity transcript hash must be %d bytes, got %d", sha512.Size384, len(transcriptHash))
 	}
-	return clientAgree(pub, transcriptHash, hkdfInfoIdentity)
+	return clientAgree(pub, transcriptHash)
 }
 
-func clientAgree(pub PublicKey, salt []byte, info string) (*Channel, Handshake, error) {
+func clientAgree(pub PublicKey, salt []byte) (*Channel, Handshake, error) {
 	if len(pub.MLKEM768) != MLKEM768EKBytes {
 		return nil, Handshake{}, fmt.Errorf("overenc: ML-KEM key must be %d bytes, got %d", MLKEM768EKBytes, len(pub.MLKEM768))
 	}
@@ -155,18 +145,18 @@ func clientAgree(pub PublicKey, salt []byte, info string) (*Channel, Handshake, 
 	if err != nil {
 		return nil, Handshake{}, fmt.Errorf("overenc: X25519 ECDH: %w", err)
 	}
-	ch, err := deriveChannel(mlkemSS, x25519SS, salt, info)
+	ch, err := deriveChannel(mlkemSS, x25519SS, salt)
 	if err != nil {
 		return nil, Handshake{}, err
 	}
 	return ch, Handshake{ClientX25519: clientPriv.PublicKey().Bytes(), MLKEMCiphertext: ct}, nil
 }
 
-func deriveChannel(mlkemSS, x25519SS, salt []byte, info string) (*Channel, error) {
+func deriveChannel(mlkemSS, x25519SS, salt []byte) (*Channel, error) {
 	ikm := make([]byte, 0, len(mlkemSS)+len(x25519SS))
 	ikm = append(ikm, mlkemSS...)
 	ikm = append(ikm, x25519SS...)
-	key, err := hkdf.Key(sha256.New, ikm, salt, info, 32)
+	key, err := hkdf.Key(sha256.New, ikm, salt, hkdfInfo, 32)
 	if err != nil {
 		return nil, fmt.Errorf("overenc: HKDF: %w", err)
 	}

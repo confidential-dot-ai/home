@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/overenc"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 	"github.com/fxamacker/cbor/v2"
@@ -20,22 +21,53 @@ import (
 
 const fakeCDSCert = "-----BEGIN CERTIFICATE-----\nMIIBfakefakefake\n-----END CERTIFICATE-----\n"
 
-func newTestServer() *httptest.Server {
+func newTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	identity := writeTestMeshIdentity(t)
 	srv := NewServer(Config{
 		Evidence: FixtureEvidenceProvider{
 			Raw:        json.RawMessage(`{"attestation_report":"AAAA","cert_chain":{"vcek":"BBBB"}}`),
 			Platform:   "snp",
 			Generation: "genoa",
 		},
-		CDSCertPEM: []byte(fakeCDSCert),
+		CDSCertPEM:           []byte(fakeCDSCert),
+		MeshIdentityCertFile: identity.certFile,
+		MeshIdentityKeyFile:  identity.keyFile,
+		MeshIdentityCAFile:   identity.caFile,
 	})
 	return httptest.NewServer(srv.Handler())
 }
 
 func b64url(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 
+// clientChannelFromBundle does what a real client does after verifying the
+// bundle: recompute the identity transcript from the served chain and derive
+// the channel from it.
+func clientChannelFromBundle(t *testing.T, bundle types.AttestationBundle, nonce []byte) (*overenc.Channel, overenc.Handshake) {
+	t.Helper()
+	x, _ := base64.RawURLEncoding.DecodeString(bundle.SessionPubKey.X25519)
+	m, _ := base64.RawURLEncoding.DecodeString(bundle.SessionPubKey.MLKEM768)
+	pub := overenc.PublicKey{X25519: x, MLKEM768: m}
+	certs, err := certutil.ParsePEMCertificates([]byte(bundle.CDSCertPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(certs) != 2 {
+		t.Fatalf("bundle chain has %d certs, want leaf + issuing CA", len(certs))
+	}
+	transcript, err := overenc.IdentityTranscriptHash(pub, nonce, certs[0].Raw, certs[1].Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, hs, err := overenc.ClientAgree(pub, transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return channel, hs
+}
+
 func TestServesCDSCert(t *testing.T) {
-	ts := newTestServer()
+	ts := newTestServer(t)
 	defer ts.Close()
 	resp, err := http.Get(ts.URL + "/.well-known/c8s/cds-cert.pem")
 	if err != nil {
@@ -71,12 +103,7 @@ func fetchBundle(t *testing.T, base string, nonce []byte) types.AttestationBundl
 func establishSession(t *testing.T, base string, nonce []byte) (*overenc.Channel, string) {
 	t.Helper()
 	bundle := fetchBundle(t, base, nonce)
-	x, _ := base64.RawURLEncoding.DecodeString(bundle.SessionPubKey.X25519)
-	m, _ := base64.RawURLEncoding.DecodeString(bundle.SessionPubKey.MLKEM768)
-	channel, hs, err := overenc.ClientAgree(overenc.PublicKey{X25519: x, MLKEM768: m}, nonce)
-	if err != nil {
-		t.Fatal(err)
-	}
+	channel, hs := clientChannelFromBundle(t, bundle, nonce)
 	hsBody, _ := json.Marshal(types.HandshakeRequest{
 		Nonce:        b64url(nonce),
 		ClientX25519: b64url(hs.ClientX25519),
@@ -101,21 +128,21 @@ func establishSession(t *testing.T, base string, nonce []byte) (*overenc.Channel
 }
 
 func TestFullFlowOverEncryptedEcho(t *testing.T) {
-	ts := newTestServer()
+	ts := newTestServer(t)
 	defer ts.Close()
 
 	nonce := make([]byte, 32)
 	rand.Read(nonce)
 	bundle := fetchBundle(t, ts.URL, nonce)
 
-	if bundle.Version != "c8s-verify/v1" || bundle.Platform != "snp" || bundle.Generation != "genoa" {
+	if bundle.Version != types.ProtocolVersion || bundle.Platform != "snp" || bundle.Generation != "genoa" {
 		t.Fatalf("unexpected bundle header: %+v", bundle)
+	}
+	if bundle.Binding != types.BindingOverEncryption || bundle.IdentityProof == nil {
+		t.Fatalf("bundle is not identity-bound: %+v", bundle)
 	}
 	if bundle.Nonce != b64url(nonce) {
 		t.Fatal("nonce not echoed")
-	}
-	if bundle.CDSCertPEM != fakeCDSCert {
-		t.Fatal("cds cert not included")
 	}
 
 	x, _ := base64.RawURLEncoding.DecodeString(bundle.SessionPubKey.X25519)
@@ -124,10 +151,7 @@ func TestFullFlowOverEncryptedEcho(t *testing.T) {
 		t.Fatalf("bad session pubkey sizes: %d %d", len(x), len(m))
 	}
 
-	channel, hs, err := overenc.ClientAgree(overenc.PublicKey{X25519: x, MLKEM768: m}, nonce)
-	if err != nil {
-		t.Fatal(err)
-	}
+	channel, hs := clientChannelFromBundle(t, bundle, nonce)
 
 	// handshake
 	hsBody, _ := json.Marshal(types.HandshakeRequest{
@@ -230,10 +254,14 @@ func TestTunnelForwardsToUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	identity := writeTestMeshIdentity(t)
 	srv := NewServer(Config{
-		Evidence:   FixtureEvidenceProvider{Raw: json.RawMessage(`{"attestation_report":"AAAA","cert_chain":{"vcek":"BBBB"}}`), Platform: "snp", Generation: "genoa"},
-		CDSCertPEM: []byte(fakeCDSCert),
-		Backend:    hb,
+		Evidence:             FixtureEvidenceProvider{Raw: json.RawMessage(`{"attestation_report":"AAAA","cert_chain":{"vcek":"BBBB"}}`), Platform: "snp", Generation: "genoa"},
+		CDSCertPEM:           []byte(fakeCDSCert),
+		MeshIdentityCertFile: identity.certFile,
+		MeshIdentityKeyFile:  identity.keyFile,
+		MeshIdentityCAFile:   identity.caFile,
+		Backend:              hb,
 	})
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -241,12 +269,7 @@ func TestTunnelForwardsToUpstream(t *testing.T) {
 	nonce := make([]byte, 32)
 	rand.Read(nonce)
 	bundle := fetchBundle(t, ts.URL, nonce)
-	x, _ := base64.RawURLEncoding.DecodeString(bundle.SessionPubKey.X25519)
-	m, _ := base64.RawURLEncoding.DecodeString(bundle.SessionPubKey.MLKEM768)
-	channel, hs, err := overenc.ClientAgree(overenc.PublicKey{X25519: x, MLKEM768: m}, nonce)
-	if err != nil {
-		t.Fatal(err)
-	}
+	channel, hs := clientChannelFromBundle(t, bundle, nonce)
 	hsBody, _ := json.Marshal(types.HandshakeRequest{Nonce: b64url(nonce), ClientX25519: b64url(hs.ClientX25519), MLKEMCt: b64url(hs.MLKEMCiphertext)})
 	hsResp, _ := http.Post(ts.URL+"/.well-known/c8s/handshake", "application/json", bytes.NewReader(hsBody))
 	var hr types.HandshakeResponse
@@ -274,7 +297,7 @@ func TestTunnelForwardsToUpstream(t *testing.T) {
 }
 
 func TestHandshakeRejectsUnknownNonce(t *testing.T) {
-	ts := newTestServer()
+	ts := newTestServer(t)
 	defer ts.Close()
 	body, _ := json.Marshal(types.HandshakeRequest{
 		Nonce:        b64url([]byte("never-issued-nonce-bytes-32xxxxx")),
@@ -292,10 +315,14 @@ func TestHandshakeRejectsUnknownNonce(t *testing.T) {
 }
 
 func TestHandshakeRejectsExpiredNonce(t *testing.T) {
+	identity := writeTestMeshIdentity(t)
 	srv := NewServer(Config{
-		Evidence:   FixtureEvidenceProvider{Raw: json.RawMessage(`{"attestation_report":"AAAA","cert_chain":{"vcek":"BBBB"}}`), Platform: "snp", Generation: "genoa"},
-		CDSCertPEM: []byte(fakeCDSCert),
-		NonceTTL:   time.Millisecond,
+		Evidence:             FixtureEvidenceProvider{Raw: json.RawMessage(`{"attestation_report":"AAAA","cert_chain":{"vcek":"BBBB"}}`), Platform: "snp", Generation: "genoa"},
+		CDSCertPEM:           []byte(fakeCDSCert),
+		MeshIdentityCertFile: identity.certFile,
+		MeshIdentityKeyFile:  identity.keyFile,
+		MeshIdentityCAFile:   identity.caFile,
+		NonceTTL:             time.Millisecond,
 	})
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -305,12 +332,7 @@ func TestHandshakeRejectsExpiredNonce(t *testing.T) {
 	bundle := fetchBundle(t, ts.URL, nonce)
 	time.Sleep(5 * time.Millisecond)
 
-	x, _ := base64.RawURLEncoding.DecodeString(bundle.SessionPubKey.X25519)
-	m, _ := base64.RawURLEncoding.DecodeString(bundle.SessionPubKey.MLKEM768)
-	_, hs, err := overenc.ClientAgree(overenc.PublicKey{X25519: x, MLKEM768: m}, nonce)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, hs := clientChannelFromBundle(t, bundle, nonce)
 	body, _ := json.Marshal(types.HandshakeRequest{
 		Nonce:        b64url(nonce),
 		ClientX25519: b64url(hs.ClientX25519),
@@ -327,10 +349,14 @@ func TestHandshakeRejectsExpiredNonce(t *testing.T) {
 }
 
 func TestTunnelRejectsExpiredSession(t *testing.T) {
+	identity := writeTestMeshIdentity(t)
 	srv := NewServer(Config{
-		Evidence:   FixtureEvidenceProvider{Raw: json.RawMessage(`{"attestation_report":"AAAA","cert_chain":{"vcek":"BBBB"}}`), Platform: "snp", Generation: "genoa"},
-		CDSCertPEM: []byte(fakeCDSCert),
-		SessionTTL: time.Millisecond,
+		Evidence:             FixtureEvidenceProvider{Raw: json.RawMessage(`{"attestation_report":"AAAA","cert_chain":{"vcek":"BBBB"}}`), Platform: "snp", Generation: "genoa"},
+		CDSCertPEM:           []byte(fakeCDSCert),
+		MeshIdentityCertFile: identity.certFile,
+		MeshIdentityKeyFile:  identity.keyFile,
+		MeshIdentityCAFile:   identity.caFile,
+		SessionTTL:           time.Millisecond,
 		// Generous nonce TTL so the handshake survives establishment; this test
 		// exercises established-session idle expiry, not nonce expiry.
 		NonceTTL: time.Minute,
@@ -351,7 +377,7 @@ func TestTunnelRejectsExpiredSession(t *testing.T) {
 }
 
 func TestAppRequiresSession(t *testing.T) {
-	ts := newTestServer()
+	ts := newTestServer(t)
 	defer ts.Close()
 	resp, err := http.Post(ts.URL+"/.well-known/c8s/tunnel", "application/json", strings.NewReader(`{"iv":"AA","ct":"BB"}`))
 	if err != nil {

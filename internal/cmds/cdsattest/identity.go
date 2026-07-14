@@ -25,7 +25,7 @@ type meshIdentity struct {
 	bundlePEM []byte
 }
 
-// loadMeshIdentity reads all three files for every v2 attestation request so a
+// loadMeshIdentity reads all three files for every attestation request so a
 // get-cert rotation is observed without restarting the sidecar. X509KeyPair
 // verifies that the private key matches the leaf. A transient rotation mismatch
 // or an expired credential fails this request closed; the next request can

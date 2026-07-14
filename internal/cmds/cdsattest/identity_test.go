@@ -15,7 +15,6 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -123,7 +122,7 @@ func TestIdentityBoundAttestationAndChannel(t *testing.T) {
 	if _, err := rand.Read(nonce); err != nil {
 		t.Fatal(err)
 	}
-	endpoint := ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(nonce) + "&binding=" + url.QueryEscape(types.BindingOverEncryptionMeshIdentityV2)
+	endpoint := ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(nonce)
 	resp, err := http.Get(endpoint)
 	if err != nil {
 		t.Fatal(err)
@@ -136,11 +135,11 @@ func TestIdentityBoundAttestationAndChannel(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&bundle); err != nil {
 		t.Fatal(err)
 	}
-	if bundle.Version != "c8s-verify/v2" || bundle.Binding != types.BindingOverEncryptionMeshIdentityV2 {
-		t.Fatalf("unexpected v2 bundle header: %+v", bundle)
+	if bundle.Version != types.ProtocolVersion || bundle.Binding != types.BindingOverEncryption {
+		t.Fatalf("unexpected bundle header: %+v", bundle)
 	}
 	if bundle.IdentityProof == nil || bundle.SessionPubKey == nil {
-		t.Fatalf("v2 bundle missing identity proof or session key: %+v", bundle)
+		t.Fatalf("bundle missing identity proof or session key: %+v", bundle)
 	}
 
 	x25519, err := base64.RawURLEncoding.DecodeString(bundle.SessionPubKey.X25519)
@@ -178,7 +177,7 @@ func TestIdentityBoundAttestationAndChannel(t *testing.T) {
 		t.Fatal("mesh identity proof signature did not verify")
 	}
 
-	clientChannel, handshake, err := overenc.ClientAgreeIdentity(pub, wantReportData)
+	clientChannel, handshake, err := overenc.ClientAgree(pub, wantReportData)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,8 +220,7 @@ func TestIdentityBoundAttestationFailsClosedWithoutIdentity(t *testing.T) {
 	srv := NewServer(Config{Evidence: &capturingProvider{}})
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-	nonce := make([]byte, 32)
-	resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(nonce) + "&binding=" + url.QueryEscape(types.BindingOverEncryptionMeshIdentityV2))
+	resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 32)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +239,7 @@ func TestIdentityBoundAttestationFailsClosedOnInvalidConfiguredIdentity(t *testi
 	})
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-	resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 32)) + "&binding=" + url.QueryEscape(types.BindingOverEncryptionMeshIdentityV2))
+	resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 32)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,24 +273,10 @@ func TestLoadMeshIdentityRejectsExpiredLeaf(t *testing.T) {
 	}
 }
 
-func TestIdentityBoundAttestationRejectsUnknownBinding(t *testing.T) {
-	srv := NewServer(Config{Evidence: &capturingProvider{}})
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-	resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 32)) + "&binding=unknown")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-}
-
-// PROTOCOL.md requires clients to percent-encode the binding value because its
-// literal "+" decodes as a space. A naive client that sends it unescaped must
-// get a loud 400, never a silent v1 downgrade.
-func TestIdentityBoundAttestationRejectsUnescapedBindingParam(t *testing.T) {
+// The endpoint takes no binding parameter: there is a single over-encryption
+// binding and nothing to negotiate. Any binding param — even the served
+// binding's own name — must get a loud 400.
+func TestAttestationRejectsBindingParam(t *testing.T) {
 	identity := writeTestMeshIdentity(t)
 	srv := NewServer(Config{
 		Evidence:             &capturingProvider{},
@@ -302,16 +286,19 @@ func TestIdentityBoundAttestationRejectsUnescapedBindingParam(t *testing.T) {
 	})
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-	// Literal "+" in the raw query — the server decodes it as a space.
-	endpoint := ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 32)) +
-		"&binding=" + types.BindingOverEncryptionMeshIdentityV2
-	resp, err := http.Get(endpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 (unescaped binding must not silently downgrade)", resp.StatusCode)
+	for _, query := range []string{
+		"binding=" + types.BindingOverEncryption,
+		"binding=unknown",
+		"pq=false&binding=" + types.BindingTLSCert,
+	} {
+		resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 32)) + "&" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400", query, resp.StatusCode)
+		}
 	}
 }
 
@@ -325,47 +312,14 @@ func TestIdentityBoundAttestationRejectsShortNonce(t *testing.T) {
 	})
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-	// 16 bytes passes the generic minNonceBytes gate but not the v2 transcript's
-	// exact 32-byte requirement.
-	resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 16)) +
-		"&binding=" + url.QueryEscape(types.BindingOverEncryptionMeshIdentityV2))
+	// 16 bytes passes the generic minNonceBytes gate but not the identity
+	// transcript's exact 32-byte requirement.
+	resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 16)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-}
-
-func TestAttestationRejectsPQFalseCombinedWithBinding(t *testing.T) {
-	srv := NewServer(Config{Evidence: &capturingProvider{}})
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-	resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 32)) +
-		"&pq=false&binding=" + url.QueryEscape(types.BindingOverEncryptionMeshIdentityV2))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-}
-
-// A binding that reaches handleAttestationOverEncryption without a report_data
-// case must fail closed, not serve evidence bound to nothing.
-func TestAttestationOverEncryptionFailsClosedOnUnroutedBinding(t *testing.T) {
-	provider := &capturingProvider{}
-	srv := NewServer(Config{Evidence: provider})
-	nonce := make([]byte, 32)
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/.well-known/c8s/attestation", nil)
-	srv.handleAttestationOverEncryption(rec, req, b64url(nonce), nonce, "future-binding")
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", rec.Code)
-	}
-	if provider.lastReportData != nil {
-		t.Fatal("evidence was fetched for an unrouted binding")
 	}
 }
