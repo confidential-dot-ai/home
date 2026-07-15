@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	hkdfInfo = "c8s-verify/over-encryption/pq-mesh-identity/v1"
+	hkdfInfo = "c8s-verify/v1/over-encryption"
 	ivBytes  = 12
 
 	// X25519PubBytes is the raw X25519 public key length.
