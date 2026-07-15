@@ -5,10 +5,12 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
+
+	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
 const (
-	identityTranscriptDomain = "c8s-verify/pq-mesh-identity/v1"
+	identityTranscriptDomain = types.ProtocolVersion
 	identityProofDomain      = "c8s-verify/pq-mesh-identity-proof/v1"
 	identityNonceBytes       = 32
 )
