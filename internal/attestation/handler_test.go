@@ -59,6 +59,10 @@ func mustJSON(v any) string {
 // signing happens in-process in cds, so these handlers carry no signer
 // dependency.
 func testApp(attestationURL string) http.Handler {
+	return testAppWithOperatorPolicy(attestationURL, "")
+}
+
+func testAppWithOperatorPolicy(attestationURL, operatorKeysHash string) http.Handler {
 	challengeStore := attestation.NewChallengeStore(60 * time.Second)
 
 	earIssuer, err := ear.NewIssuer(testKeyPEM(), "test-issuer", 24*time.Hour)
@@ -70,6 +74,7 @@ func testApp(attestationURL string) http.Handler {
 		Challenges:        &challengeStore,
 		AttestationClient: attestationclient.NewClient(attestationURL),
 		EarIssuer:         earIssuer,
+		OperatorKeysHash:  operatorKeysHash,
 	}
 
 	mux := http.NewServeMux()
@@ -136,13 +141,14 @@ func TestAuthenticateRejectsGetMethod(t *testing.T) {
 }
 
 func TestAttestKeyReturnsEARForAttestedPubkey(t *testing.T) {
+	const operatorKeysHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	mockAS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, mockVerifyResponse(true, true))
 	}))
 	defer mockAS.Close()
 
-	app := httptest.NewServer(testApp(mockAS.URL))
+	app := httptest.NewServer(testAppWithOperatorPolicy(mockAS.URL, operatorKeysHash))
 	defer app.Close()
 
 	challenge := authenticate(t, app.URL)
@@ -159,7 +165,8 @@ func TestAttestKeyReturnsEARForAttestedPubkey(t *testing.T) {
 			Platform: "snp",
 			Evidence: json.RawMessage(`{"quote":"abc"}`),
 		},
-		PublicKey: base64.StdEncoding.EncodeToString(pubDER),
+		PublicKey:        base64.StdEncoding.EncodeToString(pubDER),
+		OperatorKeysHash: operatorKeysHash,
 	})
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
@@ -191,6 +198,38 @@ func TestAttestKeyReturnsEARForAttestedPubkey(t *testing.T) {
 	wantPubKeyClaim := base64.RawURLEncoding.EncodeToString(pubDER)
 	if got, _ := claims[earclaims.TEEPublicKey].(string); got != wantPubKeyClaim {
 		t.Fatalf("tee_public_key = %q, want %q", got, wantPubKeyClaim)
+	}
+	if got, _ := claims[earclaims.OperatorKeysHash].(string); got != operatorKeysHash {
+		t.Fatalf("operator_keys_hash = %q, want %q", got, operatorKeysHash)
+	}
+}
+
+func TestAttestKeyRejectsMismatchedOperatorPolicy(t *testing.T) {
+	const requiredHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	app := httptest.NewServer(testAppWithOperatorPolicy("http://unused", requiredHash))
+	defer app.Close()
+
+	challenge := authenticate(t, app.URL)
+	pubDER, err := x509.MarshalPKIXPublicKey(generateAttestKeyPubKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(types.AttestKeyRequestBody{
+		Challenge:        challenge,
+		Evidence:         types.AttestationEvidence{Platform: "snp", Evidence: json.RawMessage(`{}`)},
+		PublicKey:        base64.StdEncoding.EncodeToString(pubDER),
+		OperatorKeysHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(app.URL+"/attest-key", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
 	}
 }
 

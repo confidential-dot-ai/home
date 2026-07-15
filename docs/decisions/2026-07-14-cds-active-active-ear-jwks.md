@@ -1,6 +1,6 @@
 # 2026-07-14 — Active/active CDS: the EAR/JWKS problem (stage 3)
 
-Status: **proposed** (design only; not implemented). Tracks #75.
+Status: **proposed** (design only; not implemented).
 
 ## Context
 
@@ -39,7 +39,7 @@ against keys it generated itself (`pkg/earsigner/rotator.go:104-119` →
 Service (load-balanced) via `issuer.JWKSKeyProvider`, which force-refreshes on a
 kid-miss, rate-limited to 1/s (`internal/issuer/keyprovider.go:89-117`).
 
-Result: with two active pods, any EAR signed by pod A and presented to pod B
+Result: with two active CDS pods, any EAR signed by pod A and presented to pod B
 (inbound) or verified against pod B's JWKS (outbound) fails with
 `invalid signature` / `no token-signer key`. Active/active is broken for the EAR
 path until the two pods agree on signing keys.
@@ -113,7 +113,7 @@ required.** Reasons:
 Do **not** implement stage 3 now. Active/standby (stage 2) already gives
 continuity across the common case (rolling restart, planned maintenance). True
 node-failure HA is worth the added machinery only when an operator needs it;
-this memo records the design so it can be picked up under #75.
+this memo records the design for that follow-up.
 
 ## If/when implemented — shape
 

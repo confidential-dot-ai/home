@@ -21,15 +21,18 @@
 package operatorauth
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -68,6 +71,59 @@ var validMethods = []string{
 	jwt.SigningMethodES256.Alg(),
 	jwt.SigningMethodES384.Alg(),
 	jwt.SigningMethodES512.Alg(),
+}
+
+const keySetHashDomain = "c8s-operator-key-set-v1\x00"
+
+// KeySetHash returns a canonical SHA-256 commitment to a non-empty operator
+// public-key set. Each key is first reduced to its SPKI fingerprint, then the
+// fixed-size fingerprints are sorted before hashing, so PEM formatting and key
+// order do not change the result. Handoff attestation uses this value to prove
+// that both CDS replicas started with the same allowlist-write policy.
+func KeySetHash(keys []*ecdsa.PublicKey) (string, error) {
+	if len(keys) == 0 {
+		return "", fmt.Errorf("operator key set is empty")
+	}
+
+	fingerprints := make([][]byte, 0, len(keys))
+	for i, key := range keys {
+		if key == nil {
+			return "", fmt.Errorf("operator key %d is nil", i)
+		}
+		der, err := x509.MarshalPKIXPublicKey(key)
+		if err != nil {
+			return "", fmt.Errorf("marshal operator key %d: %w", i, err)
+		}
+		sum := sha256.Sum256(der)
+		fingerprints = append(fingerprints, append([]byte(nil), sum[:]...))
+	}
+	sort.Slice(fingerprints, func(i, j int) bool {
+		return bytes.Compare(fingerprints[i], fingerprints[j]) < 0
+	})
+
+	h := sha256.New()
+	_, _ = h.Write([]byte(keySetHashDomain))
+	for i, fingerprint := range fingerprints {
+		if i > 0 && bytes.Equal(fingerprint, fingerprints[i-1]) {
+			continue
+		}
+		_, _ = h.Write(fingerprint)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ValidateKeySetHash accepts only the canonical lowercase hex encoding
+// produced by KeySetHash. Keeping one wire representation avoids two strings
+// naming the same attested policy commitment.
+func ValidateKeySetHash(value string) error {
+	if value == "" {
+		return fmt.Errorf("operator key-set hash is empty")
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != sha256.Size || strings.ToLower(value) != value {
+		return fmt.Errorf("operator key-set hash must be %d lowercase hex characters", sha256.Size*2)
+	}
+	return nil
 }
 
 // Signer mints operator authorization tokens from an EC private key. Construct

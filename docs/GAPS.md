@@ -2,16 +2,16 @@
 
 These are known gaps after the operator consolidation milestone. They are
 listed here so demos and reviews do not confuse bootstrap convenience with the
-final security model. Each bullet links to the tracking issue.
+final security model.
 
 ## Trust model
 
-- Chart-managed CDS runs as a singleton and keeps the active CA key in memory (tracked at [#18](https://github.com/confidential-dot-ai/c8s/issues/18)).
-- CDS allowlist persistence is off by default (`cds.persistence.enabled=false`), so a restart resets the served allowlist to the install seed and operator-added digests (`c8s allowlist add`) are lost — workloads using them are denied ~30s later. CDS warns at startup when persistence is off; enable `cds.persistence.enabled=true` to retain dynamic entries. See `docs/operator.md` "Operator-added allowlist entries need persistence to survive a restart".
-- Active/active CDS replica handoff is opt-in via `cds.handoff.enabled`; it is off by default (tracked at [#18](https://github.com/confidential-dot-ai/c8s/issues/18)).
+- Chart-managed CDS runs as a singleton and keeps the active CA key in memory.
+- CDS allowlist persistence is off by default (`cds.persistence.enabled=false`). A restart without a surviving adoption peer resets the served allowlist to the install seed and loses operator-added digests (`c8s allowlist add`) — workloads using them are denied ~30s later. Planned CA-adoption rolls now transfer the complete allowlist in the encrypted handoff snapshot, with a documented concurrent-write race. See `docs/operator.md` "Operator-added allowlist entries across restarts".
+- Active/active CDS remains unimplemented. Attested handoff plus a singleton RollingUpdate provides active/standby restart continuity; per-pod EAR keys still block simultaneous serving.
 - Application-secret release is not implemented (tracked at [#46](https://github.com/confidential-dot-ai/c8s/issues/46)).
 - Per-workload measurement allowlists are not enforced at `/attest` (tracked at [#57](https://github.com/confidential-dot-ai/c8s/issues/57)).
-- Allowlist writes are authorized by pinned, long-lived operator public keys (`cds.operatorKeys`), verified at the app layer. Revocation is coarse — no CRL/OCSP, so revoking one operator means removing its key and re-installing. Write tokens are bound to body, method, and path, with a server-enforced 5-minute maximum validity, but carry no `aud`/cluster binding: clusters that pin the **same** operator key accept each other's captured tokens within that window, so pin distinct keys per cluster. The pinned-key list is host-supplied config, read only at CDS start; `c8s cds verify` now reports the pinned-key fingerprints (fetched from `GET /operator-keys` over a connection bound to the attested serving cert), but the list is still not committed to CDS's attestation (HOST_DATA/initdata) — a verifier sees what CDS claims, not what was measured. Longer term: a CA + short-lived operator certificates (single-file cert+key credentials, CA-based revocation). See `docs/pitfalls.md` and `docs/decisions/2026-07-01-operator-cert-allowlist-write.md`.
+- Allowlist writes are authorized by pinned, long-lived operator public keys (`cds.operatorKeys`), verified at the app layer. Revocation is coarse — no CRL/OCSP, so revoking one operator means removing its key and re-installing. Write tokens are bound to body, method, and path, with a server-enforced 5-minute maximum validity, but carry no `aud`/cluster binding: clusters that pin the **same** operator key accept each other's captured tokens within that window, so pin distinct keys per cluster. Handoff now commits the canonical key-set hash into requester and issuer REPORTDATA and requires an exact match, preventing policy substitution between replicas. The general CDS serving attestation still does not commit this list (or the seed and startup flags), and because the keys are public the handoff commitment is not proof of operator private-key possession. `c8s cds verify` reports pinned-key fingerprints over the attested serving connection. Longer term: commit all startup policy to attested init data and move to a CA + short-lived operator certificates. See `docs/pitfalls.md` and `docs/decisions/2026-07-01-operator-cert-allowlist-write.md`.
 - The c8s infrastructure images are not pinned into NRI policy by default (tracked at [#51](https://github.com/confidential-dot-ai/c8s/issues/51)).
 - The in-guest CDS allowlist refresh is disabled on every default kata install:
   it fail-closed-refuses to run without `C8S_CDS_MEASUREMENTS`, and no shipping
@@ -23,12 +23,13 @@ final security model. Each bullet links to the tracking issue.
   guests. Also note the SNP launch digest covers the VMSA set, so even a correct
   pin is per-VM-shape (vCPU count). Candidate fix is operator-signed allowlist
   entries verified in-guest against a baked operator public key.
-- RA-TLS measurement pinning is SNP-only: the TDX verify path drops
-  `policy.Measurements` and `MinTCBVersion` — the attestation-api's TDX
-  verifier surfaces no launch measurement and takes no minimum-TCB parameter,
-  so `verifyTDXEvidence` sends neither (`pkg/attestationclient/verify.go`,
-  `EvidencePolicy`). A TDX deployment relying on `cds.measurements` gets
-  signature + report-data + debug checks only.
+- **TDX measurement scope is MRTD-only.** The attestation-api surfaces MRTD as
+  the normalized `claims.launch_digest`, and c8s applies `policy.Measurements`
+  to it just as it applies the same allowlist to SNP LAUNCH_DIGEST. That pins
+  the TDX guest's initial contents, but it does not pin RTMR[0..3], including
+  the per-workload RTMR[3]. `MinTCBVersion` also remains SNP-only because the
+  c8s TDX verify request has no minimum-TCB policy field. Callers must not treat
+  an MRTD match as an RTMR or workload-identity verdict.
 
 ## Mesh and certificates
 
@@ -120,7 +121,7 @@ final security model. Each bullet links to the tracking issue.
 
 ## Operations
 
-- Chart-managed CDS is not highly available by default (broker side tracked at [#75](https://github.com/confidential-dot-ai/c8s/issues/75)). Restart continuity ships via CA adoption + RollingUpdate (active/standby); true active/active is blocked by per-pod EAR signing keys (design: [decisions/2026-07-14-cds-active-active-ear-jwks.md](decisions/2026-07-14-cds-active-active-ear-jwks.md); scope: [decisions/2026-07-14-cds-active-active-scope.md](decisions/2026-07-14-cds-active-active-scope.md)).
+- Chart-managed CDS is not highly available by default. Restart continuity ships via CA adoption + RollingUpdate (active/standby); true active/active is blocked by per-pod EAR signing keys (design: [decisions/2026-07-14-cds-active-active-ear-jwks.md](decisions/2026-07-14-cds-active-active-ear-jwks.md); scope: [decisions/2026-07-14-cds-active-active-scope.md](decisions/2026-07-14-cds-active-active-scope.md)).
 - Multi-tenancy isolation has no complete design (tracked at [#56](https://github.com/confidential-dot-ai/c8s/issues/56)).
 - Federation and multi-cluster orchestration remain fleet-level concerns.
 - No operator↔chart capability handshake: the chart renders webhook-dependent

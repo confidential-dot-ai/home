@@ -116,6 +116,9 @@ ctr_sec_ctx=$(sed -n 6p <<<"$pod_fields"); [ -n "$ctr_sec_ctx" ] || ctr_sec_ctx=
 [ -n "$cds_image" ] || fail "cds pod $cds_ns/$cds_pod has no container named cds"
 
 pod="ca-handoff-probe-$$"
+operator_keys_cm="${cds_deploy}-operator-keys"
+kubectl get configmap "$operator_keys_cm" -n "$cds_ns" >/dev/null 2>&1 ||
+  fail "CDS handoff requires operator keys, but ConfigMap $cds_ns/$operator_keys_cm is missing"
 echo "cds: $cds_ns/$cds_deploy on $cds_node; peer $peer_url"
 
 # Release namespace + cds ServiceAccount: image pull secrets ride along and
@@ -145,9 +148,18 @@ spec:
         - --peer-url=$peer_url
         - --attestation-api-url=$attest_url
         - --measurements=$handoff_meas
+        - --operator-keys=/etc/cds-operator-keys/keys.pem
         - --expected-issuer=$ear_issuer
         - --timeout=${probe_timeout}s
+      volumeMounts:
+        - name: operator-keys
+          mountPath: /etc/cds-operator-keys
+          readOnly: true
       securityContext: $ctr_sec_ctx
+  volumes:
+    - name: operator-keys
+      configMap:
+        name: $operator_keys_cm
 EOF
 
 # --- await verdict ------------------------------------------------------------

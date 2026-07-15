@@ -12,6 +12,9 @@
     {{- /* Structured marker (kind=...) lets tests discriminate this fail without substring-matching the prose. */ -}}
     {{- fail "VALIDATION_ERROR kind=cds_handoff_measurements: cds.handoff.enabled requires cds.measurements to be set (the joining replica's launch digest). See docs/operator.md." -}}
   {{- end -}}
+  {{- if not .Values.cds.operatorKeys -}}
+    {{- fail "VALIDATION_ERROR kind=cds_handoff_operator_keys: cds.handoff.enabled requires cds.operatorKeys so both replicas commit the same allowlist-write policy into handoff attestation. See docs/operator.md." -}}
+  {{- end -}}
 {{- end -}}
 {{- if .Values.cds.handoff.peerUrl -}}
   {{- /* Without enabled no pod serves /handoff (--handoff-measurements renders
@@ -24,10 +27,11 @@
   {{- if not (hasPrefix "https://" (include "c8s.cdsHandoffPeerURL" .)) -}}
     {{- fail "VALIDATION_ERROR kind=cds_handoff_peer_scheme: cds.handoff.peerUrl must use https (RA-TLS), or the sentinel \"self\" for the CDS Service URL." -}}
   {{- end -}}
-  {{- /* The surge pod can't co-mount the RWO PVC; its allowlist rebuilds from
-         the seed, so forbid the combo rather than deadlock the roll. */ -}}
+  {{- /* The surge pod can't co-mount the RWO PVC. Its allowlist is restored
+         from the encrypted handoff snapshot, so forbid the combo rather than
+         deadlock the roll. */ -}}
   {{- if .Values.cds.persistence.enabled -}}
-    {{- fail "VALIDATION_ERROR kind=cds_handoff_peer_persistence: cds.handoff.peerUrl (adoption) cannot be combined with cds.persistence.enabled (the surge pod cannot share the RWO data PVC). The allowlist is rebuilt from the seed. See docs/operator.md." -}}
+    {{- fail "VALIDATION_ERROR kind=cds_handoff_peer_persistence: cds.handoff.peerUrl (adoption) cannot be combined with cds.persistence.enabled (the surge pod cannot share the RWO data PVC). Dynamic allowlist state is transferred in the encrypted handoff snapshot. See docs/operator.md." -}}
   {{- end -}}
 {{- end -}}
 apiVersion: v1

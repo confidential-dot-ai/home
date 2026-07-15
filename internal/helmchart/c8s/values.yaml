@@ -248,8 +248,10 @@ cds:
   ## Attested CA handoff to a joining cds replica. When enabled, cds
   ## self-provisions its handoff signer EAR in process (no external dial) and
   ## registers /handoff, authorising peers whose launch digest is in
-  ## cds.measurements. Required for any active/active cds deployment; without
-  ## it, a cds pod restart triggers a full mesh re-bootstrap.
+  ## cds.measurements. Handoff also requires cds.operatorKeys: a canonical hash
+  ## of that public-key set is bound into both replicas' REPORTDATA and must
+  ## match before state is released. Required for any active/active cds
+  ## deployment; without it, a cds pod restart triggers a full mesh re-bootstrap.
   handoff:
     enabled: false
     ## peerUrl: where a starting cds ADOPTS its mesh CA from over /handoff
@@ -268,6 +270,8 @@ cds:
     ## Requires handoff.enabled=true (the serving pod must offer /handoff for
     ## the next roll) and cds.measurements; cannot combine with
     ## persistence.enabled (the surge pod cannot share the RWO data PVC).
+    ## The encrypted handoff snapshot carries the complete served allowlist, so
+    ## planned adoption rolls preserve operator-added entries despite emptyDir.
     peerUrl: ""
   persistence:
     enabled: false

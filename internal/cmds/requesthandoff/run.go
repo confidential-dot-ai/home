@@ -11,12 +11,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/internal/issuer"
 	"github.com/confidential-dot-ai/c8s/pkg/attestclient"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
+	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 )
 
@@ -28,6 +30,7 @@ type config struct {
 	expectedIssuer    string
 	logLevel          string
 	measurements      []string
+	operatorKeys      string
 	timeout           time.Duration
 }
 
@@ -41,6 +44,8 @@ type report struct {
 	CACertSubject           string `json:"ca_cert_subject"`
 	CACertNotAfter          string `json:"ca_cert_not_after"`
 	BundleCerts             int    `json:"bundle_certs"`
+	AllowlistVersion        string `json:"allowlist_version"`
+	AllowlistDigestCount    int    `json:"allowlist_digest_count"`
 	ServedCAMatch           bool   `json:"served_ca_match"`
 }
 
@@ -75,6 +80,21 @@ func run(ctx context.Context, cfg config, out, errOut io.Writer) int {
 	}
 	if len(pinned) == 0 {
 		fmt.Fprintf(errOut, "error: --measurements: no usable measurement\n")
+		return exitUsage
+	}
+	operatorKeysPEM, err := os.ReadFile(cfg.operatorKeys)
+	if err != nil {
+		fmt.Fprintf(errOut, "error: --operator-keys: %v\n", err)
+		return exitUsage
+	}
+	operatorKeys, err := operatorauth.ParsePublicKeysPEM(operatorKeysPEM)
+	if err != nil {
+		fmt.Fprintf(errOut, "error: --operator-keys: %v\n", err)
+		return exitUsage
+	}
+	operatorKeysHash, err := operatorauth.KeySetHash(operatorKeys)
+	if err != nil {
+		fmt.Fprintf(errOut, "error: --operator-keys: %v\n", err)
 		return exitUsage
 	}
 	// The same digest set pins both channels: the peer's RA-TLS serving cert
@@ -115,6 +135,7 @@ func run(ctx context.Context, cfg config, out, errOut io.Writer) int {
 			KeyProvider:         keyProvider,
 			ExpectedIssuer:      cfg.expectedIssuer,
 			AllowedMeasurements: allowed,
+			OperatorKeysHash:    operatorKeysHash,
 		},
 		Attest:            attestclient.NewClientWithHTTP(peerURL, httpClient),
 		PeerURL:           peerURL,
@@ -145,6 +166,8 @@ func run(ctx context.Context, cfg config, out, errOut io.Writer) int {
 		CACertSubject:           material.CACert.Subject.String(),
 		CACertNotAfter:          material.CACert.NotAfter.Format(time.RFC3339),
 		BundleCerts:             len(material.Bundle),
+		AllowlistVersion:        material.AllowlistVersion,
+		AllowlistDigestCount:    len(material.Allowlist),
 		ServedCAMatch:           servedCAMatch(served, material.CACert),
 	}
 	if !rep.ServedCAMatch {

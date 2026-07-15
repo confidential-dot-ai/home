@@ -31,13 +31,14 @@ type fakeAttestKeyClient struct {
 	measurement string
 }
 
-func (f *fakeAttestKeyClient) AttestKey(_ context.Context, _ string, pubKeyDER []byte) (string, error) {
+func (f *fakeAttestKeyClient) AttestKeyWithOperatorKeysHash(_ context.Context, _ string, pubKeyDER []byte, operatorKeysHash string) (string, error) {
 	f.t.Helper()
 	now := time.Now().Unix()
 	return signJWT(f.t, f.tokenKey, map[string]any{
-		earclaims.IssuedAt:     now,
-		earclaims.ExpiresAt:    now + 3600,
-		earclaims.TEEPublicKey: base64.RawURLEncoding.EncodeToString(pubKeyDER),
+		earclaims.IssuedAt:         now,
+		earclaims.ExpiresAt:        now + 3600,
+		earclaims.TEEPublicKey:     base64.RawURLEncoding.EncodeToString(pubKeyDER),
+		earclaims.OperatorKeysHash: operatorKeysHash,
 		earclaims.Submods: map[string]any{
 			earclaims.SubmodAttester: map[string]any{
 				earclaims.LaunchDigest: f.measurement,
@@ -58,6 +59,7 @@ func pullTestHandoffServer(t *testing.T, tokenKey *ecdsa.PrivateKey, allowed map
 		Logger:              slog.Default(),
 		KeyProvider:         testKeyProvider{pub: &tokenKey.PublicKey},
 		AllowedMeasurements: allowed,
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 		Signer:              activeHandoffKey,
 		EARSource:           staticHandoffEARSource{ear: activeEAR},
 		Snapshot:            snapshotFromCA(ca),
@@ -78,6 +80,7 @@ func TestPullHandoffTransfersCA(t *testing.T) {
 	deps := HandoffClientDeps{
 		KeyProvider:         testKeyProvider{pub: &tokenKey.PublicKey},
 		AllowedMeasurements: allowed,
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 	}
 	attest := &fakeAttestKeyClient{t: t, tokenKey: tokenKey, measurement: "allowed_measurement"}
 	material, err := PullHandoff(context.Background(), PullConfig{
@@ -142,6 +145,7 @@ func TestPullHandoffRetriesTransientThenSucceeds(t *testing.T) {
 	deps := HandoffClientDeps{
 		KeyProvider:         testKeyProvider{pub: &tokenKey.PublicKey},
 		AllowedMeasurements: allowed,
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 	}
 	attest := &fakeAttestKeyClient{t: t, tokenKey: tokenKey, measurement: "allowed_measurement"}
 	material, err := PullHandoff(context.Background(), PullConfig{
@@ -173,6 +177,7 @@ func TestPullHandoffFailsFastOnDefinitiveVerdict(t *testing.T) {
 	deps := HandoffClientDeps{
 		KeyProvider:         testKeyProvider{pub: &tokenKey.PublicKey},
 		AllowedMeasurements: map[string]bool{"allowed_measurement": true},
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 	}
 	attest := &fakeAttestKeyClient{t: t, tokenKey: tokenKey, measurement: "allowed_measurement"}
 	_, err := PullHandoff(context.Background(), PullConfig{

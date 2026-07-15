@@ -3849,6 +3849,7 @@ func TestChartCDSHandoffEnabledWiresMeasurements(t *testing.T) {
 	out, err := helmTemplate(t,
 		"--set", "cds.handoff.enabled=true",
 		"--set", "cds.measurements[0]="+measurement,
+		"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
@@ -3883,6 +3884,20 @@ func TestChartCDSHandoffEnabledFailsWithoutMeasurements(t *testing.T) {
 }
 
 const cdsPeerMeasurement = "0011223344556677889900112233445566778899001122334455667788990011223344556677889900112233445566ff"
+const cdsHandoffOperatorKeys = "-----BEGIN PUBLIC KEY-----fake"
+
+func TestChartCDSHandoffEnabledRequiresOperatorKeys(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set", "cds.handoff.enabled=true",
+		"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+	)
+	if err == nil {
+		t.Fatalf("helm template succeeded with CDS handoff but no operator keys; output=%s", out)
+	}
+	if got := parseValidationErrorKind(out); got != "cds_handoff_operator_keys" {
+		t.Fatalf("validation kind = %q, want cds_handoff_operator_keys; output=%s", got, out)
+	}
+}
 
 // TestChartCDSHandoffPeerURLWiresFlag confirms cds.handoff.peerUrl renders the
 // requester-side --handoff-peer-url flag (pull-on-startup adoption) alongside
@@ -3894,6 +3909,7 @@ func TestChartCDSHandoffPeerURLWiresFlag(t *testing.T) {
 		"--set", "cds.handoff.enabled=true",
 		"--set", "cds.handoff.peerUrl="+peer,
 		"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+		"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
@@ -3937,6 +3953,7 @@ func TestChartCDSHandoffPeerURLFailsOnNonHTTPS(t *testing.T) {
 		"--set", "cds.handoff.enabled=true",
 		"--set", "cds.handoff.peerUrl=http://peer:8443",
 		"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+		"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
 	)
 	if err == nil {
 		t.Fatalf("helm template succeeded with an http peerUrl; output=%s", out)
@@ -3976,6 +3993,7 @@ func TestChartCDSStrategyTracksAdoption(t *testing.T) {
 			"--set", "cds.handoff.enabled=true",
 			"--set", "cds.handoff.peerUrl=self",
 			"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+			"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
 		)
 		if err != nil {
 			t.Fatalf("helm template: %v\n%s", err, out)
@@ -4011,6 +4029,7 @@ func TestChartCDSHandoffPeerSelfResolvesToServiceURL(t *testing.T) {
 		"--set", "cds.handoff.enabled=true",
 		"--set", "cds.handoff.peerUrl=self",
 		"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+		"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
@@ -4027,6 +4046,7 @@ func TestChartCDSHandoffPeerRejectsPersistence(t *testing.T) {
 		"--set", "cds.handoff.peerUrl=self",
 		"--set", "cds.measurements[0]="+cdsPeerMeasurement,
 		"--set", "cds.persistence.enabled=true",
+		"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
 	)
 	if err == nil {
 		t.Fatalf("helm template succeeded with peerUrl + persistence; output=%s", out)

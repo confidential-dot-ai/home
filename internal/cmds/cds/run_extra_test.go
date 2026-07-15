@@ -20,6 +20,8 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
+const testOperatorKeysHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 func TestCompilePattern(t *testing.T) {
 	t.Run("empty returns nil", func(t *testing.T) {
 		re, err := compilePattern("--x", "")
@@ -82,6 +84,8 @@ func TestBuildHandoffHandler_DisabledWhenNoMeasurements(t *testing.T) {
 		context.Background(),
 		cfg,
 		nil,          // mesh unused on the disabled path
+		nil,          // allowlist store unused on the disabled path
+		"",           // operator policy unused on the disabled path
 		nil,          // keyProvider unused
 		ear.Issuer{}, // earIssuer unused on the disabled path
 		attestationclient.NewClient(""),
@@ -116,12 +120,17 @@ func TestBuildHandoffHandler_EnabledReturnsHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ca: %v", err)
 	}
+	store, err := allowlist.OpenInMemory()
+	if err != nil {
+		t.Fatalf("allowlist: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 
 	cfg := config{
 		handoffMeasurements: []string{"deadbeef"},
 		earIssuerName:       "cds",
 	}
-	hh, err := buildHandoffHandler(ctx, cfg, ca, rotator, earIss, attestationclient.NewClient(""))
+	hh, err := buildHandoffHandler(ctx, cfg, ca, &store, testOperatorKeysHash, rotator, earIss, attestationclient.NewClient(""))
 	if err != nil {
 		t.Fatalf("buildHandoffHandler: %v", err)
 	}
@@ -360,7 +369,7 @@ func newStubRouterWithHandoff(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatalf("rotator: %v", err)
 	}
-	boot, err := issuer.NewLocalHandoffBootstrap(attestationclient.NewClient(""), earIss)
+	boot, err := issuer.NewLocalHandoffBootstrap(attestationclient.NewClient(""), earIss, testOperatorKeysHash)
 	if err != nil {
 		t.Fatalf("handoff bootstrap: %v", err)
 	}
@@ -368,10 +377,15 @@ func newStubRouterWithHandoff(t *testing.T) http.Handler {
 		KeyProvider:         rotator,
 		ExpectedIssuer:      "cds",
 		AllowedMeasurements: map[string]bool{"deadbeef": true},
+		OperatorKeysHash:    testOperatorKeysHash,
 		Signer:              boot.Signer(),
 		EARSource:           boot.EARSource(),
 		Snapshot: func() (issuer.CASnapshot, bool) {
-			return issuer.CASnapshot{Cert: ca.Cert, Key: ca.Key}, true
+			version, digests, err := store.ListAll()
+			if err != nil {
+				return issuer.CASnapshot{}, false
+			}
+			return issuer.CASnapshot{Cert: ca.Cert, Key: ca.Key, AllowlistVersion: version, Allowlist: digests}, true
 		},
 	})
 	if err != nil {

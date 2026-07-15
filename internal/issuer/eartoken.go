@@ -37,6 +37,7 @@ const (
 	ReasonNotYetValid       Reason = "not_yet_valid"
 	ReasonMeasurementDenied Reason = "measurement_denied"
 	ReasonKeyBinding        Reason = "key_binding"
+	ReasonOperatorPolicy    Reason = "operator_policy"
 )
 
 // TokenValidationError wraps the underlying validation error with a stable

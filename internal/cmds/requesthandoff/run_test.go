@@ -74,7 +74,7 @@ func TestNewCmdDefaults(t *testing.T) {
 			t.Errorf("--%s default = %q, want %q", flag, f.DefValue, want)
 		}
 	}
-	for _, flag := range []string{"peer-url", "attestation-api-url", "measurements"} {
+	for _, flag := range []string{"peer-url", "attestation-api-url", "measurements", "operator-keys"} {
 		f := cmd.Flags().Lookup(flag)
 		if f == nil {
 			t.Fatalf("flag --%s not registered", flag)

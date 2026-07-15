@@ -66,8 +66,8 @@ func NewCmd() *cobra.Command {
 	flags.BoolVar(&cfg.allowlistPersistent, "allowlist-persistent", false, "whether --allowlist-db is on durable storage; false makes CDS warn at startup that operator-added digests and the mesh CA do not survive a restart")
 	flags.StringVar(&cfg.allowlistSeed, "allowlist-seed", "", "Path to a JSON allowlist (version + digests map) seeded into the store at startup before serving; missing digests are added, existing entries are left untouched (empty disables seeding)")
 	flags.StringVar(&cfg.operatorKeys, "operator-keys", "", "Path to a PEM bundle of pinned operator EC public keys; /allowlist writes (POST/PUT/DELETE) require an operator token signed by one of them (empty = writes disabled, reads still served)")
-	flags.StringSliceVar(&cfg.handoffMeasurements, "handoff-measurements", nil, "SHA-384 hex launch measurements allowed to pull the mesh CA via /handoff (empty = /handoff disabled)")
-	flags.StringVar(&cfg.handoffPeerURL, "handoff-peer-url", "", "https URL of a surviving CDS peer to adopt the mesh CA from on startup via attested /handoff (empty = generate a fresh CA). When set, startup fails closed if the peer cannot be reached or denies the handoff, so a partition never mints a divergent trust root. Pins the peer with --handoff-measurements.")
+	flags.StringSliceVar(&cfg.handoffMeasurements, "handoff-measurements", nil, "SHA-384 hex launch measurements allowed to pull the mesh CA and allowlist via /handoff; requires --operator-keys so both replicas attest the same policy (empty = /handoff disabled)")
+	flags.StringVar(&cfg.handoffPeerURL, "handoff-peer-url", "", "https URL of a surviving CDS peer to adopt the mesh CA and allowlist from on startup via attested /handoff (empty = generate a fresh CA). When set, startup fails closed if the peer cannot be reached, denies handoff, or attests a different operator-key policy. Pins the peer with --handoff-measurements.")
 	flags.DurationVar(&cfg.handoffPeerTimeout, "handoff-peer-timeout", 2*time.Minute, "deadline for adopting the CA from --handoff-peer-url before failing startup")
 
 	flags.Float64Var(&cfg.rateLimit, "rate-limit", 10, "max requests per second per source IP on attestation endpoints")
@@ -101,8 +101,8 @@ func NewCmd() *cobra.Command {
 		DefaultPort: 8443,
 	}))
 
-	// `c8s cds request-handoff` — client side of /handoff; live-cluster probe
-	// today, replica pull-on-startup precursor (#18).
+	// `c8s cds request-handoff` — live-cluster probe for the same /handoff
+	// protocol used by startup adoption.
 	cmd.AddCommand(requesthandoff.NewCmd())
 
 	return cmd

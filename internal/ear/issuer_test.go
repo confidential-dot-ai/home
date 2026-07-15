@@ -179,6 +179,32 @@ func TestIssueWithLaunchDigestAndPubKeyAddsTEEPubKeyClaim(t *testing.T) {
 	}
 }
 
+func TestIssueAttestedKeyAddsOperatorPolicyClaim(t *testing.T) {
+	issuer, err := NewIssuer(testKeyPEM(t), "test-issuer", 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	teeKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const operatorKeysHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	token, err := issuer.IssueAttestedKey(json.RawMessage(`{"evidence":"data"}`), "abc123", &teeKey.PublicKey, operatorKeysHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var claims map[string]json.RawMessage
+	decodeJWTPayload(t, token, &claims)
+	var got string
+	if err := json.Unmarshal(claims[earclaims.OperatorKeysHash], &got); err != nil {
+		t.Fatalf("unmarshal %s: %v", earclaims.OperatorKeysHash, err)
+	}
+	if got != operatorKeysHash {
+		t.Fatalf("%s = %q, want %q", earclaims.OperatorKeysHash, got, operatorKeysHash)
+	}
+}
+
 func TestTokenExpiryMatchesLifetime(t *testing.T) {
 	keyPEM := testKeyPEM(t)
 	lifetime := 10 * time.Minute

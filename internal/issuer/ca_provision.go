@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/pkg/attestclient"
+	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
+	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
 // CAProvisionConfig configures how CDS obtains its mesh CA at startup.
@@ -38,6 +40,13 @@ type CAProvisionConfig struct {
 	// failures until this elapses; a peer still unreachable at the deadline
 	// is a fail-closed error, not a cue to self-generate.
 	Timeout time.Duration
+	// OperatorKeysHash is the canonical local operator-key policy committed
+	// into both sides' handoff attestations.
+	OperatorKeysHash string
+	// RestoreAllowlist atomically installs the peer's encrypted allowlist
+	// snapshot before CDS serves. Required when PeerURL is set, so adoption
+	// cannot preserve the CA while silently resetting runtime policy state.
+	RestoreAllowlist func(version string, digests map[types.Digest]string) error
 }
 
 // caPuller adopts a CA from the configured peer. It is a seam so the
@@ -76,6 +85,12 @@ func provisionCA(ctx context.Context, cfg CAProvisionConfig, logger *slog.Logger
 		}
 		return generated, false, nil
 	}
+	if cfg.RestoreAllowlist == nil {
+		return nil, false, fmt.Errorf("adopting a CA requires an allowlist snapshot restorer")
+	}
+	if err := operatorauth.ValidateKeySetHash(cfg.OperatorKeysHash); err != nil {
+		return nil, false, fmt.Errorf("adopting a CA requires an operator-key policy: %w", err)
+	}
 
 	material, err := pull(ctx, cfg, logger)
 	if err != nil {
@@ -85,6 +100,9 @@ func provisionCA(ctx context.Context, cfg CAProvisionConfig, logger *slog.Logger
 	// rotation bundles rather than silently drop trust material.
 	if material.ParentCert != nil || len(material.Bundle) > 1 {
 		return nil, false, fmt.Errorf("peer %s handed off a chained or multi-cert CA (parent=%t, bundle=%d certs); adoption supports a single self-signed mesh CA", cfg.PeerURL, material.ParentCert != nil, len(material.Bundle))
+	}
+	if err := cfg.RestoreAllowlist(material.AllowlistVersion, material.Allowlist); err != nil {
+		return nil, false, fmt.Errorf("restore allowlist snapshot from peer %s: %w", cfg.PeerURL, err)
 	}
 	return &CA{Cert: material.CACert, Key: material.CAKey}, true, nil
 }
@@ -131,6 +149,7 @@ func adoptFromPeer(ctx context.Context, cfg CAProvisionConfig, logger *slog.Logg
 			KeyProvider:         keyProvider,
 			ExpectedIssuer:      cfg.ExpectedIssuer,
 			AllowedMeasurements: allowed,
+			OperatorKeysHash:    cfg.OperatorKeysHash,
 		},
 		Attest:            attestclient.NewClientWithHTTP(cfg.PeerURL, httpClient),
 		PeerURL:           cfg.PeerURL,

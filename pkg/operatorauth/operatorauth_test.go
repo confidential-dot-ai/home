@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -302,5 +303,60 @@ func TestParsePublicKeysPEM(t *testing.T) {
 	privPEM, _ := genKey(t, elliptic.P256())
 	if _, err := ParsePublicKeysPEM(privPEM); err == nil {
 		t.Fatal("expected a private-key PEM to be rejected (no PUBLIC KEY block)")
+	}
+}
+
+func TestKeySetHashIsCanonical(t *testing.T) {
+	keyA, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyB, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ab, err := KeySetHash([]*ecdsa.PublicKey{&keyA.PublicKey, &keyB.PublicKey})
+	if err != nil {
+		t.Fatalf("KeySetHash: %v", err)
+	}
+	ba, err := KeySetHash([]*ecdsa.PublicKey{&keyB.PublicKey, &keyA.PublicKey})
+	if err != nil {
+		t.Fatalf("KeySetHash reversed: %v", err)
+	}
+	if ab != ba {
+		t.Fatalf("key order changed hash: %q != %q", ab, ba)
+	}
+	withDuplicate, err := KeySetHash([]*ecdsa.PublicKey{&keyA.PublicKey, &keyB.PublicKey, &keyA.PublicKey})
+	if err != nil {
+		t.Fatalf("KeySetHash duplicate: %v", err)
+	}
+	if withDuplicate != ab {
+		t.Fatalf("duplicate key changed set hash: %q != %q", withDuplicate, ab)
+	}
+	if err := ValidateKeySetHash(ab); err != nil {
+		t.Fatalf("ValidateKeySetHash: %v", err)
+	}
+
+	onlyA, err := KeySetHash([]*ecdsa.PublicKey{&keyA.PublicKey})
+	if err != nil {
+		t.Fatalf("KeySetHash one key: %v", err)
+	}
+	if onlyA == ab {
+		t.Fatal("adding a key did not change the key-set hash")
+	}
+}
+
+func TestKeySetHashRejectsInvalidInputs(t *testing.T) {
+	if _, err := KeySetHash(nil); err == nil {
+		t.Fatal("expected empty key set to fail")
+	}
+	if _, err := KeySetHash([]*ecdsa.PublicKey{nil}); err == nil {
+		t.Fatal("expected nil key to fail")
+	}
+	for _, value := range []string{"", "abcd", strings.Repeat("A", 64), strings.Repeat("z", 64)} {
+		if err := ValidateKeySetHash(value); err == nil {
+			t.Fatalf("ValidateKeySetHash(%q) succeeded", value)
+		}
 	}
 }

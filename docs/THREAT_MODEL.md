@@ -299,8 +299,10 @@ binary:
   Attested CA handoff is in-process: CDS self-provisions its handoff signer EAR
   (signer key generated at startup, minted by its own EAR issuer — no external
   service to dial). It is opt-in via `cds.handoff.enabled=true`, which
-  authorises peers whose launch digest is in `cds.measurements`; the chart
-  fails to render if measurements is empty while handoff is enabled.
+  authorises peers whose launch digest is in `cds.measurements` and whose
+  REPORTDATA-bound operator-key-set hash exactly matches the serving CDS. The
+  chart fails to render if measurements or operator keys are empty while
+  handoff is enabled.
 - `GET /ca` serves the public CA bundle without EAR authorization
   so ratls-mesh can poll trust anchors after its initial trust seed is
   established from the authenticated certificate issuance response.
@@ -319,8 +321,10 @@ binary:
   control. Keys are long-lived and CDS consults no CRL/OCSP, so revoking an
   operator means removing its public key from `cds.operatorKeys` and
   re-installing; protect operator keys accordingly. The pinned-key list is
-  host-supplied config, read only at CDS start and not yet in CDS's attestation —
-  an interim tradeoff, see `docs/pitfalls.md` (§5 Addressable).
+  host-supplied config. Handoff EARs commit its canonical set hash into
+  REPORTDATA, but the general CDS serving attestation still does not commit the
+  list, seed, or startup flags — an interim tradeoff, see `docs/pitfalls.md`
+  (§5 Addressable).
   With `cds.operatorKeys` unset, writes are rejected and only reads are served.
   See `docs/decisions/2026-07-01-operator-cert-allowlist-write.md`.
 
@@ -329,11 +333,11 @@ binary:
 - **`/attest`** enforces the `cds.measurements` launch-digest allowlist before
   issuing a leaf. **`/attest-key`** issues a TEE-bound EAR (no cert) for a
   caller-generated key — used by in-cluster components (CDS's handoff signer).
-  Its handler verifies the TEE attestation evidence (the `protected` wrapper
-  adds only rate limiting and a body cap) but **does not** consult
-  `cds.measurements`. This asymmetry is intentional for in-cluster self-attestation;
-  it means measurement pinning does not constrain this route. (Flagged for review —
-  confirm whether `/attest-key` should also honor `cds.measurements`.)
+  For handoff, REPORTDATA binds the generated key, challenge, and canonical
+  operator-key-set hash; the handler rejects a hash that differs from its own
+  policy. It verifies the TEE evidence but does not itself consult
+  `cds.measurements`; `/handoff` verifies the resulting EAR's launch digest
+  before releasing state.
 - Unauthenticated reads: `GET /ca`, `GET /operator-keys`, `/.well-known/jwks.json`,
   `GET /allowlist`, `/healthz`, `/readyz`, `/metrics`. `/authenticate` is
   unauthenticated and mints an in-memory challenge (single-instance; lost on restart).
@@ -386,7 +390,8 @@ In that model:
 
 - the mesh CA private key is not stored in Kubernetes Secrets;
 - new replicas receive CA signing material only after both sides validate EAR
-  measurements allowed for handoff. The signature chain is
+  measurements allowed for handoff and exact REPORTDATA-bound operator-key
+  policy equality. The signature chain is
   transitive: each EAR carries a `tee_public_key` (ECDSA), and that key
   signs a transcript including the ephemeral X25519 KEM public key. The
   X25519 key is therefore bound to the EAR via the ECDSA proof-of-possession,
@@ -398,6 +403,9 @@ In that model:
 - allowlists and policy are signed by an operator-held key. (The whitepaper's
   fuller design has CDS signing a Kettle-attested image manifest; Kettle is not
   shipped — today the operator key signs JWT write-tokens, not the manifest.)
+- planned replica adoption transfers the current allowlist version and digests
+  inside the recipient-encrypted handoff payload. A write racing after the
+  snapshot can still be missed by the joining singleton.
 - secret release is gated by workload attestation (designed; see GAPS §Trust model);
 - recovery from total CDS outage means re-bootstrap and re-issue certificates.
 
@@ -414,19 +422,28 @@ must re-run initial CDS provisioning to converge.
 The handoff endpoint (`/handoff`) closes this when the chart enables
 `cds.handoff.enabled=true`: CDS generates an ECDSA handoff signer key in
 process at startup and self-provisions its EAR via its own EAR issuer (no
-external service to dial). No operator key file or Kubernetes Secret is
-involved (the alternative — mounting a Secret-backed PEM — would put
-CA-adjacent material into etcd, which the design forbids). Active/active
-deployments can then handoff the active CA key to a joining replica without
+external service to dial). The existing public operator-key ConfigMap is
+hashed into both replicas' REPORTDATA; no private operator key or CA-adjacent
+Kubernetes Secret is introduced. The singleton Deployment can then hand off
+the active CA key and allowlist snapshot to its surge replacement without
 re-issuing workload certs.
 
 Until the operator turns handoff on, run CDS with `replicas: 1`
 and `strategy: Recreate` (the chart defaults), guard it with a PDB, and
 treat any restart as a planned re-bootstrap event. To turn handoff on,
-set `cds.handoff.enabled=true` and pin `cds.measurements` to CDS's launch
-digest — the same flat allowlist authorises `/handoff` (setting
-handoff.enabled without measurements fails chart render). Then scale up
-freely.
+set `cds.handoff.enabled=true`, pin `cds.measurements` to CDS's launch digest,
+and configure `cds.operatorKeys`; missing either policy fails chart render.
+Then enable `cds.handoff.peerUrl=self` for active/standby RollingUpdate
+continuity. Replicas remain fixed at one until the per-pod EAR/JWKS problem is
+solved.
+
+The operator-key commitment prevents an untrusted host from substituting a
+different allowlist-write policy between the serving and joining replicas. It
+does **not** prove possession of an operator private key: the public bundle is
+readable and a malicious control plane can copy it into another same-measured
+CDS. Fully authorizing a unique joining instance needs an interactive
+operator-signed approval bound to its ephemeral key, or attestation-gated
+secret release; neither exists today.
 
 ## 10. Browser / out-of-cluster verification (c8s-verify)
 

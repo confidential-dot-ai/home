@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
+	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
 func TestProvisionCAGeneratesWithoutPeer(t *testing.T) {
@@ -42,11 +43,23 @@ func TestProvisionCAAdoptsFromPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	pull := func(context.Context, CAProvisionConfig, *slog.Logger) (*HandoffMaterial, error) {
-		return &HandoffMaterial{CACert: peerCA.Cert, CAKey: peerCA.Key}, nil
+		return &HandoffMaterial{
+			CACert:           peerCA.Cert,
+			CAKey:            peerCA.Key,
+			AllowlistVersion: "9",
+			Allowlist:        map[types.Digest]string{handoffTestDigest(): "dynamic/image"},
+		}, nil
 	}
+	var restoredVersion string
+	var restored map[types.Digest]string
 	ca, adopted, err := provisionCA(context.Background(), CAProvisionConfig{
-		PeerURL:      "https://peer:8443",
-		Measurements: []string{"m"},
+		PeerURL:          "https://peer:8443",
+		Measurements:     []string{"m"},
+		OperatorKeysHash: handoffTestOperatorKeysHash,
+		RestoreAllowlist: func(version string, digests map[types.Digest]string) error {
+			restoredVersion, restored = version, digests
+			return nil
+		},
 	}, slog.Default(), pull)
 	if err != nil {
 		t.Fatalf("provisionCA: %v", err)
@@ -59,6 +72,9 @@ func TestProvisionCAAdoptsFromPeer(t *testing.T) {
 	}
 	if !ca.Key.PublicKey.Equal(&peerCA.Key.PublicKey) {
 		t.Fatal("adopted CA key does not match the peer's key")
+	}
+	if restoredVersion != "9" || restored[handoffTestDigest()] != "dynamic/image" {
+		t.Fatalf("restored allowlist = version %q, digests %#v", restoredVersion, restored)
 	}
 }
 
@@ -78,8 +94,10 @@ func TestProvisionCAFailsClosedWhenPullErrors(t *testing.T) {
 				return nil, tc.err
 			}
 			ca, adopted, err := provisionCA(context.Background(), CAProvisionConfig{
-				PeerURL:      "https://peer:8443",
-				Measurements: []string{"m"},
+				PeerURL:          "https://peer:8443",
+				Measurements:     []string{"m"},
+				OperatorKeysHash: handoffTestOperatorKeysHash,
+				RestoreAllowlist: func(string, map[types.Digest]string) error { return nil },
 			}, slog.Default(), pull)
 			if err == nil {
 				t.Fatal("provisionCA succeeded despite a pull error; must fail closed")
@@ -91,6 +109,34 @@ func TestProvisionCAFailsClosedWhenPullErrors(t *testing.T) {
 				t.Fatalf("fail-closed path returned a CA (ca=%v adopted=%v)", ca, adopted)
 			}
 		})
+	}
+}
+
+func TestProvisionCAFailsClosedWhenAllowlistRestoreFails(t *testing.T) {
+	peerCA, err := NewCA("Peer Mesh CA", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pull := func(context.Context, CAProvisionConfig, *slog.Logger) (*HandoffMaterial, error) {
+		return &HandoffMaterial{
+			CACert:           peerCA.Cert,
+			CAKey:            peerCA.Key,
+			AllowlistVersion: "9",
+			Allowlist:        map[types.Digest]string{},
+		}, nil
+	}
+	wantErr := errors.New("store unavailable")
+	ca, adopted, err := provisionCA(context.Background(), CAProvisionConfig{
+		PeerURL:          "https://peer:8443",
+		Measurements:     []string{"m"},
+		OperatorKeysHash: handoffTestOperatorKeysHash,
+		RestoreAllowlist: func(string, map[types.Digest]string) error { return wantErr },
+	}, slog.Default(), pull)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("provisionCA error = %v, want %v", err, wantErr)
+	}
+	if ca != nil || adopted {
+		t.Fatalf("failed restore returned ca=%v adopted=%v", ca, adopted)
 	}
 }
 
@@ -117,8 +163,10 @@ func TestProvisionCARejectsChainedOrMultiCertHandoff(t *testing.T) {
 				return tc.material, nil
 			}
 			ca, adopted, err := provisionCA(context.Background(), CAProvisionConfig{
-				PeerURL:      "https://peer:8443",
-				Measurements: []string{"m"},
+				PeerURL:          "https://peer:8443",
+				Measurements:     []string{"m"},
+				OperatorKeysHash: handoffTestOperatorKeysHash,
+				RestoreAllowlist: func(string, map[types.Digest]string) error { return nil },
 			}, slog.Default(), pull)
 			if err == nil {
 				t.Fatal("provisionCA adopted a chained/multi-cert handoff; must refuse")

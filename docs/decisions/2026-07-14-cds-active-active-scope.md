@@ -1,7 +1,7 @@
 # 2026-07-14 — Stage 3 scope: active/active CDS (JWKS aggregation)
 
 Status: **scope** (breaks the design in `2026-07-14-cds-active-active-ear-jwks.md`
-into workstreams). Tracks #75. Not started.
+into workstreams). Not started.
 
 ## Goal and non-goals
 
@@ -105,7 +105,9 @@ Gate behind a new `cds.ha.enabled` (implies `replicas: 2` + `peerUrl: self`):
 - Second headless Service for sibling discovery (W2), selecting the CDS pods.
 - `POD_IP` downward-API env for self-exclusion.
 - PDB `maxUnavailable` can rise to 1 (two pods, one can drain).
-- Keep the persistence guard (still forbidden; the allowlist rebuilds from seed).
+- Keep the RWO persistence guard (still forbidden during a surge); stage-2
+  handoff transfers the full allowlist snapshot into each joining pod's local
+  store instead of rebuilding dynamic state from the seed.
 
 Readiness needs **no** change: `readinessFn` (`run.go` readinessFn) is already
 per-pod and peer-agnostic.
@@ -187,4 +189,4 @@ expires). Reuse the stage-1/2 Colima-build + `ctr import` image-load path.
 
 W1 small · W2 medium (the real work) · W3 medium · W4 design-first then small-ish
 depending on the choice (StatefulSet is the largest). No new external
-dependencies. Land as its own stack after PR #74/#75 merge.
+dependencies. Land as its own follow-up stack after active/standby handoff.

@@ -134,18 +134,22 @@ func (s stubAttestation) Verify(context.Context, types.VerifyRequest) (types.Ver
 }
 
 type stubMinter struct {
-	called       atomic.Int32
-	gotDigest    string
-	gotPub       *ecdsa.PublicKey
-	tokenToIssue string
+	called              atomic.Int32
+	gotDigest           string
+	gotPub              *ecdsa.PublicKey
+	gotOperatorKeysHash string
+	tokenToIssue        string
 }
 
-func (m *stubMinter) IssueWithLaunchDigestAndPubKey(_ json.RawMessage, launchDigest string, pub *ecdsa.PublicKey) (string, error) {
+func (m *stubMinter) IssueAttestedKey(_ json.RawMessage, launchDigest string, pub *ecdsa.PublicKey, operatorKeysHash string) (string, error) {
 	m.called.Add(1)
 	m.gotDigest = launchDigest
 	m.gotPub = pub
+	m.gotOperatorKeysHash = operatorKeysHash
 	return m.tokenToIssue, nil
 }
+
+const testOperatorKeysHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func verifyOK(match bool, digest string) types.VerifyResponse {
 	return types.VerifyResponse{Result: types.VerificationResult{
@@ -180,6 +184,7 @@ func TestLocalHandoffBootstrapMintsOnlyAfterVerify(t *testing.T) {
 					verifyResp: tc.verify,
 				},
 				minter,
+				testOperatorKeysHash,
 			)
 			if err != nil {
 				t.Fatalf("NewLocalHandoffBootstrap: %v", err)
@@ -206,6 +211,9 @@ func TestLocalHandoffBootstrapMintsOnlyAfterVerify(t *testing.T) {
 				}
 				if minter.gotPub == nil || !minter.gotPub.Equal(&lb.signer.PublicKey) {
 					t.Fatalf("minted EAR not bound to the signer pubkey")
+				}
+				if minter.gotOperatorKeysHash != testOperatorKeysHash {
+					t.Fatalf("operator key-set hash = %q, want %q", minter.gotOperatorKeysHash, testOperatorKeysHash)
 				}
 			} else {
 				if err == nil {
@@ -234,10 +242,13 @@ func TestLocalHandoffBootstrapRequiresDeps(t *testing.T) {
 		{"nil minter", as, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := NewLocalHandoffBootstrap(tc.as, tc.mi); err == nil {
+			if _, err := NewLocalHandoffBootstrap(tc.as, tc.mi, testOperatorKeysHash); err == nil {
 				t.Fatal("expected constructor to reject nil dependency")
 			}
 		})
+	}
+	if _, err := NewLocalHandoffBootstrap(as, mi, ""); err == nil {
+		t.Fatal("expected constructor to reject an empty operator key-set hash")
 	}
 }
 
