@@ -110,8 +110,12 @@ func run(cfg config) error {
 	if err != nil {
 		return fmt.Errorf("provision mesh CA: %w", err)
 	}
+	caSource := "self-generated"
+	if adopted {
+		caSource = "adopted-from-peer"
+	}
 	slog.Info("loaded in-memory mesh CA",
-		"source", map[bool]string{true: "adopted-from-peer", false: "self-generated"}[adopted],
+		"source", caSource,
 		"fingerprint", certutil.CertFingerprint(mesh.Cert.Raw),
 		"not_after", mesh.Cert.NotAfter.Format(time.RFC3339),
 	)
