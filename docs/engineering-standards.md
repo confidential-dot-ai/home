@@ -1,8 +1,7 @@
 # Engineering Standards
 
-Standards for every Confidential AI repository — c8s and the wider stack, public and
-private. This file is the canonical version; the Notion copy is a mirror and the git
-version wins on any conflict. The [skills repo](https://github.com/confidential-dot-ai/skills)
+Standards for every Confidential AI repo in the c8s stack, public and private. This
+file is the canonical version. The [skills repo](https://github.com/confidential-dot-ai/skills)
 holds helpers and LLM prompts, not policy.
 
 The key words MUST, SHOULD, and MAY are used as in RFC 2119.
@@ -49,7 +48,7 @@ Rules below apply to both tiers unless marked. Appendix A summarizes what change
   repo settings.
 - PR titles MUST follow [Conventional Commits](https://www.conventionalcommits.org)
   (`feat:`, `fix:`, `docs:`, with optional scope). On squash the title becomes the
-  commit message and drives release notes. Enforce with a title-lint check.
+  commit message and drives release notes. A title-lint check SHOULD enforce this.
 - Keep feature branches current by rebasing on `main`, not merging `main` in.
 
 ## 3. Continuous integration
@@ -71,7 +70,7 @@ Rules below apply to both tiers unless marked. Appendix A summarizes what change
   project, use its established style — don't bring your own.
 - Follow the host language's accepted standards and idioms. Deviations need a good,
   documented reason — a brief note in-code or an entry under `/docs`.
-- Comments explain **why**, not what. A comment MUST be shorter than the code it
+- Comments explain **why**, not what. A comment SHOULD be shorter than the code it
   annotates; if it needs paragraphs, it's documentation — move it to a markdown file
   under `/docs` and leave a one-line pointer.
 
@@ -157,7 +156,6 @@ The product is trust in artifacts; our own supply chain has to clear the same ba
 - Non-trivial changes SHOULD get the skills-repo review and security-audit skills run
   before human review — surface issues while they're cheap.
 - Cheap-model CI jobs (docs/code parity and similar) MAY run on a schedule or per PR.
-  Advisory only, never blocking.
 
 ## 11. Live integration
 
@@ -174,13 +172,10 @@ Standards that live only in a doc rot. In order of preference:
    required checks, merge-method restrictions, secret scanning + push protection,
    signed commits where required. One configuration, inherited by new repos;
    per-repo exceptions need a documented reason.
-2. **Bootstrap** — new repos start from the template/installer so the baseline (CI
-   workflows, community files, `CLAUDE.md`, lockfiles, Renovate) exists at creation.
-3. **Conformance audits** — periodically check every repo against Appendix B
+2. **Conformance audits** — periodically check every repo against Appendix B
    (automate where cheap: an action or an LLM sweep) and file issues for gaps.
 
-This doc changes by PR to c8s like any other change; refresh the Notion mirror after
-merge.
+This doc changes by PR to c8s like any other change.
 
 ## Appendix A — what changes at v0.1.0
 
