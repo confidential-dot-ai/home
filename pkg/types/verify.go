@@ -10,29 +10,15 @@ import "encoding/json"
 // SnpEvidence shape).
 
 // SessionPublicKey is the LB's per-session hybrid (X25519 + ML-KEM-768) public
-// key. The selected Binding defines the report_data transcript that commits it.
+// key, committed by the report_data transcript.
 type SessionPublicKey struct {
 	X25519   string `json:"x25519"`   // base64url, 32 bytes
 	MLKEM768 string `json:"mlkem768"` // base64url, 1184 bytes
 }
 
-// Binding identifies what the hardware report_data commits to in an
-// AttestationBundle. The default (over-encryption) binds the per-session hybrid
-// key and the mesh identity; the tls-cert binding commits to the LB's
-// serving-leaf SPKI instead, for clients (e.g. TEErminator Flow B) that ride
-// the validated upstream TLS rather than the post-quantum tunnel.
 const (
 	// ProtocolVersion is the c8s-verify wire version stamped on every bundle.
 	ProtocolVersion = "c8s-verify/v1"
-
-	// BindingOverEncryption commits report_data to the identity transcript:
-	// hybrid session key, nonce, mesh leaf, and issuing mesh CA. IdentityProof
-	// then proves possession of that exact leaf's private key.
-	BindingOverEncryption = "over-encryption"
-	// BindingTLSCert: report_data = SHA-384(serving_leaf_spki || nonce). The
-	// attestation is bound to the LB's TLS leaf, so a client verifies it against
-	// the certificate it already sees on the (mesh-CA-validated) connection.
-	BindingTLSCert = "tls-cert"
 
 	// MeshIdentityProofECDSASHA384 is the proof-of-possession algorithm.
 	MeshIdentityProofECDSASHA384 = "ecdsa-sha384"
@@ -51,7 +37,13 @@ type MeshIdentityProof struct {
 }
 
 // AttestationBundle is the response body of
-// GET /.well-known/c8s/attestation?nonce=<b64url>[&binding=...|&pq=false].
+// GET /.well-known/c8s/attestation?nonce=<b64url>[&pq=false]. The default
+// (over-encryption) response binds report_data to the per-session hybrid key
+// and the mesh identity; pq=false selects the tls-cert response, whose
+// report_data commits to the LB's serving-leaf SPKI instead, for clients
+// (e.g. TEErminator Flow B) that ride the validated upstream TLS rather than
+// the post-quantum tunnel. The client knows which shape it asked for; the
+// response carries no discriminator.
 type AttestationBundle struct {
 	Version    string          `json:"version"`      // ProtocolVersion
 	Platform   string          `json:"platform"`     // "snp" today
@@ -59,12 +51,10 @@ type AttestationBundle struct {
 	Nonce      string          `json:"nonce"`        // echoed client nonce (b64url)
 	Evidence   json.RawMessage `json:"evidence"`     // attestation-rs SnpEvidence
 	CDSCertPEM string          `json:"cds_cert_pem"` // exact mesh leaf + issuing CA committed by report_data; empty for tls-cert
-	// Binding names what report_data commits to.
-	Binding string `json:"binding"`
 	// SessionPubKey is the per-session over-encryption key, present only for the
-	// over-encryption binding; omitted (nil) for the tls-cert binding.
+	// over-encryption response; omitted (nil) for tls-cert.
 	SessionPubKey *SessionPublicKey `json:"session_pubkey,omitempty"`
-	// IdentityProof is present for the over-encryption binding: it proves
+	// IdentityProof is present for the over-encryption response: it proves
 	// possession of the mesh leaf committed by report_data.
 	IdentityProof *MeshIdentityProof `json:"identity_proof,omitempty"`
 }

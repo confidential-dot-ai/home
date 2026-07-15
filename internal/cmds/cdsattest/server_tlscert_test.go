@@ -85,8 +85,8 @@ func TestAttestationTLSCertBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if b.Binding != types.BindingTLSCert {
-		t.Errorf("binding = %q, want %q", b.Binding, types.BindingTLSCert)
+	if b.IdentityProof != nil {
+		t.Errorf("tls-cert response must omit identity_proof, got %+v", b.IdentityProof)
 	}
 	if b.SessionPubKey != nil {
 		t.Errorf("tls-cert binding must omit session_pubkey, got %+v", b.SessionPubKey)

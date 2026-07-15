@@ -135,7 +135,7 @@ func TestIdentityBoundAttestationAndChannel(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&bundle); err != nil {
 		t.Fatal(err)
 	}
-	if bundle.Version != types.ProtocolVersion || bundle.Binding != types.BindingOverEncryption {
+	if bundle.Version != types.ProtocolVersion {
 		t.Fatalf("unexpected bundle header: %+v", bundle)
 	}
 	if bundle.IdentityProof == nil || bundle.SessionPubKey == nil {
@@ -287,9 +287,9 @@ func TestAttestationRejectsBindingParam(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	for _, query := range []string{
-		"binding=" + types.BindingOverEncryption,
+		"binding=over-encryption",
 		"binding=unknown",
-		"pq=false&binding=" + types.BindingTLSCert,
+		"pq=false&binding=tls-cert",
 	} {
 		resp, err := http.Get(ts.URL + "/.well-known/c8s/attestation?nonce=" + b64url(make([]byte, 32)) + "&" + query)
 		if err != nil {

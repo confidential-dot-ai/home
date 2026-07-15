@@ -118,7 +118,7 @@ func TestFullFlowOverEncryptedEcho(t *testing.T) {
 	if bundle.Version != types.ProtocolVersion || bundle.Platform != "snp" || bundle.Generation != "genoa" {
 		t.Fatalf("unexpected bundle header: %+v", bundle)
 	}
-	if bundle.Binding != types.BindingOverEncryption || bundle.IdentityProof == nil {
+	if bundle.IdentityProof == nil {
 		t.Fatalf("bundle is not identity-bound: %+v", bundle)
 	}
 	if bundle.Nonce != b64url(nonce) {

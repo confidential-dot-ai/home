@@ -225,7 +225,6 @@ func (s *Server) handleAttestationOverEncryption(w http.ResponseWriter, r *http.
 		Nonce:      nonceB64,
 		Evidence:   evidence,
 		CDSCertPEM: string(identity.bundlePEM),
-		Binding:    types.BindingOverEncryption,
 		SessionPubKey: &types.SessionPublicKey{
 			X25519:   base64.RawURLEncoding.EncodeToString(pub.X25519),
 			MLKEM768: base64.RawURLEncoding.EncodeToString(pub.MLKEM768),
@@ -265,7 +264,6 @@ func (s *Server) handleAttestationTLSCert(w http.ResponseWriter, r *http.Request
 		Generation: generation,
 		Nonce:      nonceB64,
 		Evidence:   evidence,
-		Binding:    types.BindingTLSCert,
 	})
 }
 
