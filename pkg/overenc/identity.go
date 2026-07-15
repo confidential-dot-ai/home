@@ -36,13 +36,14 @@ func IdentityTranscriptHash(pub PublicKey, nonce, leafDER, caDER []byte) ([]byte
 	leafHash := sha256.Sum256(leafDER)
 	caHash := sha256.Sum256(caDER)
 	var encoded []byte
+	// Most-stable fields first so a signer can reuse the hash state across sessions.
 	for _, field := range [][]byte{
 		[]byte(identityTranscriptDomain),
+		caHash[:],
+		leafHash[:],
 		pub.X25519,
 		pub.MLKEM768,
 		nonce,
-		leafHash[:],
-		caHash[:],
 	} {
 		var err error
 		if encoded, err = appendLengthPrefixed(encoded, field); err != nil {

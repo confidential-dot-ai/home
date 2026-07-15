@@ -23,7 +23,7 @@ func TestIdentityTranscriptHashBindsEveryField(t *testing.T) {
 	if len(base) != sha512.Size384 {
 		t.Fatalf("transcript hash length = %d, want %d", len(base), sha512.Size384)
 	}
-	const vector = "ee5bd763a62f0ee89a2205b5d91482965735e12078e5fcf43afbf63d8f5ff0a964521cacf9f1ad7f8f65dccb5bbedada"
+	const vector = "0f1adeacacf9a6586aa102432616634e0307bdeb982aa295c0c8862e449b74c8bec6fda53529e58b84f1ad2cc15e481d"
 	if hex.EncodeToString(base) != vector {
 		t.Fatalf("cross-language transcript vector = %x, want %s", base, vector)
 	}
