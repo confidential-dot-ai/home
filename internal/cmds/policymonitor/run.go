@@ -18,8 +18,8 @@
 // the allowlist (the baked /etc/c8s/bootstrap-allowlist.json seed on the
 // dm-verity root, plus whatever the CDS refresh has merged on top). If
 // the digest is not allowlisted, the monitor
-// resolves the container's init PID via the kata-agent / runc cgroup
-// (cgroup.procs under the container's cgroup) and sends SIGKILL.
+// resolves the container's cgroup via the kata-agent / runc hierarchy and
+// sends SIGKILL to the cgroup as a unit.
 //
 // # Why post-start kill, not pre-start gate
 //
@@ -35,7 +35,7 @@
 //
 // So we accept the post-start window. The container's init process runs
 // for the duration of the inotify event delivery + config.json parse +
-// cgroup.procs read + SIGKILL syscall — typically a handful of
+// cgroup lookup + cgroup.kill write — typically a handful of
 // milliseconds on hardware. That window is documented as a known
 // limitation in docs/kata-image-policy.md, with the BPF-LSM upgrade
 // path noted as the way to close it (intercept execve in the
@@ -58,11 +58,10 @@
 //     in-memory (LinuxContainer struct in
 //     src/agent/rustjail/src/container.rs). The init process PID is
 //     stored in LinuxContainer.init_process_pid (set at line 1182 of
-//     container.rs after fork). The external observation channel for
-//     that PID is the container's cgroup: the agent's cgroup_manager
-//     puts the init under /sys/fs/cgroup/<container_id>/cgroup.procs
-//     (unified hierarchy) or one of the v1 controller paths. We read
-//     that file.
+//     container.rs after fork). The external observation channel is the
+//     container's cgroup: the agent's cgroup_manager puts the init under
+//     /sys/fs/cgroup/<container_id> (unified hierarchy) or one of the v1
+//     controller paths. We terminate the cgroup as a unit.
 //
 //   - The container_id format is verified by kata_sys_util::validate::
 //     verify_id (rpc.rs:222), which restricts to a conservative
@@ -138,8 +137,8 @@ func newMonitorCommand() *cobra.Command {
   - Sets up an inotify watch on /run/kata-containers/.
   - For each new container directory, reads <id>/config.json, extracts
     the image digest from OCI annotations, checks the allowlist.
-  - If denied, locates the container's init PID via cgroup.procs and
-    sends SIGKILL.
+  - If denied, locates the container cgroup and sends SIGKILL to the
+    cgroup as a unit.
 
 Decisions are logged at info level for operator visibility. If the
 allowlist file is missing or unparseable, monitor exits non-zero — the

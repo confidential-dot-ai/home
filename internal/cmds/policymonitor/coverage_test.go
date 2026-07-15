@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -194,40 +193,21 @@ func TestRunAllowlistRefresh_EmptyMeasurementsFailsClosed(t *testing.T) {
 
 // --- monitor.kill paths ---------------------------------------------------
 
-func TestMonitorKill_LocatorError(t *testing.T) {
-	m, killer, locator, _ := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
-	locator.err = os.ErrPermission
-	m.kill("somecid")
-	if calls := killer.snapshot(); len(calls) != 0 {
-		t.Fatalf("expected no kill when locator errors, got %+v", calls)
-	}
-}
-
-func TestMonitorKill_PIDNotFound(t *testing.T) {
-	m, killer, locator, _ := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
-	locator.ok = false
-	m.kill("somecid")
-	if calls := killer.snapshot(); len(calls) != 0 {
-		t.Fatalf("expected no kill when pid not found, got %+v", calls)
-	}
-}
-
-func TestMonitorKill_ESRCHIsBenign(t *testing.T) {
-	m, killer, _, _ := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
-	killer.err = syscall.ESRCH
-	// kill should swallow ESRCH (process already gone) without panicking.
+func TestMonitorKill_KillerError(t *testing.T) {
+	m, killer, _ := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
+	killer.err = os.ErrPermission
 	m.kill("somecid")
 	if calls := killer.snapshot(); len(calls) != 1 {
-		t.Fatalf("expected the kill syscall to be attempted once, got %+v", calls)
+		t.Fatalf("expected one cgroup kill attempt, got %+v", calls)
 	}
 }
 
-func TestMonitorKill_OtherKillError(t *testing.T) {
-	m, killer, _, _ := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
-	killer.err = syscall.EPERM
+func TestMonitorKill_CgroupNotFound(t *testing.T) {
+	m, killer, _ := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
+	killer.ok = false
 	m.kill("somecid")
 	if calls := killer.snapshot(); len(calls) != 1 {
-		t.Fatalf("expected one attempted kill, got %+v", calls)
+		t.Fatalf("expected one cgroup lookup, got %+v", calls)
 	}
 }
 
@@ -235,7 +215,7 @@ func TestMonitorKill_OtherKillError(t *testing.T) {
 
 func TestSeedExisting_DeniesPreexistingContainer(t *testing.T) {
 	denied := strings.Repeat("b", 64)
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
 
 	// A container directory already present when the monitor starts (e.g.
 	// systemd restarted policy-monitor while a workload was live).
@@ -256,7 +236,7 @@ func TestSeedExisting_DeniesPreexistingContainer(t *testing.T) {
 }
 
 func TestSeedExisting_MissingWatchDir(t *testing.T) {
-	m, _, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
+	m, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
 	m.cfg.WatchDir = filepath.Join(watchDir, "does-not-exist")
 	if err := m.seedExisting(); err == nil {
 		t.Fatal("expected error reading a missing watch dir")
@@ -266,7 +246,7 @@ func TestSeedExisting_MissingWatchDir(t *testing.T) {
 // --- readConfigJSON / readOCISpec error paths -----------------------------
 
 func TestReadConfigJSON_MissingForeverTimesOut(t *testing.T) {
-	m, _, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
+	m, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
 	m.configReadDeadline = 60 * time.Millisecond
 	m.configReadInterval = 10 * time.Millisecond
 	_, err := m.readConfigJSON(context.Background(), filepath.Join(watchDir, "nope", "config.json"))
@@ -276,7 +256,7 @@ func TestReadConfigJSON_MissingForeverTimesOut(t *testing.T) {
 }
 
 func TestReadConfigJSON_ContextCancelled(t *testing.T) {
-	m, _, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
+	m, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
 	m.configReadDeadline = 5 * time.Second
 	m.configReadInterval = 10 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
@@ -288,7 +268,7 @@ func TestReadConfigJSON_ContextCancelled(t *testing.T) {
 }
 
 func TestReadConfigJSON_UnrecoverableIsADir(t *testing.T) {
-	m, _, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
+	m, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
 	// Point at a directory: os.ReadFile returns a non-ENOENT, non-partial
 	// error, which readConfigJSON must surface immediately rather than
 	// retrying to the deadline.
@@ -331,7 +311,7 @@ func TestReadOCISpec_BadJSONIsPartial(t *testing.T) {
 }
 
 func TestHandleNewContainer_ConfigNeverAppears_NoKill(t *testing.T) {
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
 	m.configReadDeadline = 40 * time.Millisecond
 	m.configReadInterval = 10 * time.Millisecond
 	// Only the directory, no config.json ever. The read fails and the
@@ -347,49 +327,15 @@ func TestHandleNewContainer_ConfigNeverAppears_NoKill(t *testing.T) {
 	}
 }
 
-// --- signalSender ---------------------------------------------------------
-
-func TestSignalSender_RefusesLowPID(t *testing.T) {
-	s := signalSender{}
-	if err := s.kill(1, syscall.SIGKILL); err == nil {
-		t.Error("expected refusal to signal pid 1")
-	}
-	if err := s.kill(0, syscall.SIGKILL); err == nil {
-		t.Error("expected refusal to signal pid 0")
-	}
-}
-
-func TestSignalSender_UnsupportedSignalType(t *testing.T) {
-	s := signalSender{}
-	if err := s.kill(4242, fakeSignal{}); err == nil {
-		t.Error("expected error for non-syscall.Signal type")
-	}
-}
-
-func TestSignalSender_ESRCHForDeadPID(t *testing.T) {
-	s := signalSender{}
-	// PID 2^30 is overwhelmingly unlikely to exist; signal 0 only checks
-	// for existence and never actually delivers, so this is safe.
-	err := s.kill(1<<30, syscall.Signal(0))
-	if err == nil {
-		t.Skip("pid unexpectedly existed; skipping")
-	}
-}
-
-type fakeSignal struct{}
-
-func (fakeSignal) String() string { return "fake" }
-func (fakeSignal) Signal()        {}
-
 // --- cgroup helpers -------------------------------------------------------
 
-func TestNewCgroupLocator_Defaults(t *testing.T) {
-	loc := newCgroupLocator("/sys/fs/cgroup")
-	if loc.cgroupRoot != "/sys/fs/cgroup" {
-		t.Errorf("cgroupRoot = %q", loc.cgroupRoot)
+func TestNewCgroupKiller_Defaults(t *testing.T) {
+	killer := newCgroupKiller("/sys/fs/cgroup")
+	if killer.cgroupRoot != "/sys/fs/cgroup" {
+		t.Errorf("cgroupRoot = %q", killer.cgroupRoot)
 	}
-	if loc.waitTimeout <= 0 || loc.pollInterval <= 0 {
-		t.Errorf("expected positive wait/poll, got %v/%v", loc.waitTimeout, loc.pollInterval)
+	if killer.waitTimeout <= 0 || killer.pollInterval <= 0 {
+		t.Errorf("expected positive wait/poll, got %v/%v", killer.waitTimeout, killer.pollInterval)
 	}
 }
 
@@ -397,43 +343,6 @@ func TestFindCgroupDir_EmptyID(t *testing.T) {
 	_, err := findCgroupDir(t.TempDir(), "")
 	if err == nil {
 		t.Fatal("expected error for empty container id")
-	}
-}
-
-func TestFindInitPID_EmptyProcsTreatedAsNotFound(t *testing.T) {
-	root := t.TempDir()
-	cid := "emptyprocs"
-	dir := filepath.Join(root, cid)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(""), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	loc := &cgroupLocator{cgroupRoot: root, waitTimeout: 100 * time.Millisecond, pollInterval: 20 * time.Millisecond}
-	pid, ok, err := loc.findInitPID(cid)
-	if err != nil {
-		t.Fatalf("findInitPID: %v", err)
-	}
-	if ok {
-		t.Fatalf("expected ok=false for empty cgroup.procs, got pid=%d", pid)
-	}
-}
-
-func TestReadFirstPID_NonNumeric(t *testing.T) {
-	dir := t.TempDir()
-	procs := filepath.Join(dir, "cgroup.procs")
-	if err := os.WriteFile(procs, []byte("not-a-pid\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := readFirstPID(procs); err == nil {
-		t.Fatal("expected parse error for non-numeric pid")
-	}
-}
-
-func TestReadFirstPID_MissingFile(t *testing.T) {
-	if _, err := readFirstPID(filepath.Join(t.TempDir(), "absent")); err == nil {
-		t.Fatal("expected error opening a missing file")
 	}
 }
 
@@ -533,7 +442,7 @@ func TestRunMonitor_RunsAndStopsOnContextCancel(t *testing.T) {
 
 func TestMonitorRun_AllowedContainerNotKilled(t *testing.T) {
 	digest := strings.Repeat("a", 64)
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:" + digest})
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:" + digest})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -559,7 +468,7 @@ func TestMonitorRun_AllowedContainerNotKilled(t *testing.T) {
 // is not an error. "Uncreatable" still must be: a regular file where the
 // parent dir should be.
 func TestMonitorRun_WatchDirUncreatable(t *testing.T) {
-	m, _, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
+	m, _, watchDir := newTestMonitor(t, []string{"sha256:" + strings.Repeat("a", 64)})
 	blocker := filepath.Join(watchDir, "blocker")
 	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
 		t.Fatal(err)

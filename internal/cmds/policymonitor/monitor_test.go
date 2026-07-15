@@ -8,8 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -34,7 +32,7 @@ func writeConfigJSON(t *testing.T, watchDir, cid string, annotations map[string]
 }
 
 // newTestMonitor wires the monitor against tempdirs + fakes.
-func newTestMonitor(t *testing.T, allowlistEntries []string) (*monitor, *fakeKiller, *threadSafeFakeLocator, string) {
+func newTestMonitor(t *testing.T, allowlistEntries []string) (*monitor, *fakeKiller, string) {
 	t.Helper()
 	watchDir := t.TempDir()
 
@@ -53,7 +51,7 @@ func newTestMonitor(t *testing.T, allowlistEntries []string) (*monitor, *fakeKil
 	}
 
 	killer := &fakeKiller{}
-	locator := &threadSafeFakeLocator{pid: 4242, ok: true}
+	killer.ok = true
 
 	logger, err := certutil.NewJSONLogger("debug")
 	if err != nil {
@@ -69,31 +67,15 @@ func newTestMonitor(t *testing.T, allowlistEntries []string) (*monitor, *fakeKil
 		logger:             logger,
 		allowlist:          a,
 		killer:             killer,
-		pidLocator:         locator,
 		configReadDeadline: 200 * time.Millisecond,
 		configReadInterval: 10 * time.Millisecond,
 	}
-	return m, killer, locator, watchDir
-}
-
-// threadSafeFakeLocator is a fakePIDLocator with a mutex so the
-// concurrent inotify-event goroutines can read it without -race tripping.
-type threadSafeFakeLocator struct {
-	mu  sync.Mutex
-	pid int
-	ok  bool
-	err error
-}
-
-func (l *threadSafeFakeLocator) findInitPID(string) (int, bool, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.pid, l.ok, l.err
+	return m, killer, watchDir
 }
 
 func TestHandleNewContainer_AllowedDigest(t *testing.T) {
 	digest := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:" + digest})
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:" + digest})
 
 	cid := "abcdef0123"
 	writeConfigJSON(t, watchDir, cid, map[string]string{
@@ -111,7 +93,7 @@ func TestHandleNewContainer_AllowedDigest(t *testing.T) {
 func TestHandleNewContainer_DeniedDigest(t *testing.T) {
 	allowed := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	denied := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:" + allowed})
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:" + allowed})
 
 	cid := "deadbeef"
 	writeConfigJSON(t, watchDir, cid, map[string]string{
@@ -125,16 +107,13 @@ func TestHandleNewContainer_DeniedDigest(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 kill, got %d: %+v", len(calls), calls)
 	}
-	if calls[0].pid != 4242 {
-		t.Errorf("pid = %d, want 4242", calls[0].pid)
-	}
-	if calls[0].sig != syscall.SIGKILL {
-		t.Errorf("signal = %v, want SIGKILL", calls[0].sig)
+	if calls[0] != cid {
+		t.Errorf("container ID = %q, want %q", calls[0], cid)
 	}
 }
 
 func TestHandleNewContainer_NoDigestAnnotation_Denies(t *testing.T) {
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
 	cid := "no-anno"
 	writeConfigJSON(t, watchDir, cid, map[string]string{})
 
@@ -150,7 +129,7 @@ func TestHandleNewContainer_SandboxSkipped(t *testing.T) {
 	// no image digest. kata runs the measured baked pause for it, so
 	// policy-monitor must skip it rather than deny — otherwise every pod's
 	// sandbox gets killed and no pod can start.
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
 	cid := "sandbox0"
 	writeConfigJSON(t, watchDir, cid, map[string]string{
 		"io.kubernetes.cri.container-type": "sandbox",
@@ -172,7 +151,7 @@ func TestHandleNewContainer_SandboxSkippedEvenWithUnallowlistedDigest(t *testing
 	// never runs. policy-monitor identifies the sandbox the same way kata
 	// does (isSandbox), keeping the two in lockstep.
 	denied := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
 	cid := "sandbox-evil"
 	writeConfigJSON(t, watchDir, cid, map[string]string{
 		"io.kubernetes.cri.container-type": "sandbox",
@@ -188,7 +167,7 @@ func TestHandleNewContainer_SandboxSkippedEvenWithUnallowlistedDigest(t *testing
 
 func TestHandleNewContainer_ConfigJSONAppearsLate(t *testing.T) {
 	digest := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:" + digest})
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:" + digest})
 
 	cid := "late-config"
 	// Create only the directory; spawn a goroutine to drop config.json
@@ -214,81 +193,27 @@ func TestHandleNewContainer_ConfigJSONAppearsLate(t *testing.T) {
 	}
 }
 
-// TestReadConfigJSON_WaitsForContainerType covers the mid-write race: config.json
-// parses as valid JSON but its CRI annotations haven't landed yet.
-// readConfigJSON must keep polling until container-type is present, not decide
-// on the annotation-less spec.
-func TestReadConfigJSON_WaitsForContainerType(t *testing.T) {
-	m, _, _, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
-	cid := "mid-write"
-	// A valid but annotation-less config.json (kata-agent has written the file
-	// but not the annotations yet).
-	writeConfigJSON(t, watchDir, cid, map[string]string{})
+// A valid annotation-less spec is a complete policy input and must not wait
+// for an attacker-controlled annotation to appear.
+func TestReadConfigJSON_ValidAnnotationlessSpecReturnsImmediately(t *testing.T) {
+	m, _, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+	cid := "annotationless"
 	path := filepath.Join(watchDir, cid, "config.json")
-	go func() {
-		time.Sleep(40 * time.Millisecond)
-		writeConfigJSON(t, watchDir, cid, map[string]string{
-			"io.kubernetes.cri.container-type": "container",
-			"io.kubernetes.cri.image-name":     "repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		})
-	}()
-	spec, err := m.readConfigJSON(context.Background(), path)
+	writeConfigJSON(t, watchDir, cid, map[string]string{"unrelated": "x"})
+	m.configReadDeadline = time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	spec, err := m.readConfigJSON(ctx, path)
 	if err != nil {
 		t.Fatalf("readConfigJSON: %v", err)
 	}
-	if _, ok := spec.Annotations["io.kubernetes.cri.container-type"]; !ok {
-		t.Fatalf("expected readConfigJSON to wait for the container-type annotation; got %+v", spec.Annotations)
-	}
-}
-
-// TestReadConfigJSON_DeadlineFailsClosed proves that a config.json that parses
-// but never grows a container-type annotation (a bundle with the CRI
-// annotations stripped, e.g. a host trying to evade policy) returns the parsed
-// spec with a nil error on deadline — so the caller still classifies and denies
-// it, rather than getting an error and skipping enforcement (fail-open).
-func TestReadConfigJSON_DeadlineFailsClosed(t *testing.T) {
-	m, _, _, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
-	cid := "stripped"
-	writeConfigJSON(t, watchDir, cid, map[string]string{"unrelated": "x"})
-	path := filepath.Join(watchDir, cid, "config.json")
-	spec, err := m.readConfigJSON(context.Background(), path)
-	if err != nil {
-		t.Fatalf("want nil error so the caller fails closed on the returned spec, got %v", err)
-	}
-	if spec == nil {
-		t.Fatal("want the parsed (annotation-less) spec returned so the caller denies")
-	}
-	if isSandbox(spec.Annotations) {
-		t.Fatal("annotation-less spec must not classify as a sandbox")
-	}
-	if _, ok := extractDigest(spec.Annotations); ok {
-		t.Fatal("annotation-less spec must not yield a digest — caller must deny")
-	}
-}
-
-// TestHandleNewContainer_SandboxLateContainerType_NotKilled is the safety test
-// for the fix: the pod sandbox (pause) container's container-type=sandbox
-// annotation can be observed late. policy-monitor must wait for it and allow
-// the sandbox — decking it on the mid-write spec would SIGKILL the measured
-// pause and break the pod.
-func TestHandleNewContainer_SandboxLateContainerType_NotKilled(t *testing.T) {
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
-	cid := "late-sandbox"
-	writeConfigJSON(t, watchDir, cid, map[string]string{}) // annotations not written yet
-	go func() {
-		time.Sleep(40 * time.Millisecond)
-		writeConfigJSON(t, watchDir, cid, map[string]string{
-			"io.kubernetes.cri.container-type": "sandbox",
-		})
-	}()
-	m.handleNewContainer(context.Background(), filepath.Join(watchDir, cid))
-	if calls := killer.snapshot(); len(calls) != 0 {
-		t.Fatalf("sandbox must be allowed once its container-type lands; got kills %+v", calls)
+	if spec == nil || spec.Annotations["unrelated"] != "x" {
+		t.Fatalf("got spec %+v, want complete annotationless spec", spec)
 	}
 }
 
 func TestPathLooksLikeContainer(t *testing.T) {
-	m, _, _, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+	m, _, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
 	for _, tc := range []struct {
 		path string
 		want bool
@@ -310,7 +235,7 @@ func TestPathLooksLikeContainer(t *testing.T) {
 func TestRun_DetectsCreatedContainer(t *testing.T) {
 	digest := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	denied := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:" + digest})
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:" + digest})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -358,7 +283,7 @@ func killSeen(k *fakeKiller) bool {
 func TestRun_SurvivesWatchDirReplacement(t *testing.T) {
 	allowed := strings.Repeat("a", 64)
 	denied := strings.Repeat("b", 64)
-	m, killer, _, watchDir := newTestMonitor(t, []string{"sha256:" + allowed})
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:" + allowed})
 	// Shrink the revalidation backstop so the test doesn't depend on
 	// the Remove event being delivered (either recovery path must work).
 	m.revalidateInterval = 25 * time.Millisecond

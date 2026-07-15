@@ -46,7 +46,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -80,11 +79,10 @@ func runMonitor(ctx context.Context, cfg *Config) error {
 	logger.Info("allowlist loaded", "entries", a.Size())
 
 	m := &monitor{
-		cfg:        cfg,
-		logger:     logger,
-		allowlist:  a,
-		killer:     signalSender{},
-		pidLocator: newCgroupLocator(cfg.CgroupRoot),
+		cfg:       cfg,
+		logger:    logger,
+		allowlist: a,
+		killer:    newCgroupKiller(cfg.CgroupRoot),
 		// configReadDeadline is the budget for re-reading config.json
 		// after the initial CREATE event. kata-agent's setup_bundle
 		// finishes well under this; the limit is just to bound a
@@ -109,15 +107,14 @@ func runMonitor(ctx context.Context, cfg *Config) error {
 }
 
 // monitor encapsulates the runtime state. Exposed via dependency
-// injection (killer + pidLocator) so the test suite can drive
+// injection (killer) so the test suite can drive
 // decisions against a tempdir without touching /sys/fs/cgroup or
 // real PIDs.
 type monitor struct {
 	cfg                *Config
 	logger             *slog.Logger
 	allowlist          *allowlist
-	killer             killer
-	pidLocator         pidLocator
+	killer             containerKiller
 	configReadDeadline time.Duration
 	configReadInterval time.Duration
 	revalidateInterval time.Duration
@@ -369,33 +366,20 @@ func (m *monitor) handleNewContainer(ctx context.Context, dir string) {
 	m.kill(cid)
 }
 
-// kill resolves the container's init PID via its cgroup and sends
-// SIGKILL. Best-effort: if the init has already exited, or its
-// cgroup hasn't materialised yet, we log and move on (the worst-case
-// is that an unallowlisted container ran for the duration of the
-// kata-agent CreateContainer call before kata-agent's own cleanup
-// reaps it — same as the inherent post-start window).
+// kill resolves the container's cgroup and terminates it as a unit.
+// Best-effort: if the container has already exited, or its cgroup never
+// materialises within the budget, we log and move on.
 func (m *monitor) kill(cid string) {
-	pid, ok, err := m.pidLocator.findInitPID(cid)
+	ok, err := m.killer.kill(cid)
 	if err != nil {
-		m.logger.Warn("locate init pid failed", "cid", cid, "error", err)
+		m.logger.Warn("kill cgroup failed", "cid", cid, "error", err)
 		return
 	}
 	if !ok {
-		m.logger.Warn("init pid not found", "cid", cid)
+		m.logger.Warn("container cgroup not found", "cid", cid)
 		return
 	}
-	if err := m.killer.kill(pid, syscall.SIGKILL); err != nil {
-		// ESRCH = process already gone. Not an error from our POV;
-		// the only goal was "this PID is dead", and it is.
-		if errors.Is(err, syscall.ESRCH) {
-			m.logger.Info("init already exited", "cid", cid, "pid", pid)
-			return
-		}
-		m.logger.Warn("SIGKILL failed", "cid", cid, "pid", pid, "error", err)
-		return
-	}
-	m.logger.Info("SIGKILLed container init", "cid", cid, "pid", pid)
+	m.logger.Info("SIGKILLed container cgroup", "cid", cid)
 }
 
 // readConfigJSON retries reading + parsing config.json for the budget
@@ -403,42 +387,25 @@ func (m *monitor) kill(cid string) {
 // (which triggers our IN_CREATE event, and re-seed after kata-agent replaces
 // the watch dir) and kata-agent finishing the config.json write.
 //
-// It waits not just for the file to parse but for the OCI annotations to be
-// present (hasContainerType): kata-agent writes config.json and its CRI/kata
-// annotations as part of one create-container step, but policy-monitor can
-// observe the file after it parses yet before the annotations land — and a
-// decision on that half-written spec misclassifies the pod sandbox (denied,
-// which would SIGKILL the measured pause and break the pod) and reads no image
-// digest for a workload. On deadline it returns the last parsed spec anyway
-// (never nil-with-no-error for a spec that did parse) so the caller still fails
-// closed: a genuinely annotation-less bundle — e.g. a host that stripped the
-// annotations to evade policy — is denied, not skipped.
+// A successfully parsed spec is complete: kata-agent builds the OCI spec in
+// memory and saves config.json once. A valid spec without annotations is
+// therefore an enforcement decision, not a partial write. The host controls
+// this file, so delaying that decision based on an optional annotation would
+// give a stripped workload an avoidable execution window.
 func (m *monitor) readConfigJSON(ctx context.Context, path string) (*ociSpec, error) {
 	deadline := time.Now().Add(m.configReadDeadline)
-	var lastSpec *ociSpec
 	var lastErr error
 	for {
 		spec, err := readOCISpec(path)
-		switch {
-		case err == nil && hasContainerType(spec.Annotations):
+		if err == nil {
 			return spec, nil
-		case err == nil:
-			// Parsed, but the annotations we key on aren't written yet.
-			// Remember it so a deadline still fails closed rather than skipping
-			// enforcement, and retry for the annotations to appear.
-			lastSpec = spec
-			lastErr = errPartialJSON
-		default:
-			lastErr = err
-			if !errors.Is(err, os.ErrNotExist) && !isPartialJSON(err) {
-				// Unrecoverable: not a transient race. Return immediately.
-				return nil, err
-			}
+		}
+		lastErr = err
+		if !errors.Is(err, os.ErrNotExist) && !isPartialJSON(err) {
+			// Unrecoverable: not a transient race. Return immediately.
+			return nil, err
 		}
 		if time.Now().After(deadline) {
-			if lastSpec != nil {
-				return lastSpec, nil
-			}
 			return nil, lastErr
 		}
 		select {
@@ -447,22 +414,6 @@ func (m *monitor) readConfigJSON(ctx context.Context, path string) (*ociSpec, er
 		case <-time.After(m.configReadInterval):
 		}
 	}
-}
-
-// hasContainerType reports whether the OCI annotations carry a CRI
-// container-type marker (io.kubernetes.cri.container-type / the CRI-O
-// equivalent). Every container kata-agent creates for a Kubernetes pod — both
-// the sandbox and the workload — carries one, so its presence is a reliable
-// "kata-agent finished writing the annotations" signal. Absence means either a
-// mid-write read (retry) or a bundle with no CRI annotations at all (denied on
-// deadline, fail-closed).
-func hasContainerType(annotations map[string]string) bool {
-	for _, key := range k8sContainerTypeKeys {
-		if _, ok := annotations[key]; ok {
-			return true
-		}
-	}
-	return false
 }
 
 // ociSpec is the subset of the OCI Runtime Spec we care about: the

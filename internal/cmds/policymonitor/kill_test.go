@@ -10,39 +10,29 @@ import (
 	"time"
 )
 
-// (The thread-safe pidLocator test double lives in monitor_test.go as
-// threadSafeFakeLocator, because it's used from goroutines started by
-// the inotify dispatcher. There is no second non-thread-safe variant —
-// the kill_test.go cases drive findInitPID directly through the real
-// cgroupLocator against a tempdir-rooted fake hierarchy.)
-
-// fakeKiller records every call and lets the test assert on it. The
+// fakeKiller records every cgroup termination and lets the test assert on it. The
 // mutex makes it safe to share between the inotify dispatch goroutine
 // and the test's polling loop in monitor_test.go.
 type fakeKiller struct {
 	mu    sync.Mutex
-	calls []killCall
+	calls []string
+	ok    bool
 	err   error
 }
 
-type killCall struct {
-	pid int
-	sig os.Signal
-}
-
-func (k *fakeKiller) kill(pid int, sig os.Signal) error {
+func (k *fakeKiller) kill(containerID string) (bool, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.calls = append(k.calls, killCall{pid: pid, sig: sig})
-	return k.err
+	k.calls = append(k.calls, containerID)
+	return k.ok, k.err
 }
 
 // snapshot returns a copy of the recorded calls so tests can assert
 // without holding the lock.
-func (k *fakeKiller) snapshot() []killCall {
+func (k *fakeKiller) snapshot() []string {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	out := make([]killCall, len(k.calls))
+	out := make([]string, len(k.calls))
 	copy(out, k.calls)
 	return out
 }
@@ -135,67 +125,33 @@ func TestFindCgroupDir_NotFound(t *testing.T) {
 	}
 }
 
-func TestReadFirstPID(t *testing.T) {
-	dir := t.TempDir()
-	procs := filepath.Join(dir, "cgroup.procs")
-	if err := os.WriteFile(procs, []byte("12345\n67890\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	pid, err := readFirstPID(procs)
-	if err != nil {
-		t.Fatalf("readFirstPID: %v", err)
-	}
-	if pid != 12345 {
-		t.Errorf("pid = %d, want 12345", pid)
-	}
-}
-
-func TestReadFirstPID_EmptyFile(t *testing.T) {
-	dir := t.TempDir()
-	procs := filepath.Join(dir, "cgroup.procs")
-	if err := os.WriteFile(procs, []byte(""), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	_, err := readFirstPID(procs)
-	if err == nil {
-		t.Fatal("expected error on empty file")
-	}
-}
-
-func TestCgroupLocator_WaitsForCgroupToAppear(t *testing.T) {
+func TestCgroupKiller_WaitsForCgroupToAppear(t *testing.T) {
 	root := t.TempDir()
 	cid := "feedface"
-	locator := &cgroupLocator{
+	killer := &cgroupKiller{
 		cgroupRoot:   root,
 		waitTimeout:  500 * time.Millisecond,
 		pollInterval: 20 * time.Millisecond,
 	}
-	// Drop the cgroup in after a short delay; the locator should
+	// Drop the cgroup in after a short delay; the killer should
 	// re-scan and find it.
 	go func() {
 		time.Sleep(75 * time.Millisecond)
 		dir := filepath.Join(root, cid)
 		_ = os.MkdirAll(dir, 0o755)
 		_ = os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte("4242\n"), 0o644)
+		_ = os.WriteFile(filepath.Join(dir, "cgroup.kill"), nil, 0o644)
 	}()
-	pid, ok, err := locator.findInitPID(cid)
+	ok, err := killer.kill(cid)
 	if err != nil {
-		t.Fatalf("findInitPID: %v", err)
+		t.Fatalf("kill: %v", err)
 	}
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
-	if pid != 4242 {
-		t.Errorf("pid = %d, want 4242", pid)
-	}
 }
 
-// TestCgroupLocator_WaitsForProcsToPopulate is the regression test for the
-// silent kill miss: kata-agent creates the container cgroup and writes
-// config.json (policy-monitor's trigger) BEFORE it forks the init into the
-// cgroup, so cgroup.procs is briefly empty. findInitPID must poll until the
-// PID appears, not give up on the first empty read.
-func TestCgroupLocator_WaitsForProcsToPopulate(t *testing.T) {
+func TestCgroupKiller_WaitsForProcsToPopulateAndKillsGroup(t *testing.T) {
 	root := t.TempDir()
 	cid := "b790433fdb4f223a51940bae06c1cd54d73377fc3ea45c4fa5c7ea3bd4b6c829"
 	scope := filepath.Join(root, "kubepods.slice", "cri-containerd-"+cid+".scope")
@@ -207,7 +163,10 @@ func TestCgroupLocator_WaitsForProcsToPopulate(t *testing.T) {
 	if err := os.WriteFile(procs, []byte(""), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	locator := &cgroupLocator{
+	if err := os.WriteFile(filepath.Join(scope, "cgroup.kill"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	killer := &cgroupKiller{
 		cgroupRoot:   root,
 		waitTimeout:  1 * time.Second,
 		pollInterval: 20 * time.Millisecond,
@@ -216,22 +175,26 @@ func TestCgroupLocator_WaitsForProcsToPopulate(t *testing.T) {
 		time.Sleep(75 * time.Millisecond)
 		_ = os.WriteFile(procs, []byte("4242\n1234\n"), 0o644)
 	}()
-	pid, ok, err := locator.findInitPID(cid)
+	ok, err := killer.kill(cid)
 	if err != nil {
-		t.Fatalf("findInitPID: %v", err)
+		t.Fatalf("kill: %v", err)
 	}
 	if !ok {
-		t.Fatal("expected ok=true — findInitPID must wait for cgroup.procs to populate")
+		t.Fatal("expected ok=true — killer must wait for cgroup.procs to populate")
 	}
-	if pid != 4242 {
-		t.Errorf("pid = %d, want 4242 (first/lowest in cgroup.procs)", pid)
+	contents, err := os.ReadFile(filepath.Join(scope, "cgroup.kill"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "1" {
+		t.Errorf("cgroup.kill = %q, want 1", contents)
 	}
 }
 
-// TestCgroupLocator_EmptyProcsTimesOut confirms a cgroup that stays empty
+// TestCgroupKiller_EmptyProcsTimesOut confirms a cgroup that stays empty
 // (a container that genuinely exited before we looked) times out to a
 // harmless no-op rather than blocking or erroring.
-func TestCgroupLocator_EmptyProcsTimesOut(t *testing.T) {
+func TestCgroupKiller_EmptyProcsTimesOut(t *testing.T) {
 	root := t.TempDir()
 	cid := "cafef00d"
 	scope := filepath.Join(root, "cri-containerd-"+cid+".scope")
@@ -241,32 +204,70 @@ func TestCgroupLocator_EmptyProcsTimesOut(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(scope, "cgroup.procs"), []byte(""), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	locator := &cgroupLocator{
+	if err := os.WriteFile(filepath.Join(scope, "cgroup.kill"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	killer := &cgroupKiller{
 		cgroupRoot:   root,
 		waitTimeout:  60 * time.Millisecond,
 		pollInterval: 20 * time.Millisecond,
 	}
-	_, ok, err := locator.findInitPID(cid)
+	ok, err := killer.kill(cid)
 	if err != nil {
-		t.Fatalf("findInitPID: %v", err)
+		t.Fatalf("kill: %v", err)
 	}
 	if ok {
 		t.Fatal("expected ok=false when cgroup.procs never populates")
 	}
 }
 
-func TestCgroupLocator_Timeout(t *testing.T) {
+func TestCgroupKiller_Timeout(t *testing.T) {
 	root := t.TempDir()
-	locator := &cgroupLocator{
+	killer := &cgroupKiller{
 		cgroupRoot:   root,
 		waitTimeout:  50 * time.Millisecond,
 		pollInterval: 20 * time.Millisecond,
 	}
-	pid, ok, err := locator.findInitPID("never-appears")
+	ok, err := killer.kill("never-appears")
 	if err != nil {
-		t.Fatalf("findInitPID: %v", err)
+		t.Fatalf("kill: %v", err)
 	}
 	if ok {
-		t.Fatalf("expected ok=false, got pid=%d", pid)
+		t.Fatal("expected ok=false")
+	}
+}
+
+func TestCgroupKiller_PropagatesMalformedProcs(t *testing.T) {
+	root := t.TempDir()
+	cid := "malformed"
+	dir := filepath.Join(root, cid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte("not-a-pid\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.kill"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	killer := &cgroupKiller{cgroupRoot: root, waitTimeout: time.Second, pollInterval: time.Millisecond}
+	if ok, err := killer.kill(cid); err == nil || ok {
+		t.Fatalf("kill = (%v, %v), want permanent parse error", ok, err)
+	}
+}
+
+func TestCgroupKiller_PropagatesMissingKillInterface(t *testing.T) {
+	root := t.TempDir()
+	cid := "missing-kill"
+	dir := filepath.Join(root, cid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte("1234\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	killer := &cgroupKiller{cgroupRoot: root, waitTimeout: time.Second, pollInterval: time.Millisecond}
+	if ok, err := killer.kill(cid); err == nil || ok {
+		t.Fatalf("kill = (%v, %v), want missing cgroup.kill error", ok, err)
 	}
 }
