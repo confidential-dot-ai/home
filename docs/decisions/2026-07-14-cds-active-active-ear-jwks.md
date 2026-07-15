@@ -9,8 +9,9 @@ starting CDS adopts the mesh CA from a surviving peer over attested `/handoff`
 (`issuer.ProvisionCA`, `--handoff-peer-url`), and the chart uses a RollingUpdate
 that keeps **exactly one** pod a Service endpoint at a time
 (`maxUnavailable: 0`/`maxSurge: 1`). That is active/**standby**: continuity
-across a rollover, but a node failure still drops the trust root until a
-replacement schedules and adopts.
+across a rollover, but a node failure still drops the trust root — with no
+surviving peer the replacement fails closed, and recovery is a deliberate
+re-bootstrap (unset `peerUrl`; see docs/operator.md).
 
 Stage 3 is active/**active**: two CDS pods both serving behind the Service, so a
 node failure is survived with no gap. Proven on the SNP cluster, adoption keeps
@@ -124,9 +125,9 @@ this memo records the design so it can be picked up under #75.
   `ratls.NewVerifyingHTTPClient` + `JWKSKeyProvider`), pinned by
   `cds.measurements`, and calls `SetExternalKeys`. Sibling set from a headless
   CDS Service (enable `clusterIP: None` non-kata) or the pod-listing API.
-- **Chart:** relax the `replicas>1 requires peerUrl` guard to permit a true
-  multi-endpoint Service (drop `maxUnavailable: 0`), gated behind a new
-  `cds.ha.enabled`; keep the two-phase bootstrap (first pod generates, rest
+- **Chart:** introduce a replicas knob (the template fixes `replicas: 1` today)
+  and a true multi-endpoint Service (drop `maxUnavailable: 0`), gated behind a
+  new `cds.ha.enabled`; keep the two-phase bootstrap (first pod generates, rest
   adopt CA + start serving the union). PDB `maxUnavailable` can rise to 1.
 - **Readiness:** `/readyz` is already per-pod and peer-agnostic
   (`run.go:447-460`), so both pods can be endpoints simultaneously (no change).

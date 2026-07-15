@@ -98,7 +98,8 @@ Size: medium. This is the bulk of the work and the only net-new subsystem.
 ### W3 — Chart topology (`internal/helmchart/c8s/templates/cds.yaml`, values)
 
 Gate behind a new `cds.ha.enabled` (implies `replicas: 2` + `peerUrl: self`):
-- Relax the stage-2 `replicas>1 requires peerUrl` guard (peerUrl is implied on).
+- Introduce a replicas knob (the stage-2 template fixes `replicas: 1`; per-pod
+  EAR keys make a second steady-state endpoint unsafe until W1/W2 land).
 - Change strategy: drop `maxUnavailable: 0` (that keeps ONE endpoint); a plain
   RollingUpdate or `maxUnavailable: 1` lets both pods be simultaneous endpoints.
 - Second headless Service for sibling discovery (W2), selecting the CDS pods.

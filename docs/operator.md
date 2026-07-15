@@ -317,11 +317,12 @@ entries, are also enforced from the baked floor.
 
 Setting `cds.handoff.peerUrl` makes a starting CDS **adopt** the peer's mesh CA
 over `/handoff` instead of generating a fresh one — the same attested pull the
-probe performs, run in process at startup. It pins the peer with
-`cds.measurements` (same launch digest) and **fails closed**: if the peer is
-unreachable within `--handoff-peer-timeout` or denies the handoff, CDS refuses
-to start rather than mint a divergent trust root. The startup log reports
-`source=adopted-from-peer` or `source=self-generated`.
+probe performs, run in process at startup. It requires `cds.handoff.enabled=true`
+(the serving pod must offer `/handoff` for the next roll to adopt from), pins
+the peer with `cds.measurements` (same launch digest), and **fails closed**: if
+the peer is unreachable within `--handoff-peer-timeout` or denies the handoff,
+CDS refuses to start rather than mint a divergent trust root. The startup log
+reports `source=adopted-from-peer` or `source=self-generated`.
 
 Setting `peerUrl` also flips the rollout to `RollingUpdate`
 (`maxUnavailable: 0`/`maxSurge: 1`): the replacement pod starts and adopts from
@@ -330,12 +331,16 @@ restart and no workload re-provisions. The sentinel `peerUrl: self` expands to
 the CDS Service URL — the new pod adopts from its own predecessor, which is the
 only Ready Service endpoint while it starts. `peerUrl` cannot be combined with
 `persistence.enabled` (the surge pod cannot share the RWO data PVC; the
-allowlist rebuilds from the seed), and `replicas > 1` requires `peerUrl`.
+allowlist rebuilds from the seed). Replicas stay fixed at 1 either way: EAR
+signing keys are per pod, so a second steady-state endpoint would break EAR
+verification even though adoption shares the CA (see
+[the active/active memo](decisions/2026-07-14-cds-active-active-ear-jwks.md)).
 
 **Two-phase install** (adoption is a deliberate day-2 opt-in):
 
-1. Install normally with `peerUrl` empty — the first CDS cold-starts and
-   self-generates (`replicas: 1`, `Recreate`).
+1. Install with `cds.handoff.enabled=true` and pinned `cds.measurements` but
+   `peerUrl` empty — the first CDS cold-starts and self-generates (`Recreate`)
+   while already serving `/handoff`.
 2. Once it is serving, enable adoption:
    `helm upgrade <release> ... --reuse-values --set cds.handoff.peerUrl=self`.
    The upgrade surges a new pod that adopts the running CA; every subsequent
@@ -344,6 +349,14 @@ allowlist rebuilds from the seed), and `replicas > 1` requires `peerUrl`.
 Verify with `kubectl rollout restart deploy/<release>-cds`: the new pod logs
 `source=adopted-from-peer` with the **same** CA fingerprint as before the
 restart (a plain restart without adoption changes it).
+
+**If the sole pod dies involuntarily** (container crash, OOM kill, node
+failure), no peer survives to adopt from, so the replacement fails closed and
+crash-loops — by design, since silently minting a fresh CA is exactly what
+adoption exists to prevent. The mesh CA is gone regardless; recover with a
+deliberate re-bootstrap: `helm upgrade <release> ... --reuse-values --set
+cds.handoff.peerUrl=""` (cold start, new trust root, workloads re-provision),
+then re-enable adoption with `--set cds.handoff.peerUrl=self`.
 
 ## Verifying attestation after install
 
