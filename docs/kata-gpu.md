@@ -155,10 +155,10 @@ that provides the agent).
 
 Two deliberate deltas from the non-GPU guest:
 
-- **It boots kata's GPU kernel, not the steep one.** The NVIDIA modules must
-  match the kernel they were built for, and the steep kernel has
+- **It boots kata's GPU kernel, not the confos one.** The NVIDIA modules must
+  match the kernel they were built for, and the confos kernel has
   `CONFIG_MODULES=n`. The GPU kernel is measured and version-pinned like
-  everything else; building the modules against a steep GPU kernel flavor
+  everything else; building the modules against a confos GPU kernel flavor
   (module signing + `CONFIG_MODULE_SIG_FORCE`) is the remaining hardening
   step, tracked in [`docs/GAPS.md`](GAPS.md). Until then, boot-time module
   loading is closed after driver load (`kernel.modules_disabled=1`, set by
@@ -216,7 +216,7 @@ self-hosted runner serializes jobs anyway.
 - **One GPU model per pod, advertised per-model.** The sandbox device plugin
   names resources per model (`nvidia.com/<MODEL>`); a pod targets one model. NVLink
   multi-GPU topologies are untested here.
-- **The GPU guest boots kata's GPU kernel, not the steep-hardened one** —
+- **The GPU guest boots kata's GPU kernel, not the confos-hardened one** —
   see "The `-nvidia` artifact" above and "Threat-model gaps".
 
 ### Raising the vCPU pin (SNP)
@@ -306,7 +306,7 @@ reach.
   GPU kernel (`CONFIG_MODULES=y`; module loading is locked down post-boot by
   `nvidia-gpu-ready.service` rather than compiled out) and the driver
   modules/userland are grafted from kata's digest-pinned GPU rootfs. Building
-  the modules signed against a steep GPU kernel flavor is the remaining
+  the modules signed against a confos GPU kernel flavor is the remaining
   hardening step — [`docs/GAPS.md`](GAPS.md). Everything grafted is inside
   the measured verity root, so it is attested — just not c8s-compiled.
 - **GPU attestation is not wired.** The NVIDIA GPU's own attestation (SPDM /

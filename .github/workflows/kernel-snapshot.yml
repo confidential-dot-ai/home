@@ -1,7 +1,7 @@
 name: Kernel config snapshot
 
-# Builds steep's hardened guest kernel with c8s's container.config fragment and
-# publishes the resolved-config snapshot (steep's required+hardening baseline +
+# Builds confos's hardened guest kernel with c8s's container.config fragment and
+# publishes the resolved-config snapshot (confos's required+hardening baseline +
 # the fragment, merged) as a downloadable artifact. This is the KERNEL HALF of
 # the kata-guest-base build, decoupled: no osbuilder, no fetch.sh, no Docker /
 # allowlist dependency — so it runs on ANY commit, unlike kata-guest-base.yml
@@ -14,8 +14,8 @@ name: Kernel config snapshot
 #                       gate calls this, diffs the artifact against the committed
 #                       lockfile, and fails on drift.
 #
-# DUPLICATION (deliberate, temporary): the steep setup + cache steps below
-# mirror kata-guest-base.yml. The two SHARE cache keys (steep build, mkosi
+# DUPLICATION (deliberate, temporary): the confos setup + cache steps below
+# mirror kata-guest-base.yml. The two SHARE cache keys (confos build, mkosi
 # tools tree, the kata-kernel-v3 kernel cache), so a run here warms the cache
 # kata-guest-base uses and vice-versa. The end state is kata-guest-base.yml
 # calling this workflow for its kernel (vmlinuz as an artifact + SKIP_KERNEL=1),
@@ -25,22 +25,18 @@ name: Kernel config snapshot
 on:
   workflow_dispatch:
     inputs:
-      steep_ref:
-        description: steep commit/ref to build the kernel from (default = pinned)
+      confos_ref:
+        description: confos commit/ref to build the kernel from (default = pinned)
         required: false
         type: string
-        default: "96975ef5407035f766b6b48051ebf3a5e4a9632c"
+        default: "45e19477362583d31c06b2749777498b0d4e64db" # v0.2.0
   workflow_call:
     inputs:
-      steep_ref:
-        description: steep commit/ref to build the kernel from
+      confos_ref:
+        description: confos commit/ref to build the kernel from
         required: false
         type: string
-        default: "96975ef5407035f766b6b48051ebf3a5e4a9632c"
-    secrets:
-      STEEP_REPO_TOKEN:
-        description: token with read access to confidential-dot-ai/steep (falls back to github.token)
-        required: false
+        default: "45e19477362583d31c06b2749777498b0d4e64db" # v0.2.0
     outputs:
       snapshot_sha256:
         description: sha256 of the resolved kernel-config snapshot
@@ -50,41 +46,41 @@ permissions:
   contents: read
 
 env:
-  # steep ref — keep the default in lockstep with kata-guest-base.yml's
-  # STEEP_REF until the two share this workflow. Overridable per call/dispatch.
-  STEEP_REF: ${{ inputs.steep_ref }}
+  # confos ref — keep the default in lockstep with kata-guest-base.yml's
+  # CONFOS_REF until the two share this workflow. Overridable per call/dispatch.
+  CONFOS_REF: ${{ inputs.confos_ref }}
 
 jobs:
   kernel:
-    name: Build steep kernel + snapshot
-    # Same self-hosted SEV-SNP host as kata-guest-base.yml: `steep kernel` runs
+    name: Build confos kernel + snapshot
+    # Same self-hosted SEV-SNP host as kata-guest-base.yml: `confos kernel` runs
     # mkosi/nspawn under sudo for the kernel-builder sandbox, which can't run on
     # a user-namespaced GitHub-hosted runner.
     runs-on: the-machine
     outputs:
       snapshot_sha256: ${{ steps.snapshot.outputs.sha256 }}
     steps:
-      # c8s -> ./c8s and steep -> ./steep, mirroring kata-guest-base.yml so the
-      # cache keys (which hashFiles these paths) match byte-for-byte.
+      # c8s -> ./c8s and confidential-os-builder -> ./confidential-os-builder,
+      # mirroring kata-guest-base.yml so the cache keys (which hashFiles these
+      # paths) match byte-for-byte.
       - name: Checkout c8s
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: c8s
 
-      - name: Checkout steep
+      - name: Checkout confidential-os-builder
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          repository: confidential-dot-ai/steep
-          ref: ${{ env.STEEP_REF }}
-          path: steep
-          token: ${{ secrets.STEEP_REPO_TOKEN || github.token }}
+          repository: confidential-dot-ai/confidential-os-builder
+          ref: ${{ env.CONFOS_REF }}
+          path: confidential-os-builder
 
-      # --- steep kernel-builder sandbox deps (mirror kata-guest-base.yml) ----
+      # --- confos kernel-builder sandbox deps (mirror kata-guest-base.yml) ----
       - name: Setup uv (mkosi v26 toolchain)
         uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.7.0
 
       - name: Setup mkosi
-        # Keep in lockstep with steep/.github/workflows/base.yml + kata-guest-base.yml.
+        # Keep in lockstep with confidential-os-builder/.github/workflows/base.yml + kata-guest-base.yml.
         uses: systemd/mkosi@84af20892b61c8e177e391f997ded8b4cb5514f2 # v26
 
       - name: Install systemd-container (mkosi sandbox dep)
@@ -93,43 +89,43 @@ jobs:
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.12.0
 
-      # --- steep binary (shared cache with kata-guest-base.yml) --------------
-      - name: Restore steep build
-        id: steep-cache
+      # --- confos binary (shared cache with kata-guest-base.yml) --------------
+      - name: Restore confos build
+        id: confos-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: steep/target/release/steep
-          key: ${{ runner.os }}-steep-${{ hashFiles('steep/Cargo.lock', 'steep/src/**', 'steep/crates/**') }}
+          path: confidential-os-builder/target/release/confos
+          key: ${{ runner.os }}-confos-${{ hashFiles('confidential-os-builder/Cargo.lock', 'confidential-os-builder/src/**', 'confidential-os-builder/crates/**') }}
 
-      - name: Build steep
-        id: build-steep
-        if: steps.steep-cache.outputs.cache-hit != 'true'
-        working-directory: steep
+      - name: Build confos
+        id: build-confos
+        if: steps.confos-cache.outputs.cache-hit != 'true'
+        working-directory: confidential-os-builder
         run: cargo build --release
 
-      - name: Save steep build
-        if: steps.steep-cache.outputs.cache-hit != 'true' && steps.build-steep.outcome == 'success'
+      - name: Save confos build
+        if: steps.confos-cache.outputs.cache-hit != 'true' && steps.build-confos.outcome == 'success'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: steep/target/release/steep
-          key: ${{ steps.steep-cache.outputs.cache-primary-key }}
+          path: confidential-os-builder/target/release/confos
+          key: ${{ steps.confos-cache.outputs.cache-primary-key }}
 
       # --- mkosi kernel-builder tools tree (shared cache; the 58-min part) ---
-      # Hit here means Step 0a short-circuits (steep checks its .steep-tools-stamp
+      # Hit here means Step 0a short-circuits (confos checks its .confos-tools-stamp
       # against the mkosi.conf hash). See kata-guest-base.yml for the full rationale.
       - name: Restore kernel-builder tools tree
         id: tools-tree-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ runner.temp }}/steep-tools-tree.tar.zst
-          key: ${{ runner.os }}-steep-tools-tree-mkosi-v26-${{ hashFiles('steep/mkosi/kernel-builder/mkosi.conf') }}
+          path: ${{ runner.temp }}/confos-tools-tree.tar.zst
+          key: ${{ runner.os }}-confos-tools-tree-mkosi-v26-${{ hashFiles('confidential-os-builder/mkosi/kernel-builder/mkosi.conf') }}
 
       - name: Unpack kernel-builder tools tree
         if: steps.tools-tree-cache.outputs.cache-hit == 'true'
         run: |
           sudo tar --zstd --numeric-owner --xattrs --xattrs-include='*' \
-            -xpf "${RUNNER_TEMP}/steep-tools-tree.tar.zst" \
-            -C steep/mkosi/kernel-builder
+            -xpf "${RUNNER_TEMP}/confos-tools-tree.tar.zst" \
+            -C confidential-os-builder/mkosi/kernel-builder
 
       # --- guest kernel output (shared kata-kernel-v3 cache) ----------------
       - name: Restore guest kernel build
@@ -137,28 +133,28 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
-            steep/output/kernel
-            steep/kernel/config-x86_64.snapshot
-          key: ${{ runner.os }}-kata-kernel-v3-${{ env.STEEP_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}
+            confidential-os-builder/output/kernel
+            confidential-os-builder/kernel/config-x86_64.snapshot
+          key: ${{ runner.os }}-kata-kernel-v3-${{ env.CONFOS_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}
           restore-keys: |
-            ${{ runner.os }}-kata-kernel-v3-${{ env.STEEP_REF }}-
+            ${{ runner.os }}-kata-kernel-v3-${{ env.CONFOS_REF }}-
 
       # Resolve + compile the kernel and capture the snapshot. Mirrors
-      # build.sh Step 1 (`cd steep && steep kernel --kernel-config-fragment
-      # <c8s fragment>`), then copies steep's resolved snapshot to the in-repo
+      # build.sh Step 1 (`cd confidential-os-builder && confos kernel --kernel-config-fragment
+      # <c8s fragment>`), then copies confos's resolved snapshot to the in-repo
       # path build.sh writes it to, so the uploaded artifact is identical to
-      # what a full kata-guest-base build would commit. steep escalates to sudo
+      # what a full kata-guest-base build would commit. confos escalates to sudo
       # internally for mkosi/nspawn, exactly as under build.sh.
-      - name: Build steep kernel + capture snapshot
+      - name: Build confos kernel + capture snapshot
         id: snapshot
         run: |
           set -euo pipefail
           frag="${GITHUB_WORKSPACE}/c8s/kata-guest-base/kernel/container.config"
           [[ -f "${frag}" ]] || { echo "::error::kernel fragment missing: ${frag}"; exit 1; }
-          [[ -x steep/target/release/steep ]] || { echo "::error::steep binary missing"; exit 1; }
-          ( cd steep && ./target/release/steep kernel --kernel-config-fragment "${frag}" )
-          src="steep/kernel/config-x86_64.snapshot"
-          [[ -f "${src}" ]] || { echo "::error::steep did not write ${src}"; exit 1; }
+          [[ -x confidential-os-builder/target/release/confos ]] || { echo "::error::confos binary missing"; exit 1; }
+          ( cd confidential-os-builder && ./target/release/confos kernel --kernel-config-fragment "${frag}" )
+          src="confidential-os-builder/kernel/config-x86_64.snapshot"
+          [[ -f "${src}" ]] || { echo "::error::confos did not write ${src}"; exit 1; }
           dest="c8s/kata-guest-base/kernel/config-x86_64.snapshot"
           install -m 0644 "${src}" "${dest}"
           sha="$(sha256sum "${dest}" | awk '{print $1}')"
@@ -177,10 +173,10 @@ jobs:
         id: tools-tree-tar
         if: always() && steps.tools-tree-cache.outputs.cache-hit != 'true'
         run: |
-          if [[ -f steep/mkosi/kernel-builder/mkosi.output/.steep-tools-stamp ]]; then
+          if [[ -f confidential-os-builder/mkosi/kernel-builder/mkosi.output/.confos-tools-stamp ]]; then
             sudo tar --zstd --numeric-owner --xattrs --xattrs-include='*' \
-              -cpf "${RUNNER_TEMP}/steep-tools-tree.tar.zst" \
-              -C steep/mkosi/kernel-builder mkosi.output
+              -cpf "${RUNNER_TEMP}/confos-tools-tree.tar.zst" \
+              -C confidential-os-builder/mkosi/kernel-builder mkosi.output
             echo "exists=true" >> "${GITHUB_OUTPUT}"
           else
             echo "exists=false" >> "${GITHUB_OUTPUT}"
@@ -190,7 +186,7 @@ jobs:
         if: always() && steps.tools-tree-cache.outputs.cache-hit != 'true' && steps.tools-tree-tar.outputs.exists == 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ runner.temp }}/steep-tools-tree.tar.zst
+          path: ${{ runner.temp }}/confos-tools-tree.tar.zst
           key: ${{ steps.tools-tree-cache.outputs.cache-primary-key }}
 
       # Same completeness guard as kata-guest-base.yml: never bank a kernel
@@ -199,7 +195,7 @@ jobs:
         id: kernel-out
         if: always()
         run: |
-          if [[ -f steep/output/kernel/vmlinuz && -f steep/output/kernel/manifest.json ]]; then
+          if [[ -f confidential-os-builder/output/kernel/vmlinuz && -f confidential-os-builder/output/kernel/manifest.json ]]; then
             echo "complete=true" >> "${GITHUB_OUTPUT}"
           else
             echo "complete=false" >> "${GITHUB_OUTPUT}"
@@ -210,6 +206,6 @@ jobs:
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
-            steep/output/kernel
-            steep/kernel/config-x86_64.snapshot
-          key: ${{ runner.os }}-kata-kernel-v3-${{ env.STEEP_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}
+            confidential-os-builder/output/kernel
+            confidential-os-builder/kernel/config-x86_64.snapshot
+          key: ${{ runner.os }}-kata-kernel-v3-${{ env.CONFOS_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}

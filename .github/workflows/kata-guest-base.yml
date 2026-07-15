@@ -3,7 +3,7 @@ name: Kata guest base
 # Builds + pushes the kata-guest-base rootfs image — the kata-native
 # guest every c8s kata-qemu-snp pod boots into. kata-qemu does measured
 # direct-kernel boot (no IGVM/UKI), so we publish the parts kata wants: a
-# hardened kernel (built by steep), a dm-verity ext4 rootfs (built by
+# hardened kernel (built by confos), a dm-verity ext4 rootfs (built by
 # kata's osbuilder, with our ratls-mesh / attestation-service /
 # policy-monitor + bootstrap allowlist baked into the verity root), and
 # the verity params. The rootfs root hash rides in the kata kernel
@@ -80,14 +80,13 @@ env:
   # download + its cache key below, and is inherited by build.sh (whose own
   # KATA_VERSION default is just the local-build fallback — keep it in sync).
   KATA_VERSION: "3.30.0"
-  # steep ref the guest kernel is built against. Single source of truth: the
+  # confos ref the guest kernel is built against. Single source of truth: the
   # checkout pins it and the kernel-output cache key below is scoped to it (a
-  # different steep => a potentially different kernel). Pinned to a main
-  # commit now that PR #13 (feat/kernel-config) has merged. Bump deliberately:
-  # steep main's kernel fragments move (e.g. #16 added dm-crypt/AES-XTS, #21
-  # added VIRTIO_IOMMU to required.config), so a new pin means a new guest
-  # kernel and therefore a new SNP launch measurement.
-  STEEP_REF: "96975ef5407035f766b6b48051ebf3a5e4a9632c"
+  # different confos => a potentially different kernel). Bump deliberately: a
+  # new pin means a new guest kernel and therefore a new SNP launch
+  # measurement, and the committed kernel/config-x86_64.snapshot lockfile must
+  # be refreshed in the same PR (kernel-snapshot.yml produces it).
+  CONFOS_REF: "45e19477362583d31c06b2749777498b0d4e64db" # v0.2.0
 
 jobs:
   build:
@@ -132,7 +131,7 @@ jobs:
       # Source layout in the runner workspace mirrors local dev:
       #   ./c8s
       #   ./attestation-service
-      #   ./steep
+      #   ./confidential-os-builder
       # so the scripts' WORKSPACE resolution (IMAGE_DIR/../..) finds
       # both sibling repos without env overrides.
       - name: Checkout c8s
@@ -150,20 +149,13 @@ jobs:
           repository: confidential-dot-ai/attestation-rs
           path: attestation-rs
 
-      - name: Checkout steep
-        # steep is a private repo, so the checkout needs STEEP_REPO_TOKEN (a
-        # token with read access; falls back to github.token if/when steep
-        # goes public).
-        # Pinned to a steep main commit — PR #13 (feat/kernel-config) merged
-        # 2026-06-03, so main carries `steep kernel --kernel-config-fragment`,
-        # which build.sh needs to fold c8s's kernel/container.config into the
-        # guest kernel. STEEP_REF above is the single source of truth.
+      - name: Checkout confidential-os-builder
+        # CONFOS_REF above is the single source of truth for the ref.
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          repository: confidential-dot-ai/steep
-          ref: ${{ env.STEEP_REF }}
-          path: steep
-          token: ${{ secrets.STEEP_REPO_TOKEN || github.token }}
+          repository: confidential-dot-ai/confidential-os-builder
+          ref: ${{ env.CONFOS_REF }}
+          path: confidential-os-builder
 
       # --- Build the in-guest binaries ---------------------------------
 
@@ -239,17 +231,17 @@ jobs:
           path: attestation-rs/target/release/attestation-api
           key: ${{ steps.attestation-api-cache.outputs.cache-primary-key }}
 
-      # --- Build steep (kernel only) + its sandbox deps ----------------
-      # steep is used ONLY to compile the hardened guest kernel here; the
+      # --- Build confos (kernel only) + its sandbox deps ----------------
+      # confos is used ONLY to compile the hardened guest kernel here; the
       # rootfs is built by kata's osbuilder (in Docker) inside build.sh.
-      # The mkosi/systemd-container/uv steps below are steep's kernel-
+      # The mkosi/systemd-container/uv steps below are confos's kernel-
       # builder sandbox deps.
 
       - name: Setup uv (mkosi v26 toolchain)
         uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.7.0
 
       - name: Setup mkosi
-        # Keep in lockstep with steep/.github/workflows/base.yml.
+        # Keep in lockstep with confidential-os-builder/.github/workflows/base.yml.
         uses: systemd/mkosi@84af20892b61c8e177e391f997ded8b4cb5514f2 # v26
 
       - name: Install systemd-container (mkosi sandbox dep)
@@ -258,28 +250,28 @@ jobs:
       # restore/save split for the same reason as attestation-api above —
       # the save must not hang off whole-job success while we stabilise the
       # kata-guest-base build.
-      - name: Restore steep build
-        id: steep-cache
+      - name: Restore confos build
+        id: confos-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: steep/target/release/steep
-          key: ${{ runner.os }}-steep-${{ hashFiles('steep/Cargo.lock', 'steep/src/**', 'steep/crates/**') }}
+          path: confidential-os-builder/target/release/confos
+          key: ${{ runner.os }}-confos-${{ hashFiles('confidential-os-builder/Cargo.lock', 'confidential-os-builder/src/**', 'confidential-os-builder/crates/**') }}
 
-      # steep changes less often than this repo; skip the rebuild when the cached
+      # confos changes less often than this repo; skip the rebuild when the cached
       # binary matches the source. (Without this gate the cache restored the
       # binary but cargo rebuilt it anyway — its fingerprints aren't cached.)
-      - name: Build steep
-        id: build-steep
-        if: steps.steep-cache.outputs.cache-hit != 'true'
-        working-directory: steep
+      - name: Build confos
+        id: build-confos
+        if: steps.confos-cache.outputs.cache-hit != 'true'
+        working-directory: confidential-os-builder
         run: cargo build --release
 
-      - name: Save steep build
-        if: steps.steep-cache.outputs.cache-hit != 'true' && steps.build-steep.outcome == 'success'
+      - name: Save confos build
+        if: steps.confos-cache.outputs.cache-hit != 'true' && steps.build-confos.outcome == 'success'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: steep/target/release/steep
-          key: ${{ steps.steep-cache.outputs.cache-primary-key }}
+          path: confidential-os-builder/target/release/confos
+          key: ${{ steps.confos-cache.outputs.cache-primary-key }}
 
       # --- Assemble + build the rootfs image ---------------------------
 
@@ -388,17 +380,17 @@ jobs:
           path: ${{ runner.temp }}/kata-base-rootfs.tar.zst
           key: kata-base-rootfs-${{ env.KATA_VERSION }}-${{ hashFiles('c8s/kata-guest-base/scripts/build.sh') }}
 
-      # Cache the guest kernel build output (steep/output/kernel) — the most
-      # expensive INVARIANT in this job. build.sh Step 1/5 runs `steep kernel`,
+      # Cache the guest kernel build output (confidential-os-builder/output/kernel) — the most
+      # expensive INVARIANT in this job. build.sh Step 1/5 runs `confos kernel`,
       # which short-circuits the compile + the mkosi tools-tree build (and the
       # kernel-source download under output/kernel/cache/) when its
-      # manifest.json fingerprint matches the inputs (steep
+      # manifest.json fingerprint matches the inputs (confos
       # src/commands/kernel.rs).
       #
-      # The resolved-config snapshot (steep/kernel/config-x86_64.snapshot) MUST
-      # be cached alongside: steep rewrites it during the build (committed
+      # The resolved-config snapshot (confidential-os-builder/kernel/config-x86_64.snapshot) MUST
+      # be cached alongside: confos rewrites it during the build (committed
       # baseline + our container.config fragment merged in) and hashes it into
-      # the fingerprint. Without it a fresh steep checkout reverts the snapshot
+      # the fingerprint. Without it a fresh confos checkout reverts the snapshot
       # to the committed baseline, the fingerprint never matches, and the
       # "cached" kernel rebuilds every run — tools tree (~200s) + compile
       # (~150s) — which is exactly what happened before the -v2 key.
@@ -408,10 +400,10 @@ jobs:
       # ~30 KiB snapshot-only entries an unguarded always()-save once seeded
       # when a build died mid-kernel (see the Save step's completeness guard).
       #
-      # Key on STEEP_REF (a different steep can yield a different kernel) + the
+      # Key on CONFOS_REF (a different confos can yield a different kernel) + the
       # c8s kernel config fragment; restore-keys falls back to the latest
-      # same-steep cache so even a fragment change reuses the cached
-      # kernel-source tarball. steep re-validates the fingerprint internally,
+      # same-confos cache so even a fragment change reuses the cached
+      # kernel-source tarball. confos re-validates the fingerprint internally,
       # so a stale restore can never yield the wrong kernel — it just rebuilds.
       # Restore here (before build); the matching always()-save is after the
       # build step below.
@@ -420,19 +412,19 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
-            steep/output/kernel
-            steep/kernel/config-x86_64.snapshot
-          key: ${{ runner.os }}-kata-kernel-v3-${{ env.STEEP_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}
+            confidential-os-builder/output/kernel
+            confidential-os-builder/kernel/config-x86_64.snapshot
+          key: ${{ runner.os }}-kata-kernel-v3-${{ env.CONFOS_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}
           restore-keys: |
-            ${{ runner.os }}-kata-kernel-v3-${{ env.STEEP_REF }}-
+            ${{ runner.os }}-kata-kernel-v3-${{ env.CONFOS_REF }}-
 
-      # Cache steep's mkosi kernel-builder tools tree (build.sh Step 1 →
-      # `steep kernel` Step 0a). The tools tree is the only part of this job
+      # Cache confos's mkosi kernel-builder tools tree (build.sh Step 1 →
+      # `confos kernel` Step 0a). The tools tree is the only part of this job
       # that talks to snapshot.ubuntu.com — the point-in-time apt mirror
-      # pinned in steep's mkosi/kernel-builder/mkosi.conf — which 5xxes often
+      # pinned in confos's mkosi/kernel-builder/mkosi.conf — which 5xxes often
       # enough to be the job's top flake source. A cache hit takes it off the
-      # network entirely: steep owns the reuse decision (it stamps
-      # mkosi.output/.steep-tools-stamp with the mkosi.conf hash and skips the
+      # network entirely: confos owns the reuse decision (it stamps
+      # mkosi.output/.confos-tools-stamp with the mkosi.conf hash and skips the
       # `sudo mkosi --force` rebuild on a match — src/commands/kernel.rs
       # ensure_tools_tree), so a restored tree short-circuits Step 0a and a
       # stale one is merely rebuilt, never trusted.
@@ -441,29 +433,29 @@ jobs:
       # mkosi runs under sudo and leaves a root-owned tree, and actions/cache
       # tars as the runner user, which would drop that ownership. The tarball
       # contains mkosi.output itself (not just its contents) so the
-      # directory's own ownership/mode round-trip too — steep (running
+      # directory's own ownership/mode round-trip too — confos (running
       # unprivileged) must still be able to manage the stamp file inside.
       #
-      # Key: the mkosi.conf hash — the exact digest steep stamps the tree
+      # Key: the mkosi.conf hash — the exact digest confos stamps the tree
       # with (the snapshot mirror URL and package list are both in that file)
       # — plus a mkosi version literal, because the stamp only covers the
       # conf while the tree is built by whatever mkosi the Setup step
       # installs. Keep "mkosi-v26" in lockstep with the Setup mkosi step
       # above. No restore-keys: a prefix match could only restore a
-      # stamp-mismatched tree that steep would rebuild anyway.
+      # stamp-mismatched tree that confos would rebuild anyway.
       - name: Restore kernel-builder tools tree
         id: tools-tree-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ runner.temp }}/steep-tools-tree.tar.zst
-          key: ${{ runner.os }}-steep-tools-tree-mkosi-v26-${{ hashFiles('steep/mkosi/kernel-builder/mkosi.conf') }}
+          path: ${{ runner.temp }}/confos-tools-tree.tar.zst
+          key: ${{ runner.os }}-confos-tools-tree-mkosi-v26-${{ hashFiles('confidential-os-builder/mkosi/kernel-builder/mkosi.conf') }}
 
       - name: Unpack kernel-builder tools tree
         if: steps.tools-tree-cache.outputs.cache-hit == 'true'
         run: |
           sudo tar --zstd --numeric-owner --xattrs --xattrs-include='*' \
-            -xpf "${RUNNER_TEMP}/steep-tools-tree.tar.zst" \
-            -C steep/mkosi/kernel-builder
+            -xpf "${RUNNER_TEMP}/confos-tools-tree.tar.zst" \
+            -C confidential-os-builder/mkosi/kernel-builder
 
       # kata osbuilder's rootfs-builder Dockerfile fails its first RUN with
       # "apparmor failed to apply profile: ... /proc/thread-self/attr/apparmor/
@@ -484,7 +476,7 @@ jobs:
           sudo aa-teardown || true
           sudo systemctl restart docker
 
-      - name: Build kata-guest-base image (steep kernel + kata osbuilder)
+      - name: Build kata-guest-base image (confos kernel + kata osbuilder)
         working-directory: c8s/kata-guest-base
         env:
           # build.sh fetches the kata-containers source at the pinned
@@ -542,18 +534,18 @@ jobs:
       #
       # COMPLETENESS GUARD: always() also fires when the build died DURING the
       # kernel (a Step 0a tools-tree flake or a Step 0d compile error) — but by
-      # then Step 0c.5 has already written steep/kernel/config-x86_64.snapshot,
+      # then Step 0c.5 has already written confidential-os-builder/kernel/config-x86_64.snapshot,
       # so an unguarded save banks a snapshot-only ~30 KiB cache with no
       # vmlinuz/manifest. That entry then exact-hits the key forever (this save
       # only re-runs on a miss), so every later build recompiles against a cache
-      # that can never satisfy steep's fingerprint. Only save when output/kernel
+      # that can never satisfy confos's fingerprint. Only save when output/kernel
       # is actually complete — the same existence-probe the rootfs/tools-tree
       # saves use.
       - name: Check guest kernel output
         id: kernel-out
         if: always()
         run: |
-          if [[ -f steep/output/kernel/vmlinuz && -f steep/output/kernel/manifest.json ]]; then
+          if [[ -f confidential-os-builder/output/kernel/vmlinuz && -f confidential-os-builder/output/kernel/manifest.json ]]; then
             echo "complete=true" >> "${GITHUB_OUTPUT}"
           else
             echo "complete=false" >> "${GITHUB_OUTPUT}"
@@ -564,14 +556,14 @@ jobs:
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           # Keep in lockstep with the Restore step: the snapshot must travel
-          # with output/kernel or steep's fingerprint check misses every run.
+          # with output/kernel or confos's fingerprint check misses every run.
           path: |
-            steep/output/kernel
-            steep/kernel/config-x86_64.snapshot
-          key: ${{ runner.os }}-kata-kernel-v3-${{ env.STEEP_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}
+            confidential-os-builder/output/kernel
+            confidential-os-builder/kernel/config-x86_64.snapshot
+          key: ${{ runner.os }}-kata-kernel-v3-${{ env.CONFOS_REF }}-${{ hashFiles('c8s/kata-guest-base/kernel/container.config') }}
 
       # Publish the resolved kernel-config snapshot build.sh wrote in Step 1
-      # (steep's required+hardening baseline + our container.config, merged) as
+      # (confos's required+hardening baseline + our container.config, merged) as
       # a downloadable artifact — the runner-produced source of truth for the
       # committed lockfile kata-guest-base/kernel/config-x86_64.snapshot and the
       # reference a future drift gate diffs. Pulling it from the build (not the
@@ -589,7 +581,7 @@ jobs:
           if-no-files-found: warn
 
       # Pack + save the kernel-builder tools tree (see the Restore step
-      # above). The stamp file is the completeness witness: steep writes it
+      # above). The stamp file is the completeness witness: confos writes it
       # only after a successful `mkosi --force` and wipes it before any
       # rebuild, so stamp present ⇒ tree complete, and a Step-0a failure
       # (e.g. snapshot.ubuntu.com 5xx mid-build) leaves nothing to save.
@@ -602,10 +594,10 @@ jobs:
         id: tools-tree-tar
         if: always() && steps.tools-tree-cache.outputs.cache-hit != 'true'
         run: |
-          if [[ -f steep/mkosi/kernel-builder/mkosi.output/.steep-tools-stamp ]]; then
+          if [[ -f confidential-os-builder/mkosi/kernel-builder/mkosi.output/.confos-tools-stamp ]]; then
             sudo tar --zstd --numeric-owner --xattrs --xattrs-include='*' \
-              -cpf "${RUNNER_TEMP}/steep-tools-tree.tar.zst" \
-              -C steep/mkosi/kernel-builder mkosi.output
+              -cpf "${RUNNER_TEMP}/confos-tools-tree.tar.zst" \
+              -C confidential-os-builder/mkosi/kernel-builder mkosi.output
             echo "exists=true" >> "${GITHUB_OUTPUT}"
           else
             echo "exists=false" >> "${GITHUB_OUTPUT}"
@@ -615,7 +607,7 @@ jobs:
         if: always() && steps.tools-tree-cache.outputs.cache-hit != 'true' && steps.tools-tree-tar.outputs.exists == 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ runner.temp }}/steep-tools-tree.tar.zst
+          path: ${{ runner.temp }}/confos-tools-tree.tar.zst
           key: ${{ steps.tools-tree-cache.outputs.cache-primary-key }}
 
       # build.sh packs the tarball right after Step 2, before the later steps

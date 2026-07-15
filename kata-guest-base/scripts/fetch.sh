@@ -13,7 +13,7 @@
 # osbuilder (scripts/build.sh), which installs the version-matched
 # kata-agent (and its systemd unit) for us — so the old kata-static
 # initrd extraction is gone. This is the whole reason we moved off the
-# steep image build: osbuilder gives us a kata-native rootfs with the
+# confos image build: osbuilder gives us a kata-native rootfs with the
 # correct agent, and we only overlay our c8s binaries/services on top.
 #
 # ratls-mesh + policy-monitor are produced by this c8s repo's

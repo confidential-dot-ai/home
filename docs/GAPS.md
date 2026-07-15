@@ -61,8 +61,8 @@ final security model. Each bullet links to the tracking issue.
   measured, manifest published — parity with the non-GPU guest), but it boots
   **kata's GPU kernel** with the NVIDIA modules/userland grafted from kata's
   digest-pinned GPU rootfs (`kata-guest-base/scripts/build.sh` Step 6): the
-  steep kernel has `CONFIG_MODULES=n` and cannot load the driver. Remaining
-  hardening: a steep GPU kernel flavor (`CONFIG_MODULES=y` +
+  confos kernel has `CONFIG_MODULES=n` and cannot load the driver. Remaining
+  hardening: a confos GPU kernel flavor (`CONFIG_MODULES=y` +
   `CONFIG_MODULE_SIG_FORCE=y`, ephemeral build-time key) compiling and
   signing the NVIDIA open GPU kernel modules, replacing the graft — needs
   GPU hardware in CI to validate. Until then the guest locks module loading

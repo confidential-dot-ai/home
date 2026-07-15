@@ -6,7 +6,7 @@
 # guest-pull image store with a dm-crypt-encrypted filesystem on it, so
 # large workload images unpack to encrypted DISK instead of the RAM tmpfs that
 # otherwise caps image size at guest memory. No such disk => no-op (guest-pull
-# keeps using the default tmpfs). Matches Steep's ephemeral-encrypted-overlay
+# keeps using the default tmpfs). Matches confos's ephemeral-encrypted-overlay
 # pattern: random per-boot key, held only in (TDX-encrypted) guest RAM, never
 # written to disk; the volume is reformatted every boot (pure scratch).
 set -u
