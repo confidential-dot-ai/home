@@ -805,3 +805,18 @@ terminates TLS in front of the broker and forwards a plain TCP stream with
 no peer identity) is still open, so the validation stays. Lift it once
 `ratls-mesh` propagates the caller's identity (or the broker exposes an
 out-of-mesh port) — see the follow-up list in the decision doc.
+
+## The openbao image needs CHOWN+SETGID+SETUID — `drop: ALL` alone crashloops it
+
+`internal/helmchart/c8s/templates/kms-openbao.yaml` (container securityContext)
+
+The `ghcr.io/openbao/openbao` entrypoint starts as root, chowns its data
+dirs, and `su-exec`s down to the service user. Under `capabilities.drop: ALL`
+that dies instantly with `su-exec: setgroups: Operation not permitted` — the
+pod crashloops before a single log line from openbao itself. The dev-KMS
+template drops ALL and adds back exactly `CHOWN`, `SETGID`, `SETUID` (still a
+subset of the runtime default set; `allowPrivilegeEscalation: false` is fine —
+su-exec uses the caps, not setuid binaries). Anything running this image with
+a hardened securityContext needs the same floor. The injected secrets *agent*
+runs the same image but as `bao agent` under the pod's own user — it never
+su-execs, so this floor does not apply there.

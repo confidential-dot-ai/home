@@ -46,6 +46,7 @@ var (
 	installGetCertRunAsNonRoot  bool
 
 	installKataDebug        bool
+	installKMS              bool
 	installCvmMode          string
 	installHardwarePlatform string
 	installSingleNode       bool
@@ -1178,6 +1179,20 @@ func appendKataInstallArgs(helmArgs []string, cvmMode string, debug bool) []stri
 	return helmArgs
 }
 
+// appendKMSInstallArgs translates --kms into helm --set values: the in-chart
+// dev-mode OpenBao plus the secret-broker that fronts it (kms.enabled without
+// the broker fails the render — the store is only reachable through the
+// broker). Dev/demo only; see the kms block in values.yaml.
+func appendKMSInstallArgs(helmArgs []string, kms bool) []string {
+	if !kms {
+		return helmArgs
+	}
+	return append(helmArgs,
+		"--set", "kms.enabled=true",
+		"--set", "secretBroker.enabled=true",
+	)
+}
+
 // preflightImagePullSecret reads the Secret --image-pull-secret names (absent
 // is reported by checkImagePullSecret, not the kubectl error) and delegates to
 // checkImagePullSecret. A kubectl failure other than NotFound aborts: the
@@ -1716,6 +1731,7 @@ func init() {
 	installCmd.Flags().StringVar(&installCvmMode, flagCvmMode, "", "CVM deployment shape (REQUIRED; orthogonal to --hardware-platform): pod (per-pod confidential VMs via the Kata runtime — every workload pod is a kata CVM, host-side attestation-api/nri/ratls-mesh served by the in-guest counterparts), node (generalized node-as-CVM: our own TDX/SNP nodes are themselves confidential VMs, pods run as ordinary processes, attestation-api + nri baked into the node image), gke (GKE managed confidential VMs), or aks (vTPM /dev/tpm0)")
 	installCmd.Flags().StringVar(&installHardwarePlatform, flagHardwarePlatform, "sev-snp", "CPU-level TEE hardware (orthogonal to --cvm-mode): sev-snp (default, /dev/sev-guest) or tdx (Intel TDX, /dev/tdx-guest). Under --cvm-mode=aks the CPU TEE rides the Azure vTPM: sev-snp selects az-snp and tdx selects az-tdx (no guest device needed — the report comes from /dev/tpm0)")
 	installCmd.Flags().BoolVar(&installKataDebug, "debug", false, "use the kata-guest-base DEBUG guest variant (<tag>-debug): kubectl logs/exec work on kata pods, but container I/O becomes readable by the untrusted host and the launch measurement differs from the locked image. Requires --cvm-mode=pod; development only")
+	installCmd.Flags().BoolVar(&installKMS, "kms", false, "deploy an in-chart dev-mode OpenBao and the secret-broker fronting it (sets kms.enabled and secretBroker.enabled). In-memory store, root token in a plain Secret — dev/demo only; production points secretBroker.openbao.address at an external store instead")
 	installCmd.Flags().BoolVar(&installResolveDigests, "resolve-digests", true, "resolve each c8s component image tag to its registry digest (via crane), pin it, and add the resolved images to the NRI allowlist (enables deriveComponents). On by default; pass --resolve-digests=false when supplying digests via -f")
 	installCmd.Flags().StringVar(&installImagePullSecret, "image-pull-secret", "", "name of an existing registry-credential Secret (kubernetes.io/dockerconfigjson) in the release namespace; the chart appends it to every component's imagePullSecrets, so all pods can pull the c8s images from an authenticated registry (e.g. a private mirror) from first start. The Secret itself is never created or managed by the install — the install fails fast if it is missing or has the wrong type")
 	installCmd.Flags().StringVar(&installImageTag, "image-tag", "", "component image tag to resolve digests at (default: the CLI build version, or 'main' for an unstamped build). Override to pin a specific branch/tag/release")

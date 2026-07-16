@@ -1286,6 +1286,28 @@ secretAgent:
   ## Agent binary in the image: "bao" for OpenBao, "vault" for HashiCorp Vault.
   command: bao
 
+## Dev-mode KMS: an in-chart OpenBao dev server the secret-broker fronts,
+## for demo/dev clusters (`c8s install --kms`). In-memory storage (data lost
+## on pod restart), no seal, root token in a plain k8s Secret — NEVER
+## production. Production runs an external (eventually attested) store and
+## leaves this disabled. Requires secretBroker.enabled; conflicts with an
+## explicit secretBroker.openbao.address (see validations.yaml).
+## Runs the secretAgent.image (same openbao image/digest), so the derived
+## NRI allowlist already covers it.
+kms:
+  enabled: false
+  port: 8200
+  ## Dev root token, rendered into the <release>-openbao-dev-cred Secret and
+  ## wired to the broker when secretBroker.openbao.credentialSecret is unset.
+  devRootToken: root
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
 ## LUKS integration — openbao-gated encrypted volumes. A workload pod attaches
 ## an encrypted block device by annotation
 ## (confidential.ai/luks-<name>: dev=/dev/vdX,mount=/data,secret=secret/data/…#field);

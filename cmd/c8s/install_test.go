@@ -206,6 +206,22 @@ func TestAppendKataInstallArgsNonPodModeIsNoOp(t *testing.T) {
 	}
 }
 
+func TestAppendKMSInstallArgsDisabledIsNoOp(t *testing.T) {
+	got := appendKMSInstallArgs([]string{"upgrade"}, false)
+	assertArgsEqual(t, got, []string{"upgrade"})
+}
+
+func TestAppendKMSInstallArgsEnablesStoreAndBroker(t *testing.T) {
+	// --kms deploys the dev store AND the broker fronting it — the chart's
+	// kms_without_broker validation rejects the store alone.
+	got := appendKMSInstallArgs([]string{"upgrade"}, true)
+	assertArgsEqual(t, got, []string{
+		"upgrade",
+		"--set", "kms.enabled=true",
+		"--set", "secretBroker.enabled=true",
+	})
+}
+
 func TestAppendKataInstallArgsPodModeIsEnforcing(t *testing.T) {
 	// --cvm-mode=pod is enforcing: alongside the kata stack it must turn off the
 	// host-side components whose function runs inside the kata-guest-base

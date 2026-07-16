@@ -1404,6 +1404,116 @@ func TestChartAllowlistsSecretAgentImage(t *testing.T) {
 	})
 }
 
+// kmsArgs enables the in-chart dev store + broker with no explicit store
+// address — the shape `c8s install --kms` produces. nri is disabled for the
+// same reason as the broker tests (the digest-pinned agent image would trip
+// the uncovered_component_digest guard; coverage has its own test).
+func kmsArgs(args ...string) []string {
+	return append([]string{
+		"--set", "kms.enabled=true",
+		"--set", "secretBroker.enabled=true",
+		"--set", "nriImagePolicy.enabled=false",
+	}, args...)
+}
+
+// TestChartKMSRendersDevStoreAndWiresBroker pins the --kms contract: the dev
+// store renders (Deployment + Service + dev-cred Secret) and the broker's
+// unset openbao settings default to it — in-release address, unattested
+// (plain-HTTP dev store), dev-cred token file.
+func TestChartKMSRendersDevStoreAndWiresBroker(t *testing.T) {
+	out, err := helmTemplate(t, kmsArgs()...)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+
+	store := renderedDeployment(t, out, "c8s-openbao")
+	c := store.Spec.Template.Spec.Containers[0]
+	if want := []string{"server", "-dev"}; !slices.Equal(c.Args, want) {
+		t.Errorf("dev store args = %v, want %v", c.Args, want)
+	}
+	if !strings.Contains(c.Image, "ghcr.io/openbao/openbao@sha256:") {
+		t.Errorf("dev store image = %q, want the digest-pinned secretAgent image", c.Image)
+	}
+	var sec corev1.Secret
+	if !findDoc(t, out, "Secret", "c8s-openbao-dev-cred", &sec) {
+		t.Fatalf("rendered manifest missing dev-cred Secret\n%s", out)
+	}
+	if got := sec.StringData["token"]; got != "root" {
+		t.Errorf("dev-cred token = %q, want root (values default)", got)
+	}
+	renderedService(t, out, "c8s-openbao")
+
+	broker := renderedDeployment(t, out, "c8s-secret-broker")
+	brokerC, ok := findContainer(broker.Spec.Template.Spec.Containers, "secret-broker")
+	if !ok {
+		t.Fatalf("secret-broker container missing; have %v", containerNames(broker.Spec.Template.Spec.Containers))
+	}
+	assertContainerArgs(t, brokerC,
+		"--openbao-addr=http://c8s-openbao.c8s-system.svc:8200",
+		"--openbao-attested=false",
+		"--openbao-token-file=/etc/secret-broker-creds/token",
+	)
+	credWired := false
+	for _, v := range broker.Spec.Template.Spec.Volumes {
+		if v.Secret != nil && v.Secret.SecretName == "c8s-openbao-dev-cred" {
+			credWired = true
+		}
+	}
+	if !credWired {
+		t.Errorf("broker volumes do not mount the dev-cred Secret\n%v", broker.Spec.Template.Spec.Volumes)
+	}
+}
+
+// An explicitly configured credentialSecret must win over the kms dev-cred —
+// operators pointing the broker at their own token keep that wiring even with
+// the dev store deployed.
+func TestChartKMSExplicitCredentialWins(t *testing.T) {
+	out, err := helmTemplate(t, kmsArgs(
+		"--set-string", "secretBroker.openbao.credentialSecret.name=my-cred",
+		"--set-string", "secretBroker.openbao.credentialSecret.key=tok",
+	)...)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	broker := renderedDeployment(t, out, "c8s-secret-broker")
+	brokerC, ok := findContainer(broker.Spec.Template.Spec.Containers, "secret-broker")
+	if !ok {
+		t.Fatalf("secret-broker container missing; have %v", containerNames(broker.Spec.Template.Spec.Containers))
+	}
+	assertContainerArgs(t, brokerC, "--openbao-token-file=/etc/secret-broker-creds/tok")
+	for _, v := range broker.Spec.Template.Spec.Volumes {
+		if v.Secret != nil && v.Secret.SecretName == "c8s-openbao-dev-cred" {
+			t.Errorf("dev-cred Secret mounted despite an explicit credentialSecret")
+		}
+	}
+}
+
+// TestChartKMSGuards: the dev store without a broker is dead weight with a
+// root token lying around; alongside an explicit external address it is a
+// contradiction. Both must fail the render.
+func TestChartKMSGuards(t *testing.T) {
+	t.Run("kms without broker", func(t *testing.T) {
+		out, err := helmTemplate(t, "--set", "kms.enabled=true")
+		if err == nil {
+			t.Fatalf("helm template succeeded, want kms_without_broker failure\n%s", out)
+		}
+		if got := parseValidationErrorKind(out); got != "kms_without_broker" {
+			t.Fatalf("validation kind = %q, want kms_without_broker\n%s", got, out)
+		}
+	})
+	t.Run("kms with explicit store address", func(t *testing.T) {
+		out, err := helmTemplate(t, kmsArgs(
+			"--set-string", "secretBroker.openbao.address=https://external:8200",
+		)...)
+		if err == nil {
+			t.Fatalf("helm template succeeded, want kms_conflicting_store failure\n%s", out)
+		}
+		if got := parseValidationErrorKind(out); got != "kms_conflicting_store" {
+			t.Fatalf("validation kind = %q, want kms_conflicting_store\n%s", got, out)
+		}
+	})
+}
+
 // TestChartRejectsBrokerRatlsUnderKata: under kata the in-guest mesh already
 // terminates and attests the broker's inbound TLS, so peerVerify=ratls is inert
 // — the chart must refuse it (see validations.yaml).

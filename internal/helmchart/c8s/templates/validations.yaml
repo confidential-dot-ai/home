@@ -131,3 +131,16 @@
 {{- include "tls-lb.requireSecuredBackend" (dict "protocol" $tlsLB.upstream.protocol "tls" $tlsLB.upstream.tls "address" $tlsLB.upstream.address "label" "tlsLb.upstream" "kind" "tlslb_unsecured_upstream" "suggest" "To reach a confidential workload adopt it with --workload-ref <id>=<ns>/<kind>/<name>:<port> and pass --upstream <id> (the mesh wraps that plaintext hop in attested mTLS); ") -}}
 {{- end -}}
 {{- end -}}
+{{- /*
+  Dev-mode KMS (kms.enabled) sanity. The dev store exists solely for the
+  secret-broker to front — without the broker it is dead weight with a root
+  token lying around. And an explicit secretBroker.openbao.address alongside
+  it is a contradiction: an external store AND a managed dev store, with the
+  broker only speaking to the former. Fail both shapes at render.
+*/ -}}
+{{- if and .Values.kms.enabled (not .Values.secretBroker.enabled) -}}
+{{- fail "VALIDATION_ERROR kind=kms_without_broker: kms.enabled=true requires secretBroker.enabled=true — the dev store is only reachable through the attestation-gated broker. `c8s install --kms` sets both." -}}
+{{- end -}}
+{{- if and .Values.kms.enabled .Values.secretBroker.openbao.address -}}
+{{- fail "VALIDATION_ERROR kind=kms_conflicting_store: kms.enabled=true deploys an in-chart dev OpenBao and points the broker at it, but secretBroker.openbao.address is also set. Unset the address to use the dev store, or drop --kms / kms.enabled to use the external store." -}}
+{{- end -}}

@@ -1,0 +1,100 @@
+{{- /*
+  Dev-mode KMS: an in-chart OpenBao dev server (`c8s install --kms`).
+  In-memory storage, no seal, root token in a plain Secret — dev/demo only;
+  see the kms block in values.yaml. The broker's openbao settings default to
+  this store via the secret-broker.openbao* helpers when kms.enabled.
+*/ -}}
+{{- if .Values.kms.enabled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "kms.credSecretName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kms.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kms
+type: Opaque
+stringData:
+  token: {{ .Values.kms.devRootToken | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kms.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kms.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kms
+spec:
+  selector:
+    {{- include "kms.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.kms.port }}
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kms.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kms.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kms.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kms.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: kms
+    spec:
+      {{- include "c8s.imagePullSecrets" (dict "root" $ "local" list) | nindent 6 }}
+      containers:
+        - name: openbao
+          image: {{ include "secret-broker.agentImage" . }}
+          imagePullPolicy: {{ .Values.secretAgent.image.pullPolicy | default "IfNotPresent" }}
+          args: ["server", "-dev"]
+          env:
+            - name: BAO_DEV_ROOT_TOKEN_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kms.credSecretName" . }}
+                  key: token
+            - name: BAO_DEV_LISTEN_ADDRESS
+              value: "0.0.0.0:{{ .Values.kms.port }}"
+          ports:
+            - name: http
+              containerPort: {{ .Values.kms.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              # The image entrypoint starts as root, chowns its data dirs, and
+              # su-execs down to the openbao user — these three are the floor.
+              add:
+                - CHOWN
+                - SETGID
+                - SETUID
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              {{- toYaml .Values.kms.resources.requests | nindent 14 }}
+            limits:
+              {{- toYaml .Values.kms.resources.limits | nindent 14 }}
+      nodeSelector:
+        kubernetes.io/os: linux
+{{- end }}
