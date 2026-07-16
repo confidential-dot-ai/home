@@ -6,6 +6,23 @@ holds helpers and LLM prompts, not policy.
 
 The key words MUST, SHOULD, and MAY are used as in RFC 2119.
 
+## TL;DR
+
+- `main` is PR-only from the first commit; green build/lint/test to merge; squash
+  with Conventional Commit titles.
+- Every repo: README, GitHub metadata, CI on PRs and `main`, pinned toolchain,
+  committed lockfiles, update bot, `CLAUDE.md`.
+- Every repo has a CLA and requires signed commits, whatever the licence; public
+  repos add `LICENCE` (AGPL for services, MIT for libraries), `CONTRIBUTING.md`,
+  `SECURITY.md`.
+- Released repos (≥ `v0.1.0`) add: ≥ 1 approval via `CODEOWNERS`, digest/SHA pinning,
+  vulnerability scanning, signed releases + SBOM + provenance.
+- Releases are SemVer, tag-driven, and fully automated.
+- Docs live under `/docs`; a PR that changes behavior updates them in the same PR.
+  carry no secrets or tenant data.
+- Use LLMs aggressively; the PR owner owns the output; secrets never go to a
+  provider.
+
 ## Maturity tiers
 
 Requirements tighten as a repo matures:
@@ -29,8 +46,8 @@ Rules below apply to both tiers unless marked. Appendix A summarizes what change
   - Services and applications default to **AGPL-3.0**.
   - Client libraries and SDKs default to **MIT** — adoption is their whole point.
   - Unsure? Start AGPL; loosening later is a discussion, not an emergency.
-  - AGPL repos MUST have a CLA covering external contributions (keeps relicensing and
-    dual-licensing possible) and MUST require signed commits.
+  - Every repo MUST have a CLA covering external contributions, whatever the licence
+    — MIT and Apache-2.0 included (keeps relicensing and dual-licensing possible).
 - Repos that are no longer maintained MUST be archived on GitHub, not left to rot.
 
 ## 2. Branches, reviews, and merging
@@ -112,8 +129,7 @@ The product is trust in artifacts; our own supply chain has to clear the same ba
 - CI SHOULD authenticate to clouds via OIDC, not long-lived credentials.
 - Release and deploy workflows MUST run with minimal `GITHUB_TOKEN` permissions and
   SHOULD use protected environments, so a compromised PR can't publish.
-- Commit signing: MUST on AGPL repos (contribution provenance for the CLA), SHOULD
-  everywhere else.
+- Commit signing: MUST on every repo (contribution provenance for the CLA).
 - TCB components — anything whose hash lands in an attestation measurement (IGVM,
   guest kernels, kata artifacts, runtime images) — SHOULD build reproducibly from
   tagged source. For us, binary identity *is* the security claim.
@@ -170,7 +186,7 @@ Standards that live only in a doc rot. In order of preference:
 
 1. **Org rulesets** carry the GitHub-level rules — PR-only `main`, force-push block,
    required checks, merge-method restrictions, secret scanning + push protection,
-   signed commits where required. One configuration, inherited by new repos;
+   signed commits. One configuration, inherited by new repos;
    per-repo exceptions need a documented reason.
 2. **Conformance audits** — periodically check every repo against Appendix B
    (automate where cheap: an action or an LLM sweep) and file issues for gaps.
@@ -199,6 +215,6 @@ Everything else applies equally to both tiers.
 - [ ] Toolchain pinned; `make build` / `make lint` / `make test` work
 - [ ] Lockfiles committed; Renovate/Dependabot enabled
 - [ ] `CLAUDE.md` present
-- [ ] AGPL repos: CLA wired up, signed commits required
+- [ ] CLA wired up; signed commits required
 - [ ] At `v0.1.0`: `CODEOWNERS`, ≥ 1 approval required, digest/SHA pinning, vuln
       scanning, signed releases + SBOM + provenance
