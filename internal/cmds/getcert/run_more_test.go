@@ -6,11 +6,13 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha512"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -299,20 +301,45 @@ func TestCreateCSR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ratlsExt := pkix.Extension{Id: ratls.OIDRATLSAttestation, Value: []byte{0x30, 0x03, 0x02, 0x01, 0x42}}
 
-	t.Run("dns san", func(t *testing.T) {
-		csrPEM, err := createCSR(key, "host.example.com")
-		if err != nil {
-			t.Fatalf("createCSR: %v", err)
-		}
+	parseCSR := func(t *testing.T, csrPEM []byte) *x509.CertificateRequest {
+		t.Helper()
 		block, _ := pem.Decode(csrPEM)
 		if block == nil || block.Type != "CERTIFICATE REQUEST" {
 			t.Fatalf("not a CSR PEM: %q", csrPEM)
 		}
+		csr, err := x509.ParseCertificateRequest(block.Bytes)
+		if err != nil {
+			t.Fatalf("parse CSR: %v", err)
+		}
+		return csr
+	}
+
+	t.Run("dns san", func(t *testing.T) {
+		csrPEM, err := createCSR(key, "host.example.com", ratlsExt)
+		if err != nil {
+			t.Fatalf("createCSR: %v", err)
+		}
+		csr := parseCSR(t, csrPEM)
+		// INVARIANT: the CSR carries the RA-TLS extension so CDS can copy it
+		// into the issued leaf for downstream ratls-mode re-verification.
+		found := false
+		for _, ext := range csr.Extensions {
+			if ext.Id.Equal(ratls.OIDRATLSAttestation) {
+				found = true
+				if string(ext.Value) != string(ratlsExt.Value) {
+					t.Fatalf("RA-TLS ext value = %x, want %x", ext.Value, ratlsExt.Value)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("CSR missing the RA-TLS attestation extension")
+		}
 	})
 
 	t.Run("ip san", func(t *testing.T) {
-		csrPEM, err := createCSR(key, "10.0.0.5")
+		csrPEM, err := createCSR(key, "10.0.0.5", ratlsExt)
 		if err != nil {
 			t.Fatalf("createCSR: %v", err)
 		}
@@ -348,6 +375,53 @@ func TestCreateCSR(t *testing.T) {
 			t.Fatal("RA-TLS extension not carried into the CSR")
 		}
 	})
+}
+
+// The extension embedded in the CSR must bind the bare public key — REPORTDATA
+// = SHA-384(pubkey) with NO nonce — or downstream verifiers calling
+// ratls.VerifyCert(cert, policy, nil) can never re-verify the issued leaf
+// (the report_data mismatch bug this flow fixes).
+func TestAttestationExtensionBindsBareKey(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var sawReportData []byte
+	attestationApi := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/attest" {
+			t.Errorf("attestation-api path = %s, want /attest", r.URL.Path)
+		}
+		var req types.AttestRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode attest request: %v", err)
+		}
+		sawReportData = append([]byte(nil), req.ReportData.Bytes()...)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"platform":"az-snp","evidence":{"quote":"abc"}}`)
+	}))
+	defer attestationApi.Close()
+
+	ext, err := attestclient.NewClient("").AttestationExtensionForClaims(context.Background(), attestationApi.URL, &key.PublicKey, nil)
+	if err != nil {
+		t.Fatalf("AttestationExtensionForClaims: %v", err)
+	}
+
+	want, err := ratls.ReportDataForKey(&key.PublicKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(sawReportData) != string(want[:sha512.Size384]) {
+		t.Fatalf("report_data sent to attestation-api = %x, want SHA-384(pubkey) = %x", sawReportData, want[:sha512.Size384])
+	}
+
+	att, err := ratls.UnmarshalExtension(ext.Value)
+	if err != nil {
+		t.Fatalf("unmarshal extension: %v", err)
+	}
+	if att.TEEType != ratls.TEETypeSEVSNP {
+		t.Fatalf("TEEType = %v, want SEV-SNP", att.TEEType)
+	}
 }
 
 func TestSnapshotReloadWatchPathsErrors(t *testing.T) {
@@ -489,9 +563,12 @@ func startFakeServers(t *testing.T, issuedChain string) (cdsURL, attURL string) 
 			http.NotFound(w, r)
 			return
 		}
+		// snp evidence must carry attestation_report — the CSR extension
+		// build extracts the raw report bytes for the on-cert form.
+		fakeReport := base64.StdEncoding.EncodeToString([]byte("fake-snp-report"))
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"platform": "snp",
-			"evidence": json.RawMessage(`{"quote":"fake"}`),
+			"evidence": json.RawMessage(`{"attestation_report":"` + fakeReport + `"}`),
 		})
 	}))
 	t.Cleanup(att.Close)
@@ -539,7 +616,7 @@ func TestObtainCertEndToEnd(t *testing.T) {
 
 func TestObtainCertCDSError(t *testing.T) {
 	att := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"platform": "snp", "evidence": json.RawMessage(`{}`)})
+		_ = json.NewEncoder(w).Encode(map[string]any{"platform": "snp", "evidence": json.RawMessage(`{"attestation_report":"ZmFrZS1zbnAtcmVwb3J0"}`)})
 	}))
 	t.Cleanup(att.Close)
 	cds := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -559,7 +636,7 @@ func TestObtainCertWithRetrySucceedsAfterTransientFailure(t *testing.T) {
 	chain := testIssuedChainPEM(t)
 
 	att := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"platform": "snp", "evidence": json.RawMessage(`{}`)})
+		_ = json.NewEncoder(w).Encode(map[string]any{"platform": "snp", "evidence": json.RawMessage(`{"attestation_report":"ZmFrZS1zbnAtcmVwb3J0"}`)})
 	}))
 	t.Cleanup(att.Close)
 
@@ -602,7 +679,7 @@ func TestObtainCertWithRetrySucceedsAfterTransientFailure(t *testing.T) {
 
 func TestObtainCertWithRetryNoTimeoutTriesOnce(t *testing.T) {
 	att := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"platform": "snp", "evidence": json.RawMessage(`{}`)})
+		_ = json.NewEncoder(w).Encode(map[string]any{"platform": "snp", "evidence": json.RawMessage(`{"attestation_report":"ZmFrZS1zbnAtcmVwb3J0"}`)})
 	}))
 	t.Cleanup(att.Close)
 	var calls int

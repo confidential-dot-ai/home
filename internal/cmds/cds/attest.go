@@ -19,7 +19,6 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/attestation"
 	"github.com/confidential-dot-ai/c8s/internal/issuer"
 	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
-	"github.com/confidential-dot-ai/c8s/pkg/attestclient"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
@@ -189,27 +188,19 @@ func (h AttestHandler) HandleAttest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Embed the just-verified attestation as OID .1.1 in the issued leaf so a
-	// downstream ratls-mode verifier (e.g. secret-broker --peer-verify=ratls)
-	// sees the same evidence CDS accepted. RATLSEvidence extracts the
-	// platform-appropriate payload: raw SNP report for bare-metal SNP, or the
-	// full evidence envelope for TDX / other platforms (see pkg/ratls docs on
-	// the on-cert format). Failure here does not deny issuance — the mesh cert
-	// remains valid for CA-chain-verified peers; only ratls-mode verification
-	// on downstream services degrades.
-	var ratlsAtt *ratls.Attestation
-	if att, err := buildAttestationExtension(req.Evidence); err == nil {
-		ratlsAtt = att
-	} else {
-		slog.Warn("skipping .1.1 attestation embed", "error", err)
-	}
-
+	// The leaf's OID .1.1 RA-TLS extension is copied from the client's CSR
+	// (see issuer.SignCSR): the client embeds evidence bound to
+	// SHA-384(pubkey) with no nonce, which is the only form downstream
+	// ratls-mode verifiers (secret-broker --peer-verify=ratls) can re-verify.
+	// The challenge-bound evidence verified above proves freshness at
+	// issuance but is NOT embeddable — its REPORTDATA includes the consumed
+	// challenge, so re-verification against the bare key would always fail.
+	// See docs/decisions/2026-07-16-ratls-embed-binding.md.
 	certPEM, _, err := h.CA.SignCSR(issuer.SignCSRParams{
 		CSR:             csr,
 		TTL:             issuer.CapTTL(h.CertTTL, issuer.MaxLeafTTL),
 		Evidence:        evidenceJSON,
 		ConfigClaimsExt: claimsDER,
-		Attestation:     ratlsAtt,
 	})
 	if err != nil {
 		slog.Error("in-process sign failed", "error", err)
@@ -324,27 +315,4 @@ func classifyVerifyError(err error) (int, string, string) {
 	}
 	return http.StatusBadGateway, types.ErrorCodeAttestationApiUnreachable,
 		fmt.Sprintf("failed to reach attestation-api: %s", err)
-}
-
-// buildAttestationExtension packages the request's already-verified evidence
-// into the ratls.Attestation the leaf's OID .1.1 extension wants. The
-// platform-appropriate on-cert form is delegated to
-// attestclient.RATLSEvidence — bare-metal SNP carries the raw SNP report bytes;
-// TDX and other platforms carry the JSON evidence envelope stripped to the
-// fields the /verify endpoint needs.
-func buildAttestationExtension(evidence types.AttestationEvidence) (*ratls.Attestation, error) {
-	var teeType ratls.TEEType
-	switch evidence.Platform {
-	case string(types.PlatformSnp), string(types.PlatformAzSnp), string(types.PlatformGcpSnp):
-		teeType = ratls.TEETypeSEVSNP
-	case string(types.PlatformTdx):
-		teeType = ratls.TEETypeTDX
-	default:
-		return nil, fmt.Errorf("unsupported platform %q", evidence.Platform)
-	}
-	report, err := attestclient.RATLSEvidence(types.AttestResponse(evidence))
-	if err != nil {
-		return nil, fmt.Errorf("extract RA-TLS evidence: %w", err)
-	}
-	return &ratls.Attestation{TEEType: teeType, Report: []byte(report)}, nil
 }

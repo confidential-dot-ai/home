@@ -298,21 +298,17 @@ func obtainCert(ctx context.Context, cfg config, client attestclient.Client) err
 		return err
 	}
 
-	// When binding a workload claim, embed a nonce-free RA-TLS attestation
-	// extension over the same claims into the CSR. CDS copies it onto the leaf,
-	// so `c8s verify --workload-image` can check the leaf's config-claims
-	// against hardware evidence — without it the leaf is verifiable only by CA
-	// chain (docs/ratls.md).
-	var csrExts []pkix.Extension
-	if wc.claimsDER != nil {
-		ext, err := client.AttestationExtensionForClaims(ctx, cfg.AttestationApiURL, &privateKey.PublicKey, wc.claimsDER)
-		if err != nil {
-			return fmt.Errorf("build workload attestation extension: %w", err)
-		}
-		csrExts = append(csrExts, ext)
+	// Always embed a nonce-free RA-TLS .1.1 extension so a downstream ratls-mode
+	// verifier (secret-broker --peer-verify=ratls) can re-verify the leaf. When
+	// the pod binds a workload claim the extension covers the claims too
+	// (`c8s verify --workload-image`); with no claim it binds the bare key — the
+	// same nonce-free embed the mesh client uses (docs/ratls.md).
+	ext, err := client.AttestationExtensionForClaims(ctx, cfg.AttestationApiURL, &privateKey.PublicKey, wc.claimsDER)
+	if err != nil {
+		return fmt.Errorf("build RA-TLS attestation extension: %w", err)
 	}
 
-	csrPEM, err := createCSR(privateKey, cfg.SAN, csrExts...)
+	csrPEM, err := createCSR(privateKey, cfg.SAN, ext)
 	if err != nil {
 		return err
 	}
