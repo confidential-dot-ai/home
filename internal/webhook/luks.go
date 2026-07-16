@@ -16,7 +16,8 @@ import (
 //
 // Value grammar (comma-separated key=value):
 //
-//	dev=<block-device>          (required) block device to luksOpen
+//	dev=<block-device>          (XOR pvc=) node block device to luksOpen
+//	pvc=<claim-name>            (XOR dev=) raw-block PVC attached by the webhook
 //	mount=<path>                (required) mount point inside the app container
 //	secret=<vault-path>[#field] (required) KV path holding the passphrase
 //	fstype=<fs>                 (optional, default ext4) filesystem inside the volume
@@ -29,6 +30,7 @@ const (
 type luksVolume struct {
 	Name       string // sanitised from the annotation suffix (DNS-1123 label)
 	Dev        string // e.g. /dev/vdb — passed verbatim to cryptsetup
+	PVC        string // raw-block claim name; webhook wires it as a volumeDevice
 	Mount      string // absolute in-container path where the decrypted fs is mounted
 	SecretName string // matches secretsInjection.Entries[].Name — the passphrase file name
 	SecretPath string // KV path (fed into the secrets agent so the file exists)
@@ -36,6 +38,22 @@ type luksVolume struct {
 	FSType     string // "ext4" default
 	Mode       string // "open" (default) or "format-if-empty"
 }
+
+// devicePath is what the luks-open init container luksOpens: the operator's
+// dev= verbatim, or — for pvc= — the fixed in-container path the claim's block
+// device is mapped to. NOT under /dev: that mount IS the host's /dev, and a
+// volumeDevice path inside a hostPath mount would race the runtime's device
+// node creation against the bind mount.
+func (lv luksVolume) devicePath() string {
+	if lv.PVC != "" {
+		return "/c8s-dev/" + lv.Name
+	}
+	return lv.Dev
+}
+
+// pvcVolumeName is the pod-scope volume name the webhook declares for a
+// pvc= LUKS volume.
+func (lv luksVolume) pvcVolumeName() string { return "c8s-luks-pvc-" + lv.Name }
 
 // parseLUKSVolumes returns nil when the pod does not request any LUKS volume.
 // A luks-<name> annotation without secrets-inject: true is a hard error — the
@@ -102,6 +120,12 @@ func parseLUKSValue(name, value string) (luksVolume, error) {
 		switch key {
 		case "dev":
 			lv.Dev = val
+		case "pvc":
+			if errs := validation.IsDNS1123Subdomain(val); len(errs) > 0 {
+				return luksVolume{}, fmt.Errorf("%w: luks-%s: pvc= must be a valid claim name: %s",
+					errInvalidInjectionAnnotation, name, strings.Join(errs, "; "))
+			}
+			lv.PVC = val
 		case "mount":
 			lv.Mount = val
 		case "secret":
@@ -131,8 +155,12 @@ func parseLUKSValue(name, value string) (luksVolume, error) {
 				errInvalidInjectionAnnotation, name, key)
 		}
 	}
-	if lv.Dev == "" {
-		return luksVolume{}, fmt.Errorf("%w: luks-%s: dev= is required",
+	if lv.Dev == "" && lv.PVC == "" {
+		return luksVolume{}, fmt.Errorf("%w: luks-%s: one of dev= or pvc= is required",
+			errInvalidInjectionAnnotation, name)
+	}
+	if lv.Dev != "" && lv.PVC != "" {
+		return luksVolume{}, fmt.Errorf("%w: luks-%s: dev= and pvc= are mutually exclusive",
 			errInvalidInjectionAnnotation, name)
 	}
 	if !strings.HasPrefix(lv.Mount, "/") {
@@ -182,13 +210,22 @@ func injectLUKS(pod *corev1.Pod, eff injection, cfg Config) {
 	})
 
 	// Mount each per-name subdir into the app containers at the operator's
-	// requested mount path.
+	// requested mount path. pvc= volumes additionally get their claim declared
+	// at pod scope; the luks-open container maps it as a raw volumeDevice.
 	for _, v := range eff.LUKS {
 		mountAll(pod, corev1.VolumeMount{
 			Name:      luksDataVolume,
 			MountPath: v.Mount,
 			SubPath:   v.Name,
 		})
+		if v.PVC != "" {
+			ensureVolume(pod, corev1.Volume{
+				Name: v.pvcVolumeName(),
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: v.PVC},
+				},
+			})
+		}
 	}
 
 	pod.Spec.InitContainers = insertAfterContainer(pod.Spec.InitContainers,
@@ -200,9 +237,13 @@ func injectLUKS(pod *corev1.Pod, eff injection, cfg Config) {
 // can create /dev/mapper/c8s-<name> nodes.
 func luksOpenContainer(cfg Config, eff injection) corev1.Container {
 	args := []string{"luks-open", "--secrets-dir=" + defaultSecretsDir, "--mount-root=" + luksDataDir}
+	var devices []corev1.VolumeDevice
 	for _, v := range eff.LUKS {
-		spec := fmt.Sprintf("%s=%s:%s:%s:%s", v.Name, v.Dev, v.SecretName, v.FSType, v.Mode)
+		spec := fmt.Sprintf("%s=%s:%s:%s:%s", v.Name, v.devicePath(), v.SecretName, v.FSType, v.Mode)
 		args = append(args, "--volume="+spec)
+		if v.PVC != "" {
+			devices = append(devices, corev1.VolumeDevice{Name: v.pvcVolumeName(), DevicePath: v.devicePath()})
+		}
 	}
 	priv := true
 	f := false
@@ -212,6 +253,7 @@ func luksOpenContainer(cfg Config, eff injection) corev1.Container {
 		Image:           cfg.LUKSOpenImage,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Args:            args,
+		VolumeDevices:   devices,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: secretsDataVolume, MountPath: defaultSecretsDir, ReadOnly: true},
 			{Name: luksDataVolume, MountPath: luksDataDir, MountPropagation: mountPropagation(corev1.MountPropagationBidirectional)},

@@ -26,6 +26,8 @@ func newCreateCmd() *cobra.Command {
 		passphraseEntropy int
 		output            string
 		localBackingDir   string
+		namespace         string
+		storageClass      string
 	)
 	cmd := &cobra.Command{
 		Use:   "create",
@@ -46,6 +48,8 @@ func newCreateCmd() *cobra.Command {
 				entropyBytes:    passphraseEntropy,
 				output:          output,
 				localBackingDir: localBackingDir,
+				namespace:       namespace,
+				storageClass:    storageClass,
 			}
 			size, err := resource.ParseQuantity(sizeStr)
 			if err != nil {
@@ -59,7 +63,7 @@ func newCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&workload, "workload", "", "confidential.ai/cw workload id the volume belongs to (required)")
 	cmd.Flags().StringVar(&name, "name", "", "volume name; forms the KV suffix (luks-<name>) and pod annotation (required)")
 	cmd.Flags().StringVar(&sizeStr, "size", "", "volume size as a k8s quantity, e.g. 10Gi (required)")
-	cmd.Flags().StringVar(&driver, "driver", "local", "backing driver: local (loop-file on this host, dev clusters only) | pvc (not yet implemented) | csi (not yet implemented)")
+	cmd.Flags().StringVar(&driver, "driver", "local", "backing driver: local (loop-file on this host, dev clusters only) | pvc (raw-block PersistentVolumeClaim via kubectl — no node access needed, implies mode=format-if-empty) | csi (not yet implemented)")
 	cmd.Flags().StringVar(&fstype, "fstype", "ext4", "filesystem to create inside the LUKS container")
 	cmd.Flags().StringVar(&mount, "mount", "/data", "in-container mountpoint for the app")
 	cmd.Flags().BoolVar(&deferFormat, "defer-format", false, "skip luksFormat + mkfs; emit annotation with mode=format-if-empty so the pod formats on first boot")
@@ -67,6 +71,10 @@ func newCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&output, "output", "yaml", "output format: yaml | json")
 	cmd.Flags().StringVar(&localBackingDir, "local-dir", "/var/lib/c8s/luks",
 		"host directory where the local driver stores backing .img files")
+	cmd.Flags().StringVar(&namespace, "namespace", "default",
+		"workload namespace the pvc driver creates the claim in")
+	cmd.Flags().StringVar(&storageClass, "storage-class", "",
+		"StorageClass for the pvc driver (empty = the cluster default; must support volumeMode: Block)")
 	return cmd
 }
 
@@ -81,6 +89,8 @@ type createConfig struct {
 	entropyBytes    int
 	output          string
 	localBackingDir string
+	namespace       string
+	storageClass    string
 }
 
 // createResult is what --output serialises.
@@ -89,12 +99,29 @@ type createResult struct {
 	Name        string            `json:"name"                     yaml:"name"`
 	Size        string            `json:"size"                     yaml:"size"`
 	Driver      string            `json:"driver"                   yaml:"driver"`
-	Device      string            `json:"device"                   yaml:"device"`
+	Device      string            `json:"device,omitempty"         yaml:"device,omitempty"`
+	Claim       string            `json:"claim,omitempty"          yaml:"claim,omitempty"`
+	Namespace   string            `json:"namespace,omitempty"      yaml:"namespace,omitempty"`
 	KVPath      string            `json:"kv_path"                  yaml:"kv_path"`
 	Annotations map[string]string `json:"annotations"              yaml:"annotations"`
 	Volume      any               `json:"volume,omitempty"         yaml:"volume,omitempty"`
 	VolumeMount any               `json:"volume_mount,omitempty"   yaml:"volume_mount,omitempty"`
 	Notes       []string          `json:"notes,omitempty"          yaml:"notes,omitempty"`
+}
+
+// provisioned is a driver's provisioning outcome: what the annotation leads
+// with (dev=<path> or pvc=<claim>), the effective open mode, and any PodSpec
+// extras the operator must merge (local driver only — the pvc driver's claim
+// is attached by the webhook).
+type provisioned struct {
+	device    string // node device path (local) or "" (pvc)
+	claim     string // claim name (pvc) or "" (local)
+	namespace string // claim namespace (pvc) or "" (local)
+	devToken  string // "dev=/dev/loop7" | "pvc=c8s-luks-api-data"
+	mode      string // "open" | "format-if-empty"
+	notes     []string
+	volume    any
+	mount     any
 }
 
 func runCreate(ctx context.Context, bf *baoFlags, cfg createConfig) error {
@@ -119,7 +146,7 @@ func runCreate(ctx context.Context, bf *baoFlags, cfg createConfig) error {
 	}
 
 	// 3. Provision the backing device.
-	device, notes, extraVolume, extraMount, err := provision(cfg, passphrase)
+	prov, err := provision(ctx, cfg, passphrase)
 	if err != nil {
 		// Roll back the KV entry so a retry gets a fresh passphrase and doesn't
 		// see stale versions. Best-effort; log on failure.
@@ -130,22 +157,24 @@ func runCreate(ctx context.Context, bf *baoFlags, cfg createConfig) error {
 	// 4. Emit the annotations + snippet.
 	kvSubpath := fmt.Sprintf("%s/luks-%s", cfg.workload, cfg.name)
 	kvFullPath := "secret/data/" + kvSubpath
-	annoValue := fmt.Sprintf("dev=%s,mount=%s,secret=%s#passphrase,fstype=%s,mode=%s",
-		device, cfg.mount, kvFullPath, cfg.fstype, luksMode(cfg.deferFormat))
+	annoValue := fmt.Sprintf("%s,mount=%s,secret=%s#passphrase,fstype=%s,mode=%s",
+		prov.devToken, cfg.mount, kvFullPath, cfg.fstype, prov.mode)
 	result := createResult{
-		Workload: cfg.workload,
-		Name:     cfg.name,
-		Size:     cfg.size.String(),
-		Driver:   cfg.driver,
-		Device:   device,
-		KVPath:   kvFullPath,
+		Workload:  cfg.workload,
+		Name:      cfg.name,
+		Size:      cfg.size.String(),
+		Driver:    cfg.driver,
+		Device:    prov.device,
+		Claim:     prov.claim,
+		Namespace: prov.namespace,
+		KVPath:    kvFullPath,
 		Annotations: map[string]string{
 			"confidential.ai/luks-" + cfg.name:   annoValue,
 			"confidential.ai/secret-" + cfg.name: kvFullPath + "#passphrase",
 		},
-		Volume:      extraVolume,
-		VolumeMount: extraMount,
-		Notes:       notes,
+		Volume:      prov.volume,
+		VolumeMount: prov.mount,
+		Notes:       prov.notes,
 	}
 	// Always remind the operator secrets-inject is required — it isn't part of
 	// the CLI's mint but the Stage 5 admission guard demands it.
@@ -172,6 +201,11 @@ func validateCreate(cfg createConfig) error {
 	if cfg.mount == "" || cfg.mount[0] != '/' {
 		return errors.New("--mount must be an absolute path")
 	}
+	if cfg.driver == "pvc" {
+		if errs := validation.IsDNS1123Label(cfg.namespace); len(errs) > 0 {
+			return fmt.Errorf("--namespace %q must be a DNS-1123 label: %v", cfg.namespace, errs)
+		}
+	}
 	if cfg.output != "yaml" && cfg.output != "json" {
 		return fmt.Errorf("--output %q: must be yaml or json", cfg.output)
 	}
@@ -185,18 +219,33 @@ func luksMode(deferFormat bool) string {
 	return "open"
 }
 
-// provision routes to the selected driver and returns the device path plus
-// any extra PodSpec-fragment volume/mount and human-readable notes.
-func provision(cfg createConfig, passphrase []byte) (device string, notes []string, volume any, mount any, err error) {
+// provision routes to the selected driver.
+func provision(ctx context.Context, cfg createConfig, passphrase []byte) (provisioned, error) {
 	switch cfg.driver {
 	case "local":
-		return provisionLocal(cfg, passphrase)
+		device, notes, volume, mount, err := provisionLocal(cfg, passphrase)
+		if err != nil {
+			return provisioned{}, err
+		}
+		return provisioned{
+			device: device, devToken: "dev=" + device,
+			mode: luksMode(cfg.deferFormat), notes: notes, volume: volume, mount: mount,
+		}, nil
 	case "pvc":
-		return "", nil, nil, nil, errors.New("--driver pvc: not yet implemented (design in docs/decisions/2026-07-10-luks-cli.md)")
+		claim, notes, err := provisionPVC(ctx, cfg)
+		if err != nil {
+			return provisioned{}, err
+		}
+		// Always format-if-empty: nothing can luksFormat an unbound claim,
+		// so first-boot formatting in the pod is the only coherent mode.
+		return provisioned{
+			claim: claim, namespace: cfg.namespace, devToken: "pvc=" + claim,
+			mode: "format-if-empty", notes: notes,
+		}, nil
 	case "csi":
-		return "", nil, nil, nil, errors.New("--driver csi: not yet implemented")
+		return provisioned{}, errors.New("--driver csi: not yet implemented")
 	default:
-		return "", nil, nil, nil, fmt.Errorf("--driver %q: want local | pvc | csi", cfg.driver)
+		return provisioned{}, fmt.Errorf("--driver %q: want local | pvc | csi", cfg.driver)
 	}
 }
 

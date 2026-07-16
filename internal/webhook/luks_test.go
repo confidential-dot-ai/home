@@ -53,7 +53,9 @@ func TestParseLUKSValueErrors(t *testing.T) {
 		value string
 		want  string
 	}{
-		{"missing dev", "mount=/data,secret=secret/data/api/luks#p", "dev= is required"},
+		{"missing dev", "mount=/data,secret=secret/data/api/luks#p", "one of dev= or pvc= is required"},
+		{"dev and pvc together", "dev=/dev/vdb,pvc=my-claim,mount=/data,secret=secret/data/api/luks#p", "mutually exclusive"},
+		{"bad pvc name", "pvc=Not_A_Claim,mount=/data,secret=secret/data/api/luks#p", "pvc= must be a valid claim name"},
 		{"missing mount", "dev=/dev/vdb,secret=secret/data/api/luks#p", "mount= must be an absolute path"},
 		{"relative mount", "dev=/dev/vdb,mount=data,secret=secret/data/api/luks#p", "mount= must be an absolute path"},
 		{"missing secret", "dev=/dev/vdb,mount=/data", "secret= is required"},
@@ -191,6 +193,66 @@ func TestMutatePodInjectsLUKSContainer(t *testing.T) {
 	}
 	if !hostDev {
 		t.Error("host-dev hostPath volume not declared on pod")
+	}
+}
+
+// TestMutatePodInjectsPVCLUKSVolume pins the pvc= contract: the webhook
+// declares the claim at pod scope, maps it as a raw volumeDevice on the
+// luks-open init container at the fixed /c8s-dev/<name> path, and passes that
+// path — not a host device — in the --volume spec. The operator pastes only
+// annotations; no PodSpec surgery.
+func TestMutatePodInjectsPVCLUKSVolume(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+	inj := &injection{
+		WorkloadID: "api",
+		Secrets: &secretsInjection{
+			Entries: []secretEntry{{Name: "data", Path: "secret/data/api/luks-data", Field: "passphrase"}},
+		},
+		LUKS: []luksVolume{{
+			Name: "data", PVC: "c8s-luks-api-data", Mount: "/data",
+			SecretName: "data", SecretPath: "secret/data/api/luks-data", SecretKey: "passphrase",
+			FSType: "ext4", Mode: "format-if-empty",
+		}},
+	}
+	mutatePod(pod, inj, luksTestConfig())
+
+	var openC *corev1.Container
+	for i, c := range pod.Spec.InitContainers {
+		if c.Name == "c8s-luks-open" {
+			openC = &pod.Spec.InitContainers[i]
+		}
+	}
+	if openC == nil {
+		t.Fatal("c8s-luks-open init container not injected")
+	}
+	joined := strings.Join(openC.Args, " ")
+	if !strings.Contains(joined, "--volume=data=/c8s-dev/data:data:ext4:format-if-empty") {
+		t.Errorf("volume spec must use the in-container device path: %v", openC.Args)
+	}
+	devFound := false
+	for _, d := range openC.VolumeDevices {
+		if d.Name == "c8s-luks-pvc-data" && d.DevicePath == "/c8s-dev/data" {
+			devFound = true
+		}
+	}
+	if !devFound {
+		t.Errorf("luks-open missing the claim volumeDevice (%+v)", openC.VolumeDevices)
+	}
+	pvcVol := false
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "c8s-luks-pvc-data" && v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == "c8s-luks-api-data" {
+			pvcVol = true
+		}
+	}
+	if !pvcVol {
+		t.Errorf("pod missing the PVC volume declaration (%+v)", pod.Spec.Volumes)
+	}
+	// The app container must NOT see the raw device — only the decrypted fs.
+	if len(pod.Spec.Containers[0].VolumeDevices) != 0 {
+		t.Errorf("app container must not get raw volumeDevices (%+v)", pod.Spec.Containers[0].VolumeDevices)
 	}
 }
 
