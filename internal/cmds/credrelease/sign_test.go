@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"testing"
@@ -162,19 +163,20 @@ func parseLeaf(t *testing.T, certPEM []byte) *x509.Certificate {
 	return cert
 }
 
-// namedCA writes a fresh self-signed CA (cert+key PEM) to files in dir and
-// returns the paths and the CA cert. Stands in for RKE2's distinct
-// client-ca / server-ca on disk.
+// namedCA writes a fresh self-signed CA to files in dir, the key in the SEC1
+// "EC PRIVATE KEY" form RKE2 writes, and returns the paths and the CA cert.
+// Stands in for RKE2's distinct client-ca / server-ca on disk.
 func namedCA(t *testing.T, dir, name string) (certPath, keyPath string, cert *x509.Certificate) {
 	t.Helper()
 	ca, err := issuer.NewCA(name, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	keyPEM, err := certutil.MarshalECKeyPEM(ca.Key)
+	keyDER, err := x509.MarshalECPrivateKey(ca.Key)
 	if err != nil {
 		t.Fatal(err)
 	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	certPath = filepath.Join(dir, name+".crt")
 	keyPath = filepath.Join(dir, name+".key")
 	if err := os.WriteFile(certPath, certutil.EncodeCertPEM(ca.Cert.Raw), 0o600); err != nil {
