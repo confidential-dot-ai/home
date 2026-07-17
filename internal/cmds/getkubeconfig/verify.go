@@ -42,6 +42,18 @@ func expectedRTMR3(operatorPubPEM []byte) string {
 // quote must be bound to: the caller's nonce on the attest gate, the cert-key
 // hash on the RA-TLS dial. Fails closed on any missing piece.
 func verifyEvidence(envelopeJSON, expectedReportData []byte) (*teetypes.VerificationResult, error) {
+	// The operator-key binding lives in RTMR[3], which only TDX measures, so
+	// reject other platforms up front with a clear error instead of a late
+	// "quote carries no rtmr_3" (e.g. a SEV-SNP node can never satisfy the
+	// binding, however genuine its quote).
+	var env teetypes.AttestationEvidence
+	if err := json.Unmarshal(envelopeJSON, &env); err != nil {
+		return nil, fmt.Errorf("parse evidence envelope: %w", err)
+	}
+	if env.Platform != teetypes.PlatformTDX {
+		return nil, fmt.Errorf("node platform is %q: the operator-key binding lives in RTMR[3], so credential release requires a TDX guest", env.Platform)
+	}
+
 	res, err := verifyEnvelope(envelopeJSON, teetypes.VerifyParams{
 		ExpectedReportData: expectedReportData,
 	})

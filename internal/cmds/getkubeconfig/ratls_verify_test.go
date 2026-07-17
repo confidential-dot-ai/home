@@ -88,6 +88,16 @@ func verifiedResult(rtmr3 string) *teetypes.VerificationResult {
 	}
 }
 
+func TestVerifyEvidenceRejectsNonTDX(t *testing.T) {
+	// A SEV-SNP node can never satisfy the RTMR[3] key binding; the gate must
+	// name the platform up front, before any verification runs.
+	stubVerify(t, verifiedResult("aa"), nil) // must not be reached
+	_, err := verifyEvidence([]byte(`{"platform":"snp","evidence":{}}`), nil)
+	if err == nil || !strings.Contains(err.Error(), "requires a TDX guest") {
+		t.Fatalf("want TDX-required error, got %v", err)
+	}
+}
+
 func TestVerifyServerCertNoExtension(t *testing.T) {
 	// A plain (non-RA-TLS) cert must be rejected before any verification.
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
