@@ -883,6 +883,15 @@ func getCertEnv(inj *injection) []corev1.EnvVar {
 		{Name: "C8S_POD_UID", ValueFrom: &corev1.EnvVarSource{
 			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"},
 		}},
+		// cvmMode=node: the chart passes the operator a verbatim
+		// --attestation-api-url=http://$(HOST_IP):8400, forwarded unexpanded into
+		// this arg (certContainer). The kubelet expands $(HOST_IP) against THIS
+		// tenant pod's node, so the sidecar reaches the node-baked host
+		// attestation-api on whichever node it lands. Unused (harmless) in modes
+		// whose URL has no $(HOST_IP).
+		{Name: "HOST_IP", ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.hostIP"},
+		}},
 	}
 }
 
