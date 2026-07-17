@@ -8,10 +8,10 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"math/big"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
@@ -64,22 +64,32 @@ func attestedCert(t *testing.T, envelope types.AttestationEvidence) *x509.Certif
 	return cert
 }
 
-// fakeAttestationCLI writes a stub attestation-cli that prints the given claims
-// JSON and points ATTESTATION_CLI at it. Lets the tests drive verifyServerCert's
-// post-extraction logic deterministically without real hardware.
-func fakeAttestationCLI(t *testing.T, claimsJSON string) {
+// stubVerify replaces the in-process attestation-go verifier with one that
+// returns the given result/error. Lets the tests drive verifyServerCert's
+// post-verification logic deterministically without real hardware.
+func stubVerify(t *testing.T, res *teetypes.VerificationResult, err error) {
 	t.Helper()
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-attestation-cli")
-	script := "#!/bin/sh\ncat >/dev/null\ncat <<'EOF'\n" + claimsJSON + "\nEOF\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
+	orig := verifyEnvelope
+	verifyEnvelope = func([]byte, teetypes.VerifyParams) (*teetypes.VerificationResult, error) {
+		return res, err
 	}
-	t.Setenv("ATTESTATION_CLI", bin)
+	t.Cleanup(func() { verifyEnvelope = orig })
+}
+
+// verifiedResult builds a passing VerificationResult carrying the given rtmr_3.
+func verifiedResult(rtmr3 string) *teetypes.VerificationResult {
+	return &teetypes.VerificationResult{
+		SignatureValid:  true,
+		Platform:        teetypes.PlatformTDX,
+		ReportDataMatch: teetypes.Ptr(true),
+		Claims: teetypes.Claims{
+			PlatformData: map[string]any{"rtmr_3": rtmr3},
+		},
+	}
 }
 
 func TestVerifyServerCertNoExtension(t *testing.T) {
-	// A plain (non-RA-TLS) cert must be rejected before any CLI call.
+	// A plain (non-RA-TLS) cert must be rejected before any verification.
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1)}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
@@ -95,9 +105,11 @@ func TestVerifyServerCertNoExtension(t *testing.T) {
 }
 
 func TestVerifyServerCertRejectsBadReportData(t *testing.T) {
-	// The CLI reports the quote is valid but report_data isn't bound to the
-	// cert key — a MITM presenting someone else's quote. Must fail closed.
-	fakeAttestationCLI(t, `{"signature_valid":true,"report_data_match":false,"claims":{"platform_data":{"rtmr_3":"aa"}}}`)
+	// The verifier reports the quote is valid but report_data isn't bound to
+	// the cert key — a MITM presenting someone else's quote. Must fail closed.
+	res := verifiedResult("aa")
+	res.ReportDataMatch = teetypes.Ptr(false)
+	stubVerify(t, res, nil)
 	cert := attestedCert(t, types.AttestationEvidence{Platform: "tdx", Evidence: json.RawMessage(`{}`)})
 
 	err := verifyServerCert(cert, operatorPub(t))
@@ -109,7 +121,7 @@ func TestVerifyServerCertRejectsBadReportData(t *testing.T) {
 func TestVerifyServerCertRejectsWrongRTMR3(t *testing.T) {
 	// Genuine, key-bound quote, but rtmr_3 doesn't equal H(op_pub): the node
 	// wasn't launched to trust this operator. Must fail closed.
-	fakeAttestationCLI(t, `{"signature_valid":true,"report_data_match":true,"claims":{"platform_data":{"rtmr_3":"00"}}}`)
+	stubVerify(t, verifiedResult("00"), nil)
 	cert := attestedCert(t, types.AttestationEvidence{Platform: "tdx", Evidence: json.RawMessage(`{}`)})
 
 	err := verifyServerCert(cert, operatorPub(t))
@@ -121,9 +133,7 @@ func TestVerifyServerCertRejectsWrongRTMR3(t *testing.T) {
 func TestVerifyServerCertAccepts(t *testing.T) {
 	// Genuine quote, bound to the cert key, rtmr_3 == H(op_pub): accept.
 	pub := operatorPub(t)
-	want := expectedRTMR3(pub)
-	claims := `{"signature_valid":true,"report_data_match":true,"claims":{"platform_data":{"rtmr_3":"` + want + `"}}}`
-	fakeAttestationCLI(t, claims)
+	stubVerify(t, verifiedResult(expectedRTMR3(pub)), nil)
 	cert := attestedCert(t, types.AttestationEvidence{Platform: "tdx", Evidence: json.RawMessage(`{}`)})
 
 	if err := verifyServerCert(cert, pub); err != nil {

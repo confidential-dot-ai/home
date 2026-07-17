@@ -16,15 +16,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"os/exec"
 	"strings"
+
+	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
+	"github.com/confidential-dot-ai/attestation-go/attestation/teeverify"
 )
 
-// attestationCLIBinary is the external verifier we shell out to — the same
-// tool confai's `verify` requires, so the operator flow uses one verifier.
-// Override with ATTESTATION_CLI.
-const attestationCLIBinary = "attestation-cli"
+// verifyEnvelope verifies a self-describing evidence envelope in-process with
+// attestation-go, the same engine `c8s verify` uses, so the operator flow
+// needs no external verifier binary. A package var so tests can stub the
+// verdict.
+var verifyEnvelope = teeverify.Verify
 
 // expectedRTMR3 computes RTMR[3] = SHA384(0x00*48 || SHA384(pubkey)) — the
 // value the guest reports iff it was launched to trust this exact key. The
@@ -35,39 +37,35 @@ func expectedRTMR3(operatorPubPEM []byte) string {
 	return hex.EncodeToString(rtmr3[:])
 }
 
-// attestAndCheckRTMR3 fetches a nonce-bound quote from the guest's
-// attestation-api, verifies it with attestation-cli (HW chain + report_data
-// freshness), and asserts the quote's rtmr_3 equals expectedRTMR3(pub). It
-// proves: genuine TDX + the node trusts the operator's key. Returns nil on
-// success. The RTMR[3] equality is a plain compare of the (CLI-authenticated)
-// rtmr_3 claim — same posture as confai verify.
-func attestAndCheckRTMR3(ctx context.Context, attestURL string, operatorPubPEM []byte) error {
-	nonce := make([]byte, 32)
-	if _, err := rand.Read(nonce); err != nil {
-		return fmt.Errorf("nonce: %w", err)
-	}
-	nonceHex := hex.EncodeToString(nonce)
-
-	evidence, err := postAttest(ctx, attestURL, nonce)
+// verifyEvidence verifies an evidence envelope with attestation-go (HW chain +
+// report_data binding) and returns the result. expectedReportData is what the
+// quote must be bound to: the caller's nonce on the attest gate, the cert-key
+// hash on the RA-TLS dial. Fails closed on any missing piece.
+func verifyEvidence(envelopeJSON, expectedReportData []byte) (*teetypes.VerificationResult, error) {
+	res, err := verifyEnvelope(envelopeJSON, teetypes.VerifyParams{
+		ExpectedReportData: expectedReportData,
+	})
 	if err != nil {
-		return fmt.Errorf("attest: %w", err)
+		return nil, fmt.Errorf("verify evidence: %w", err)
 	}
+	// Defense in depth: a nil error already implies these, but never report a
+	// success the result contradicts.
+	if !res.SignatureValid {
+		return nil, fmt.Errorf("quote signature invalid")
+	}
+	if res.ReportDataMatch == nil || !*res.ReportDataMatch {
+		return nil, fmt.Errorf("report_data does not match the expected binding (stale/replayed quote)")
+	}
+	return res, nil
+}
 
-	claims, err := runAttestationCLIVerify(ctx, evidence, nonceHex)
-	if err != nil {
-		return fmt.Errorf("attestation-cli verify: %w", err)
-	}
-
-	sigValid, _ := claims["signature_valid"].(bool)
-	rdMatch, _ := claims["report_data_match"].(bool)
-	if !sigValid {
-		return fmt.Errorf("quote signature invalid")
-	}
-	if !rdMatch {
-		return fmt.Errorf("report_data does not match nonce (stale/replayed quote)")
-	}
-
-	got := platformDataString(claims, "rtmr_3")
+// checkRTMR3 asserts the verified quote's rtmr_3 equals expectedRTMR3(pub),
+// i.e. the node was launched to trust the operator's key. The compare is over
+// the rtmr_3 claim attestation-go extracted from the signature-verified quote
+// body, the same posture as confai verify.
+func checkRTMR3(res *teetypes.VerificationResult, operatorPubPEM []byte) error {
+	got, _ := res.Claims.PlatformData["rtmr_3"].(string)
+	got = strings.ToLower(strings.TrimSpace(got))
 	want := expectedRTMR3(operatorPubPEM)
 	if got == "" {
 		return fmt.Errorf("quote carries no rtmr_3")
@@ -79,13 +77,34 @@ func attestAndCheckRTMR3(ctx context.Context, attestURL string, operatorPubPEM [
 	return nil
 }
 
+// attestAndCheckRTMR3 fetches a nonce-bound quote from the guest's
+// attestation-api, verifies it in-process (HW chain + report_data freshness),
+// and asserts the quote's rtmr_3 equals expectedRTMR3(pub). It proves: genuine
+// TDX + the node trusts the operator's key. Returns nil on success.
+func attestAndCheckRTMR3(ctx context.Context, attestURL string, operatorPubPEM []byte) error {
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		return fmt.Errorf("nonce: %w", err)
+	}
+
+	evidence, err := postAttest(ctx, attestURL, nonce)
+	if err != nil {
+		return fmt.Errorf("attest: %w", err)
+	}
+
+	res, err := verifyEvidence(evidence, nonce)
+	if err != nil {
+		return err
+	}
+	return checkRTMR3(res, operatorPubPEM)
+}
+
 // postAttest sends the nonce to POST /attest and returns the raw evidence body
-// (the same shape attestation-cli verify consumes on stdin).
+// (the self-describing {platform, evidence} envelope attestation-go consumes).
 //
-// report_data goes to /attest base64-encoded (what the attestation-api decodes)
-// but to attestation-cli --expected-report-data as hex; the two encodings must
-// agree on the same bytes or verify reports "report_data mismatch". Matches
-// confai's verify.
+// report_data goes to /attest base64-encoded (what the attestation-api
+// decodes); attestation-go compares the same raw bytes. Matches confai's
+// verify.
 func postAttest(ctx context.Context, attestURL string, nonce []byte) ([]byte, error) {
 	body, _ := json.Marshal(map[string]string{
 		"platform":    "auto",
@@ -109,44 +128,4 @@ func postAttest(ctx context.Context, attestURL string, nonce []byte) ([]byte, er
 		return nil, fmt.Errorf("attest HTTP %d: %s", resp.StatusCode, respBody)
 	}
 	return respBody, nil
-}
-
-// runAttestationCLIVerify pipes evidence to `attestation-cli verify` and
-// returns the parsed claims map. Mirrors confai's invocation.
-func runAttestationCLIVerify(ctx context.Context, evidence []byte, nonceHex string) (map[string]any, error) {
-	bin := attestationCLIBinary
-	if env := os.Getenv("ATTESTATION_CLI"); env != "" {
-		bin = env
-	}
-	cmd := exec.CommandContext(ctx, bin, "verify", "--expected-report-data", nonceHex)
-	cmd.Stdin = bytes.NewReader(evidence)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	runErr := cmd.Run()
-
-	// attestation-cli exits non-zero on both hard failure (no JSON) and policy
-	// mismatch (full JSON on stdout). Try to parse stdout first.
-	var claims map[string]any
-	if err := json.Unmarshal(stdout.Bytes(), &claims); err != nil {
-		if runErr != nil {
-			return nil, fmt.Errorf("%w: %s", runErr, strings.TrimSpace(stderr.String()))
-		}
-		return nil, fmt.Errorf("parse verify output: %w", err)
-	}
-	return claims, nil
-}
-
-// platformDataString pulls claims.platform_data.<key> (where the TDX RTMRs
-// live), lowercased/trimmed, or "".
-func platformDataString(claims map[string]any, key string) string {
-	c, ok := claims["claims"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	pd, ok := c["platform_data"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	v, _ := pd[key].(string)
-	return strings.ToLower(strings.TrimSpace(v))
 }

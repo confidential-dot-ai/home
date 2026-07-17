@@ -37,7 +37,7 @@ type Config struct {
 	OutPath string
 	// InsecureSkipTLSVerify drops the :8443 dial from RA-TLS verification to a
 	// plain (unverified) TLS dial. Default false: the dial is RA-TLS-verified
-	// against the operator's local attestation-cli, so the host can't MITM the
+	// in-process by the operator's own verifier, so the host can't MITM the
 	// channel. Set only to bypass RA-TLS for debugging — the release is still
 	// gated by the RTMR[3] attestation check + the RKE2-CA signature + JWT PoP.
 	InsecureSkipTLSVerify bool
@@ -78,8 +78,8 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	// 3. Exchange the CSR for a signed cert over cred-release. By default the
-	//    :8443 dial is RA-TLS-verified against the operator's local
-	//    attestation-cli (newRATLSClient): the serving cert's embedded quote
+	//    :8443 dial is RA-TLS-verified in-process by the operator's own
+	//    verifier (newRATLSClient): the serving cert's embedded quote
 	//    must bind to the cert key AND carry rtmr_3 == H(op_pub), so the host
 	//    can't MITM the channel. --insecure-skip-tls-verify drops that to a
 	//    plain TLS dial (the release is still gated by attestation + the RKE2-CA

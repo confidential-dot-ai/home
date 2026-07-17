@@ -22,7 +22,7 @@ func NewCmd() *cobra.Command {
 		Long: "get-kubeconfig attests a measured c8s TDX CVM, confirms rtmr[3] proves\n" +
 			"the node trusts the operator's key, then exchanges a CSR for a\n" +
 			"short-lived RKE2 client cert over the cred-release endpoint and writes\n" +
-			"a kubeconfig. Needs attestation-cli on PATH (or $ATTESTATION_CLI).",
+			"a kubeconfig. Verification runs in-process (attestation-go).",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if cfg.OperatorKeyPath == "" || cfg.OutPath == "" {
 				return fmt.Errorf("--operator-key and --out are required")
