@@ -171,11 +171,9 @@ func namedCA(t *testing.T, dir, name string) (certPath, keyPath string, cert *x5
 	return certPath, keyPath, ca.Cert
 }
 
-// TestLoadClusterCAReleasesServerCA is the regression guard for the CA-confusion
-// bug: RKE2 signs the apiserver serving cert with a server-CA distinct from the
-// client-CA that signs kube clients. The released kubeconfig's trust anchor
-// (clusterCA.pem) MUST be the server CA, or kubectl fails with "certificate
-// signed by unknown authority". Signing must still use the client CA.
+// TestLoadClusterCAReleasesServerCA guards the CA-confusion regression: the
+// released kubeconfig anchors on the server CA while issued certs chain to the
+// client CA (the CA-path consts in sign.go explain the RKE2/kubeadm split).
 func TestLoadClusterCAReleasesServerCA(t *testing.T) {
 	dir := t.TempDir()
 	clientCertPath, clientKeyPath, clientCA := namedCA(t, dir, "client-ca")
