@@ -7,6 +7,9 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -155,4 +158,95 @@ func parseLeaf(t *testing.T, certPEM []byte) *x509.Certificate {
 		t.Fatal(err)
 	}
 	return cert
+}
+
+// namedCA writes a self-signed ECDSA CA (cert+key PEM) to files in dir and
+// returns the cert path, key path, and cert PEM. Stands in for RKE2's distinct
+// client-ca / server-ca on disk.
+func namedCA(t *testing.T, dir, name string) (certPath, keyPath string, certPEM []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          bigOne(),
+		Subject:               pkix.Name{CommonName: name},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	certPath = filepath.Join(dir, name+".crt")
+	keyPath = filepath.Join(dir, name+".key")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certPath, keyPath, certPEM
+}
+
+// TestLoadClusterCAReleasesServerCA is the regression guard for the CA-confusion
+// bug: RKE2 signs the apiserver serving cert with a server-CA distinct from the
+// client-CA that signs kube clients. The released kubeconfig's trust anchor
+// (clusterCA.pem) MUST be the server CA, or kubectl fails with "certificate
+// signed by unknown authority". Signing must still chain to the client CA.
+func TestLoadClusterCAReleasesServerCA(t *testing.T) {
+	dir := t.TempDir()
+	clientCert, clientKey, clientPEM := namedCA(t, dir, "client-ca")
+	serverCert, _, serverPEM := namedCA(t, dir, "server-ca")
+
+	ca, err := loadClusterCA(clientCert, clientKey, serverCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The kubeconfig anchor is the SERVER CA, not the client CA.
+	if string(ca.pem) != string(serverPEM) {
+		t.Error("clusterCA.pem is not the server CA — kubeconfig would fail apiserver verification")
+	}
+	if string(ca.pem) == string(clientPEM) {
+		t.Error("clusterCA.pem is the client CA — this is the exact bug being guarded")
+	}
+
+	// Signing still uses the CLIENT CA: the issued cert must chain to it.
+	certPEM, err := ca.signOperatorCert(signParams{
+		csr: testCSR(t), org: "system:masters", cn: "operator", ttl: time.Hour,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf := parseLeaf(t, certPEM)
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(clientPEM) {
+		t.Fatal("append client CA")
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		t.Errorf("issued cert does not chain to the client CA: %v", err)
+	}
+}
+
+// TestLoadClusterCAKubeadmSingleCA covers the kubeadm case: one ca.crt signs
+// both serving and client certs, so all three paths point at the same file.
+func TestLoadClusterCAKubeadmSingleCA(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath, certPEM := namedCA(t, dir, "ca")
+	ca, err := loadClusterCA(certPath, keyPath, certPath)
+	if err != nil {
+		t.Fatalf("single-CA (kubeadm) load failed: %v", err)
+	}
+	if string(ca.pem) != string(certPEM) {
+		t.Error("single-CA anchor mismatch")
+	}
 }
