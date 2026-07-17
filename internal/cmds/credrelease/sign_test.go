@@ -201,15 +201,26 @@ func TestLoadClusterCAReleasesServerCA(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The kubeconfig anchor is the SERVER CA; releasing the client CA there
-	// is the exact bug being guarded.
-	if !parseLeaf(t, ca.pem).Equal(serverCA) {
-		t.Error("clusterCA.pem is not the server CA; kubeconfig would fail apiserver verification")
+	// The kubeconfig anchor is the SERVER CA and nothing else.
+	if string(ca.pem) != string(certutil.EncodeCertPEM(serverCA.Raw)) {
+		t.Error("clusterCA.pem is not exactly the server CA; kubeconfig would fail apiserver verification")
 	}
-	// The signer stays the CLIENT CA (signing behavior itself is covered by
-	// TestSignOperatorCert).
-	if !ca.cert.Equal(clientCA) {
-		t.Error("clusterCA.cert is not the client CA; issued certs would not chain to it")
+
+	// A cert issued by the loaded CA chains to the CLIENT CA: proves the cert
+	// and the key both came from the client-CA files.
+	certPEM, err := ca.signOperatorCert(signParams{
+		csr: testCSR(t), org: "system:masters", cn: "operator", ttl: time.Hour,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(clientCA)
+	if _, err := parseLeaf(t, certPEM).Verify(x509.VerifyOptions{
+		Roots:     roots,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		t.Errorf("issued cert does not chain to the client CA: %v", err)
 	}
 }
 
