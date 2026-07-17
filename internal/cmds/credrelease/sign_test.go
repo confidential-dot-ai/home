@@ -7,35 +7,24 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/confidential-dot-ai/c8s/internal/issuer"
+	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 )
 
-// testCA builds a self-signed ECDSA CA standing in for the RKE2 client-CA.
+// testCA builds a self-signed CA standing in for the RKE2 client-CA.
 func testCA(t *testing.T) *clusterCA {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	ca, err := issuer.NewCA("test-client-ca", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tmpl := &x509.Certificate{
-		SerialNumber:          bigOne(),
-		Subject:               pkix.Name{CommonName: "test-client-ca"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageCertSign,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &clusterCA{cert: cert, key: key}
+	return &clusterCA{cert: ca.Cert, key: ca.Key}
 }
 
 func testCSR(t *testing.T) *x509.CertificateRequest {
@@ -155,4 +144,104 @@ func parseLeaf(t *testing.T, certPEM []byte) *x509.Certificate {
 		t.Fatal(err)
 	}
 	return cert
+}
+
+// namedCA writes a fresh self-signed CA to files in dir, the key in the SEC1
+// "EC PRIVATE KEY" form RKE2 writes, and returns the paths and the CA cert.
+// Stands in for RKE2's distinct client-ca / server-ca on disk.
+func namedCA(t *testing.T, dir, name string) (certPath, keyPath string, cert *x509.Certificate) {
+	t.Helper()
+	ca, err := issuer.NewCA(name, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(ca.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	certPath = filepath.Join(dir, name+".crt")
+	keyPath = filepath.Join(dir, name+".key")
+	if err := os.WriteFile(certPath, certutil.EncodeCertPEM(ca.Cert.Raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certPath, keyPath, ca.Cert
+}
+
+// TestLoadClusterCAReleasesServerCA guards the CA-confusion regression: the
+// released kubeconfig anchors on the server CA while issued certs chain to the
+// client CA (the CA-path consts in sign.go explain the RKE2/kubeadm split).
+func TestLoadClusterCAReleasesServerCA(t *testing.T) {
+	dir := t.TempDir()
+	clientCertPath, clientKeyPath, clientCA := namedCA(t, dir, "client-ca")
+	serverCertPath, _, serverCA := namedCA(t, dir, "server-ca")
+
+	ca, err := loadClusterCA(clientCertPath, clientKeyPath, serverCertPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The kubeconfig anchor is the SERVER CA and nothing else.
+	if string(ca.pem) != string(certutil.EncodeCertPEM(serverCA.Raw)) {
+		t.Error("clusterCA.pem is not exactly the server CA; kubeconfig would fail apiserver verification")
+	}
+
+	// A cert issued by the loaded CA chains to the CLIENT CA: proves the cert
+	// and the key both came from the client-CA files.
+	certPEM, err := ca.signOperatorCert(signParams{
+		csr: testCSR(t), org: "system:masters", cn: "operator", ttl: time.Hour,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(clientCA)
+	if _, err := parseLeaf(t, certPEM).Verify(x509.VerifyOptions{
+		Roots:     roots,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		t.Errorf("issued cert does not chain to the client CA: %v", err)
+	}
+}
+
+// TestLoadClusterCAKubeadmSingleCA covers the kubeadm shape: one RSA ca.crt
+// with a PKCS#1 ca.key signs both serving and client certs, so all three
+// paths point at the same files.
+func TestLoadClusterCAKubeadmSingleCA(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial, err := certutil.GenerateSerial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := certutil.NewCATemplate(serial, "kubernetes", time.Now().Add(time.Hour))
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := certutil.EncodeCertPEM(der)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ca, err := loadClusterCA(certPath, keyPath, certPath)
+	if err != nil {
+		t.Fatalf("single-CA (kubeadm) load failed: %v", err)
+	}
+	if string(ca.pem) != string(certPEM) {
+		t.Error("single-CA anchor mismatch")
+	}
 }

@@ -2,11 +2,8 @@ package credrelease
 
 import (
 	"encoding/pem"
-	"math/big"
 	"testing"
 )
-
-func bigOne() *big.Int { return big.NewInt(1) }
 
 // decodeOnePEM decodes a single PEM block and asserts its type.
 func decodeOnePEM(t *testing.T, pemBytes []byte, wantType string) []byte {
