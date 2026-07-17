@@ -282,17 +282,43 @@ a floating tag would be root on every GPU node — so the digest is what's used.
 
 {{- /*
 c8s.attestationApiURL — the attestation-api endpoint injected into the operator
-and CDS. Under kata.enabled the host attestation-api DaemonSet is typically not
-rendered; the kata-guest-base image bakes an in-guest attestation-service on
-loopback, and the components that consume this URL (the operator's get-cert
-sidecars and CDS) run INSIDE the CVM, so they must dial 127.0.0.1, not the
-(absent) host Service.
+and CDS. Three shapes:
+
+  - kata.enabled: the kata-guest-base image bakes an in-guest attestation-service
+    on loopback, and the consumers (the operator's get-cert sidecars and CDS) run
+    INSIDE the CVM, so they dial 127.0.0.1 — not the (absent) host Service.
+  - cvmMode=node: the node image bakes a HOST attestation-api on the node's
+    loopback :8400 (no in-cluster Service). Pod-netns consumers cannot reach host
+    loopback, so they dial the node's own IP via the $(HOST_IP) downward-API env
+    var (c8s.attestationApiHostIPEnv), which the kubelet expands per-node before
+    the process sees the arg. The operator forwards this string verbatim to the
+    tenant get-cert sidecars it injects, so it must stay unexpanded there (the
+    operator container deliberately omits HOST_IP); each tenant pod expands it
+    against its own node.
+  - otherwise: the in-cluster host Service DNS.
 */ -}}
 {{- define "c8s.attestationApiURL" -}}
 {{- if .Values.kata.enabled -}}
 http://127.0.0.1:{{ .Values.attestationApi.port }}
+{{- else if eq (.Values.attestationApi.cvmMode | default "baremetal") "node" -}}
+http://$(HOST_IP):{{ .Values.attestationApi.port }}
 {{- else -}}
 http://{{ include "c8s.attestationApiName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.attestationApi.port }}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+c8s.attestationApiHostIPEnv — the HOST_IP downward-API env var that expands the
+$(HOST_IP) placeholder in c8s.attestationApiURL. Rendered only under
+cvmMode=node, where pod-netns consumers reach the node-baked host attestation-api
+via the node's own IP. Empty in every other mode.
+*/ -}}
+{{- define "c8s.attestationApiHostIPEnv" -}}
+{{- if eq (.Values.attestationApi.cvmMode | default "baremetal") "node" -}}
+- name: HOST_IP
+  valueFrom:
+    fieldRef:
+      fieldPath: status.hostIP
 {{- end -}}
 {{- end -}}
 
@@ -377,6 +403,12 @@ Caller passes a dict:
     {{- range .extraArgs }}
     - {{ . }}
     {{- end }}
+  {{- with (include "c8s.attestationApiHostIPEnv" $root) }}
+  # cvmMode=node: expands $(HOST_IP) in --attestation-api-url to the node IP so
+  # this pod-netns sidecar reaches the node-baked host attestation-api.
+  env:
+    {{- . | nindent 4 }}
+  {{- end }}
   volumeMounts:
     - name: {{ .volume }}
       mountPath: {{ .mountPath }}

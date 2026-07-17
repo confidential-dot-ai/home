@@ -237,6 +237,12 @@ spec:
             - --rate-limiter-idle-timeout={{ .Values.cds.rateLimiterIdleTimeout }}
             - --ratls-platform={{ .Values.cds.ratlsPlatform }}
             - --ratls-cert-ttl={{ .Values.cds.ratlsCertTTL }}
+          {{- with (include "c8s.attestationApiHostIPEnv" .) }}
+          # cvmMode=node: expands $(HOST_IP) in --attestation-api-url to the node
+          # IP so this pod-netns pod reaches the node-baked host attestation-api.
+          env:
+            {{- . | nindent 12 }}
+          {{- end }}
           ports:
             - name: https
               containerPort: {{ .Values.cds.port }}

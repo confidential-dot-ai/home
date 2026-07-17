@@ -1,5 +1,5 @@
 {{- if .Values.ratlsMesh.enabled }}
-{{- $attestationApiURL := printf "http://%s-attestation-api.%s.svc:8400" .Release.Name .Release.Namespace -}}
+{{- $attestationApiURL := include "c8s.attestationApiURL" . -}}
 {{/*
   cds mode points a single --cds-url at the unified CDS, which serves both
   /attest and /ca.
@@ -283,6 +283,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.hostIP
+            {{- /* cvmMode=node: HOST_IP expands $(HOST_IP) in
+                   --attestation-api-url. hostNetwork, so the node IP is this
+                   pod's own — the node-baked host attestation-api. */}}
+            {{- with (include "c8s.attestationApiHostIPEnv" .) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           ports:
             - name: outbound
               containerPort: {{ .Values.ratlsMesh.ports.outbound }}

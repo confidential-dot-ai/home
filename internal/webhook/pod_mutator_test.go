@@ -111,6 +111,43 @@ func TestMutatePodInjectsCertSidecar(t *testing.T) {
 	}
 }
 
+// TestMutatePodCertSidecarCarriesHostIPEnv proves the injected c8s-cert sidecar
+// defines HOST_IP from status.hostIP. Under cvmMode=node the chart passes the
+// operator --attestation-api-url=http://$(HOST_IP):8400 verbatim, forwarded into
+// this sidecar's args; the kubelet expands $(HOST_IP) against the tenant pod's
+// own node so the sidecar reaches the node-baked host attestation-api wherever
+// it lands. The env is unconditional (harmless when the URL has no placeholder).
+func TestMutatePodCertSidecarCarriesHostIPEnv(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+
+	mutatePod(pod, &injection{WorkloadID: "api"}, Config{
+		GetCertImage:      "image",
+		CDSURL:            "http://cds",
+		AttestationApiURL: "http://$(HOST_IP):8400",
+		CertDir:           "/etc/c8s/certs",
+	})
+
+	cert := pod.Spec.InitContainers[0]
+	if !hasArg(cert.Args, "--attestation-api-url=http://$(HOST_IP):8400") {
+		t.Fatalf("c8s-cert args %v missing verbatim $(HOST_IP) URL", cert.Args)
+	}
+	var found bool
+	for _, e := range cert.Env {
+		if e.Name == "HOST_IP" {
+			found = true
+			if e.ValueFrom == nil || e.ValueFrom.FieldRef == nil || e.ValueFrom.FieldRef.FieldPath != "status.hostIP" {
+				t.Fatalf("HOST_IP env = %#v, want fieldRef status.hostIP", e)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("c8s-cert env %#v missing HOST_IP (tenant sidecar cannot expand $(HOST_IP))", cert.Env)
+	}
+}
+
 func TestMutatePodPreservesExistingFSGroup(t *testing.T) {
 	existing := int64(1234)
 	pod := &corev1.Pod{
