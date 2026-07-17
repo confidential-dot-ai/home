@@ -226,11 +226,11 @@ attestation-bound certificate from CDS and renews it. Certificates land in
 
 ### Pod-as-CVM
 
-`--kata` installs the Kata runtime and enforces it: every in-scope workload
+`--cvm-mode=pod` installs the Kata runtime and enforces it: every in-scope workload
 pod becomes a confidential VM, and non-Kata pods are rejected at admission.
 
 ```sh
-c8s install --kata --namespace c8s-system \
+c8s install --cvm-mode=pod --namespace c8s-system \
   --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 \
   --upstream vllm
 ```

@@ -47,7 +47,7 @@
 {{- if .Values.attestationApi.enabled -}}{{- $hostSide = append $hostSide "attestationApi.enabled" -}}{{- end -}}
 {{- if .Values.nriImagePolicy.enabled -}}{{- $hostSide = append $hostSide "nriImagePolicy.enabled" -}}{{- end -}}
 {{- with $hostSide -}}
-{{- fail (printf "VALIDATION_ERROR kind=enforce_host_components: kata.enabled=true requires %s =false. kata is enforcing — every workload runs as a kata CVM, where these host-side components are replaced by their in-guest counterparts in the kata-guest-base image (in-VM ratls routing, in-guest attestation-api on loopback, in-guest policy-monitor image admission). `c8s install --kata` sets them for you." (join ", " .)) -}}
+{{- fail (printf "VALIDATION_ERROR kind=enforce_host_components: kata.enabled=true requires %s =false. kata is enforcing — every workload runs as a kata CVM, where these host-side components are replaced by their in-guest counterparts in the kata-guest-base image (in-VM ratls routing, in-guest attestation-api on loopback, in-guest policy-monitor image admission). `c8s install --cvm-mode=pod` sets them for you." (join ", " .)) -}}
 {{- end -}}
 {{- end -}}
 {{- if and .Values.nriImagePolicy.enabled (not .Values.cds.image.digest) -}}

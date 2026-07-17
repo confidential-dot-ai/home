@@ -45,7 +45,6 @@ var (
 	installGetCertRunAsGroup    int64
 	installGetCertRunAsNonRoot  bool
 
-	installKata             bool
 	installKataDebug        bool
 	installCvmMode          string
 	installHardwarePlatform string
@@ -70,6 +69,14 @@ const (
 	flagWorkloadRef      = "workload-ref"
 	flagUpstream         = "upstream"
 )
+
+// allowedCvmModes is the --cvm-mode enum. pod is per-pod confidential VMs via
+// the Kata runtime (what --kata used to select before this replaced it); node/gke/aks are host-shaped
+// deployments. There is no default: the shape must be stated explicitly.
+var allowedCvmModes = []string{"pod", "node", "gke", "aks"}
+
+// cvmModeIsPod reports whether the mode selects the Kata per-pod-CVM stack.
+func cvmModeIsPod(cvmMode string) bool { return cvmMode == "pod" }
 
 // c8sComponent maps a chart image to the helm value keys --resolve-digests
 // pins. valuePrefix is the values path whose image the chart renders;
@@ -333,9 +340,9 @@ func podBindsHostPort(p corev1.Pod, port int32) bool {
 // preflightTDXNodes fails fast when --hardware-platform=tdx but no node carries
 // the confidential.ai/tdx=true label — the label the kata-qemu-tdx*
 // RuntimeClass nodeSelectors expect (kata.tdxNodeSelector default). On the
-// default --kata path the install applies it itself right before this check
+// default pod (kata) path the install applies it itself right before this check
 // (autoLabelTEENodes, trusting --hardware-platform), so a failure there means
-// no node matched the kata node selector at all; with -f, or without --kata
+// no node matched the kata node selector at all; with -f, or outside --cvm-mode=pod
 // (e.g. --cvm-mode=node), the operator owns the label. Without a labelled
 // node, TDX pods would sit Pending until timeout with an opaque scheduler
 // error.
@@ -353,13 +360,13 @@ func preflightTDXNodes(ctx context.Context) error {
 		return fmt.Errorf("kubectl get nodes -l %s=true: %w", tdxHostLabelKey, err)
 	}
 	if strings.TrimSpace(string(out)) == "" {
-		return fmt.Errorf("--hardware-platform=tdx but no node is labelled %s=true. A default `c8s install --kata` labels every kata-targeted node automatically, so either no node matched the kata node selector, or this is a -f/non-kata install where labels are yours to manage. A TDX node also needs /dev/tdx_guest available, qgsd (Intel DCAP Quote Generation Service) running, and a socat unix→vsock bridge so kata's QGS-over-vsock path reaches qgsd. To label a host yourself:\n\n    kubectl label node <node> %s=true",
+		return fmt.Errorf("--hardware-platform=tdx but no node is labelled %s=true. A default `c8s install --cvm-mode=pod` labels every kata-targeted node automatically, so either no node matched the kata node selector, or this is a -f/non-pod install where labels are yours to manage. A TDX node also needs /dev/tdx_guest available, qgsd (Intel DCAP Quote Generation Service) running, and a socat unix→vsock bridge so kata's QGS-over-vsock path reaches qgsd. To label a host yourself:\n\n    kubectl label node <node> %s=true",
 			tdxHostLabelKey, tdxHostLabelKey)
 	}
 	return nil
 }
 
-// preflightTEENodes fails fast (before the helm install) when a --kata
+// preflightTEENodes fails fast (before the helm install) when a --cvm-mode=pod
 // install would schedule confidential pods that can never start: the
 // platform's confidential RuntimeClasses select platform-labelled nodes
 // (kata.snpNodeSelector / kata.tdxNodeSelector), and the chart-managed CDS
@@ -566,12 +573,12 @@ var installCmd = &cobra.Command{
   - the CDS trust root (attestation, EAR issuance, mesh CA, leaf signing)
   - the ratls-mesh, nri-image-policy, and tls-lb components
 
-Under --kata the install is ENFORCING: every workload pod runs as a kata VM
+Under --cvm-mode=pod the install is ENFORCING: every workload pod runs as a kata VM
 (injected and validated at admission), and the host-side ratls-mesh,
 attestation-api, and nri-image-policy are replaced by their in-guest
 counterparts baked into the kata-guest-base image.
 
---debug (with --kata) selects the kata-guest-base DEBUG image variant, whose
+--debug (with --cvm-mode=pod) selects the kata-guest-base DEBUG image variant, whose
 baked guest policy allows the host log/exec stream RPCs so 'kubectl logs' and
 'kubectl exec' work against kata pods. Container I/O then crosses the TEE
 boundary in plaintext, and the debug image's SNP launch measurement differs
@@ -595,7 +602,7 @@ render guards then require those values.
 When the c8s images live in a registry that requires authentication, create a
 kubernetes.io/dockerconfigjson Secret in the release namespace and pass
 --image-pull-secret <name>: the chart wires it into every component's
-imagePullSecrets, so pods authenticate from first start. Under --kata the
+imagePullSecrets, so pods authenticate from first start. Under --cvm-mode=pod the
 same Secret also authenticates the kata-image-puller's in-pod oras pull of
 the kata-guest-base artifact (override: kata.guestImage.pullerAuthSecret).
 This is the cluster-side (kubelet) credential; digest resolution runs locally
@@ -611,12 +618,15 @@ tls-lb routes its catch-all to that adopted workload's headless Service
 (c8s-<id>.<ns>.svc.cluster.local:<port>). With --resolve-digests, install also
 resolves adopted workload images into nriImagePolicy.bootstrapAllowlist.digests
 so image admission (the host NRI plugin, or the in-guest policy-monitor under
---kata) allows those rollouts.
+--cvm-mode=pod) allows those rollouts.
 
 Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 --resolve-digests=false.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := validateKataDebugFlags(installKata, installKataDebug); err != nil {
+		if err := validateCvmMode(installCvmMode); err != nil {
+			return err
+		}
+		if err := validateDebugFlag(installCvmMode, installKataDebug); err != nil {
 			return err
 		}
 		adoptions, err := collectWorkloadAdoptions(installWorkloadRefs)
@@ -709,7 +719,7 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 			return err
 		}
 		defer os.Remove(computedValues)
-		helmArgs := buildInstallHelmArgs(chartPath, computedValues, installValues, installCRDs, installWait, installKata)
+		helmArgs := buildInstallHelmArgs(chartPath, computedValues, installValues, installCRDs, installWait, cvmModeIsPod(installCvmMode))
 
 		// Fail fast on the default path if the CDS node is unlabelled, before
 		// mutating the cluster. Skipped when -f is supplied: a custom values
@@ -746,7 +756,7 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 			}
 		}
 
-		// --kata: label every kata-targeted node for the declared
+		// --cvm-mode=pod: label every kata-targeted node for the declared
 		// --hardware-platform (refusing if the other platform's label is
 		// still present — a platform switch must be the operator's explicit
 		// act), then fail fast if the platform's confidential pods still
@@ -756,7 +766,7 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 		// with -f, whose owner owns node labels; NOT skipped under
 		// --single-node — even a one-node cluster needs its platform label
 		// for confidential pods to schedule.
-		kataDefaultPath := installKata && len(installValues) == 0
+		kataDefaultPath := cvmModeIsPod(installCvmMode) && len(installValues) == 0
 		if kataDefaultPath {
 			if err := autoLabelTEENodes(cmd.Context(), chartPath, installHardwarePlatform); err != nil {
 				return err
@@ -767,10 +777,10 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 		}
 
 		// Fail fast when --hardware-platform=tdx but no node carries the TDX
-		// label. Under --kata the TDX RuntimeClasses have a nodeSelector on
+		// label. Under --cvm-mode=pod the TDX RuntimeClasses have a nodeSelector on
 		// it; under --cvm-mode=node the attestationApi DaemonSet needs at
 		// least one TDX-capable node. Checks a fact about the cluster, not
-		// the values, so it runs with -f too — but the default --kata path
+		// the values, so it runs with -f too — but the default pod (kata) path
 		// above already checked the chart's actual tdxNodeSelector (which
 		// may be customized or cleared), so skip the fixed-key check there.
 		if installHardwarePlatform == "tdx" && installCvmMode != "aks" && !kataDefaultPath {
@@ -782,8 +792,8 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 		// The install always ships pods that exceed the restricted pod-security
 		// profile: nri-image-policy runs privileged unconditionally, ratls-mesh's
 		// iptables init containers run as root with NET_ADMIN/NET_RAW, and
-		// attestation-api needs SYS_RAWIO (baremetal/gke) or privileged (aks).
-		// --kata adds kata-deploy on top. No supported shape fits restricted, so
+		// attestation-api needs SYS_RAWIO (node/gke) or privileged (aks).
+		// --cvm-mode=pod adds kata-deploy on top. No supported shape fits restricted, so
 		// the namespace is always labelled privileged (a CIS-hardened cluster, e.g.
 		// RKE2 with profile: cis, would otherwise reject those pods at admission).
 		if err := applyNamespace(cmd.Context(), installNamespace); err != nil {
@@ -885,7 +895,7 @@ func defaultInstallImageTag(buildVersion string) string {
 // load-bearing: the operator's -f files come first and the computed values file
 // LAST, so the CLI's computed values win on the keys they set (helm merges -f
 // last-wins) — matching the prior "--set beats -f" precedence. --skip-crds is a
-// helm invocation flag (not a value), emitted iff CRDs are skipped. A --kata
+// helm invocation flag (not a value), emitted iff CRDs are skipped. A pod-mode (kata)
 // install waits 10m instead of 5m: on a node without a prior kata install,
 // kata-deploy downloads the multi-GB kata-static payload inside the --wait
 // window, and 5m routinely left the release `failed` with the cluster
@@ -972,7 +982,7 @@ func appendInstallCRDArgs(setArgs []string, installCRDs bool) []string {
 // appendDistroInstallArgs translates the detected host distro into the
 // per-component values. Both targets are always set — each install shape uses
 // exactly one of them (nri-image-policy on the host shape, kata-deploy under
-// --kata) and both must bind the containerd config layout the host distro
+// --cvm-mode=pod) and both must bind the containerd config layout the host distro
 // uses; the unused one is inert. No enum guard: the value comes from
 // chooseDistro, and the chart re-validates anyway.
 func appendDistroInstallArgs(helmArgs []string, distro string) []string {
@@ -990,13 +1000,18 @@ func appendDistroInstallArgs(helmArgs []string, distro string) []string {
 // level — all modes render privileged: true, since a hostPath device mount alone
 // does not grant device-cgroup access):
 //
-//	baremetal, node, gke → native /dev/sev-guest (SEV-SNP) by default, or
-//	                       /dev/tdx-guest (Intel TDX) if --hardware-platform tdx
-//	aks                  → vTPM /dev/tpm0
+//	pod, node, gke → native /dev/sev-guest (SEV-SNP) by default, or
+//	                 /dev/tdx-guest (Intel TDX) if --hardware-platform tdx
+//	aks            → vTPM /dev/tpm0
 //
-// node and gke are distinct deployment targets that happen to share the
+// pod, node, and gke are distinct deployment targets that happen to share the
 // native-TEE-device wiring (they are NOT aliases):
 //
+//	pod  → per-pod confidential VMs via the Kata runtime: every workload pod is
+//	       a kata CVM. appendKataInstallArgs turns on the kata stack and turns
+//	       off host-side attestation-api/nri/ratls-mesh (served by the in-guest
+//	       counterparts baked into kata-guest-base). The device is still mounted
+//	       for the host-side attestation-api that kata-guest-base derives from.
 //	node → generalized node-as-CVM: our own nodes (bare-metal TDX/SNP,
 //	       self-managed) are themselves confidential VMs. Pods run as ordinary
 //	       processes attested via the node's own quote. Cloud-agnostic. The node
@@ -1013,7 +1028,7 @@ func appendDistroInstallArgs(helmArgs []string, distro string) []string {
 // hostPath CharDevice check.
 //
 // `--cvm-mode` (deployment shape) and `--hardware-platform` (CPU TEE) are
-// ORTHOGONAL axes. baremetal/gke pair with either SEV-SNP
+// ORTHOGONAL axes. pod/node/gke pair with either SEV-SNP
 // (--hardware-platform sev-snp, default) or Intel TDX (--hardware-platform
 // tdx). aks uses its own vTPM path regardless, and combining `--cvm-mode aks`
 // with `--hardware-platform tdx` is refused (AKS doesn't expose
@@ -1032,9 +1047,8 @@ func appendDistroInstallArgs(helmArgs []string, distro string) []string {
 // GitOps/HelmRelease installs get it too), not emitted as a --set here; see
 // internal/helmchart/c8s/templates/webhook.yaml.
 func appendCvmModeInstallArgs(helmArgs []string, cvmMode, hardwarePlatform string) ([]string, error) {
-	allowedModes := []string{"baremetal", "node", "gke", "aks"}
-	if !slices.Contains(allowedModes, cvmMode) {
-		return nil, fmt.Errorf("--%s must be one of %s, got %q", flagCvmMode, strings.Join(allowedModes, ", "), cvmMode)
+	if !slices.Contains(allowedCvmModes, cvmMode) {
+		return nil, fmt.Errorf("--%s must be one of %s, got %q", flagCvmMode, strings.Join(allowedCvmModes, ", "), cvmMode)
 	}
 	allowedPlatforms := []string{"sev-snp", "tdx"}
 	if !slices.Contains(allowedPlatforms, hardwarePlatform) {
@@ -1046,8 +1060,8 @@ func appendCvmModeInstallArgs(helmArgs []string, cvmMode, hardwarePlatform strin
 	helmArgs = append(helmArgs, "--set-string", "attestationApi.cvmMode="+cvmMode)
 	// aks: vTPM regardless of --hardware-platform (validated above; only
 	// --hardware-platform sev-snp reaches here)
-	// baremetal/gke + --hardware-platform sev-snp: native /dev/sev-guest
-	// baremetal/gke + --hardware-platform tdx:     native /dev/tdx-guest
+	// pod/node/gke + --hardware-platform sev-snp: native /dev/sev-guest
+	// pod/node/gke + --hardware-platform tdx:     native /dev/tdx-guest
 	sevGuest, tdxGuest, tpm := "false", "false", "false"
 	switch {
 	case cvmMode == "aks":
@@ -1089,19 +1103,35 @@ func appendCvmModeInstallArgs(helmArgs []string, cvmMode, hardwarePlatform strin
 	return helmArgs, nil
 }
 
-// validateKataDebugFlags rejects --debug without --kata: the flag selects the
+// validateDebugFlag rejects --debug outside --cvm-mode=pod: the flag selects the
 // kata-guest-base debug image, which only exists under the kata stack, so a
 // bare --debug is meaningless and almost certainly a mistaken expectation
 // (e.g. hoping for verbose install output). Checked first in RunE, before
 // anything touches the cluster.
-func validateKataDebugFlags(kata, debug bool) error {
-	if debug && !kata {
-		return fmt.Errorf("--debug selects the kata-guest-base debug image, which only exists under --kata; add --kata or drop --debug")
+// validateCvmMode enforces that --cvm-mode is set and is a known shape. There
+// is no default: an unstated deployment shape silently mismatching the cluster
+// (baked vs chart-provided attestation stack, kata vs plain runtime) is exactly
+// the failure this makes impossible.
+func validateCvmMode(cvmMode string) error {
+	if cvmMode == "" {
+		return fmt.Errorf("--%s is required; one of %s", flagCvmMode, strings.Join(allowedCvmModes, ", "))
+	}
+	if !slices.Contains(allowedCvmModes, cvmMode) {
+		return fmt.Errorf("--%s must be one of %s, got %q", flagCvmMode, strings.Join(allowedCvmModes, ", "), cvmMode)
 	}
 	return nil
 }
 
-// appendKataInstallArgs translates --kata into helm --set values. kata is
+// validateDebugFlag rejects --debug outside --cvm-mode=pod: the flag selects the
+// kata-guest-base debug image, which only exists under the pod (kata) stack.
+func validateDebugFlag(cvmMode string, debug bool) error {
+	if debug && !cvmModeIsPod(cvmMode) {
+		return fmt.Errorf("--debug selects the kata-guest-base debug image, which only exists under --%s=pod; set --%s=pod or drop --debug", flagCvmMode, flagCvmMode)
+	}
+	return nil
+}
+
+// appendKataInstallArgs translates --cvm-mode=pod into helm --set values. kata is
 // enforcing — there is no kata-without-enforcement shape: the chart renders
 // the runtime stack, the runtimeClass-injecting webhook behavior, and the
 // ValidatingAdmissionPolicy together off kata.enabled.
@@ -1117,11 +1147,11 @@ func validateKataDebugFlags(kata, debug bool) error {
 // derives the `<tag>-debug` artifact tag). The confidential-GPU stack (runtime
 // class, shim, GPU image puller, sandbox device plugin) ships with every kata
 // install — it renders off kata.enabled, so there is no GPU flag here. RunE
-// rejects --debug without --kata before args are built; everything here still
+// rejects --debug outside --cvm-mode=pod before args are built; everything here still
 // keys on kata so a call-order change cannot emit a debug value for a non-kata
 // install.
-func appendKataInstallArgs(helmArgs []string, kata, debug bool) []string {
-	if !kata {
+func appendKataInstallArgs(helmArgs []string, cvmMode string, debug bool) []string {
+	if !cvmModeIsPod(cvmMode) {
 		return helmArgs
 	}
 	helmArgs = append(helmArgs,
@@ -1668,10 +1698,9 @@ func init() {
 	installCmd.Flags().BoolVar(&installSingleNode, "single-node", false, "single-node / single-CVM cluster: clear the dedicated-CDS-node selector and taint toleration so every node is CDS-eligible (no role=cds label or dedicated node needed). Sets cds.node.selector={} and cds.node.tolerations=[]")
 	installCmd.Flags().StringSliceVar(&installWorkloadRefs, flagWorkloadRef, nil, "existing workload to adopt as a c8s confidential workload, as <cw-id>=<namespace>/<kind>/<name>[:<port>]; repeatable. Kind is any resource exposing a pod template at spec.template (deployment, statefulset, daemonset, or an operator CRD such as <kind>.<group>). The optional :<port> is the tls-lb upstream port, needed on the ref --upstream selects")
 	installCmd.Flags().StringVar(&installUpstream, flagUpstream, "", "confidential.ai/cw id of the adopted --workload-ref workload tls-lb routes its catch-all to; derives the mesh-wrapped upstream c8s-<id>.<ns>.svc.cluster.local:<port> from that ref's :<port>. Without this or a verified-https tlsLb.upstream, tls-lb renders no catch-all route until one is attached")
-	installCmd.Flags().StringVar(&installCvmMode, flagCvmMode, "baremetal", "CVM deployment shape (orthogonal to --hardware-platform): baremetal, or node (generalized node-as-CVM: our own TDX/SNP nodes are themselves confidential VMs, pods run as ordinary processes), or gke (GKE managed confidential VMs), or aks (vTPM /dev/tpm0). All modes render a privileged attestation-api (a hostPath device mount alone does not grant device-cgroup access)")
+	installCmd.Flags().StringVar(&installCvmMode, flagCvmMode, "", "CVM deployment shape (REQUIRED; orthogonal to --hardware-platform): pod (per-pod confidential VMs via the Kata runtime — every workload pod is a kata CVM, host-side attestation-api/nri/ratls-mesh served by the in-guest counterparts), node (generalized node-as-CVM: our own TDX/SNP nodes are themselves confidential VMs, pods run as ordinary processes, attestation-api + nri baked into the node image), gke (GKE managed confidential VMs), or aks (vTPM /dev/tpm0)")
 	installCmd.Flags().StringVar(&installHardwarePlatform, flagHardwarePlatform, "sev-snp", "CPU-level TEE hardware (orthogonal to --cvm-mode): sev-snp (default, /dev/sev-guest) or tdx (Intel TDX, /dev/tdx-guest). Ignored when --cvm-mode=aks (Azure vTPM path); combining --cvm-mode=aks with --hardware-platform=tdx is refused")
-	installCmd.Flags().BoolVar(&installKata, "kata", false, "install and enforce the Kata Containers runtime stack: every workload pod runs as a confidential VM (kata RuntimeClass injected; non-kata classes rejected), including NVIDIA GPU pods. Labels every kata node for the declared --hardware-platform (clearing the other platform's label), failing fast when no node qualifies")
-	installCmd.Flags().BoolVar(&installKataDebug, "debug", false, "use the kata-guest-base DEBUG guest variant (<tag>-debug): kubectl logs/exec work on kata pods, but container I/O becomes readable by the untrusted host and the launch measurement differs from the locked image. Requires --kata; development only")
+	installCmd.Flags().BoolVar(&installKataDebug, "debug", false, "use the kata-guest-base DEBUG guest variant (<tag>-debug): kubectl logs/exec work on kata pods, but container I/O becomes readable by the untrusted host and the launch measurement differs from the locked image. Requires --cvm-mode=pod; development only")
 	installCmd.Flags().BoolVar(&installResolveDigests, "resolve-digests", true, "resolve each c8s component image tag to its registry digest (via crane), pin it, and add the resolved images to the NRI allowlist (enables deriveComponents). On by default; pass --resolve-digests=false when supplying digests via -f")
 	installCmd.Flags().StringVar(&installImagePullSecret, "image-pull-secret", "", "name of an existing registry-credential Secret (kubernetes.io/dockerconfigjson) in the release namespace; the chart appends it to every component's imagePullSecrets, so all pods can pull the c8s images from an authenticated registry (e.g. a private mirror) from first start. The Secret itself is never created or managed by the install — the install fails fast if it is missing or has the wrong type")
 	installCmd.Flags().StringVar(&installImageTag, "image-tag", "", "component image tag to resolve digests at (default: the CLI build version, or 'main' for an unstamped build). Override to pin a specific branch/tag/release")

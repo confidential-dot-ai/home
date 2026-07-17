@@ -15,7 +15,7 @@ metadata:
     stays authoritative across re-installs. An explicit webhook.annotations
     value for the same key wins.
   */}}
-  {{- if and (eq (.Values.attestationApi.cvmMode | default "baremetal") "aks") (not (hasKey $webhookAnnotations "admissions.enforcer/disabled")) }}
+  {{- if and (eq (.Values.attestationApi.cvmMode | default "node") "aks") (not (hasKey $webhookAnnotations "admissions.enforcer/disabled")) }}
   {{- $_ := set $webhookAnnotations "admissions.enforcer/disabled" "true" }}
   {{- end }}
   {{- with $webhookAnnotations }}

@@ -622,14 +622,22 @@ cache_max_entries = 1024
 
 {{/*
   c8s.serveAllowlistSeed is true when CDS should render the --allowlist-seed
-  ConfigMap/flag/mount. Two admission shapes consume CDS's served allowlist and
-  so need the seed: the host NRI plugin (nriImagePolicy.enabled), and the
-  in-guest policy-monitor baked into the kata-guest-base image (kata.enabled),
-  where the host plugin is off. Gating on nriImagePolicy.enabled alone dropped
-  the seed under kata, so adopted --workload-ref digests never reached CDS.
+  ConfigMap/flag/mount. Three admission shapes consume CDS's served allowlist
+  and so need the seed:
+    - the chart's host NRI plugin (nriImagePolicy.enabled),
+    - the in-guest policy-monitor baked into the kata-guest-base image
+      (kata.enabled, i.e. --cvm-mode=pod), where the host plugin is off, and
+    - the BAKED host NRI plugin on a node-as-CVM (--cvm-mode=node), where the
+      chart's nriImagePolicy is disabled because the node image bakes the
+      plugin — but that plugin still pulls the live allowlist from CDS, so the
+      seed must be served or CDS starts empty and every un-baked component
+      (operator, ratls-mesh, tls-lb's nginx, adopted workloads) is denied
+      until an operator hand-runs `c8s allowlist add`.
+  Gating on nriImagePolicy.enabled alone dropped the seed under both pod and
+  node mode.
 */}}
 {{- define "c8s.serveAllowlistSeed" -}}
-{{- or .Values.nriImagePolicy.enabled .Values.kata.enabled -}}
+{{- or .Values.nriImagePolicy.enabled .Values.kata.enabled (eq .Values.attestationApi.cvmMode "node") -}}
 {{- end -}}
 
 {{/*

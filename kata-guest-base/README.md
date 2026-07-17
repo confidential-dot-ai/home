@@ -8,7 +8,7 @@ kata-containers runtime on each c8s node; kata-runtime boots this guest
 for every `runtimeClassName: kata-qemu-snp*` pod. The pod *is* the
 SEV-SNP confidential VM — its memory is encrypted against the host. See
 [`../docs/kata-guest-base.md`](../docs/kata-guest-base.md) for the design
-rationale, the attestation flow, and how it fits into `c8s install --kata`.
+rationale, the attestation flow, and how it fits into `c8s install --cvm-mode=pod`.
 
 ## Boot model — why this is NOT an IGVM/UKI image
 
@@ -189,7 +189,7 @@ only, never production. Because the policy is in the dm-verity root, the
 debug image's launch measurement necessarily differs from the locked one:
 attestation pinned to the locked reference value rejects debug guests, so
 a debug image can't silently stand in for a locked one. Select it with
-`c8s install --kata --debug` (`kata.guestImage.debug=true`).
+`c8s install --cvm-mode=pod --debug` (`kata.guestImage.debug=true`).
 
 ## Constraints
 

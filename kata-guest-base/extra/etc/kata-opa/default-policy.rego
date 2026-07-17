@@ -36,7 +36,7 @@
 #   it (e.g. to add a non-permissive default to some RPC), the operator
 #   rebuilds the guest image and rolls kata-qemu-snp pods to pick up the
 #   new kata-guest-base tag by setting `kata.guestImage.tag` in a values
-#   file (`c8s install --kata -f values.yaml`).
+#   file (`c8s install --cvm-mode=pod -f values.yaml`).
 #
 # Historical note:
 #

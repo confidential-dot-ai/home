@@ -121,7 +121,7 @@ mesh client (ratls-mesh, nri-image-policy, get-cert, policy-monitor — all
 
 `internal/webhook/pod_mutator.go` + `internal/helmchart/c8s/templates/kata.yaml`
 
-A `--kata` install renders the GPU RuntimeClass, shim, puller, and device plugin
+A `--cvm-mode=pod` install renders the GPU RuntimeClass, shim, puller, and device plugin
 off `kata.enabled`, but the *injection* — the platform's confidential classes
 for `confidential.ai/cw` and `nvidia.com/*` pods — lives in the operator binary
 (`kataRuntimeClassFor`). The chart and the operator binary ship as a unit: bump
@@ -208,7 +208,7 @@ cannot boot: QEMU SIGABRTs (`kvm run failed Input/output error`, vCPU dead at
 the reset vector; dmesg: `kvm_intel: Guest access before accepting 0x807000`)
 and kubelet retries forever — an unbounded crash-loop spamming register dumps
 every ~90 s, not an error surfaced on the pod. Since the chart pins
-`kata-qemu-snp` on CDS and tls-lb, a `--kata` install on such a
+`kata-qemu-snp` on CDS and tls-lb, a `--cvm-mode=pod` install on such a
 host crash-loops its own control plane.
 
 Two guards exist; keep both intact:
@@ -217,7 +217,7 @@ Two guards exist; keep both intact:
    `scheduling.nodeSelector` on the `confidential.ai/sev-snp=true` label
    (`kata.snpNodeSelector`), so a confidential pod on an unlabelled node stays
    `Pending` with a clear scheduling message;
-2. `c8s install --kata` labels every kata-targeted node from the declared
+2. `c8s install --cvm-mode=pod` labels every kata-targeted node from the declared
    `--hardware-platform` (`cmd/c8s/tee_label.go` — declarative, no hardware
    probe; it refuses to run while any node still carries the other
    platform's label, printing the clear command) and fails fast when no
@@ -273,7 +273,7 @@ values) to wire it into every component's `imagePullSecrets` at install time
 
 cds's RA-TLS serving cert needs SNP evidence from `/dev/sev-guest`, which only
 exists **inside** an SNP guest (the host has `/dev/sev`, not `/dev/sev-guest`).
-The non-kata probes are httpGet/HTTPS. So running cds as host runc (no `--kata`)
+The non-kata probes are httpGet/HTTPS. So running cds as host runc (no `--cvm-mode=pod`)
 on bare metal has no clean Ready path — it is intended to run as `kata-qemu-snp`
 (gated on `kata.enabled`). For a non-confidential dev box, disable cds's RA-TLS
 (`cds.ratlsPlatform=""`, plaintext) and expect the HTTPS probe to fail.
@@ -366,7 +366,7 @@ Error response from registry: failed to resolve <tag>: GET …/manifests/<tag>: 
 exactly where `oras` looks (the container runs as root under
 `privileged: true`, so `$HOME=/root`). That Secret defaults to the
 install-time `imagePullSecret`, so a plain
-`c8s install --kata --image-pull-secret ghcr-secret` covers the oras pull
+`c8s install --cvm-mode=pod --image-pull-secret ghcr-secret` covers the oras pull
 along with every kubelet pull. Set `kata.guestImage.pullerAuthSecret` only
 when the artifact needs a different credential than the c8s images:
 
@@ -507,12 +507,12 @@ mesh-trust-assuming endpoints on 8443 in kata pods; rebuild the guest image
 with the variable emptied for a fully-meshed posture (front doors then need
 `kubectl port-forward` + a mesh client cert, i.e. are effectively internal).
 
-## First `--kata` install can exceed helm's `--wait` window
+## First `--cvm-mode=pod` install can exceed helm's `--wait` window
 
 `cmd/c8s/install.go` (`buildInstallHelmArgs`)
 
 On a node without a prior kata install, kata-deploy downloads the multi-GB kata
-payload inside the helm `--wait` window. `c8s install --kata` therefore waits
+payload inside the helm `--wait` window. `c8s install --cvm-mode=pod` therefore waits
 10 minutes (vs 5 for non-kata installs), which covers typical first installs —
 but a slow registry path can still blow it: the release lands as `failed` while
 the cluster converges fine underneath, and a second `c8s install` run (helm
@@ -525,7 +525,7 @@ check the pods first.
 
 The kata sweep removes `confidential.ai/sev-snp` / `confidential.ai/tdx`
 along with the kata artifacts. A subsequent
-`c8s install --kata -f <values>` can fail fast at the TDX/SNP node check (the
+`c8s install --cvm-mode=pod -f <values>` can fail fast at the TDX/SNP node check (the
 auto-label path doesn't cover every `-f` shape). Relabel by hand and rerun.
 
 ## `cds.node.selector: null` in a values file does not survive helm's multi-file merge

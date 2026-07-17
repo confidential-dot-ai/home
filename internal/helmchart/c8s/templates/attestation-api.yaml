@@ -87,7 +87,7 @@ spec:
             - name: http
               containerPort: {{ .Values.attestationApi.port }}
           securityContext:
-            {{- if has .Values.attestationApi.cvmMode (list "baremetal" "node" "gke" "aks") }}
+            {{- if has .Values.attestationApi.cvmMode (list "pod" "node" "gke" "aks") }}
             # All modes need privileged. A hostPath device mount does NOT add a
             # device-cgroup rule, so open(/dev/sev-guest|/dev/tdx-guest|/dev/tpm0)
             # is EPERM from an unprivileged container regardless of SYS_RAWIO
@@ -107,7 +107,7 @@ spec:
             seccompProfile:
               type: RuntimeDefault
             {{- else }}
-{{ fail (printf "attestationApi.cvmMode must be one of baremetal, node, gke, aks (got %q)" .Values.attestationApi.cvmMode) }}
+{{ fail (printf "attestationApi.cvmMode must be one of pod, node, gke, aks (got %q)" .Values.attestationApi.cvmMode) }}
             {{- end }}
           volumeMounts:
             - name: config

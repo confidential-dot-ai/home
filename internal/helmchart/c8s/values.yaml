@@ -293,7 +293,7 @@ attestationApi:
   ## so the host DaemonSet is redundant (and crashloops on bare-metal nodes
   ## that don't attest as a TEE). c8s.attestationApiURL then resolves to the
   ## in-guest loopback endpoint for in-CVM consumers. Must be false under
-  ## kata.enabled (`c8s install --kata` sets it).
+  ## kata.enabled (`c8s install --cvm-mode=pod` sets it).
   enabled: true
   image:
     repository: ghcr.io/confidential-dot-ai/attestation-api
@@ -326,11 +326,13 @@ attestationApi:
     - gcp-tdx
   ## CVM platform shape — selects (via the install CLI) the TEE device:
   ##
-  ## baremetal (default): bare-metal CVM, native /dev/sev-guest.
-  ## node: generalized node-as-CVM — our own nodes (self-managed TDX/SNP) are
-  ##   themselves confidential VMs exposing a native TEE device (/dev/sev-guest,
-  ##   or /dev/tdx-guest with --hardware-platform tdx); pods run as ordinary
-  ##   processes attested via the node's own quote. Cloud-agnostic.
+  ## pod: per-pod confidential VMs via the Kata runtime — every workload pod is
+  ##   a kata CVM; host-side attestation-api/nri/ratls-mesh are disabled and
+  ##   served by the in-guest counterparts. Native TEE device.
+  ## node (default): generalized node-as-CVM — our own nodes (self-managed
+  ##   TDX/SNP) are themselves confidential VMs exposing a native TEE device
+  ##   (/dev/sev-guest, or /dev/tdx-guest with --hardware-platform tdx); pods run
+  ##   as ordinary processes attested via the node's own quote. Cloud-agnostic.
   ## gke: GKE managed confidential VM — also native /dev/sev-guest.
   ## aks: Azure confidential VM — SEV-SNP via the vTPM at /dev/tpm0.
   ##
@@ -338,7 +340,10 @@ attestationApi:
   ## device-cgroup rule, so open() on the TEE device is EPERM from an unprivileged
   ## container regardless of SYS_RAWIO. TODO: drop privileged by routing SNP attest
   ## through the TSM configfs report interface (/sys/kernel/config/tsm/report).
-  cvmMode: baremetal
+  ##
+  ## The install CLI requires --cvm-mode explicitly (no default there); this
+  ## chart default serves GitOps/HelmRelease consumers that set values directly.
+  cvmMode: node
   ## Unused while all modes render privileged: true (see cvmMode above). Retained
   ## for the planned least-privilege configfs path.
   securityContext:
@@ -381,7 +386,7 @@ attestationApi:
 ## Kubernetes 1.30+ (ValidatingAdmissionPolicy v1), and the host-side
 ## ratls-mesh, attestation-api, and nriImagePolicy must be disabled — their
 ## function runs inside the kata-guest-base image (the render fails
-## otherwise; `c8s install --kata` sets all of it).
+## otherwise; `c8s install --cvm-mode=pod` sets all of it).
 kata:
   enabled: false
   image:
@@ -429,7 +434,7 @@ kata:
   ## scheduling.nodeSelector on the confidential SNP RuntimeClasses so a
   ## wrong-TEE node leaves pods Pending instead of crash-looping QEMU (see
   ## docs/pitfalls.md "kata-qemu-snp on a non-SNP host"). Scheduling aid, not
-  ## a security boundary — attestation is. `c8s install --kata` applies it to
+  ## a security boundary — attestation is. `c8s install --cvm-mode=pod` applies it to
   ## every kata-targeted node (declarative, no probe); -f/GitOps installs
   ## label out-of-band. Swept by `c8s uninstall` — keep in lockstep with
   ## snpCapabilityNodeLabel in cmd/c8s/uninstall.go. Set {} for unrestricted
@@ -438,7 +443,7 @@ kata:
   snpNodeSelector:
     confidential.ai/sev-snp: "true"
   ## TDX twin of snpNodeSelector: rendered as scheduling.nodeSelector on the
-  ## confidential TDX RuntimeClasses, applied by `c8s install --kata
+  ## confidential TDX RuntimeClasses, applied by `c8s install --cvm-mode=pod
   ## --hardware-platform=tdx`, swept by `c8s uninstall` — keep in lockstep
   ## with tdxHostLabelKey in cmd/c8s/install.go. Same opt-out and
   ## repoint-at-NFD semantics as snpNodeSelector.
@@ -478,7 +483,7 @@ kata:
     ## tolerates a non-CC GPU instead of refusing to boot. The debug launch
     ## measurement differs from the locked one, so attestation pinned to the
     ## locked reference value rejects debug guests. Dev/debugging only;
-    ## `c8s install --kata --debug` sets this.
+    ## `c8s install --cvm-mode=pod --debug` sets this.
     debug: false
     ## Pull the kata-guest-base oras artifact over plain HTTP (no TLS). For a
     ## local / in-cluster registry mirror only. Never set for a real registry.
@@ -547,7 +552,7 @@ kata:
         memory: 256Mi
 
   ## Confidential GPU (NVIDIA). Ships with every kata install — no
-  ## gpu.enabled: `c8s install --kata` renders the GPU shim + RuntimeClass,
+  ## gpu.enabled: `c8s install --cvm-mode=pod` renders the GPU shim + RuntimeClass,
   ## webhook injection for nvidia.com/* pods, the <tag>-nvidia guest-image
   ## puller, and the sandbox device plugin (its `enabled` below is the only
   ## opt-out). Host GPU provisioning (vfio-pci binding, GPU CC mode, BAR
@@ -620,7 +625,7 @@ kata:
 ratlsMesh:
   ## Host-side mesh routing. Must be false under kata.enabled — the ratls
   ## routing runs in-VM via kata-guest-base in that shape
-  ## (`c8s install --kata` sets it).
+  ## (`c8s install --cvm-mode=pod` sets it).
   enabled: true
 
   image:
@@ -792,7 +797,7 @@ ratlsMesh:
 nriImagePolicy:
   ## Host-side NRI image admission. Must be false under kata.enabled — image
   ## admission is the in-guest policy-monitor in that shape, fed from CDS's
-  ## served allowlist (`c8s install --kata` sets it). The bootstrapAllowlist
+  ## served allowlist (`c8s install --cvm-mode=pod` sets it). The bootstrapAllowlist
   ## below still feeds CDS's served seed when this is disabled but kata is on:
   ## the seed renders whenever host NRI or kata consumes it (see
   ## c8s.serveAllowlistSeed).

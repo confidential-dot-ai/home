@@ -149,12 +149,23 @@ func TestValueArgsToTreeRejectsUnknownFlag(t *testing.T) {
 	}
 }
 
+// setCvmModeForTest pins the required --cvm-mode global for a buildValueArgs
+// test and restores the prior value, so a mode leaked from another test cannot
+// change the emitted args.
+func setCvmModeForTest(t *testing.T, mode string) {
+	t.Helper()
+	prev := installCvmMode
+	installCvmMode = mode
+	t.Cleanup(func() { installCvmMode = prev })
+}
+
 // buildValueArgs must assume nothing the operator did not pass — like install,
 // an unset --distro (distro == "") emits no distro keys, leaving the chart
 // default to stand; a set --distro plumbs both component distro keys.
 func TestBuildValueArgsOmitsDistroWhenUnset(t *testing.T) {
 	cmd := &cobra.Command{}
-	cmd.Flags().String(flagCvmMode, "baremetal", "") // registered, not Changed
+	cmd.Flags().String(flagCvmMode, "node", "")
+	setCvmModeForTest(t, "node")
 
 	// Isolate the distro logic from the crane digest path (which needs the
 	// binary on PATH); this test is about what the builder assumes, not digests.
@@ -187,7 +198,8 @@ func TestBuildValueArgsOmitsDistroWhenUnset(t *testing.T) {
 // coerce never int-coerces it (0640 -> 640 would pin the wrong image).
 func TestBuildValueArgsKeepsNumericImageTagAString(t *testing.T) {
 	cmd := &cobra.Command{}
-	cmd.Flags().String(flagCvmMode, "baremetal", "")
+	cmd.Flags().String(flagCvmMode, "node", "")
+	setCvmModeForTest(t, "node")
 	prev := installResolveDigests
 	installResolveDigests = false // tag is the sole image ref only when digests are off
 	defer func() { installResolveDigests = prev }()
@@ -215,7 +227,8 @@ func TestBuildValueArgsKeepsNumericImageTagAString(t *testing.T) {
 // PATH.
 func TestBuildValueArgsOmitsTagWhenDigestsResolved(t *testing.T) {
 	cmd := &cobra.Command{}
-	cmd.Flags().String(flagCvmMode, "baremetal", "")
+	cmd.Flags().String(flagCvmMode, "node", "")
+	setCvmModeForTest(t, "node")
 
 	prevFlag := installResolveDigests
 	defer func() { installResolveDigests = prevFlag }()
@@ -302,7 +315,7 @@ var coerceSafeValueArg = regexp.MustCompile(`^[A-Za-z0-9.]+=[^,]*$`)
 // shared path hides the divergence) with every existing test still green.
 func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 	cmd := &cobra.Command{}
-	cmd.Flags().String(flagCvmMode, "baremetal", "")
+	cmd.Flags().String(flagCvmMode, "node", "")
 	cmd.Flags().Int64("webhook-cert-fs-group", 0, "")
 	cmd.Flags().String("webhook-cert-key-mode", "", "")
 	cmd.Flags().Duration("webhook-get-cert-renew-interval", 0, "")
@@ -320,12 +333,12 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 	}
 
 	prev := struct {
-		crds, singleNode, kata, resolveDigests bool
-		secret, cvm, upstream, operatorKeys    string
-		workloadRefs                           []string
-	}{installCRDs, installSingleNode, installKata, installResolveDigests, installImagePullSecret, installCvmMode, installUpstream, installOperatorKeys, slices.Clone(installWorkloadRefs)}
+		crds, singleNode, debug, resolveDigests bool
+		secret, cvm, upstream, operatorKeys     string
+		workloadRefs                            []string
+	}{installCRDs, installSingleNode, installKataDebug, installResolveDigests, installImagePullSecret, installCvmMode, installUpstream, installOperatorKeys, slices.Clone(installWorkloadRefs)}
 	defer func() {
-		installCRDs, installSingleNode, installKata, installResolveDigests = prev.crds, prev.singleNode, prev.kata, prev.resolveDigests
+		installCRDs, installSingleNode, installKataDebug, installResolveDigests = prev.crds, prev.singleNode, prev.debug, prev.resolveDigests
 		installImagePullSecret, installCvmMode = prev.secret, prev.cvm
 		installUpstream = prev.upstream
 		installOperatorKeys = prev.operatorKeys
@@ -334,8 +347,9 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 	// Drive every value-producing toggle. --install-crds=false exercises the
 	// non-default CRD path; --resolve-digests=false keeps crane off PATH (the
 	// digest-arg shape is covered separately via buildDigestArgs below).
-	installCRDs, installSingleNode, installKata, installResolveDigests = false, true, true, false
-	installImagePullSecret, installCvmMode = "regcred", "aks"
+	// --cvm-mode=pod --debug exercises the kata stack args.
+	installCRDs, installSingleNode, installKataDebug, installResolveDigests = false, true, true, false
+	installImagePullSecret, installCvmMode = "regcred", "pod"
 	installWorkloadRefs = []string{"infer=workloads/deployment/vllm:8000"}
 	installUpstream = "infer"
 	installOperatorKeys = writeTestOperatorKeys(t)
@@ -385,7 +399,8 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 // duplicate ref dedups to one adoption, so --upstream still resolves it.
 func TestBuildValueArgsDerivesUpstreamFromRef(t *testing.T) {
 	cmd := &cobra.Command{}
-	cmd.Flags().String(flagCvmMode, "baremetal", "")
+	cmd.Flags().String(flagCvmMode, "node", "")
+	setCvmModeForTest(t, "node")
 
 	prev := struct {
 		resolveDigests bool

@@ -153,7 +153,10 @@ func containerArgValue(args []string, flag string) (string, bool) {
 }
 
 func TestChartDefaultRendersReplacementStack(t *testing.T) {
-	out, err := helmTemplate(t)
+	// gke keeps the host-side attestation-api enabled and reachable at its
+	// in-cluster Service DNS (node disables it and points components at the
+	// baked host attestation-api via HOST_IP; that path is covered separately).
+	out, err := helmTemplate(t, "--set", "attestationApi.cvmMode=gke")
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
@@ -1030,13 +1033,13 @@ func TestChartWebhookExtraExcludedFlowsToWebhookAndSweep(t *testing.T) {
 // pod-injector MutatingWebhookConfiguration carries
 // admissions.enforcer/disabled=true, so AKS's admissionsenforcer controller
 // stops rewriting the webhook namespaceSelector and conflicting with helm
-// re-applies. The default (baremetal) must NOT carry it — the annotation is
+// re-applies. The default (node) must NOT carry it — the annotation is
 // pure AKS plumbing and shouldn't appear on other platforms. A user-set
 // webhook.annotations value flows through alongside it.
 func TestChartWebhookOptsOutOfAKSAdmissionsEnforcer(t *testing.T) {
 	const annotation = "admissions.enforcer/disabled"
 
-	// Default (baremetal): no AKS opt-out annotation.
+	// Default (node): no AKS opt-out annotation.
 	out, err := helmTemplate(t)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
@@ -1046,7 +1049,7 @@ func TestChartWebhookOptsOutOfAKSAdmissionsEnforcer(t *testing.T) {
 		t.Fatalf("default chart missing MutatingWebhookConfiguration c8s-pod-injector\n%s", out)
 	}
 	if _, ok := def.Annotations[annotation]; ok {
-		t.Errorf("default (baremetal) webhook must not carry %s; got %v", annotation, def.Annotations)
+		t.Errorf("default (node) webhook must not carry %s; got %v", annotation, def.Annotations)
 	}
 
 	// aks: opt-out annotation present and "true".
@@ -1425,15 +1428,14 @@ func TestChartIntValueRejectsNonInteger(t *testing.T) {
 func TestChartAttestationApiPrivileged(t *testing.T) {
 	for _, tc := range []struct {
 		mode string
-		// baremetal is the chart default, so render it via the no-arg path to
+		// node is the chart default, so render it via the no-arg path to
 		// also guard that a plain install is privileged.
 		useDefault bool
 		// aks renders the privilege axis only — it must NOT also carry the
 		// least-privilege capabilities map (the modes are either/or, not merged).
 		noCapabilities bool
 	}{
-		{mode: "baremetal", useDefault: true},
-		{mode: "node"},
+		{mode: "node", useDefault: true},
 		{mode: "gke"},
 		{mode: "aks", noCapabilities: true},
 	} {
@@ -1466,7 +1468,95 @@ func TestChartAttestationApiInvalidCvmMode(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected render to fail on invalid cvmMode; got success\n%s", out)
 	}
-	assertHelmFailMessage(t, out, `attestationApi.cvmMode must be one of baremetal, node, gke, aks (got "bogus")`)
+	assertHelmFailMessage(t, out, `attestationApi.cvmMode must be one of pod, node, gke, aks (got "bogus")`)
+}
+
+// hasHostIPEnv reports whether the container carries a HOST_IP env var sourced
+// from the status.hostIP downward-API field — the substitution source for the
+// $(HOST_IP) placeholder in the node-mode attestation-api URL.
+func hasHostIPEnv(c corev1.Container) bool {
+	for _, e := range c.Env {
+		if e.Name == "HOST_IP" && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil &&
+			e.ValueFrom.FieldRef.FieldPath == "status.hostIP" {
+			return true
+		}
+	}
+	return false
+}
+
+// TestChartNodeModeAttestationApiURLUsesHostIP proves cvmMode=node points the
+// pod-netns components (cds, tls-lb's cert sidecar, ratls-mesh) at the
+// node-baked host attestation-api via the $(HOST_IP) downward-API env var, since
+// there is no in-cluster Service and pods cannot reach host loopback. The
+// operator is the exception: it forwards its --attestation-api-url verbatim into
+// the tenant get-cert sidecars it injects, so the placeholder must stay
+// UNEXPANDED there — the operator container deliberately omits HOST_IP so each
+// tenant pod expands it against its own node.
+func TestChartNodeModeAttestationApiURLUsesHostIP(t *testing.T) {
+	const hostIPURL = "--attestation-api-url=http://$(HOST_IP):8400"
+	out, err := helmTemplate(t, "--set-string", "attestationApi.cvmMode=node", "--set", "tlsLb.attest.enabled=true")
+	if err != nil {
+		t.Fatalf("helm template (cvmMode=node): %v\n%s", err, out)
+	}
+
+	// cds: pod-netns, dials the host attestation-api via $(HOST_IP).
+	cds := renderedDeploymentContainer(t, out, "c8s-cds", "cds")
+	assertContainerArgs(t, cds, hostIPURL)
+	if !hasHostIPEnv(cds) {
+		t.Errorf("cds container missing HOST_IP downward-API env; have %+v", cds.Env)
+	}
+
+	// tls-lb c8s-cert sidecar (via c8s.getCertContainers).
+	cert := tlsLBGetCertContainer(t, out, "c8s-cert")
+	assertContainerArgs(t, cert, hostIPURL)
+	if !hasHostIPEnv(cert) {
+		t.Errorf("tls-lb c8s-cert missing HOST_IP downward-API env; have %+v", cert.Env)
+	}
+
+	// tls-lb cds-attest sidecar (rendered under tlsLb.attest.enabled).
+	attest := renderedDeploymentContainer(t, out, "c8s-tls-lb", "cds-attest")
+	assertContainerArgs(t, attest, hostIPURL)
+	if !hasHostIPEnv(attest) {
+		t.Errorf("tls-lb cds-attest missing HOST_IP downward-API env; have %+v", attest.Env)
+	}
+
+	// ratls-mesh: hostNetwork, so $(HOST_IP) is its own node IP. Two-arg form.
+	mesh := renderedDaemonSetContainer(t, out, "c8s-ratls-mesh", "ratls-mesh")
+	if !slices.Contains(mesh.Args, "http://$(HOST_IP):8400") {
+		t.Errorf("ratls-mesh missing http://$(HOST_IP):8400 arg; have %v", mesh.Args)
+	}
+	if !hasHostIPEnv(mesh) {
+		t.Errorf("ratls-mesh missing HOST_IP downward-API env; have %+v", mesh.Env)
+	}
+
+	// operator: forwards the string verbatim; the placeholder must NOT be
+	// expanded here, so the container must NOT define HOST_IP.
+	if !slices.Contains(renderedOperatorArgs(t, out), hostIPURL) {
+		t.Errorf("operator missing verbatim %q\n%v", hostIPURL, renderedOperatorArgs(t, out))
+	}
+	op := renderedDeploymentContainer(t, out, "c8s-operator", "operator")
+	if hasHostIPEnv(op) {
+		t.Errorf("operator MUST NOT define HOST_IP (it forwards $(HOST_IP) verbatim to tenant sidecars); env %+v", op.Env)
+	}
+}
+
+// TestChartNonNodeModeKeepsServiceDNS proves the node-mode wiring does not leak
+// into the other cvmModes: pod/gke/aks still dial the in-cluster host
+// Service DNS and render no HOST_IP env anywhere.
+func TestChartNonNodeModeKeepsServiceDNS(t *testing.T) {
+	for _, mode := range []string{"pod", "gke", "aks"} {
+		t.Run(mode, func(t *testing.T) {
+			out, err := helmTemplate(t, "--set-string", "attestationApi.cvmMode="+mode, "--set", "tlsLb.attest.enabled=true")
+			if err != nil {
+				t.Fatalf("helm template (cvmMode=%s): %v\n%s", mode, err, out)
+			}
+			cds := renderedDeploymentContainer(t, out, "c8s-cds", "cds")
+			assertContainerArgs(t, cds, "--attestation-api-url=http://c8s-attestation-api.c8s-system.svc:8400")
+			if strings.Contains(out, "name: HOST_IP") {
+				t.Errorf("cvmMode=%s must not render any HOST_IP env\n%s", mode, out)
+			}
+		})
+	}
 }
 
 // hasHostIPEnv reports whether the container carries a HOST_IP env var sourced
@@ -3099,7 +3189,7 @@ func TestChartCwLabelIntegrityPolicyDisabled(t *testing.T) {
 	}
 }
 
-// helmTemplateKata renders the chart in the shape `c8s install --kata`
+// helmTemplateKata renders the chart in the shape `c8s install --cvm-mode=pod`
 // produces. kata is enforcing, so the host-side components whose function
 // moves into the kata-guest-base image are switched off (the chart validates
 // they are off — see TestChartKataRejectsHostSideComponents).
@@ -3167,7 +3257,7 @@ func TestChartKataRejectsHostSideComponents(t *testing.T) {
 	}
 }
 
-// The kata shape (what `c8s install --kata` renders) must drop the host-side
+// The kata shape (what `c8s install --cvm-mode=pod` renders) must drop the host-side
 // DaemonSets entirely — their in-guest counterparts ship in kata-guest-base.
 func TestChartKataShapeDropsHostSideComponents(t *testing.T) {
 	out, err := helmTemplateKata(t)
@@ -3618,7 +3708,10 @@ func TestChartPointsClientsAtCDS(t *testing.T) {
 // (no Secret/ca-cert flag), the allowlist DB, and the in-process JWKS (no
 // --jwks-url, since signing happens in the same binary).
 func TestChartCDSWiresInProcessTrustRoot(t *testing.T) {
-	out, err := helmTemplate(t)
+	// gke: host-side attestation-api at its Service DNS. node points CDS at the
+	// baked host attestation-api via HOST_IP (covered separately), so pin the
+	// Service-URL mode here.
+	out, err := helmTemplate(t, "--set", "attestationApi.cvmMode=gke")
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
@@ -4578,6 +4671,53 @@ func TestChartAllowlistsTlsLbNginxSelfEntry(t *testing.T) {
 	})
 }
 
+// TestChartServesAllowlistSeedInNodeMode guards the node-as-CVM seed path: with
+// --cvm-mode=node the chart's nriImagePolicy is disabled (the node image bakes
+// the plugin) and kata is off, yet the baked plugin still pulls the live
+// allowlist from CDS. If the seed is not served, CDS starts empty and every
+// un-baked component (operator, ratls-mesh, tls-lb's nginx) is denied until an
+// operator hand-runs `c8s allowlist add`. Regression for that deadlock: the seed
+// ConfigMap must render, be mounted, and carry the deployed digests.
+func TestChartServesAllowlistSeedInNodeMode(t *testing.T) {
+	const (
+		opD = "sha256:00000000000000000000000000000000000000000000000000000000000000c1"
+		rmD = "sha256:00000000000000000000000000000000000000000000000000000000000000c2"
+	)
+	out, err := helmTemplate(t,
+		"--set-string", "attestationApi.cvmMode=node",
+		"--set", "attestationApi.enabled=false",
+		"--set", "nriImagePolicy.enabled=false",
+		"--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true",
+		"--set-string", "image.digest="+opD,
+		"--set-string", "ratlsMesh.image.digest="+rmD,
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+
+	cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+	seed, err := pkgallowlist.ParseJSON([]byte(cm.Data["allowlist-seed.json"]))
+	if err != nil {
+		t.Fatalf("node-mode seed JSON does not parse (CDS would start empty): %v\n%s", err, cm.Data["allowlist-seed.json"])
+	}
+	// The un-baked components denied in the un-seeded case: operator, ratls-mesh,
+	// and tls-lb's nginx (default digest from values.yaml).
+	if got := seed.Digests[opD]; got != "ghcr.io/confidential-dot-ai/c8s-operator@"+opD {
+		t.Errorf("node-mode seed missing operator entry; got %q\nseed: %v", got, seed.Digests)
+	}
+	if got := seed.Digests[rmD]; got != "ghcr.io/confidential-dot-ai/ratls-mesh@"+rmD {
+		t.Errorf("node-mode seed missing ratls-mesh entry; got %q\nseed: %v", got, seed.Digests)
+	}
+	const nginxD = "sha256:4359d693e04e2384cafa10a0fcdca850767dcf541457470124542356a9852c3f"
+	if _, ok := seed.Digests[nginxD]; !ok {
+		t.Errorf("node-mode seed missing tls-lb nginx self-entry\nseed: %v", seed.Digests)
+	}
+	// The flag/mount must be present so CDS actually loads the seed.
+	if !strings.Contains(out, "--allowlist-seed=/etc/cds/allowlist-seed.json") {
+		t.Errorf("node-mode CDS missing --allowlist-seed flag; seed rendered but not loaded")
+	}
+}
+
 // The nri-image-policy containerd-prep init container (rke2 only) runs busybox,
 // which is not a c8sComponent, so it is never in the derive set. The host plugin
 // enforces every container node-wide, so unless busybox is self-seeded a
@@ -4799,13 +4939,21 @@ func TestChartWiresCDSAllowlistSeedFlagAndVolume(t *testing.T) {
 
 // With host NRI disabled and no kata, nothing consumes CDS's served allowlist,
 // so the seed wiring must drop out entirely.
-func TestChartOmitsCDSSeedWhenImagePolicyDisabled(t *testing.T) {
-	out, err := helmTemplate(t, "--set", "nriImagePolicy.enabled=false")
+func TestChartOmitsCDSSeedWhenNoAllowlistConsumer(t *testing.T) {
+	// The seed is served only when something consumes CDS's allowlist: the host
+	// NRI plugin (nriImagePolicy.enabled), the in-guest policy-monitor (kata), or
+	// the baked node-mode plugin (cvmMode=node). With all three off — a cloud
+	// mode whose host plugin is explicitly disabled — there is no consumer, so
+	// the seed ConfigMap and flag must not render.
+	out, err := helmTemplate(t,
+		"--set-string", "attestationApi.cvmMode=gke",
+		"--set", "nriImagePolicy.enabled=false",
+	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
 	if renderedManifestHasNamedKind(t, out, "ConfigMap", "c8s-cds-allowlist-seed") {
-		t.Fatalf("seed ConfigMap should not render when nriImagePolicy is disabled")
+		t.Fatalf("seed ConfigMap should not render when no allowlist consumer is enabled")
 	}
 	cds := renderedDeploymentContainer(t, out, "c8s-cds", "cds")
 	assertContainerNoArgPrefix(t, "cds", cds.Args, "--allowlist-seed")
@@ -5167,7 +5315,7 @@ func pullerEnv(t *testing.T, helmOut, name string) string {
 
 // kata.guestImage.debug must repoint the puller at the `<tag>-debug` artifact
 // — the variant whose guest policy allows host log/exec streams (published in
-// lockstep by the kata-guest-base workflow; `c8s install --kata --debug` sets
+// lockstep by the kata-guest-base workflow; `c8s install --cvm-mode=pod --debug` sets
 // the value). Default off: a plain kata install pulls the locked image.
 func TestChartKataGuestImageDebugSelectsDebugTag(t *testing.T) {
 	out, err := helmTemplateKata(t)

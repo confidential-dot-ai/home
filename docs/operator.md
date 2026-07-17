@@ -134,7 +134,7 @@ Services. `--upstream vllm-router` points tls-lb at
 `c8s-vllm-router.vllm.svc.cluster.local:8000` (its `<cw-id>` must be one of the
 adopted refs, carrying a `:<port>`). With `--resolve-digests=true`, install resolves adopted workload
 images into `nriImagePolicy.bootstrapAllowlist.digests` so image admission (the
-host NRI plugin, or the in-guest policy-monitor under `--kata`) allows those
+host NRI plugin, or the in-guest policy-monitor under `--cvm-mode=pod`) allows those
 rollouts.
 
 `c8s install --install-crds=false` passes Helm's `--skip-crds`; CRDs are
@@ -144,14 +144,14 @@ operator skips that controller rather than failing startup.
 
 ## Kata runtime installation and enforcement
 
-`c8s install --kata` additionally installs the Kata Containers runtime onto
+`c8s install --cvm-mode=pod` additionally installs the Kata Containers runtime onto
 the cluster: the embedded chart renders the upstream `kata-deploy` DaemonSet
 (which installs QEMU, the kata runtime, and the `containerd-shim-kata-v2`
 shim onto every node) and the `kata-qemu` / `kata-clh` / `kata-qemu-snp` /
 `kata-qemu-tdx` RuntimeClass objects. The host containerd config path (`k8s` vs `rke2`
 layout) is detected from the cluster's kubelet versions.
 
-`--kata` is **enforcing** — there is no kata-without-enforcement shape:
+`--cvm-mode=pod` is **enforcing** — there is no kata-without-enforcement shape:
 
 - the operator's pod webhook injects a `runtimeClassName` into workload pods
   that don't request one — `kata-qemu`, or `kata-qemu-snp` for pods annotated
@@ -177,7 +177,7 @@ webhook configuration, RuntimeClasses, and the enforcement policy). The
 release — a `failurePolicy: Fail` webhook cannot outlive the operator Service
 and block pod creation cluster-wide.
 
-For a `--kata` install it then **sweeps the host-side kata artifacts** that the
+For a `--cvm-mode=pod` install it then **sweeps the host-side kata artifacts** that the
 `kata-deploy` preStop cleanup cannot guarantee: a short-lived privileged
 DaemonSet removes `/opt/kata`, the containerd runtime drop-in (restarting the
 runtime only when the drop-in was still registered), the pulled

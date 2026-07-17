@@ -199,18 +199,20 @@ func TestBuildInstallHelmArgsOrdering(t *testing.T) {
 	})
 }
 
-func TestAppendKataInstallArgsDisabledIsNoOp(t *testing.T) {
-	got := appendKataInstallArgs([]string{"upgrade"}, false, false)
-	assertArgsEqual(t, got, []string{"upgrade"})
+func TestAppendKataInstallArgsNonPodModeIsNoOp(t *testing.T) {
+	for _, mode := range []string{"node", "gke", "aks", ""} {
+		got := appendKataInstallArgs([]string{"upgrade"}, mode, false)
+		assertArgsEqual(t, got, []string{"upgrade"})
+	}
 }
 
-func TestAppendKataInstallArgsEnabledIsEnforcing(t *testing.T) {
-	// --kata is enforcing: alongside the kata stack it must turn off the
+func TestAppendKataInstallArgsPodModeIsEnforcing(t *testing.T) {
+	// --cvm-mode=pod is enforcing: alongside the kata stack it must turn off the
 	// host-side components whose function runs inside the kata-guest-base
 	// image (the chart's enforce_host_components validation rejects them left
 	// on). Enforcement itself (webhook injection + ValidatingAdmissionPolicy)
 	// is keyed on kata.enabled in the chart — no separate value.
-	got := appendKataInstallArgs([]string{"upgrade"}, true, false)
+	got := appendKataInstallArgs([]string{"upgrade"}, "pod", false)
 	assertArgsEqual(t, got, []string{
 		"upgrade",
 		"--set", "kata.enabled=true",
@@ -221,9 +223,9 @@ func TestAppendKataInstallArgsEnabledIsEnforcing(t *testing.T) {
 }
 
 func TestAppendKataInstallArgsDebugSelectsDebugGuestImage(t *testing.T) {
-	// --kata --debug keeps the enforcing shape and additionally points the
-	// puller at the -debug guest image (host log/exec streams allowed).
-	got := appendKataInstallArgs([]string{"upgrade"}, true, true)
+	// --cvm-mode=pod --debug keeps the enforcing shape and additionally points
+	// the puller at the -debug guest image (host log/exec streams allowed).
+	got := appendKataInstallArgs([]string{"upgrade"}, "pod", true)
 	assertArgsEqual(t, got, []string{
 		"upgrade",
 		"--set", "kata.enabled=true",
@@ -234,29 +236,47 @@ func TestAppendKataInstallArgsDebugSelectsDebugGuestImage(t *testing.T) {
 	})
 }
 
-func TestAppendKataInstallArgsDebugWithoutKataIsNoOp(t *testing.T) {
-	// RunE rejects --debug without --kata before args are built; the builder
-	// still keys everything on kata so a call-order change cannot silently
-	// emit a debug guest image for a non-kata install.
-	got := appendKataInstallArgs([]string{"upgrade"}, false, true)
+func TestAppendKataInstallArgsDebugNonPodModeIsNoOp(t *testing.T) {
+	// RunE rejects --debug outside --cvm-mode=pod before args are built; the
+	// builder still keys everything on the pod mode so a call-order change
+	// cannot silently emit a debug guest image for a non-pod install.
+	got := appendKataInstallArgs([]string{"upgrade"}, "node", true)
 	assertArgsEqual(t, got, []string{"upgrade"})
 }
 
-// --debug without --kata is meaningless (the debug guest image only exists
-// under the kata stack) and must error rather than silently no-op.
-func TestValidateKataDebugFlagsRejectsDebugWithoutKata(t *testing.T) {
-	err := validateKataDebugFlags(false, true)
-	if err == nil {
-		t.Fatal("--debug without --kata: want error, got nil")
+// --cvm-mode is required: empty or unknown must error.
+func TestValidateCvmModeRequiresKnownValue(t *testing.T) {
+	if err := validateCvmMode(""); err == nil {
+		t.Fatal("empty --cvm-mode: want error, got nil")
 	}
-	for _, want := range []string{"--kata", "--debug"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q missing %q (should name both flags)", err.Error(), want)
+	if err := validateCvmMode("bogus"); err == nil {
+		t.Fatal("unknown --cvm-mode: want error, got nil")
+	}
+	for _, mode := range allowedCvmModes {
+		if err := validateCvmMode(mode); err != nil {
+			t.Errorf("mode %q: unexpected error: %v", mode, err)
 		}
 	}
-	for _, tc := range []struct{ kata, debug bool }{{false, false}, {true, false}, {true, true}} {
-		if err := validateKataDebugFlags(tc.kata, tc.debug); err != nil {
-			t.Errorf("kata=%t debug=%t: unexpected error: %v", tc.kata, tc.debug, err)
+}
+
+// --debug outside --cvm-mode=pod is meaningless (the debug guest image only
+// exists under the kata stack) and must error rather than silently no-op.
+func TestValidateDebugFlagRejectsDebugOutsidePod(t *testing.T) {
+	err := validateDebugFlag("node", true)
+	if err == nil {
+		t.Fatal("--debug with --cvm-mode=node: want error, got nil")
+	}
+	for _, want := range []string{"--cvm-mode=pod", "--debug"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+	for _, tc := range []struct {
+		mode  string
+		debug bool
+	}{{"node", false}, {"pod", false}, {"pod", true}} {
+		if err := validateDebugFlag(tc.mode, tc.debug); err != nil {
+			t.Errorf("mode=%s debug=%t: unexpected error: %v", tc.mode, tc.debug, err)
 		}
 	}
 }
@@ -973,9 +993,9 @@ func TestHostPortConflict(t *testing.T) {
 
 func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
 	// Two orthogonal axes:
-	//  --cvm-mode: baremetal / node (node-as-CVM) / gke (managed) / aks (vTPM)
+	//  --cvm-mode: pod (kata) / node (node-as-CVM) / gke (managed) / aks (vTPM)
 	//  --hardware-platform: sev-snp (/dev/sev-guest) / tdx (/dev/tdx-guest)
-	// baremetal+node+gke all take either hardware-platform; aks always emits vTPM
+	// pod+node+gke all take either hardware-platform; aks always emits vTPM
 	// (and combining aks with tdx is rejected).
 	build := func(mode string, sevGuest, tdxGuest, tpm string) []string {
 		out := []string{
@@ -1008,13 +1028,13 @@ func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
 		hardwarePlatform string
 		want             []string
 	}{
-		"baremetal + sev-snp": {"baremetal", "sev-snp", build("baremetal", "true", "false", "false")},
-		"gke + sev-snp":       {"gke", "sev-snp", build("gke", "true", "false", "false")},
-		"node + sev-snp":      {"node", "sev-snp", build("node", "true", "false", "false")},
-		"baremetal + tdx":     {"baremetal", "tdx", build("baremetal", "false", "true", "false")},
-		"gke + tdx":           {"gke", "tdx", build("gke", "false", "true", "false")},
-		"node + tdx":          {"node", "tdx", build("node", "false", "true", "false")},
-		"aks + sev-snp":       {"aks", "sev-snp", build("aks", "false", "false", "true")},
+		"pod + sev-snp":  {"pod", "sev-snp", build("pod", "true", "false", "false")},
+		"gke + sev-snp":  {"gke", "sev-snp", build("gke", "true", "false", "false")},
+		"node + sev-snp": {"node", "sev-snp", build("node", "true", "false", "false")},
+		"pod + tdx":      {"pod", "tdx", build("pod", "false", "true", "false")},
+		"gke + tdx":      {"gke", "tdx", build("gke", "false", "true", "false")},
+		"node + tdx":     {"node", "tdx", build("node", "false", "true", "false")},
+		"aks + sev-snp":  {"aks", "sev-snp", build("aks", "false", "false", "true")},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1034,7 +1054,7 @@ func TestAppendCvmModeInstallArgsRejectsUnknownMode(t *testing.T) {
 }
 
 func TestAppendCvmModeInstallArgsRejectsUnknownHardwarePlatform(t *testing.T) {
-	if _, err := appendCvmModeInstallArgs([]string{"upgrade"}, "baremetal", "sgx"); err == nil {
+	if _, err := appendCvmModeInstallArgs([]string{"upgrade"}, "node", "sgx"); err == nil {
 		t.Fatal("appendCvmModeInstallArgs accepted an unknown --hardware-platform, want error")
 	}
 }

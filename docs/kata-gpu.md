@@ -2,14 +2,14 @@
 
 Runs a Kubernetes pod as a confidential VM (SEV-SNP or Intel TDX, per the
 install's `--hardware-platform`) with an NVIDIA GPU passed through over VFIO.
-**The GPU stack ships with every `c8s install --kata`** — there is no separate
+**The GPU stack ships with every `c8s install --cvm-mode=pod`** — there is no separate
 flag or mode. Every kata cluster can run both CPU and GPU confidential pods.
 **NVIDIA only. Pod-as-CVM only** (node-as-CVM GPU is a separate story — see
 "Out of scope" below).
 
-## What ships with `--kata` (the GPU stack)
+## What ships with `--cvm-mode=pod` (the GPU stack)
 
-`c8s install --kata` renders, alongside the CPU kata stack — for the declared
+`c8s install --cvm-mode=pod` renders, alongside the CPU kata stack — for the declared
 platform (SNP shown; a `--hardware-platform=tdx` install gets the `-tdx`
 equivalents instead):
 
@@ -173,7 +173,7 @@ Two deliberate deltas from the non-GPU guest:
 
 ### `--debug` and the GPU guest
 
-`c8s install --kata --debug` switches every guest image to its debug variant:
+`c8s install --cvm-mode=pod --debug` switches every guest image to its debug variant:
 the non-GPU puller pulls `<tag>-debug` and the GPU puller pulls
 `<tag>-nvidia-debug`, both published in lockstep by CI (`kata-guest-base.yml`).
 The GPU pair is a real locked/debug split, identical in mechanism to the
@@ -348,7 +348,7 @@ with `/opt/kata` and the containerd drop-in. The GPU dir is read from the
 
 ```yaml
 kata:
-  gpu:                          # no `enabled` — the GPU stack ships with --kata
+  gpu:                          # no `enabled` — the GPU stack ships with --cvm-mode=pod
     guestImage:
       hostPath: /var/lib/c8s/kata-images-nvidia   # swept on uninstall
       pcieRootPort: 8           # VFIO cold-plug ports (stock ships 0)
@@ -364,6 +364,6 @@ kata:
 The `<tag>-nvidia` guest image reuses `kata.guestImage.{repository,insecure,
 registryAuth,pullerAuthSecret}` — same registry and credentials as the non-GPU
 image, with a `-nvidia` tag suffix. `kata.guestImage.debug` drives both
-pullers: `--kata --debug` switches the non-GPU image to `<tag>-debug` and the
+pullers: `--cvm-mode=pod --debug` switches the non-GPU image to `<tag>-debug` and the
 GPU image to `<tag>-nvidia-debug` in the same install (see "`--debug` and the
 GPU guest" above).
