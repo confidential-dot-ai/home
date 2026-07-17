@@ -2,7 +2,7 @@
 
 package policymonitor
 
-// Container init PID discovery + SIGKILL.
+// Container cgroup discovery + termination.
 //
 // kata-agent does not write a state.json or a pid file for the
 // container's init process — the PID lives in the in-memory
@@ -14,14 +14,10 @@ package policymonitor
 // (systemd >= 232 enables it by default; the upstream kata-agent and
 // runc work in this mode when systemd is PID 1, which is our case).
 // Each container created by kata-agent ends up with its own cgroup
-// directory under /sys/fs/cgroup; the directory's `cgroup.procs` file
-// lists every PID in the cgroup, one per line, lowest PID first.
-//
-// The init process is, by construction, the first process in the
-// cgroup (kata-agent creates the cgroup, then forks the init into it
-// before any exec setup; later children inherit the cgroup but get
-// higher PIDs because they're descendants of init). So `head -1
-// cgroup.procs` is the init PID.
+// directory under /sys/fs/cgroup. We wait for the cgroup to become
+// populated, then terminate the cgroup as a unit. Selecting a PID from
+// cgroup.procs is incorrect: the kernel does not order that file, and a
+// PID can be recycled between the read and a signal syscall.
 //
 // We walk the hierarchy to find the subdirectory that identifies the
 // container, because kata-agent's cgroup naming depends on the guest's
@@ -39,58 +35,29 @@ package policymonitor
 //                     ran. cgroupDirMatchesCID recognises both shapes.
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
-// killer is the dependency-injection surface the monitor uses to send
-// signals. Real production: signalSender{} which wraps syscall.Kill.
-// Tests: a fake that records its arguments.
-type killer interface {
-	kill(pid int, signal os.Signal) error
+// containerKiller is the dependency-injection surface used by the monitor.
+// The boolean is false when the container has already exited or its cgroup
+// never materialised within the configured budget.
+type containerKiller interface {
+	kill(containerID string) (bool, error)
 }
 
-type signalSender struct{}
-
-var _ killer = signalSender{}
-
-func (signalSender) kill(pid int, sig os.Signal) error {
-	if pid <= 1 {
-		// Guard against killing init / a wrap-around. kata-agent never
-		// allocates PID 1 (that's systemd inside the guest) or PID 0
-		// (kernel) for a container; treat as a programming error.
-		return fmt.Errorf("refusing to signal pid %d", pid)
-	}
-	s, ok := sig.(syscall.Signal)
-	if !ok {
-		return fmt.Errorf("unsupported signal type %T", sig)
-	}
-	return syscall.Kill(pid, s)
-}
-
-// pidLocator finds the init PID for a container. Like killer, it's an
-// interface so tests can substitute a tempdir-rooted fake without
-// having to fabricate a /sys/fs/cgroup hierarchy.
-type pidLocator interface {
-	// findInitPID returns the init PID for containerID. The boolean is
-	// false if the container's cgroup couldn't be located in the
-	// configured time budget — the monitor logs and skips, because a
-	// container whose cgroup we can't find has probably already exited
-	// (the desirable outcome anyway).
-	findInitPID(containerID string) (int, bool, error)
-}
-
-// cgroupLocator is the production implementation. It searches the
-// configured cgroup root for a directory whose basename equals the
-// container id, then reads cgroup.procs.
-type cgroupLocator struct {
+// cgroupKiller searches the configured cgroup root and terminates the
+// matching cgroup as a unit by writing the kernel's cgroup.kill interface.
+// The supported Kata guest kernels provide this interface; no best-effort
+// PID fallback is permitted because a failed kill must never be reported as
+// successful.
+type cgroupKiller struct {
 	cgroupRoot string
 	// waitTimeout caps how long we re-scan for the cgroup directory
 	// before giving up. kata-agent creates the cgroup and forks the
@@ -104,43 +71,87 @@ type cgroupLocator struct {
 	pollInterval time.Duration
 }
 
-var _ pidLocator = (*cgroupLocator)(nil)
+var _ containerKiller = (*cgroupKiller)(nil)
 
-func newCgroupLocator(root string) *cgroupLocator {
-	return &cgroupLocator{
+func newCgroupKiller(root string) *cgroupKiller {
+	return &cgroupKiller{
 		cgroupRoot:   root,
 		waitTimeout:  2 * time.Second,
 		pollInterval: 50 * time.Millisecond,
 	}
 }
 
-func (c *cgroupLocator) findInitPID(containerID string) (int, bool, error) {
+func (c *cgroupKiller) kill(containerID string) (bool, error) {
 	deadline := time.Now().Add(c.waitTimeout)
 	for {
 		dir, err := findCgroupDir(c.cgroupRoot, containerID)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return 0, false, fmt.Errorf("walk cgroup hierarchy: %w", err)
+			return false, fmt.Errorf("walk cgroup hierarchy: %w", err)
 		}
 		if dir != "" {
-			if pid, perr := readFirstPID(filepath.Join(dir, "cgroup.procs")); perr == nil {
-				return pid, true, nil
+			group, err := filepath.Rel(c.cgroupRoot, dir)
+			if err != nil {
+				return false, fmt.Errorf("resolve cgroup path: %w", err)
 			}
-			// The cgroup exists but cgroup.procs is empty (or unreadable):
-			// kata-agent creates the cgroup and writes config.json — our
-			// trigger — BEFORE it forks the container init into the cgroup, so
-			// procs is briefly empty right when we look. Keep polling within
-			// the budget rather than giving up: the common race populates and
-			// we get the init PID to SIGKILL, while a container that genuinely
-			// exited stays empty and times out to a harmless no-op. Returning
-			// "not found" here (as this used to) is why a denied container's
-			// kill silently missed — the enforce decision was correct, the
-			// SIGKILL never landed.
+			// Include descendants: cgroup.kill terminates the entire subtree,
+			// so a child cgroup must also make the group eligible for killing.
+			procs, err := readCgroupProcs(c.cgroupRoot, group)
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					return false, fmt.Errorf("read cgroup processes: %w", err)
+				}
+			} else if len(procs) > 0 {
+				if err := writeCgroupKill(dir); err != nil {
+					return false, fmt.Errorf("kill cgroup: %w", err)
+				}
+				return true, nil
+			}
 		}
 		if time.Now().After(deadline) {
-			return 0, false, nil
+			return false, nil
 		}
 		time.Sleep(c.pollInterval)
 	}
+}
+
+func readCgroupProcs(root, group string) ([]string, error) {
+	var procs []string
+	err := filepath.WalkDir(filepath.Join(root, filepath.FromSlash(group)), func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || d.Name() != "cgroup.procs" {
+			return nil
+		}
+		entries, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, proc := range strings.Fields(string(entries)) {
+			if _, err := strconv.ParseUint(proc, 10, 64); err != nil {
+				return fmt.Errorf("parse pid %q: %w", proc, err)
+			}
+			procs = append(procs, proc)
+		}
+		return nil
+	})
+	return procs, err
+}
+
+func writeCgroupKill(dir string) error {
+	f, err := os.OpenFile(filepath.Join(dir, "cgroup.kill"), os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	n, writeErr := io.WriteString(f, "1")
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if n != 1 {
+		return io.ErrShortWrite
+	}
+	return closeErr
 }
 
 // findCgroupDir walks root looking for a directory that identifies
@@ -169,7 +180,7 @@ func findCgroupDir(root, containerID string) (string, error) {
 			// fine for a denied container (kata-agent reaps it when
 			// CreateContainer returns). But do NOT swallow *every* error:
 			// anything else (an I/O error, a broken/zombie cgroup) is a
-			// real signal, so propagate it. findInitPID returns it as
+			// real signal, so propagate it. cgroupKiller returns it as
 			// "walk cgroup hierarchy: ..." and the monitor logs it at
 			// Warn — rather than silently continuing and reporting a
 			// misleading no-op kill for a container we never searched.
@@ -205,31 +216,4 @@ func findCgroupDir(root, containerID string) (string, error) {
 func cgroupDirMatchesCID(basename, containerID string) bool {
 	name := strings.TrimSuffix(basename, ".scope")
 	return name == containerID || strings.HasSuffix(name, "-"+containerID)
-}
-
-// readFirstPID reads the first line of path and returns it as an int.
-// The cgroup.procs format is one PID per line; we want the lowest,
-// which is the file's first line on every kernel that produces sorted
-// output (Linux >= 3.16 always sorts cgroup.procs; we don't care to
-// support older kernels because kata SEV-SNP requires a much newer
-// kernel anyway).
-func readFirstPID(path string) (int, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	if !scanner.Scan() {
-		if err := scanner.Err(); err != nil {
-			return 0, err
-		}
-		return 0, errors.New("cgroup.procs is empty")
-	}
-	line := strings.TrimSpace(scanner.Text())
-	pid, err := strconv.Atoi(line)
-	if err != nil {
-		return 0, fmt.Errorf("parse pid %q: %w", line, err)
-	}
-	return pid, nil
 }

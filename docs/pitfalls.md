@@ -182,18 +182,18 @@ script exits non-zero (pod stays NotReady) when the env var is empty or 0. If
 you ever see a GPU pod schedule and run but the workload reports no CUDA
 device, check this key first — a hand-patched config can still regress it.
 
-## The `<tag>-nvidia` guest boots kata's GPU kernel, not the steep one
+## The `<tag>-nvidia` guest boots kata's GPU kernel, not the confos one
 
 `kata-guest-base/scripts/build.sh` (Step 6), `docs/kata-gpu.md`
 
 The GPU guest image IS the c8s guest (in-guest attestation-service /
 ratls-mesh / policy-monitor, locked policy, measured, c8s-published reference
 manifest) — but it boots kata's GPU kernel with the NVIDIA modules grafted
-from kata's own GPU rootfs, because the steep kernel has `CONFIG_MODULES=n`
+from kata's own GPU rootfs, because the confos kernel has `CONFIG_MODULES=n`
 and cannot load the driver. Module loading is locked down after driver
 bring-up (`kernel.modules_disabled=1`), and everything grafted sits inside
 the measured verity root — but the kernel/driver provenance is the kata
-release, not the c8s build. Compiling signed modules against a steep GPU
+release, not the c8s build. Compiling signed modules against a confos GPU
 kernel flavor closes this — see `docs/GAPS.md`. Also remember GPU SPDM
 attestation is not wired yet (`docs/kata-gpu.md` "Threat-model gaps").
 

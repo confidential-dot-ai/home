@@ -3,8 +3,8 @@
 # is the trust anchor; the cache is just a network-bandwidth saver.
 .fetch-cache/
 
-# steep build artifacts (mkosi sandbox is invoked from scripts/build.sh
-# but writes into /workspace/steep/output/...; nothing should normally
+# confos build artifacts (mkosi sandbox is invoked from scripts/build.sh
+# but writes into /workspace/confidential-os-builder/output/...; nothing should normally
 # land here, but be defensive).
 output/
 

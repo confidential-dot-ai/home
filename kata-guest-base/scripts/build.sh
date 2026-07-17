@@ -2,7 +2,7 @@
 # Build the c8s kata-guest-base: a kata-NATIVE guest rootfs for the
 # kata-qemu-snp runtime class.
 #
-# WHY THIS LOOKS NOTHING LIKE THE OLD steep BUILD
+# WHY THIS LOOKS NOTHING LIKE THE OLD confos BUILD
 # ------------------------------------------------
 # kata-qemu does measured *direct-kernel* boot — there is no IGVM and no
 # UKI on kata's path (verified against kata 3.30.0: no igvm-cfg in govmm,
@@ -10,7 +10,7 @@
 # over OVMF + a directly-loaded kernel). So kata wants three passive parts,
 # not a self-booting image:
 #
-#   kernel = <vmlinuz>                 a bare bzImage  (steep's hardened kernel)
+#   kernel = <vmlinuz>                 a bare bzImage  (confos's hardened kernel)
 #   image  = <kata-rootfs.img>         a 2-partition image: p1=ext4 rootfs,
 #                                      p2=dm-verity hash tree (NO superblock)
 #   kernel_verity_params = root_hash=…,salt=…,data_blocks=…,…
@@ -20,13 +20,13 @@
 # root hash rides in the kernel cmdline, which kernel-hashes folds into
 # the SNP launch measurement → the rootfs is attested transitively.
 #
-# steep is the wrong tool for that shape (it builds UEFI/IGVM self-booting
+# confos is the wrong tool for that shape (it builds UEFI/IGVM self-booting
 # disks), so we build the ROOTFS with kata's own osbuilder — which also
-# installs the version-matched kata-agent for us. We keep steep ONLY for
+# installs the version-matched kata-agent for us. We keep confos ONLY for
 # the hardened kernel (decoupled from the rootfs in kata).
 #
 # PIPELINE
-#   1. steep kernel              -> hardened vmlinuz             (kernel =)
+#   1. confos kernel              -> hardened vmlinuz             (kernel =)
 #   2. osbuilder rootfs (ubuntu) -> base rootfs + kata-agent
 #   3. overlay extra/            -> c8s bins + units + policy + allowlist
 #   4. osbuilder image (verity)  -> locked image  -> output/
@@ -50,12 +50,12 @@
 # PREREQS (this CANNOT run in a user-namespaced dev container):
 #   - docker running        (osbuilder builds inside Docker; needs loop devices)
 #   - sudo                  (osbuilder partitions/loop-mounts the image)
-#   - a steep checkout at ${WORKSPACE}/steep (built on demand)
+#   - a confidential-os-builder checkout at ${WORKSPACE}/confidential-os-builder (built on demand)
 #   - c8s binaries staged   (run scripts/fetch.sh first)
 #   - kata source at KATA_VERSION (fetched via `gh` if not already present)
 #
 # Override knobs (env): KATA_VERSION, FS_TYPE, BUILD_VARIANT, KATA_SRC,
-#   STEEP_DIR, OUTPUT_DIR, DEBUG_OUTPUT_DIR, SKIP_KERNEL=1 (reuse an
+#   CONFOS_DIR, OUTPUT_DIR, DEBUG_OUTPUT_DIR, SKIP_KERNEL=1 (reuse an
 #   existing vmlinuz).
 #   ROOTFS_CACHE_TAR (restore the pre-overlay base rootfs from this .tar.zst
 #   when it exists, else pack the freshly built one there — the CI cache hook).
@@ -114,7 +114,7 @@ FIXED_HASH_SEED="${FIXED_HASH_SEED:-d8d8d8d8-d8d8-d8d8-d8d8-d8d8d8d8d8d8}"
 REPRO_E2FSPROGS_VERSION="${REPRO_E2FSPROGS_VERSION:-}"
 REPRO_CRYPTSETUP_VERSION="${REPRO_CRYPTSETUP_VERSION:-}"
 
-STEEP_DIR="${STEEP_DIR:-${WORKSPACE}/steep}"
+CONFOS_DIR="${CONFOS_DIR:-${WORKSPACE}/confidential-os-builder}"
 OUTPUT_DIR="${OUTPUT_DIR:-${IMAGE_DIR}/output}"
 DEBUG_OUTPUT_DIR="${DEBUG_OUTPUT_DIR:-${IMAGE_DIR}/output-debug}"
 NVIDIA_OUTPUT_DIR="${NVIDIA_OUTPUT_DIR:-${IMAGE_DIR}/output-nvidia}"
@@ -133,26 +133,26 @@ EXTRA_NVIDIA_DIR="${IMAGE_DIR}/extra-nvidia"
 # The NVIDIA driver payload (kernel modules, GSP firmware, driver userland)
 # is grafted from kata's own nvidia-gpu-confidential rootfs image — the SAME
 # digest-pinned kata release that provides the agent — and the GPU variant
-# boots kata's matching GPU kernel, NOT the steep one (the steep kernel has
+# boots kata's matching GPU kernel, NOT the confos one (the confos kernel has
 # CONFIG_MODULES=n; the NVIDIA modules need the kernel they were built for).
 BUILD_NVIDIA="${BUILD_NVIDIA:-auto}"
 KATA_NVIDIA_CONFIDENTIAL_IMG="${KATA_NVIDIA_CONFIDENTIAL_IMG:-/opt/kata/share/kata-containers/kata-containers-nvidia-gpu-confidential.img}"
 KATA_NVIDIA_VMLINUZ="${KATA_NVIDIA_VMLINUZ:-/opt/kata/share/kata-containers/vmlinuz-nvidia-gpu.container}"
-# c8s's kernel config fragment, merged after steep's required + hardening
-# baseline by `steep kernel --kernel-config-fragment`. steep resolves the
+# c8s's kernel config fragment, merged after confos's required + hardening
+# baseline by `confos kernel --kernel-config-fragment`. confos resolves the
 # merged .config and writes it to a fixed path in its own tree (the old
 # --kernel-snapshot flag is gone). That snapshot is NOT a build input —
-# steep regenerates it from scratch each resolve — but it is the only
-# place the effect of steep's baseline (kernel version / hardening) on OUR
-# guest kernel is visible. So after the kernel build Step 1 copies steep's
+# confos regenerates it from scratch each resolve — but it is the only
+# place the effect of confos's baseline (kernel version / hardening) on OUR
+# guest kernel is visible. So after the kernel build Step 1 copies confos's
 # snapshot into this repo (KERNEL_SNAPSHOT), committed, so any drift is
 # reviewable in git. See README.md "Build" + container.config header.
 KERNEL_FRAGMENT="${IMAGE_DIR}/kernel/container.config"
-# Resolved-config lockfile: steep writes STEEP_SNAPSHOT during the kernel
+# Resolved-config lockfile: confos writes CONFOS_SNAPSHOT during the kernel
 # build; Step 1 copies it to KERNEL_SNAPSHOT (tracked in git) for drift
 # detection. Not read by the build.
 KERNEL_SNAPSHOT="${IMAGE_DIR}/kernel/config-x86_64.snapshot"
-STEEP_SNAPSHOT="${STEEP_DIR}/kernel/config-x86_64.snapshot"
+CONFOS_SNAPSHOT="${CONFOS_DIR}/kernel/config-x86_64.snapshot"
 
 log() { printf '\n=== %s ===\n' "$*"; }
 die() { echo "FATAL: $*" >&2; exit 1; }
@@ -209,7 +209,7 @@ fi
 # loop device: No such file or directory`. Load it best-effort up front.
 sudo modprobe loop 2>/dev/null || true
 
-[[ -f "${KERNEL_FRAGMENT}" ]] || die "${KERNEL_FRAGMENT} missing (c8s kernel config fragment, merged after steep's required + hardening baseline) — see README."
+[[ -f "${KERNEL_FRAGMENT}" ]] || die "${KERNEL_FRAGMENT} missing (c8s kernel config fragment, merged after confos's required + hardening baseline) — see README."
 
 # The overlay binaries must be staged before we build the rootfs image,
 # because they end up in the dm-verity root (and thus the measurement).
@@ -244,38 +244,38 @@ fi
 sudo rm -rf "${DEBUG_OUTPUT_DIR}" "${NVIDIA_OUTPUT_DIR}" "${NVIDIA_DEBUG_OUTPUT_DIR}"
 mkdir -p "${OUTPUT_DIR}" "${WORK_DIR}"
 
-# --- Step 1/5: hardened kernel (steep) ---------------------------------
-# We only use steep to compile the kernel; the rootfs is osbuilder's job.
+# --- Step 1/5: hardened kernel (confos) ---------------------------------
+# We only use confos to compile the kernel; the rootfs is osbuilder's job.
 VMLINUZ_OUT="${OUTPUT_DIR}/vmlinuz"
 if [[ "${SKIP_KERNEL:-0}" == "1" && -f "${VMLINUZ_OUT}" ]]; then
     log "Step 1/5: reusing existing kernel (SKIP_KERNEL=1): ${VMLINUZ_OUT}"
 else
-    log "Step 1/5: building hardened kernel with steep"
-    [[ -d "${STEEP_DIR}" ]] || die "steep checkout not found at ${STEEP_DIR} (set STEEP_DIR)."
-    STEEP_BIN="${STEEP_BIN:-${STEEP_DIR}/target/release/steep}"
-    if [[ ! -x "${STEEP_BIN}" ]]; then
-        echo "    building steep (cargo build --release)"
-        ( cd "${STEEP_DIR}" && cargo build --release )
+    log "Step 1/5: building hardened kernel with confos"
+    [[ -d "${CONFOS_DIR}" ]] || die "confos checkout not found at ${CONFOS_DIR} (set CONFOS_DIR)."
+    CONFOS_BIN="${CONFOS_BIN:-${CONFOS_DIR}/target/release/confos}"
+    if [[ ! -x "${CONFOS_BIN}" ]]; then
+        echo "    building confos (cargo build --release)"
+        ( cd "${CONFOS_DIR}" && cargo build --release )
     fi
-    # steep writes output/kernel/vmlinuz relative to its own dir. steep
+    # confos writes output/kernel/vmlinuz relative to its own dir. confos
     # resolves its config snapshot internally (fixed kernel/config-x86_64.snapshot
-    # in the steep tree, auto-updated each build), so we pass only the fragment —
+    # in the confos tree, auto-updated each build), so we pass only the fragment —
     # the old --kernel-snapshot flag no longer exists.
-    ( cd "${STEEP_DIR}" && "${STEEP_BIN}" kernel \
+    ( cd "${CONFOS_DIR}" && "${CONFOS_BIN}" kernel \
         --kernel-config-fragment "${KERNEL_FRAGMENT}" )
-    STEEP_VMLINUZ="${STEEP_DIR}/output/kernel/vmlinuz"
-    [[ -f "${STEEP_VMLINUZ}" ]] || die "steep did not produce ${STEEP_VMLINUZ}"
-    install -m 0644 "${STEEP_VMLINUZ}" "${VMLINUZ_OUT}"
+    CONFOS_VMLINUZ="${CONFOS_DIR}/output/kernel/vmlinuz"
+    [[ -f "${CONFOS_VMLINUZ}" ]] || die "confos did not produce ${CONFOS_VMLINUZ}"
+    install -m 0644 "${CONFOS_VMLINUZ}" "${VMLINUZ_OUT}"
 
-    # Capture the resolved-config snapshot steep just wrote (baseline +
-    # our container.config, merged). steep keeps it in its own tree where
+    # Capture the resolved-config snapshot confos just wrote (baseline +
+    # our container.config, merged). confos keeps it in its own tree where
     # it gets overwritten/discarded; copy it next to the fragment in THIS
     # repo so the merged config is committed and reviewable — this is how a
-    # change in steep's kernel base that affects our guest kernel becomes
+    # change in confos's kernel base that affects our guest kernel becomes
     # visible here. Not a build input. (SKIP_KERNEL reuses an existing
     # vmlinuz without re-resolving, so it intentionally leaves the
     # committed snapshot untouched.)
-    [[ -f "${STEEP_SNAPSHOT}" ]] || die "steep did not produce ${STEEP_SNAPSHOT} — cannot capture the resolved-config snapshot."
+    [[ -f "${CONFOS_SNAPSHOT}" ]] || die "confos did not produce ${CONFOS_SNAPSHOT} — cannot capture the resolved-config snapshot."
     # Drift gate: compare the freshly-resolved config against the committed
     # lockfile BEFORE overwriting it. CHECK_SNAPSHOT=1 (set by CI on the
     # publish path) makes a mismatch fatal HERE — at Step 1, before osbuilder
@@ -283,19 +283,19 @@ else
     # drifted from what's committed/reviewed never gets built or published.
     # Local builds leave CHECK_SNAPSHOT unset and just refresh the lockfile.
     snapshot_drift=0
-    if [[ -f "${KERNEL_SNAPSHOT}" ]] && ! cmp -s "${STEEP_SNAPSHOT}" "${KERNEL_SNAPSHOT}"; then
+    if [[ -f "${KERNEL_SNAPSHOT}" ]] && ! cmp -s "${CONFOS_SNAPSHOT}" "${KERNEL_SNAPSHOT}"; then
         snapshot_drift=1
         committed_sha="$(sha256sum "${KERNEL_SNAPSHOT}" | awk '{print $1}')"
     fi
     # Copy regardless (so the uploaded artifact reflects what THIS build
     # resolved, even on a gate failure) — then enforce.
-    install -m 0644 "${STEEP_SNAPSHOT}" "${KERNEL_SNAPSHOT}"
+    install -m 0644 "${CONFOS_SNAPSHOT}" "${KERNEL_SNAPSHOT}"
     echo "    snapshot: ${KERNEL_SNAPSHOT} (sha256 $(sha256sum "${KERNEL_SNAPSHOT}" | awk '{print $1}'))"
     if [[ "${CHECK_SNAPSHOT:-0}" == "1" && "${snapshot_drift}" == "1" ]]; then
         die "resolved kernel config drifted from the committed snapshot.
        committed ${KERNEL_SNAPSHOT}: ${committed_sha}
        resolved  (this build):       $(sha256sum "${KERNEL_SNAPSHOT}" | awk '{print $1}')
-   steep's baseline (STEEP_REF) or kernel/container.config changed without
+   confos's baseline (CONFOS_REF) or kernel/container.config changed without
    re-committing kata-guest-base/kernel/config-x86_64.snapshot. Re-resolve and
    commit it (run the 'Kernel config snapshot' workflow, or a local build), or
    revert the change that moved it. Failing before osbuilder + the GHCR push."
@@ -530,7 +530,7 @@ sudo find "${TARGET_ROOTFS}" -exec touch --no-dereference --date="@${SOURCE_DATE
 seal_and_assemble() {
     local variant="$1" outdir="$2"
     # Third arg: kernel to ship with (and hash into) this artifact. Defaults
-    # to the steep kernel; the NVIDIA variants pass kata's GPU kernel, which
+    # to the confos kernel; the NVIDIA variants pass kata's GPU kernel, which
     # the grafted driver modules were built for.
     local kernel="${3:-${VMLINUZ_OUT}}"
     local img="${IMAGES_BUILD_DEST}/kata-rootfs-${variant}.img"
@@ -698,7 +698,7 @@ seal_and_assemble "${BUILD_VARIANT}-debug" "${DEBUG_OUTPUT_DIR}"
 # bring-up is re-expressed as three units in extra-nvidia/ (driver+nodes ->
 # persistenced -> CDI/CC-ready/lockdown), with kata-agent Requires= the last.
 #
-# The variant boots kata's GPU kernel (modules must match it), not the steep
+# The variant boots kata's GPU kernel (modules must match it), not the confos
 # kernel — the one hardening delta vs the non-GPU guest, recorded in
 # docs/kata-gpu.md. Measured boot is identical: verity-sealed rootfs, root
 # hash on the cmdline, kernel-hashes launch measurement, manifest published.

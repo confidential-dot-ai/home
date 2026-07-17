@@ -10,7 +10,7 @@ container is started.
 The recipe and the authoritative description of **what the image is and
 how it's built** live next to the source at
 [`kata-guest-base/README.md`](../kata-guest-base/README.md): the
-osbuilder dm-verity rootfs, the steep-built `vmlinuz`, the
+osbuilder dm-verity rootfs, the confos-built `vmlinuz`, the
 `kernel_verity_params`, the full "what's baked in" table, and the
 build/consume steps. This document is the **design rationale** above the
 recipe — why the image lives in this repo, how it boots, how a pod

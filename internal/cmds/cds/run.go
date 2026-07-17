@@ -46,7 +46,7 @@ func run(cfg config) error {
 	if err := validateConfig(cfg); err != nil {
 		return err
 	}
-	cfg.ratlsPlatform = normalizeRATLSPlatform(cfg.ratlsPlatform)
+	cfg.ratlsPlatform = ratls.NormalizePlatform(cfg.ratlsPlatform)
 
 	// EAR JWT validation reads the clock-skew leeway from this package-level
 	// var; set it before any /sign-csr request can be served.
@@ -494,16 +494,5 @@ func readinessFn(svcReady func() bool, caCert *x509.Certificate, minCAValidity t
 			return false
 		}
 		return true
-	}
-}
-
-func normalizeRATLSPlatform(platform string) string {
-	switch p := strings.ToLower(strings.TrimSpace(platform)); p {
-	case "snp", "sev-snp", "az-snp", "gcp-snp":
-		return "sev-snp"
-	case "tdx", "az-tdx", "gcp-tdx":
-		return "tdx"
-	default:
-		return p
 	}
 }

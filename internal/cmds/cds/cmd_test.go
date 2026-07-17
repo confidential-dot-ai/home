@@ -24,26 +24,3 @@ func TestNewCmdDefaultsToSupportedRATLSPlatform(t *testing.T) {
 		t.Fatalf("default --ratls-platform is not accepted by ratls: %v", err)
 	}
 }
-
-func TestNormalizeRATLSPlatform(t *testing.T) {
-	for _, tc := range []struct {
-		input string
-		want  string
-	}{
-		{"", ""},
-		{" ", ""},
-		{"snp", "sev-snp"},
-		{"SEV-SNP", "sev-snp"},
-		{"az-snp", "sev-snp"},
-		{"gcp-snp", "sev-snp"},
-		{"tdx", "tdx"},
-		{"az-tdx", "tdx"},
-		{"unknown", "unknown"},
-	} {
-		t.Run(tc.input, func(t *testing.T) {
-			if got := normalizeRATLSPlatform(tc.input); got != tc.want {
-				t.Fatalf("normalizeRATLSPlatform(%q) = %q, want %q", tc.input, got, tc.want)
-			}
-		})
-	}
-}

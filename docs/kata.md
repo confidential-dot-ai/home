@@ -603,7 +603,7 @@ the preStop-hook cleanup, but none of the sweep guarantees above.
 ## Future work
 
 - Automatic host kernel-module loading (`vhost_vsock`, `vhost_net`).
-- A steep GPU kernel flavor for the `<tag>-nvidia` guest: compile and sign
+- A confos GPU kernel flavor for the `<tag>-nvidia` guest: compile and sign
   the NVIDIA open GPU kernel modules against a c8s-built kernel, replacing
   the modules/kernel grafted from kata's GPU rootfs — see
   [`docs/kata-gpu.md`](kata-gpu.md) "Threat-model gaps" and `docs/GAPS.md`.

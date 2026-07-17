@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -609,6 +610,22 @@ func dualVerifyPeerCallback(policy *VerifyPolicy, shared *sharedCACerts) func([]
 			return fmt.Errorf("ratls: peer verification failed (CA chain: %v; RA-TLS: %w)", chainErr, err)
 		}
 		return nil
+	}
+}
+
+// NormalizePlatform maps the platform aliases used across the stack (cloud
+// prefixes like az-/gcp-, and "snp") to the two canonical values the RA-TLS
+// package understands: "sev-snp" and "tdx". Unknown values pass through
+// lowercased/trimmed so validatePlatform can reject them with a clear error.
+// Callers normalize before NewServerTLSConfig/NewClientTLSConfig.
+func NormalizePlatform(platform string) string {
+	switch p := strings.ToLower(strings.TrimSpace(platform)); p {
+	case "snp", "sev-snp", "az-snp", "gcp-snp":
+		return "sev-snp"
+	case "tdx", "az-tdx", "gcp-tdx":
+		return "tdx"
+	default:
+		return p
 	}
 }
 

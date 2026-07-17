@@ -20,7 +20,7 @@ kernel). So kata wants **three passive parts**, not a self-booting image:
 
 | kata config key | what we supply |
 |---|---|
-| `kernel` | a bare `vmlinuz` (steep's hardened kernel) |
+| `kernel` | a bare `vmlinuz` (confos's hardened kernel) |
 | `image` | `kata-rootfs.img` — a 2-partition image: **p1 = ext4 rootfs, p2 = dm-verity hash tree** (no superblock) |
 | `kernel_verity_params` | `root_hash=…,salt=…,data_blocks=…,…` (from osbuilder) |
 
@@ -29,9 +29,9 @@ pinning `root=/dev/dm-0` over `vda1`/`vda2` (qemu drops nvdimm for SNP).
 The root hash rides in the kernel cmdline, which `kernel-hashes` folds
 into the SNP launch measurement — so the rootfs is attested transitively.
 
-steep is the wrong tool for that shape (it builds UEFI/IGVM self-booting
+confos is the wrong tool for that shape (it builds UEFI/IGVM self-booting
 disks), so the **rootfs** is built by kata's osbuilder — which also
-installs the version-matched **kata-agent** for us. steep is kept ONLY
+installs the version-matched **kata-agent** for us. confos is kept ONLY
 for the hardened **kernel** (decoupled from the rootfs in kata).
 
 ## What's baked in
@@ -103,7 +103,7 @@ attests — is described in [`../docs/pitfalls.md`](../docs/pitfalls.md)
 ## Build
 
 ```bash
-# Once per build host: Docker (osbuilder runs in containers) + the steep
+# Once per build host: Docker (osbuilder runs in containers) + the confos
 # kernel-builder sandbox deps (mkosi/uv). osbuilder also needs root +
 # loop devices for the verity image — this CANNOT run in a user-
 # namespaced dev container.
@@ -120,7 +120,7 @@ cd /workspace/attestation-rs && cargo build --release -p attestation-api --bin a
 cd /workspace/c8s/kata-guest-base
 IMAGE_TAG=<c8s-release-tag> ./scripts/fetch.sh
 
-# Build: steep kernel (vmlinuz) + osbuilder rootfs + overlay + dm-verity
+# Build: confos kernel (vmlinuz) + osbuilder rootfs + overlay + dm-verity
 # image. Fetches the kata source at the pinned version via gh.
 ./scripts/build.sh
 
@@ -128,17 +128,17 @@ IMAGE_TAG=<c8s-release-tag> ./scripts/fetch.sh
 #                   kernel_verity_params, rootfs_type}
 ```
 
-The kernel is built from steep's required + hardening baseline plus this
-image's `kernel/container.config` fragment, passed as `steep kernel
---kernel-config-fragment`. steep resolves the merged `.config` and writes
+The kernel is built from confos's required + hardening baseline plus this
+image's `kernel/container.config` fragment, passed as `confos kernel
+--kernel-config-fragment`. confos resolves the merged `.config` and writes
 it to a snapshot in its own tree (there is no `--kernel-snapshot` /
 `--update-snapshot` flag). `scripts/build.sh` then copies that snapshot to
 `kernel/config-x86_64.snapshot` in **this** repo: the committed, reviewable
-record of the resolved guest-kernel config (steep's baseline + this
+record of the resolved guest-kernel config (confos's baseline + this
 fragment, merged). It is a lockfile, not a build input — editing the
-fragment or re-pinning steep (`STEEP_REF` in the workflow) moves it, so
+fragment or re-pinning confos (`CONFOS_REF` in the workflow) moves it, so
 commit the snapshot alongside that change and review its diff. It is the
-only place a change in steep's kernel base that affects our guest kernel
+only place a change in confos's kernel base that affects our guest kernel
 shows up. For kernel version bumps see
 [base-images/rke2/README.md](https://github.com/confidential-dot-ai/base-images/blob/master/rke2/README.md)
 "Bumping versions".
@@ -194,7 +194,7 @@ a debug image can't silently stand in for a locked one. Select it with
 ## Constraints
 
 - **osbuilder needs Docker + root + loop devices.** It cannot run inside a
-  user-namespaced dev container (same constraint the old steep/mkosi path
+  user-namespaced dev container (same constraint the old confos/mkosi path
   had). CI uses an `ubuntu-latest` runner; locally use a real host.
 - **No SSH server, no shell into a locked guest.** The image is driven by
   kata-runtime via vsock + cloud-init, and the locked policy denies the

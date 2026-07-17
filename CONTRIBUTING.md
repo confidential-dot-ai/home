@@ -7,6 +7,12 @@ bug reports, fixes, features, and documentation.
 This document and the repository license are still evolving; see
 [Policy changes](#policy-changes) before opening a PR.
 
+Contributions follow the team's
+[engineering standards](docs/engineering-standards.md) — the canonical rules
+for branching and review flow, code style, comments, documentation, and
+releases across Confidential AI repos. This document adds the c8s-specific
+process on top.
+
 ## Terms
 
 - **Anyone may contribute; maintainers decide.** Contributions are accepted
@@ -40,6 +46,9 @@ Using LLMs to write code is accepted and encouraged, with three conditions:
    c8s — without the LLM's help.
 
 If you can't meet all three for a given change, it isn't ready to submit.
+
+Never paste secrets into prompts. If one slips out, treat it as burned and
+rotate it immediately.
 
 ## Signed commits
 
@@ -83,6 +92,9 @@ additionally runs golangci-lint, a CRD/chart consistency check
 - **Use conventional commit style** for commits and PR titles:
   `feat(ratls-mesh): ...`, `fix(chart): ...`, `docs: ...`, `test(e2e): ...`.
 - **CI must be green** before requesting review.
+- **Update docs in the same PR.** Behavior changes update the affected docs —
+  concept docs under [docs/](docs/), decision records in `docs/decisions`,
+  pitfalls in `docs/pitfalls.md`.
 - Maintainers review and merge at their discretion; expect requests for
   changes.
 
