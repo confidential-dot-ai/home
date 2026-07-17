@@ -1,12 +1,12 @@
 {{- if .Values.cds.podDisruptionBudget.enabled }}
 {{/*
-CDS is a singleton in-memory trust root: the mesh CA and EAR signing key live
-only in process memory, so any voluntary eviction (node drain, autoscaler)
-destroys the trust root and forces every workload to re-bootstrap. maxUnavailable: 0
-blocks voluntary disruptions so a drain cannot silently take CDS down; the
-operator must delete the pod deliberately, i.e. treat it as a planned
-re-bootstrap (see docs/THREAT_MODEL.md). Set maxUnavailable: 1 to allow drains
-if you accept the re-bootstrap, or enabled: false to remove the PDB.
+CDS holds the mesh CA and EAR signing key in process memory, so a voluntary
+eviction (node drain, autoscaler) of the serving pod loses the trust root.
+maxUnavailable: 0 blocks voluntary disruptions; the operator must delete the
+pod deliberately. This bounds evictions only — it does not throttle a
+RollingUpdate rollout (that obeys the Deployment's maxSurge/maxUnavailable), so
+handoff.peerUrl adoption rolls freely. Set maxUnavailable: 1 to allow drains, or
+enabled: false to remove the PDB.
 */}}
 apiVersion: policy/v1
 kind: PodDisruptionBudget

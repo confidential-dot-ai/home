@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -56,14 +57,65 @@ func run(cfg config) error {
 		return fmt.Errorf("init rate limiter: %w", err)
 	}
 
-	// CDS generates its mesh CA in process; the private key never touches a
-	// Kubernetes Secret. Rotation and public-bundle write-back land with the
-	// in-memory CA machinery in a later stack PR.
-	mesh, err := issuer.NewCAWithCurve(cfg.caCommonName, cfg.caCertValidity, elliptic.P384())
-	if err != nil {
-		return fmt.Errorf("generate mesh CA: %w", err)
+	// Load the operator policy before either side of handoff is attested. Its
+	// canonical hash is committed to REPORTDATA by both replicas and compared
+	// before any CA or allowlist state is released.
+	var writeAuthorizer allowlist.WriteAuthorizer = func(*http.Request, []byte) error {
+		return fmt.Errorf("allowlist writes are disabled: set --operator-keys")
 	}
-	slog.Info("generated in-memory mesh CA",
+	var operatorKeysPEM []byte
+	var operatorKeysHash string
+	if cfg.operatorKeys != "" {
+		keys, pemBytes, err := loadOperatorKeys(cfg.operatorKeys)
+		if err != nil {
+			return err
+		}
+		operatorKeysHash, err = operatorauth.KeySetHash(keys)
+		if err != nil {
+			return fmt.Errorf("hash --operator-keys %q: %w", cfg.operatorKeys, err)
+		}
+		operatorKeysPEM = pemBytes
+		writeAuthorizer = operatorauth.Verifier{
+			Keys:      keys,
+			ClockSkew: time.Duration(cfg.jwtClockSkew) * time.Second,
+		}.Authorize
+		slog.Info("allowlist write authorization enabled (pinned operator keys)", "operator_keys", cfg.operatorKeys, "count", len(keys), "key_set_hash", operatorKeysHash)
+	} else {
+		slog.Warn("--operator-keys empty: allowlist writes are disabled (reads still served)")
+	}
+
+	allowlistStore, err := allowlist.OpenStore(cfg.allowlistDB)
+	if err != nil {
+		return fmt.Errorf("open allowlist database: %w", err)
+	}
+	defer allowlistStore.Close()
+
+	// CDS obtains its mesh CA in process; the private key never touches a
+	// Kubernetes Secret. With no --handoff-peer-url it generates a fresh
+	// self-signed CA (cold start); with a peer set it adopts that peer's CA
+	// via attested /handoff, failing closed if the peer cannot be reached or
+	// denies the handoff so a partition never mints a divergent trust root.
+	mesh, adopted, err := issuer.ProvisionCA(ctx, issuer.CAProvisionConfig{
+		CommonName:        cfg.caCommonName,
+		Validity:          cfg.caCertValidity,
+		Curve:             elliptic.P384(),
+		PeerURL:           strings.TrimRight(cfg.handoffPeerURL, "/"),
+		AttestationApiURL: cfg.attestationApiURL,
+		Measurements:      cfg.handoffMeasurements,
+		ExpectedIssuer:    cfg.earIssuerName,
+		Timeout:           cfg.handoffPeerTimeout,
+		OperatorKeysHash:  operatorKeysHash,
+		RestoreAllowlist:  allowlistStore.RestoreSnapshot,
+	}, slog.Default())
+	if err != nil {
+		return fmt.Errorf("provision mesh CA: %w", err)
+	}
+	caSource := "self-generated"
+	if adopted {
+		caSource = "adopted-from-peer"
+	}
+	slog.Info("loaded in-memory mesh CA",
+		"source", caSource,
 		"fingerprint", certutil.CertFingerprint(mesh.Cert.Raw),
 		"not_after", mesh.Cert.NotAfter.Format(time.RFC3339),
 	)
@@ -108,12 +160,6 @@ func run(cfg config) error {
 	challengeStore := attestation.NewChallengeStore(cfg.challengeTTL)
 	checker := readiness.NewChecker(asClient, cfg.readinessInterval)
 
-	allowlistStore, err := allowlist.OpenStore(cfg.allowlistDB)
-	if err != nil {
-		return fmt.Errorf("open allowlist database: %w", err)
-	}
-	defer allowlistStore.Close()
-
 	// Seed before serving so the first GET /allowlist returns the bootstrap
 	// allowlist (CDS, attestation-api, system images) rather than an empty
 	// set; an unseeded store would deny every worker pull until an operator
@@ -125,29 +171,11 @@ func run(cfg config) error {
 	}
 
 	if !cfg.allowlistPersistent {
-		slog.Warn("allowlist store is not persistent (cds.persistence.enabled=false): a restart resets the served allowlist to the install seed and regenerates the mesh CA. Operator-added digests do not survive — re-add them after a restart, or enable persistence.")
-	}
-
-	// /allowlist mutations (POST/PUT/DELETE) are authorized by an operator token
-	// signed by one of the pinned operator keys (--operator-keys). Without any
-	// pinned key, writes fail closed while reads keep serving.
-	var writeAuthorizer allowlist.WriteAuthorizer = func(*http.Request, []byte) error {
-		return fmt.Errorf("allowlist writes are disabled: set --operator-keys")
-	}
-	var operatorKeysPEM []byte
-	if cfg.operatorKeys != "" {
-		keys, pemBytes, err := loadOperatorKeys(cfg.operatorKeys)
-		if err != nil {
-			return err
+		if adopted {
+			slog.Warn("allowlist store is not durable (cds.persistence.enabled=false): this planned adoption restored the peer's dynamic entries, but a total CDS outage and deliberate re-bootstrap still resets them to the install seed")
+		} else {
+			slog.Warn("allowlist store is not persistent (cds.persistence.enabled=false): a restart without a surviving handoff peer resets the served allowlist to the install seed and regenerates the mesh CA. Operator-added digests do not survive")
 		}
-		operatorKeysPEM = pemBytes
-		writeAuthorizer = operatorauth.Verifier{
-			Keys:      keys,
-			ClockSkew: time.Duration(cfg.jwtClockSkew) * time.Second,
-		}.Authorize
-		slog.Info("allowlist write authorization enabled (pinned operator keys)", "operator_keys", cfg.operatorKeys, "count", len(keys))
-	} else {
-		slog.Warn("--operator-keys empty: allowlist writes are disabled (reads still served)")
 	}
 
 	policy := issuer.CSRPolicy{
@@ -158,13 +186,18 @@ func run(cfg config) error {
 	// /attest-key issues a TEE-attested EAR for a caller-generated key (no CSR,
 	// no certificate). Shares the challenge store, attestation-api, and EAR
 	// issuer with /attest.
+	attestKeyOperatorPolicy := ""
+	if len(cfg.handoffMeasurements) > 0 {
+		attestKeyOperatorPolicy = operatorKeysHash
+	}
 	attestKeyHandler := attestation.Handler{
 		Challenges:        &challengeStore,
 		AttestationClient: asClient,
 		EarIssuer:         earIssuer,
+		OperatorKeysHash:  attestKeyOperatorPolicy,
 	}
 
-	handoffHandler, err := buildHandoffHandler(ctx, cfg, mesh, rotator, earIssuer, asClient)
+	handoffHandler, err := buildHandoffHandler(ctx, cfg, mesh, &allowlistStore, operatorKeysHash, rotator, earIssuer, asClient)
 	if err != nil {
 		return err
 	}
@@ -265,14 +298,14 @@ func run(cfg config) error {
 // LocalHandoffBootstrap: cds is its own EAR issuer, so the requester EAR is
 // validated against cds's own rotator/issuer name, and the signer EAR is minted
 // by cds's earIssuer — no external service to dial for it.
-func buildHandoffHandler(ctx context.Context, cfg config, mesh *issuer.CA, keyProvider issuer.KeyProvider, earIssuer ear.Issuer, asClient attestationclient.Client) (*issuer.HandoffHandler, error) {
+func buildHandoffHandler(ctx context.Context, cfg config, mesh *issuer.CA, allowlistStore *allowlist.Store, operatorKeysHash string, keyProvider issuer.KeyProvider, earIssuer ear.Issuer, asClient attestationclient.Client) (*issuer.HandoffHandler, error) {
 	handoffMeasurements := parseMeasurementAllowlist(cfg.handoffMeasurements)
 	if len(handoffMeasurements) == 0 {
 		slog.Info("/handoff disabled: set --handoff-measurements to enable mesh CA handoff to peer replicas")
 		return nil, nil
 	}
 
-	boot, err := issuer.NewLocalHandoffBootstrap(asClient, earIssuer)
+	boot, err := issuer.NewLocalHandoffBootstrap(asClient, earIssuer, operatorKeysHash)
 	if err != nil {
 		return nil, fmt.Errorf("prepare handoff bootstrap: %w", err)
 	}
@@ -282,10 +315,21 @@ func buildHandoffHandler(ctx context.Context, cfg config, mesh *issuer.CA, keyPr
 		KeyProvider:         keyProvider,
 		ExpectedIssuer:      cfg.earIssuerName,
 		AllowedMeasurements: handoffMeasurements,
+		OperatorKeysHash:    operatorKeysHash,
 		Signer:              boot.Signer(),
 		EARSource:           boot.EARSource(),
 		Snapshot: func() (issuer.CASnapshot, bool) {
-			return issuer.CASnapshot{Cert: mesh.Cert, Key: mesh.Key}, true
+			version, digests, err := allowlistStore.ListAll()
+			if err != nil {
+				slog.Error("snapshot allowlist for handoff", "error", err)
+				return issuer.CASnapshot{}, false
+			}
+			return issuer.CASnapshot{
+				Cert:             mesh.Cert,
+				Key:              mesh.Key,
+				AllowlistVersion: version,
+				Allowlist:        digests,
+			}, true
 		},
 	})
 	if err != nil {
@@ -355,6 +399,20 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.readinessInterval <= 0 {
 		return fmt.Errorf("--readiness-interval must be positive")
+	}
+	if len(cfg.handoffMeasurements) > 0 && cfg.operatorKeys == "" {
+		return fmt.Errorf("--handoff-measurements requires --operator-keys so the operator policy is bound into handoff attestation")
+	}
+	if cfg.handoffPeerURL != "" {
+		if !strings.HasPrefix(cfg.handoffPeerURL, "https://") {
+			return fmt.Errorf("--handoff-peer-url must use https (RA-TLS)")
+		}
+		if len(cfg.handoffMeasurements) == 0 {
+			return fmt.Errorf("--handoff-peer-url requires --handoff-measurements to pin the peer")
+		}
+		if cfg.handoffPeerTimeout <= 0 {
+			return fmt.Errorf("--handoff-peer-timeout must be positive")
+		}
 	}
 	return nil
 }

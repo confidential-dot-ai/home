@@ -1,7 +1,6 @@
 // Package requesthandoff implements `c8s cds request-handoff`: the client
 // side of the attested mesh-CA handoff (/handoff), runnable standalone as a
-// live-cluster probe and the precursor of the replica pull-on-startup caller
-// (#18).
+// live-cluster rollout-continuity probe.
 package requesthandoff
 
 import (
@@ -37,6 +36,8 @@ Must run inside an attested TEE with access to the local attestation-api; the
 peer admits only launch measurements pinned in its --handoff-measurements.
 A non-empty --measurements pin is mandatory even in development; handoff has
 no accept-any mode.
+The same operator public-key bundle configured on CDS is required: its
+canonical hash is bound into both handoff attestations and must match.
 Prints a one-line JSON report on stdout. The pulled CA private key never
 leaves process memory.
 
@@ -55,6 +56,7 @@ unavailable (unreachable / disabled / still bootstrapping past --timeout).`,
 	f.StringVar(&cfg.peerURL, "peer-url", "", "https URL of the CDS peer to pull the mesh CA from")
 	f.StringVar(&cfg.attestationApiURL, "attestation-api-url", "", "URL of the attestation-api service")
 	f.StringSliceVar(&cfg.measurements, "measurements", nil, "required SHA-384 hex launch measurements the peer may present; pins both its RA-TLS serving cert and its handoff issuer EAR")
+	f.StringVar(&cfg.operatorKeys, "operator-keys", "", "PEM bundle of operator EC public keys whose policy hash must match the peer")
 	f.StringVar(&cfg.expectedIssuer, "expected-issuer", "cds", "EAR JWT issuer claim required on the peer's handoff EAR")
 	f.DurationVar(&cfg.timeout, "timeout", 2*time.Minute, "overall deadline, including retries while the peer's handoff EAR bootstraps")
 	f.StringVar(&cfg.logLevel, "log-level", "info", "log level: debug, info, warn, error")
@@ -62,6 +64,7 @@ unavailable (unreachable / disabled / still bootstrapping past --timeout).`,
 	_ = cmd.MarkFlagRequired("peer-url")
 	_ = cmd.MarkFlagRequired("attestation-api-url")
 	_ = cmd.MarkFlagRequired("measurements")
+	_ = cmd.MarkFlagRequired("operator-keys")
 
 	return cmd
 }

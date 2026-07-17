@@ -248,10 +248,31 @@ cds:
   ## Attested CA handoff to a joining cds replica. When enabled, cds
   ## self-provisions its handoff signer EAR in process (no external dial) and
   ## registers /handoff, authorising peers whose launch digest is in
-  ## cds.measurements. Required for any active/active cds deployment; without
-  ## it, a cds pod restart triggers a full mesh re-bootstrap.
+  ## cds.measurements. Handoff also requires cds.operatorKeys: a canonical hash
+  ## of that public-key set is bound into both replicas' REPORTDATA and must
+  ## match before state is released. Required for any active/active cds
+  ## deployment; without it, a cds pod restart triggers a full mesh re-bootstrap.
   handoff:
     enabled: false
+    ## peerUrl: where a starting cds ADOPTS its mesh CA from over /handoff
+    ## instead of generating a fresh one. Setting it also flips the rollout to
+    ## RollingUpdate (maxUnavailable:0/maxSurge:1) so the new pod adopts from the
+    ## still-serving old pod before it is retired — this is what closes the
+    ## restart-rebootstrap window. cds fails closed if the peer is unreachable or
+    ## denies the handoff (a partition never mints a divergent trust root).
+    ##
+    ## Two-phase install: install with handoff.enabled=true (+ pinned
+    ## cds.measurements) but peerUrl empty (cold start, self generate); once a
+    ## cds pod is serving, `helm upgrade --set cds.handoff.peerUrl=self` to
+    ## enable adoption on every subsequent roll. The sentinel "self" expands to
+    ## the cds Service URL (adopt from your own predecessor); any other value
+    ## is an explicit distinct-peer https URL.
+    ## Requires handoff.enabled=true (the serving pod must offer /handoff for
+    ## the next roll) and cds.measurements; cannot combine with
+    ## persistence.enabled (the surge pod cannot share the RWO data PVC).
+    ## The encrypted handoff snapshot carries the complete served allowlist, so
+    ## planned adoption rolls preserve operator-added entries despite emptyDir.
+    peerUrl: ""
   persistence:
     enabled: false
     size: 1Gi

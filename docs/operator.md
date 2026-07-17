@@ -268,13 +268,14 @@ future work.)
 
 To remove this restriction, enable in-process handoff by setting
 `cds.handoff.enabled=true` in values and pinning `cds.measurements` to CDS's
-launch digest; the same flat allowlist authorises `/handoff`, and enabling
-handoff without measurements fails chart render. With that flag set, CDS
-generates an ECDSA handoff signer key in process at startup and
-self-provisions its handoff EAR via its own EAR issuer (no external service to
-dial). No operator key file or Kubernetes Secret is rendered — the alternative
-would put CA-adjacent material into etcd, which the chart-managed CVM design
-forbids.
+launch digest. Handoff also requires `cds.operatorKeys`: both replicas bind a
+canonical hash of that public-key set into their handoff REPORTDATA and reject
+a peer whose hash differs. Enabling handoff without either measurements or
+operator keys fails chart render. With those values set, CDS generates an
+ECDSA handoff signer key in process at startup and self-provisions its handoff
+EAR via its own EAR issuer (no external service to dial). Only the existing
+public operator-key ConfigMap is mounted; no private operator key or
+CA-adjacent Kubernetes Secret is introduced.
 
 Until handoff is enabled:
 
@@ -299,7 +300,7 @@ and verifies it against the served `/ca`. (The probe pod dials the local
 attestation-api Service; under kata that service is in-guest loopback, so the
 script does not support kata mode.)
 
-### Operator-added allowlist entries need persistence to survive a restart
+### Operator-added allowlist entries across restarts
 
 The same restart that re-bootstraps the mesh CA also resets the **served
 allowlist**. CDS seeds its store from the install seed at startup, then serves
@@ -312,6 +313,84 @@ off. To keep dynamic entries across restarts set `cds.persistence.enabled=true`
 (an RWO PVC); otherwise re-run `c8s allowlist add` after any CDS restart.
 Component/floor digests are unaffected — they are re-seeded and, unlike dynamic
 entries, are also enforced from the baked floor.
+
+There is one important exception: a **planned CA-adoption roll** transfers the
+peer's complete allowlist (version plus digests) inside the same encrypted
+handoff payload as the CA. The replacement restores that snapshot atomically,
+then applies the install seed additively, before it starts serving. Thus
+operator-added entries survive normal `peerUrl` rollovers even though each pod
+uses `emptyDir`. Freeze allowlist writes while the rollout is in progress: a
+mutation accepted by the old pod after it took the snapshot can miss the new
+pod and must be re-added. A total outage followed by deliberate re-bootstrap
+still has no peer snapshot and resets dynamic entries to the seed.
+
+### Adopting a peer's CA on startup (`cds.handoff.peerUrl`)
+
+Setting `cds.handoff.peerUrl` makes a starting CDS **adopt** the peer's mesh CA
+over `/handoff` instead of generating a fresh one — the same attested pull the
+probe performs, run in process at startup. It requires `cds.handoff.enabled=true`
+(the serving pod must offer `/handoff` for the next roll to adopt from), pins
+the peer with `cds.measurements` (same launch digest), and requires an exact
+`cds.operatorKeys` set match committed into both handoff attestations. It
+**fails closed**: if the peer is unreachable within
+`--handoff-peer-timeout`, denies the handoff, or presents a different operator
+policy, CDS refuses to start rather than mint a divergent trust root. The
+startup log reports `source=adopted-from-peer` or `source=self-generated`.
+
+On SEV-SNP, the measurement pin is LAUNCH_DIGEST. On TDX it is MRTD; RTMRs
+(including workload RTMR[3]) are not covered by this adoption verdict.
+
+Setting `peerUrl` also flips the rollout to `RollingUpdate`
+(`maxUnavailable: 0`/`maxSurge: 1`): the replacement pod starts and adopts from
+the still-serving old pod before that pod is retired, so the CA survives a
+restart and no workload re-provisions. The sentinel `peerUrl: self` expands to
+the CDS Service URL — the new pod adopts from its own predecessor, which is the
+only Ready Service endpoint while it starts. `peerUrl` cannot be combined with
+`persistence.enabled` (the surge pod cannot share the RWO data PVC; the
+allowlist is instead restored from the encrypted handoff snapshot). Replicas
+stay fixed at 1 either way: EAR signing keys are per pod, so a second
+steady-state endpoint would break EAR verification even though adoption shares
+the CA (see
+[the active/active memo](decisions/2026-07-14-cds-active-active-ear-jwks.md)).
+
+The operator-key hash is a **configuration-continuity check**, not proof of
+operator private-key possession. The public bundle is intentionally readable,
+so a malicious control plane able to boot the same measured CDS image can copy
+the same bundle. Preventing that clone from requesting the CA requires a future
+interactive operator approval or attestation-gated secret-release primitive.
+Exact-set matching also means changing `cds.operatorKeys` cannot ride the same
+adoption roll; until a signed policy-transition mechanism exists, rotate that
+set only as part of a deliberate trust-root re-bootstrap.
+
+**Two-phase install** (adoption is a deliberate day-2 opt-in):
+
+1. Install with `cds.handoff.enabled=true`, pinned `cds.measurements`, and
+   `cds.operatorKeys`, but leave `peerUrl` empty — the first CDS cold-starts
+   and self-generates (`Recreate`) while already serving `/handoff`.
+2. Once it is serving, enable adoption:
+   `helm upgrade <release> ... --reuse-values --set cds.handoff.peerUrl=self`.
+   The upgrade surges a new pod that adopts the running CA; every subsequent
+   roll then preserves it.
+
+Verify with `kubectl rollout restart deploy/<release>-cds`: the new pod logs
+`source=adopted-from-peer` with the **same** CA fingerprint as before the
+restart (a plain restart without adoption changes it).
+
+**If the sole pod dies involuntarily** (container crash, OOM kill, node
+failure), no peer survives to adopt from, so the replacement fails closed and
+crash-loops — by design, since silently minting a fresh CA is exactly what
+adoption exists to prevent. The mesh CA is gone regardless; recover with a
+deliberate re-bootstrap: `helm upgrade <release> ... --reuse-values --set
+cds.handoff.peerUrl=""` (cold start, new trust root, workloads re-provision),
+then re-enable adoption with `--set cds.handoff.peerUrl=self`.
+
+**Adoption does not renew the CA.** Every handoff preserves the original
+certificate and its `NotAfter`, so a chain of successful rollovers still
+approaches the same expiry wall. CDS reports `not_after` at startup and
+`/readyz` turns 503 inside `cds.ca.minValidity`; scheduled `CARotator` wiring is
+not shipped. Plan a deliberate re-bootstrap (and workload re-provisioning)
+before expiry, and choose `cds.ca.certValidity` with that maintenance horizon
+in mind on the initial cold start.
 
 ## Verifying attestation after install
 

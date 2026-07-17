@@ -124,7 +124,17 @@ func (iss Issuer) IssueForRequestBody(submodsEvidence json.RawMessage, launchDig
 // normalized launch digest when available, and optionally binds the EAR to the
 // attested ECDSA TEE public key.
 func (iss Issuer) IssueWithLaunchDigestAndPubKey(submodsEvidence json.RawMessage, launchDigest string, teePubKey *ecdsa.PublicKey) (string, error) {
-	return iss.issueWithExtras(submodsEvidence, launchDigest, teePubKey, nil)
+	return iss.IssueAttestedKey(submodsEvidence, launchDigest, teePubKey, "")
+}
+
+// IssueAttestedKey produces an EAR for a TEE-bound public key and optionally
+// commits the CDS operator-key policy that was included in REPORTDATA.
+func (iss Issuer) IssueAttestedKey(submodsEvidence json.RawMessage, launchDigest string, teePubKey *ecdsa.PublicKey, operatorKeysHash string) (string, error) {
+	var extras map[string]any
+	if operatorKeysHash != "" {
+		extras = map[string]any{earclaims.OperatorKeysHash: operatorKeysHash}
+	}
+	return iss.issueWithExtras(submodsEvidence, launchDigest, teePubKey, extras)
 }
 
 func (iss Issuer) issueWithExtras(submodsEvidence json.RawMessage, launchDigest string, teePubKey *ecdsa.PublicKey, extras map[string]any) (string, error) {

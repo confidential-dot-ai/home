@@ -300,6 +300,21 @@ http://{{ include "c8s.attestationApiName" . }}.{{ .Release.Namespace }}.svc:{{ 
 https://{{ include "c8s.cdsName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.cds.port }}
 {{- end -}}
 
+{{- /*
+c8s.cdsHandoffPeerURL — the effective --handoff-peer-url for CA adoption on
+startup. Empty means cold start (self-generate). The sentinel "self" expands to
+the CDS Service URL, so an operator enabling adoption for a self-rolling
+Deployment flips one value instead of hand-typing the in-cluster address; any
+other value is used verbatim (adopt from a distinct peer).
+*/ -}}
+{{- define "c8s.cdsHandoffPeerURL" -}}
+{{- if eq .Values.cds.handoff.peerUrl "self" -}}
+{{ include "c8s.cdsURL" . }}
+{{- else -}}
+{{ .Values.cds.handoff.peerUrl }}
+{{- end -}}
+{{- end -}}
+
 {{/*
 c8s.getCertContainers renders the c8s-cert native sidecar (restartPolicy:
 Always) a chart-owned component uses to self-provision and renew a CDS-issued

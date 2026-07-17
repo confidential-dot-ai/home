@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -224,6 +225,46 @@ func (s *Store) SeedDigests(digests map[types.Digest]string) (int, error) {
 	}
 
 	return int(added), tx.Commit()
+}
+
+// RestoreSnapshot atomically replaces the store with an attested handoff
+// snapshot while preserving the peer's version. It is intended for CDS
+// startup before the HTTP server is exposed; unlike Replace, this is state
+// transfer rather than an operator mutation and therefore does not bump the
+// ETag version.
+func (s *Store) RestoreSnapshot(version string, digests map[types.Digest]string) error {
+	parsedVersion, err := strconv.ParseUint(version, 10, 64)
+	if err != nil || parsedVersion == 0 {
+		return fmt.Errorf("invalid allowlist snapshot version %q", version)
+	}
+	if digests == nil {
+		return fmt.Errorf("allowlist snapshot digests are required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM allowlist"); err != nil {
+		return err
+	}
+	for digest, image := range digests {
+		if _, err := tx.Exec(
+			"INSERT INTO allowlist (digest, image) VALUES (?, ?)",
+			digest.String(), image,
+		); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec("UPDATE allowlist_version SET version = ?", version); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Replace atomically swaps the entire allowlist for digests and bumps the

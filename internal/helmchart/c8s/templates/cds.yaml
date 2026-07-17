@@ -12,6 +12,27 @@
     {{- /* Structured marker (kind=...) lets tests discriminate this fail without substring-matching the prose. */ -}}
     {{- fail "VALIDATION_ERROR kind=cds_handoff_measurements: cds.handoff.enabled requires cds.measurements to be set (the joining replica's launch digest). See docs/operator.md." -}}
   {{- end -}}
+  {{- if not .Values.cds.operatorKeys -}}
+    {{- fail "VALIDATION_ERROR kind=cds_handoff_operator_keys: cds.handoff.enabled requires cds.operatorKeys so both replicas commit the same allowlist-write policy into handoff attestation. See docs/operator.md." -}}
+  {{- end -}}
+{{- end -}}
+{{- if .Values.cds.handoff.peerUrl -}}
+  {{- /* Without enabled no pod serves /handoff (--handoff-measurements renders
+         only under it), so the surge pod has nothing to adopt from and its own
+         config validation rejects peer-url-without-measurements: wedged roll. */ -}}
+  {{- if not .Values.cds.handoff.enabled -}}
+    {{- fail "VALIDATION_ERROR kind=cds_handoff_peer_requires_enabled: cds.handoff.peerUrl requires cds.handoff.enabled=true so the serving pod offers /handoff for the next roll to adopt from. See docs/operator.md." -}}
+  {{- end -}}
+  {{- /* Check the resolved URL ("self" -> the CDS Service URL, else verbatim). */ -}}
+  {{- if not (hasPrefix "https://" (include "c8s.cdsHandoffPeerURL" .)) -}}
+    {{- fail "VALIDATION_ERROR kind=cds_handoff_peer_scheme: cds.handoff.peerUrl must use https (RA-TLS), or the sentinel \"self\" for the CDS Service URL." -}}
+  {{- end -}}
+  {{- /* The surge pod can't co-mount the RWO PVC. Its allowlist is restored
+         from the encrypted handoff snapshot, so forbid the combo rather than
+         deadlock the roll. */ -}}
+  {{- if .Values.cds.persistence.enabled -}}
+    {{- fail "VALIDATION_ERROR kind=cds_handoff_peer_persistence: cds.handoff.peerUrl (adoption) cannot be combined with cds.persistence.enabled (the surge pod cannot share the RWO data PVC). Dynamic allowlist state is transferred in the encrypted handoff snapshot. See docs/operator.md." -}}
+  {{- end -}}
 {{- end -}}
 apiVersion: v1
 kind: ServiceAccount
@@ -85,15 +106,25 @@ metadata:
   annotations:
     confidential.ai/trust-root-mode: "inMemory"
 spec:
-  {{/* Singleton: the mesh CA and EAR signing key live in process memory, so a
-       second replica would mint a divergent trust root. Active/active needs
-       the /handoff path (cds.handoff.enabled), not extra replicas here. */}}
+  {{/* Fixed at 1: EAR signing keys are per pod, so a second Ready endpoint
+       breaks EAR verification even though adoption shares the CA (see
+       docs/decisions/2026-07-14-cds-active-active-ear-jwks.md). */}}
   replicas: 1
-  # Recreate, not surge: the RWO data PVC and singleton
-  # trust root both forbid two concurrent CDS pods. Dependents ride out the
-  # brief CDS gap via get-cert's in-process retry.
+  {{- if .Values.cds.handoff.peerUrl }}
+  # Surge the new pod so it adopts the CA from the still-serving old pod before
+  # that pod is retired; maxUnavailable:0 keeps exactly one Service endpoint, so
+  # --handoff-peer-url (the Service URL) resolves to the old pod during adoption.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  {{- else }}
+  # Recreate: two non-adopting pods would mint divergent roots and can't
+  # co-mount the RWO data PVC. Dependents ride out the gap via get-cert retry.
   strategy:
     type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: c8s-operator
@@ -193,6 +224,9 @@ spec:
             {{- if .Values.cds.handoff.enabled }}
             - --handoff-measurements={{ join "," .Values.cds.measurements }}
             {{- end }}
+            {{- with (include "c8s.cdsHandoffPeerURL" .) }}
+            - --handoff-peer-url={{ . }}
+            {{- end }}
             - --token-signer-rotation-interval={{ .Values.cds.tokenSignerRotationInterval }}
             - --token-signer-overlap={{ .Values.cds.tokenSignerOverlap }}
             - --token-signer-rotation-jitter={{ .Values.cds.tokenSignerRotationJitter }}
@@ -206,6 +240,16 @@ spec:
           ports:
             - name: https
               containerPort: {{ .Values.cds.port }}
+          {{- if .Values.cds.handoff.peerUrl }}
+          # Adoption blocks startup (no listener yet) up to --handoff-peer-timeout
+          # (2m default); hold liveness off until the port opens or it gets
+          # killed mid-pull. 30x10s covers the deadline with slack.
+          startupProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 10
+            failureThreshold: 30
+          {{- end }}
           {{- if .Values.kata.enabled }}
           # In-guest cds serves mutual RA-TLS: the kubelet prober presents no
           # attested client cert, so an httpGet handshake is rejected. The port

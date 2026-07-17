@@ -375,3 +375,51 @@ func TestSeedDigestsEmptyIsNoop(t *testing.T) {
 		t.Fatalf("version: got %q, want %q (empty seed must not bump)", version, "1")
 	}
 }
+
+func TestRestoreSnapshotReplacesStateAndPreservesVersion(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	oldDigest := mustParseDigest(t, digestA)
+	newDigest := mustParseDigest(t, digestB)
+	if err := store.Add(oldDigest, "old/image"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RestoreSnapshot("42", map[types.Digest]string{newDigest: "new/image"}); err != nil {
+		t.Fatalf("RestoreSnapshot: %v", err)
+	}
+
+	version, digests, err := store.ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != "42" {
+		t.Fatalf("version = %q, want 42", version)
+	}
+	if len(digests) != 1 || digests[newDigest] != "new/image" {
+		t.Fatalf("digests = %#v, want only transferred digest", digests)
+	}
+	if _, ok := digests[oldDigest]; ok {
+		t.Fatal("pre-existing digest survived snapshot restore")
+	}
+}
+
+func TestRestoreSnapshotRejectsInvalidState(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	for _, version := range []string{"", "0", "-1", "not-a-version"} {
+		if err := store.RestoreSnapshot(version, map[types.Digest]string{}); err == nil {
+			t.Fatalf("RestoreSnapshot accepted version %q", version)
+		}
+	}
+	if err := store.RestoreSnapshot("1", nil); err == nil {
+		t.Fatal("RestoreSnapshot accepted nil digests")
+	}
+}

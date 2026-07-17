@@ -170,6 +170,12 @@ func (c Client) ObtainCertificateWithEvidenceContext(ctx context.Context, attest
 // bootstrap) that need a CDS-issued EAR bound to a key they hold in
 // memory, without going through the cert-issuance flow.
 func (c Client) AttestKey(ctx context.Context, attestationApiURL string, pubKeyDER []byte) (string, error) {
+	return c.AttestKeyWithOperatorKeysHash(ctx, attestationApiURL, pubKeyDER, "")
+}
+
+// AttestKeyWithOperatorKeysHash is AttestKey with an additional CDS
+// operator-key policy commitment bound into REPORTDATA and the resulting EAR.
+func (c Client) AttestKeyWithOperatorKeysHash(ctx context.Context, attestationApiURL string, pubKeyDER []byte, operatorKeysHash string) (string, error) {
 	ctx = contextOrBackground(ctx)
 
 	challengeResp, err := c.AuthenticateContext(ctx)
@@ -185,7 +191,7 @@ func (c Client) AttestKey(ctx context.Context, attestationApiURL string, pubKeyD
 	if err != nil {
 		return "", fmt.Errorf("parse public key: %w", err)
 	}
-	reportData, err := ratls.ReportDataForKey(pubAny, challengeBytes)
+	reportData, err := ratls.ReportDataForKeyWithContext(pubAny, challengeBytes, []byte(operatorKeysHash))
 	if err != nil {
 		return "", err
 	}
@@ -196,9 +202,10 @@ func (c Client) AttestKey(ctx context.Context, attestationApiURL string, pubKeyD
 	}
 
 	body, err := json.Marshal(types.AttestKeyRequestBody{
-		Challenge: challengeResp.Challenge,
-		Evidence:  types.AttestationEvidence(asResp),
-		PublicKey: base64.StdEncoding.EncodeToString(pubKeyDER),
+		Challenge:        challengeResp.Challenge,
+		Evidence:         types.AttestationEvidence(asResp),
+		PublicKey:        base64.StdEncoding.EncodeToString(pubKeyDER),
+		OperatorKeysHash: operatorKeysHash,
 	})
 	if err != nil {
 		return "", err

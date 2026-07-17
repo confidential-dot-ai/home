@@ -253,6 +253,54 @@ func TestReportDataForKeyWithNonce(t *testing.T) {
 	}
 }
 
+func TestReportDataForKeyWithContext(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := []byte("challenge")
+	contextA := []byte("operator-key-set-a")
+
+	legacy, err := ReportDataForKey(&key.PublicKey, nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := ReportDataForKeyWithContext(&key.PublicKey, nonce, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty != legacy {
+		t.Fatal("empty context changed the established REPORTDATA format")
+	}
+
+	withA, err := ReportDataForKeyWithContext(&key.PublicKey, nonce, contextA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withAAgain, err := ReportDataForKeyWithContext(&key.PublicKey, nonce, contextA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withA != withAAgain {
+		t.Fatal("contextual REPORTDATA is not deterministic")
+	}
+	if withA == legacy {
+		t.Fatal("non-empty context did not change REPORTDATA")
+	}
+	withB, err := ReportDataForKeyWithContext(&key.PublicKey, nonce, []byte("operator-key-set-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withA == withB {
+		t.Fatal("different contexts produced the same REPORTDATA")
+	}
+	for i := sha512.Size384; i < len(withA); i++ {
+		if withA[i] != 0 {
+			t.Fatalf("REPORTDATA[%d] = %d, want zero padding", i, withA[i])
+		}
+	}
+}
+
 func TestGenerateKeyPair(t *testing.T) {
 	key, reportData, err := GenerateKeyPair()
 	if err != nil {

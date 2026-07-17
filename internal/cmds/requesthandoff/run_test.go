@@ -19,6 +19,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/issuer"
 	"github.com/confidential-dot-ai/c8s/pkg/attestclient"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
+	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
 func testCA(t *testing.T, cn string) *issuer.CA {
@@ -45,7 +46,17 @@ func TestServedCAMatch(t *testing.T) {
 func TestReportForVerdict(t *testing.T) {
 	ca := testCA(t, "handed-off-ca")
 	other := testCA(t, "other-ca")
-	material := &issuer.HandoffMaterial{CACert: ca.Cert, CAKey: ca.Key, Bundle: []*x509.Certificate{ca.Cert}}
+	digest, err := types.ParseDigest("sha256:" + strings.Repeat("1", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	material := &issuer.HandoffMaterial{
+		CACert:           ca.Cert,
+		CAKey:            ca.Key,
+		Bundle:           []*x509.Certificate{ca.Cert},
+		AllowlistVersion: "7",
+		Allowlist:        map[types.Digest]string{digest: "registry.example/dynamic:latest"},
+	}
 
 	rep, code := reportFor(material, []*x509.Certificate{other.Cert, ca.Cert})
 	if !rep.ServedCAMatch || code != exitVerified {
@@ -57,6 +68,9 @@ func TestReportForVerdict(t *testing.T) {
 	if rep.BundleCertCount != 1 {
 		t.Fatalf("BundleCertCount = %d, want 1", rep.BundleCertCount)
 	}
+	if rep.AllowlistVersion != "7" || rep.AllowlistDigestCount != 1 {
+		t.Fatalf("allowlist report = version %q count %d, want 7/1", rep.AllowlistVersion, rep.AllowlistDigestCount)
+	}
 	encoded, err := json.Marshal(rep)
 	if err != nil {
 		t.Fatal(err)
@@ -66,6 +80,9 @@ func TestReportForVerdict(t *testing.T) {
 	}
 	if bytes.Contains(encoded, []byte(`"bundle_certs"`)) {
 		t.Fatalf("report JSON retains ambiguous bundle_certs field: %s", encoded)
+	}
+	if !bytes.Contains(encoded, []byte(`"allowlist_version":"7"`)) || !bytes.Contains(encoded, []byte(`"allowlist_digest_count":1`)) {
+		t.Fatalf("report JSON = %s, want allowlist snapshot summary", encoded)
 	}
 
 	rep, code = reportFor(material, []*x509.Certificate{other.Cert})
@@ -145,7 +162,7 @@ func TestNewCmdDefaults(t *testing.T) {
 			t.Errorf("--%s default = %q, want %q", flag, f.DefValue, want)
 		}
 	}
-	for _, flag := range []string{"peer-url", "attestation-api-url", "measurements"} {
+	for _, flag := range []string{"peer-url", "attestation-api-url", "measurements", "operator-keys"} {
 		f := cmd.Flags().Lookup(flag)
 		if f == nil {
 			t.Fatalf("flag --%s not registered", flag)

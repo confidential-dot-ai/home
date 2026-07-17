@@ -3849,6 +3849,7 @@ func TestChartCDSHandoffEnabledWiresMeasurements(t *testing.T) {
 	out, err := helmTemplate(t,
 		"--set", "cds.handoff.enabled=true",
 		"--set", "cds.measurements[0]="+measurement,
+		"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
 	)
 	if err != nil {
 		t.Fatalf("helm template: %v\n%s", err, out)
@@ -3879,6 +3880,179 @@ func TestChartCDSHandoffEnabledFailsWithoutMeasurements(t *testing.T) {
 	}
 	if got := parseValidationErrorKind(out); got != "cds_handoff_measurements" {
 		t.Fatalf("validation kind = %q, want cds_handoff_measurements; output=%s", got, out)
+	}
+}
+
+const cdsPeerMeasurement = "0011223344556677889900112233445566778899001122334455667788990011223344556677889900112233445566ff"
+const cdsHandoffOperatorKeys = "-----BEGIN PUBLIC KEY-----fake"
+
+func TestChartCDSHandoffEnabledRequiresOperatorKeys(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set", "cds.handoff.enabled=true",
+		"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+	)
+	if err == nil {
+		t.Fatalf("helm template succeeded with CDS handoff but no operator keys; output=%s", out)
+	}
+	if got := parseValidationErrorKind(out); got != "cds_handoff_operator_keys" {
+		t.Fatalf("validation kind = %q, want cds_handoff_operator_keys; output=%s", got, out)
+	}
+}
+
+// TestChartCDSHandoffPeerURLWiresFlag confirms cds.handoff.peerUrl renders the
+// requester-side --handoff-peer-url flag (pull-on-startup adoption) alongside
+// the serving-side --handoff-measurements, so the rendered pod both adopts and
+// offers /handoff for the roll after it.
+func TestChartCDSHandoffPeerURLWiresFlag(t *testing.T) {
+	const peer = "https://c8s-cds-peer.c8s-system.svc:8443"
+	out, err := helmTemplate(t,
+		"--set", "cds.handoff.enabled=true",
+		"--set", "cds.handoff.peerUrl="+peer,
+		"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+		"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	args := renderedDeploymentContainer(t, out, "c8s-cds", "cds").Args
+	assertContainerHasArg(t, "cds", args, "--handoff-peer-url="+peer)
+	assertContainerHasArg(t, "cds", args, "--handoff-measurements="+cdsPeerMeasurement)
+}
+
+// TestChartCDSHandoffPeerURLOmittedByDefault is the negative: without peerUrl
+// the flag MUST be absent so cds self-generates (cold start).
+func TestChartCDSHandoffPeerURLOmittedByDefault(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	args := renderedDeploymentContainer(t, out, "c8s-cds", "cds").Args
+	assertContainerNoArgPrefix(t, "cds", args, "--handoff-peer-url=")
+}
+
+// TestChartCDSHandoffPeerURLRequiresHandoffEnabled locks the guard: without
+// handoff.enabled no pod serves /handoff, so a peerUrl surge pod would have
+// nothing to adopt from and the roll wedges.
+func TestChartCDSHandoffPeerURLRequiresHandoffEnabled(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set", "cds.handoff.peerUrl=https://peer:8443",
+		"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+	)
+	if err == nil {
+		t.Fatalf("helm template succeeded with peerUrl but handoff.enabled=false; output=%s", out)
+	}
+	if got := parseValidationErrorKind(out); got != "cds_handoff_peer_requires_enabled" {
+		t.Fatalf("validation kind = %q, want cds_handoff_peer_requires_enabled; output=%s", got, out)
+	}
+}
+
+// TestChartCDSHandoffPeerURLFailsOnNonHTTPS locks the https guard: an http peer
+// URL would let cds adopt a CA over an unattested channel.
+func TestChartCDSHandoffPeerURLFailsOnNonHTTPS(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set", "cds.handoff.enabled=true",
+		"--set", "cds.handoff.peerUrl=http://peer:8443",
+		"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+		"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
+	)
+	if err == nil {
+		t.Fatalf("helm template succeeded with an http peerUrl; output=%s", out)
+	}
+	if got := parseValidationErrorKind(out); got != "cds_handoff_peer_scheme" {
+		t.Fatalf("validation kind = %q, want cds_handoff_peer_scheme; output=%s", got, out)
+	}
+}
+
+// TestChartCDSStrategyTracksAdoption pins the rollout to its constraint: with
+// no adoption peer cds must Recreate (two non-adopting pods would mint
+// divergent trust roots); with cds.handoff.peerUrl set it surges so the new
+// pod adopts from the still-serving old pod before it retires, and a
+// startupProbe holds liveness off while adoption blocks the listener. Either
+// way replicas stays 1: EAR signing keys are per pod, so a second steady-state
+// endpoint breaks EAR verification (see the active/active decision memo).
+func TestChartCDSStrategyTracksAdoption(t *testing.T) {
+	t.Run("no peer: Recreate singleton", func(t *testing.T) {
+		out, err := helmTemplate(t)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		dep := renderedDeployment(t, out, "c8s-cds")
+		if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+			t.Errorf("cds strategy = %q, want Recreate", dep.Spec.Strategy.Type)
+		}
+		if got := *dep.Spec.Replicas; got != 1 {
+			t.Errorf("cds replicas = %d, want the fixed singleton 1", got)
+		}
+		if renderedDeploymentContainer(t, out, "c8s-cds", "cds").StartupProbe != nil {
+			t.Error("cds has a startupProbe without adoption; nothing blocks startup")
+		}
+	})
+
+	t.Run("peerUrl set: surge with no gap", func(t *testing.T) {
+		out, err := helmTemplate(t,
+			"--set", "cds.handoff.enabled=true",
+			"--set", "cds.handoff.peerUrl=self",
+			"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+			"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
+		)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		dep := renderedDeployment(t, out, "c8s-cds")
+		if dep.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+			t.Errorf("cds strategy = %q, want RollingUpdate", dep.Spec.Strategy.Type)
+		}
+		if ru := dep.Spec.Strategy.RollingUpdate; ru == nil ||
+			ru.MaxUnavailable == nil || ru.MaxUnavailable.IntValue() != 0 ||
+			ru.MaxSurge == nil || ru.MaxSurge.IntValue() != 1 {
+			t.Errorf("cds should surge (maxSurge=1, maxUnavailable=0), got %+v", ru)
+		}
+		if got := *dep.Spec.Replicas; got != 1 {
+			t.Errorf("cds replicas = %d, want the fixed singleton 1", got)
+		}
+		// The probe window must cover --handoff-peer-timeout (2m default) or
+		// liveness kills the pod mid-adoption.
+		sp := renderedDeploymentContainer(t, out, "c8s-cds", "cds").StartupProbe
+		if sp == nil {
+			t.Fatal("adoption rendered no startupProbe; liveness would kill a mid-adoption pod")
+		}
+		if window := sp.FailureThreshold * sp.PeriodSeconds; window < 150 {
+			t.Errorf("startupProbe window = %ds, want >= 150s to cover the 120s adoption deadline", window)
+		}
+	})
+}
+
+// TestChartCDSHandoffPeerSelfResolvesToServiceURL confirms the "self" sentinel
+// expands to the CDS Service URL so an operator flips one value, not a hostname.
+func TestChartCDSHandoffPeerSelfResolvesToServiceURL(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set", "cds.handoff.enabled=true",
+		"--set", "cds.handoff.peerUrl=self",
+		"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+		"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	args := renderedDeploymentContainer(t, out, "c8s-cds", "cds").Args
+	assertContainerHasArg(t, "cds", args, "--handoff-peer-url=https://c8s-cds.c8s-system.svc:8443")
+}
+
+// TestChartCDSHandoffPeerRejectsPersistence locks the guard that adoption and
+// the RWO data PVC are mutually exclusive (a surge pod cannot co-mount it).
+func TestChartCDSHandoffPeerRejectsPersistence(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set", "cds.handoff.enabled=true",
+		"--set", "cds.handoff.peerUrl=self",
+		"--set", "cds.measurements[0]="+cdsPeerMeasurement,
+		"--set", "cds.persistence.enabled=true",
+		"--set-string", "cds.operatorKeys="+cdsHandoffOperatorKeys,
+	)
+	if err == nil {
+		t.Fatalf("helm template succeeded with peerUrl + persistence; output=%s", out)
+	}
+	if got := parseValidationErrorKind(out); got != "cds_handoff_peer_persistence" {
+		t.Fatalf("validation kind = %q, want cds_handoff_peer_persistence; output=%s", got, out)
 	}
 }
 

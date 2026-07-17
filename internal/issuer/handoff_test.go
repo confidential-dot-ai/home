@@ -24,11 +24,22 @@ import (
 
 	"github.com/confidential-dot-ai/c8s/internal/earclaims"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
+	"github.com/confidential-dot-ai/c8s/pkg/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/crypto/cryptobyte"
 )
 
 type testKeyProvider struct{ pub *ecdsa.PublicKey }
+
+const handoffTestOperatorKeysHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func handoffTestDigest() types.Digest {
+	digest, err := types.ParseDigest("sha256:" + strings.Repeat("1", 64))
+	if err != nil {
+		panic(err)
+	}
+	return digest
+}
 
 func (p testKeyProvider) PublicKey(string) (*ecdsa.PublicKey, error) {
 	return p.pub, nil
@@ -42,7 +53,14 @@ func (s staticHandoffEARSource) Current() (string, error) {
 
 func snapshotFromCA(ca *CA) func() (CASnapshot, bool) {
 	return func() (CASnapshot, bool) {
-		return CASnapshot{Cert: ca.Cert, Key: ca.Key}, true
+		return CASnapshot{
+			Cert:             ca.Cert,
+			Key:              ca.Key,
+			AllowlistVersion: "17",
+			Allowlist: map[types.Digest]string{
+				handoffTestDigest(): "registry.example/dynamic:latest",
+			},
+		}, true
 	}
 }
 
@@ -69,6 +87,7 @@ func TestAttestedHandoffTransfersCAKeyToAllowedReplica(t *testing.T) {
 		Logger:              slog.Default(),
 		KeyProvider:         kp,
 		AllowedMeasurements: allowed,
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 		Bundle:              bm,
 		Signer:              activeHandoffKey,
 		EARSource:           staticHandoffEARSource{ear: activeEAR},
@@ -83,6 +102,7 @@ func TestAttestedHandoffTransfersCAKeyToAllowedReplica(t *testing.T) {
 	clientDeps := HandoffClientDeps{
 		KeyProvider:         kp,
 		AllowedMeasurements: map[string]bool{"allowed_measurement": true},
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 	}
 	material, err := RequestHandoff(context.Background(), clientDeps, srv.URL, requesterEAR, requesterHandoffKey, srv.Client())
 	if err != nil {
@@ -100,6 +120,9 @@ func TestAttestedHandoffTransfersCAKeyToAllowedReplica(t *testing.T) {
 	}
 	if len(material.Bundle) != 1 {
 		t.Fatalf("handoff bundle count = %d, want 1", len(material.Bundle))
+	}
+	if material.AllowlistVersion != "17" || material.Allowlist[handoffTestDigest()] != "registry.example/dynamic:latest" {
+		t.Fatalf("handoff allowlist snapshot = version %q, digests %#v", material.AllowlistVersion, material.Allowlist)
 	}
 }
 
@@ -133,6 +156,7 @@ func TestHandoffBundleStartsWithHandedOffActiveCA(t *testing.T) {
 		Logger:              slog.Default(),
 		KeyProvider:         kp,
 		AllowedMeasurements: allowed,
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 		Bundle:              bm,
 		Signer:              activeHandoffKey,
 		EARSource:           staticHandoffEARSource{ear: activeEAR},
@@ -147,6 +171,7 @@ func TestHandoffBundleStartsWithHandedOffActiveCA(t *testing.T) {
 	clientDeps := HandoffClientDeps{
 		KeyProvider:         kp,
 		AllowedMeasurements: map[string]bool{"allowed_measurement": true},
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 	}
 	material, err := RequestHandoff(context.Background(), clientDeps, srv.URL, requesterEAR, requesterHandoffKey, srv.Client())
 	if err != nil {
@@ -184,6 +209,7 @@ func TestHandoffRejectsRequesterKeyNotBoundToEAR(t *testing.T) {
 		Logger:              slog.Default(),
 		KeyProvider:         kp,
 		AllowedMeasurements: allowed,
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 		Signer:              activeHandoffKey,
 		EARSource:           staticHandoffEARSource{ear: activeEAR},
 		Snapshot:            snapshotFromCA(ca),
@@ -242,6 +268,7 @@ func TestHandoffRejectsUnallowedRequesterMeasurement(t *testing.T) {
 		Logger:              slog.Default(),
 		KeyProvider:         kp,
 		AllowedMeasurements: allowed,
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 		Signer:              activeHandoffKey,
 		EARSource:           staticHandoffEARSource{ear: activeEAR},
 		Snapshot:            snapshotFromCA(ca),
@@ -293,7 +320,10 @@ func TestRequestHandoffReturnsTypedStatusError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	deps := HandoffClientDeps{AllowedMeasurements: map[string]bool{"allowed_measurement": true}}
+	deps := HandoffClientDeps{
+		AllowedMeasurements: map[string]bool{"allowed_measurement": true},
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
+	}
 	_, err := RequestHandoff(context.Background(), deps, srv.URL, "ear", handoffTestKey(t), srv.Client())
 	var statusErr *HandoffStatusError
 	if !errors.As(err, &statusErr) {
@@ -333,6 +363,7 @@ func TestUnwrapHandoffResponseRejectsBadNonceLength(t *testing.T) {
 	clientDeps := HandoffClientDeps{
 		KeyProvider:         kp,
 		AllowedMeasurements: map[string]bool{"allowed_measurement": true},
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 	}
 	_, err = UnwrapHandoffResponse(HandoffResponse{
 		IssuerEAR:  issuerEAR,
@@ -407,6 +438,7 @@ func TestHandoffReloadsIssuerEARFromFile(t *testing.T) {
 		Logger:              slog.Default(),
 		KeyProvider:         kp,
 		AllowedMeasurements: allowed,
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 		Signer:              activeHandoffKey,
 		EARSource:           earSource,
 		Snapshot:            snapshotFromCA(ca),
@@ -527,8 +559,9 @@ func handoffTestEARWithKey(t *testing.T, tokenKey *ecdsa.PrivateKey, measurement
 	t.Helper()
 	now := time.Now().Unix()
 	claims := map[string]any{
-		earclaims.IssuedAt:  now,
-		earclaims.ExpiresAt: now + 3600,
+		earclaims.IssuedAt:         now,
+		earclaims.ExpiresAt:        now + 3600,
+		earclaims.OperatorKeysHash: handoffTestOperatorKeysHash,
 		earclaims.Submods: map[string]any{
 			earclaims.SubmodAttester: map[string]any{
 				earclaims.LaunchDigest: measurement,
@@ -603,6 +636,7 @@ func TestNewHandoffHandlerValidatesInputs(t *testing.T) {
 			Logger:              slog.Default(),
 			KeyProvider:         kp,
 			AllowedMeasurements: allowed,
+			OperatorKeysHash:    handoffTestOperatorKeysHash,
 			Bundle:              bm,
 			Signer:              signer,
 			EARSource:           src,
@@ -624,6 +658,11 @@ func TestNewHandoffHandlerValidatesInputs(t *testing.T) {
 	if _, err := NewHandoffHandler(baseDeps(nil)); err == nil {
 		t.Error("expected error when handoff measurement allowlist is empty")
 	}
+	missingPolicy := baseDeps(map[string]bool{"m": true})
+	missingPolicy.OperatorKeysHash = ""
+	if _, err := NewHandoffHandler(missingPolicy); err == nil {
+		t.Error("expected error when operator-key policy hash is empty")
+	}
 
 	// An EAR source that hasn't bootstrapped yet is accepted at construction
 	// time — the handler returns 503 at request time. This decouples
@@ -644,6 +683,42 @@ func TestNewHandoffHandlerValidatesInputs(t *testing.T) {
 	}
 	if hh.signer == nil || hh.earSource == nil {
 		t.Fatal("handoffHandler missing signer or EAR source")
+	}
+}
+
+func TestCheckOperatorPolicyRejectsMissingAndMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		claims *EARClaims
+	}{
+		{name: "missing claim", claims: &EARClaims{}},
+		{name: "malformed claim", claims: &EARClaims{OperatorKeysHash: "bad"}},
+		{name: "different policy", claims: &EARClaims{OperatorKeysHash: strings.Repeat("b", 64)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkOperatorPolicy(tc.claims, handoffTestOperatorKeysHash, "requester")
+			var validationErr *TokenValidationError
+			if !errors.As(err, &validationErr) || validationErr.Reason != ReasonOperatorPolicy {
+				t.Fatalf("error = %v, want operator-policy TokenValidationError", err)
+			}
+		})
+	}
+	if err := checkOperatorPolicy(&EARClaims{OperatorKeysHash: handoffTestOperatorKeysHash}, handoffTestOperatorKeysHash, "requester"); err != nil {
+		t.Fatalf("matching operator policy rejected: %v", err)
+	}
+}
+
+func TestValidateAllowlistSnapshot(t *testing.T) {
+	for _, version := range []string{"", "0", "-1", "not-a-version"} {
+		if err := validateAllowlistSnapshot(version, map[types.Digest]string{}); err == nil {
+			t.Fatalf("validateAllowlistSnapshot accepted version %q", version)
+		}
+	}
+	if err := validateAllowlistSnapshot("1", nil); err == nil {
+		t.Fatal("validateAllowlistSnapshot accepted nil digests")
+	}
+	if err := validateAllowlistSnapshot("1", map[types.Digest]string{}); err != nil {
+		t.Fatalf("validateAllowlistSnapshot rejected an empty snapshot: %v", err)
 	}
 }
 
@@ -673,6 +748,7 @@ func TestHandoffReturns503BeforeBootstrap(t *testing.T) {
 		Logger:              slog.Default(),
 		KeyProvider:         kp,
 		AllowedMeasurements: map[string]bool{"m": true},
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 		Bundle:              bm,
 		Signer:              handoffTestKey(t),
 		EARSource:           erroringHandoffEARSource{},
@@ -709,6 +785,7 @@ func TestHandoffReturns503ForEmptyCASnapshot(t *testing.T) {
 		Logger:              slog.Default(),
 		KeyProvider:         kp,
 		AllowedMeasurements: map[string]bool{"allowed_measurement": true},
+		OperatorKeysHash:    handoffTestOperatorKeysHash,
 		Signer:              activeHandoffKey,
 		EARSource:           staticHandoffEARSource{ear: activeEAR},
 		Snapshot: func() (CASnapshot, bool) {

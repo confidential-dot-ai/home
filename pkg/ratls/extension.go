@@ -19,6 +19,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -230,6 +231,34 @@ func ReportDataForKey(pub crypto.PublicKey, nonce []byte) ([64]byte, error) {
 	}
 	hash := h.Sum(nil)
 	copy(reportData[:], hash)
+	return reportData, nil
+}
+
+// ReportDataForKeyWithContext binds an additional protocol context to a key
+// and nonce. A non-empty context uses a domain-separated, length-framed
+// transcript so fields cannot be re-split into an equivalent byte stream. An
+// empty context deliberately preserves ReportDataForKey's established wire
+// format.
+func ReportDataForKeyWithContext(pub crypto.PublicKey, nonce, context []byte) ([64]byte, error) {
+	if len(context) == 0 {
+		return ReportDataForKey(pub, nonce)
+	}
+
+	var reportData [64]byte
+	keyBytes, err := marshalPublicKey(pub)
+	if err != nil {
+		return reportData, fmt.Errorf("ratls: marshal public key: %w", err)
+	}
+
+	h := sha512.New384()
+	_, _ = h.Write([]byte("c8s-report-data-context-v1\x00"))
+	for _, field := range [][]byte{keyBytes, nonce, context} {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(field)))
+		_, _ = h.Write(size[:])
+		_, _ = h.Write(field)
+	}
+	copy(reportData[:], h.Sum(nil))
 	return reportData, nil
 }
 

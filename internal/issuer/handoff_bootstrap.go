@@ -17,6 +17,7 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwt"
 
 	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
+	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
@@ -61,7 +62,7 @@ type HandoffBootstrap interface {
 // self-provision its handoff signer EAR in process — CDS is its own EAR issuer,
 // so there is no external service to dial for it.
 type LocalEARMinter interface {
-	IssueWithLaunchDigestAndPubKey(submodsEvidence json.RawMessage, launchDigest string, teePubKey *ecdsa.PublicKey) (string, error)
+	IssueAttestedKey(submodsEvidence json.RawMessage, launchDigest string, teePubKey *ecdsa.PublicKey, operatorKeysHash string) (string, error)
 }
 
 // AttestationApi is the attestation-api client the bootstrap drives:
@@ -79,6 +80,8 @@ type localHandoffBootstrap struct {
 
 	attestation AttestationApi
 	minter      LocalEARMinter
+
+	operatorKeysHash string
 }
 
 var _ HandoffBootstrap = (*localHandoffBootstrap)(nil)
@@ -88,19 +91,23 @@ var _ HandoffBootstrap = (*localHandoffBootstrap)(nil)
 // the EAR with the supplied minter (CDS's own EAR issuer) in process — there is
 // no RA-TLS hop and no remote measurement to pin, because the evidence is
 // verified and the EAR signed inside the CDS trust boundary.
-func NewLocalHandoffBootstrap(attestation AttestationApi, minter LocalEARMinter) (HandoffBootstrap, error) {
+func NewLocalHandoffBootstrap(attestation AttestationApi, minter LocalEARMinter, operatorKeysHash string) (HandoffBootstrap, error) {
 	if attestation == nil || minter == nil {
 		return nil, fmt.Errorf("local handoff bootstrap requires an attestation-api and EAR minter")
+	}
+	if err := operatorauth.ValidateKeySetHash(operatorKeysHash); err != nil {
+		return nil, fmt.Errorf("local handoff bootstrap requires an operator-key policy: %w", err)
 	}
 	signer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate handoff signer key: %w", err)
 	}
 	return &localHandoffBootstrap{
-		signer:      signer,
-		earSource:   &AtomicHandoffEAR{},
-		attestation: attestation,
-		minter:      minter,
+		signer:           signer,
+		earSource:        &AtomicHandoffEAR{},
+		attestation:      attestation,
+		minter:           minter,
+		operatorKeysHash: operatorKeysHash,
 	}, nil
 }
 
@@ -166,7 +173,7 @@ func (h *localHandoffBootstrap) attestKey(ctx context.Context, pubDER []byte) (s
 	if _, err := rand.Read(challenge); err != nil {
 		return "", fmt.Errorf("generate challenge: %w", err)
 	}
-	reportData, err := ratls.ReportDataForKey(ecPub, challenge)
+	reportData, err := ratls.ReportDataForKeyWithContext(ecPub, challenge, []byte(h.operatorKeysHash))
 	if err != nil {
 		return "", err
 	}
@@ -196,7 +203,7 @@ func (h *localHandoffBootstrap) attestKey(ctx context.Context, pubDER []byte) (s
 	if err != nil {
 		return "", fmt.Errorf("marshal evidence for EAR: %w", err)
 	}
-	return h.minter.IssueWithLaunchDigestAndPubKey(json.RawMessage(evidenceJSON), verifyResp.Result.Claims.LaunchDigest, ecPub)
+	return h.minter.IssueAttestedKey(json.RawMessage(evidenceJSON), verifyResp.Result.Claims.LaunchDigest, ecPub, h.operatorKeysHash)
 }
 
 // HandoffEARExpiry returns the EAR token's exp claim. The token is decoded

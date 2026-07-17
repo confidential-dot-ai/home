@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 	"unicode"
@@ -18,6 +19,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/issuer"
 	"github.com/confidential-dot-ai/c8s/pkg/attestclient"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
+	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 )
 
@@ -34,6 +36,7 @@ type config struct {
 	expectedIssuer    string
 	logLevel          string
 	measurements      []string
+	operatorKeys      string
 	timeout           time.Duration
 }
 
@@ -47,6 +50,8 @@ type report struct {
 	CACertSubject           string `json:"ca_cert_subject"`
 	CACertNotAfter          string `json:"ca_cert_not_after"`
 	BundleCertCount         int    `json:"bundle_cert_count"`
+	AllowlistVersion        string `json:"allowlist_version"`
+	AllowlistDigestCount    int    `json:"allowlist_digest_count"`
 	ServedCAMatch           bool   `json:"served_ca_match"`
 }
 
@@ -102,12 +107,26 @@ func run(ctx context.Context, cfg config, out, errOut io.Writer) int {
 		errorf(errOut, "--measurements: no usable measurement")
 		return exitUsage
 	}
+	operatorKeysPEM, err := os.ReadFile(cfg.operatorKeys)
+	if err != nil {
+		errorf(errOut, "--operator-keys: %v", err)
+		return exitUsage
+	}
+	operatorKeys, err := operatorauth.ParsePublicKeysPEM(operatorKeysPEM)
+	if err != nil {
+		errorf(errOut, "--operator-keys: %v", err)
+		return exitUsage
+	}
+	operatorKeysHash, err := operatorauth.KeySetHash(operatorKeys)
+	if err != nil {
+		errorf(errOut, "--operator-keys: %v", err)
+		return exitUsage
+	}
 	// The same digest set pins both channels: the peer's RA-TLS serving cert
 	// and its handoff issuer EAR. The EAR-side map is derived from the
 	// validated digests (hex.EncodeToString yields the NormalizeMeasurement
-	// form) so the two representations stay in sync. Against a TDX peer the
-	// RA-TLS pin fails closed (its verifier surfaces no launch measurement);
-	// handoff is SNP node-as-CVM today.
+	// form) so the two representations stay in sync. For SNP the value is
+	// LAUNCH_DIGEST; for TDX it is MRTD (not an RTMR/workload verdict).
 	allowed := make(map[string]bool, len(pinned))
 	for _, m := range pinned {
 		allowed[hex.EncodeToString(m)] = true
@@ -137,6 +156,7 @@ func run(ctx context.Context, cfg config, out, errOut io.Writer) int {
 			KeyProvider:         keyProvider,
 			ExpectedIssuer:      cfg.expectedIssuer,
 			AllowedMeasurements: allowed,
+			OperatorKeysHash:    operatorKeysHash,
 		},
 		Attest:            attestclient.NewClientWithHTTP(peerURL, httpClient),
 		PeerURL:           peerURL,
@@ -189,6 +209,8 @@ func reportFor(material *issuer.HandoffMaterial, served []*x509.Certificate) (re
 		CACertSubject:           material.CACert.Subject.String(),
 		CACertNotAfter:          material.CACert.NotAfter.Format(time.RFC3339),
 		BundleCertCount:         len(material.Bundle),
+		AllowlistVersion:        material.AllowlistVersion,
+		AllowlistDigestCount:    len(material.Allowlist),
 		ServedCAMatch:           servedCAMatch(served, material.CACert),
 	}
 	if !rep.ServedCAMatch {

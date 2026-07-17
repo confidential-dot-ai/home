@@ -327,6 +327,25 @@ func TestValidateConfigRejectsUnsafeValues(t *testing.T) {
 		{name: "negative max request size", edit: func(c *config) { c.maxRequestSize = -1 }},
 		{name: "zero readiness interval", edit: func(c *config) { c.readinessInterval = 0 }},
 		{name: "negative readiness interval", edit: func(c *config) { c.readinessInterval = -time.Second }},
+		{name: "handoff measurements without operator keys", edit: func(c *config) {
+			c.handoffMeasurements = []string{"m"}
+		}},
+		{name: "handoff peer url not https", edit: func(c *config) {
+			c.handoffPeerURL = "http://peer:8443"
+			c.handoffMeasurements = []string{"m"}
+			c.operatorKeys = "/operator-keys.pem"
+			c.handoffPeerTimeout = time.Minute
+		}},
+		{name: "handoff peer url without measurements", edit: func(c *config) {
+			c.handoffPeerURL = "https://peer:8443"
+			c.handoffPeerTimeout = time.Minute
+		}},
+		{name: "handoff peer url with non-positive timeout", edit: func(c *config) {
+			c.handoffPeerURL = "https://peer:8443"
+			c.handoffMeasurements = []string{"m"}
+			c.operatorKeys = "/operator-keys.pem"
+			c.handoffPeerTimeout = 0
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := valid
@@ -335,6 +354,16 @@ func TestValidateConfigRejectsUnsafeValues(t *testing.T) {
 				t.Fatalf("expected error, got nil")
 			}
 		})
+	}
+
+	// A fully-specified peer config is valid.
+	peerValid := valid
+	peerValid.handoffPeerURL = "https://peer:8443"
+	peerValid.handoffMeasurements = []string{"m"}
+	peerValid.operatorKeys = "/operator-keys.pem"
+	peerValid.handoffPeerTimeout = time.Minute
+	if err := validateConfig(peerValid); err != nil {
+		t.Fatalf("valid peer config rejected: %v", err)
 	}
 }
 

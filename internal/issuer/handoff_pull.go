@@ -16,6 +16,7 @@ import (
 
 	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
 	"github.com/confidential-dot-ai/c8s/pkg/attestclient"
+	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 )
 
 // DefaultPullRetryInterval is the fixed cadence between transient-failure
@@ -25,7 +26,7 @@ const DefaultPullRetryInterval = 2 * time.Second
 // AttestKeyClient obtains a TEE-bound EAR for a caller-generated key from a
 // CDS peer's /attest-key. *attestclient.Client satisfies it.
 type AttestKeyClient interface {
-	AttestKey(ctx context.Context, attestationApiURL string, pubKeyDER []byte) (string, error)
+	AttestKeyWithOperatorKeysHash(ctx context.Context, attestationApiURL string, pubKeyDER []byte, operatorKeysHash string) (string, error)
 }
 
 // PullConfig carries everything PullHandoff needs. Peer identity lives in one
@@ -147,6 +148,9 @@ func PullHandoff(ctx context.Context, cfg PullConfig) (*HandoffMaterial, error) 
 	if cfg.Attest == nil {
 		return nil, fmt.Errorf("handoff pull requires an attest-key client")
 	}
+	if err := operatorauth.ValidateKeySetHash(cfg.Deps.OperatorKeysHash); err != nil {
+		return nil, fmt.Errorf("handoff pull requires an operator-key policy: %w", err)
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -166,7 +170,7 @@ func PullHandoff(ctx context.Context, cfg PullConfig) (*HandoffMaterial, error) 
 	}
 
 	ear, err := PullRetry(ctx, logger, interval, "attest-key", func() (string, error) {
-		return cfg.Attest.AttestKey(ctx, cfg.AttestationApiURL, pubDER)
+		return cfg.Attest.AttestKeyWithOperatorKeysHash(ctx, cfg.AttestationApiURL, pubDER, cfg.Deps.OperatorKeysHash)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("attest-key: %w", err)
