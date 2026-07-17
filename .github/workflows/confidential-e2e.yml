@@ -1,32 +1,25 @@
 name: confidential-e2e
-# merge to main -> integration happens -> issues surfaced.
-#
-# Runs the c8s e2e INSIDE a measured SEV-SNP CVM for every main merge: boot a
-# fresh RKE2-node CVM on bare metal, self-discover its runtime launch
-# measurement (configfs-tsm), install THIS commit's c8s (chart packaged from
-# source at the merge sha; images resolved to the newest built tag <= the sha),
-# pin CDS to the discovered measurement, and prove a confidential workload gets
-# its CDS-issued cert — which under an enforced launch digest IS the
-# attestation test. Mechanics live in confidential-ci (the cvm-e2e primitive +
-# the e2e-c8s payload); this wrapper only decides WHEN.
-#
-# Trigger mirrors kata-guest-base.yml (the-machine precedent): chain off a
-# COMPLETED Docker run so retag-unchanged has published this sha's image tags
-# before we install them. Never pull_request — self-hosted org hardware on a
-# public repo. Commits that trigger no Docker run (docs-only) get no e2e —
-# nothing they change is deployable. Merge bursts: the runner-side concurrency
-# keeps 1 running + 1 pending; intermediate pending runs are superseded
-# (latest-wins) — per-sha signal is traded for freshest-sha coverage.
+# merge to main -> integration happens -> issues surfaced: run the c8s e2e
+# inside a measured SEV-SNP CVM for every main merge (boot a fresh RKE2-node
+# CVM, self-discover its launch measurement, install this commit's c8s, prove a
+# confidential workload gets a CDS-issued cert under the enforced digest).
+# Mechanics + rationale (trigger precedent, merge-burst semantics):
+#   confidential-dot-ai/confidential-ci/USING-THE-PRIMITIVE.md
+# This wrapper only decides WHEN. Never pull_request (self-hosted org hardware).
 on:
   workflow_run:
-    workflows: ["Docker"]
-    types: [completed]
+    workflows: ["Docker"]      # chain off a completed Docker run so retag-unchanged
+    types: [completed]         # has published this sha's image tags before we install
   workflow_dispatch:
     inputs:
       c8s_ref:
         description: c8s ref to test (dispatch only; defaults to main)
         required: false
         default: main
+
+# Least privilege: the wrapper only reads the repo to dispatch the reusable lane.
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha || github.sha }}
@@ -40,6 +33,8 @@ jobs:
        github.event.workflow_run.head_repository.full_name == github.repository &&
        (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
        (github.event.workflow_run.head_branch == 'main' || startsWith(github.event.workflow_run.head_branch, 'v')))
-    uses: confidential-dot-ai/confidential-ci/.github/workflows/e2e-c8s.yml@main
+    # Reusable lane pinned by commit SHA (bump deliberately when the lane changes);
+    # the trailing @main tag is a human label only.
+    uses: confidential-dot-ai/confidential-ci/.github/workflows/e2e-c8s.yml@cad0dd13ac445188a3bd1641b6506c45658f274f
     with:
       c8s_ref: ${{ inputs.c8s_ref || github.event.workflow_run.head_sha }}
