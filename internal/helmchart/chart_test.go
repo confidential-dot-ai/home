@@ -3101,7 +3101,7 @@ func TestChartCwLabelIntegrityPolicyDisabled(t *testing.T) {
 	}
 }
 
-// helmTemplateKata renders the chart in the shape `c8s install --kata`
+// helmTemplateKata renders the chart in the shape `c8s install --cvm-mode=pod`
 // produces. kata is enforcing, so the host-side components whose function
 // moves into the kata-guest-base image are switched off (the chart validates
 // they are off — see TestChartKataRejectsHostSideComponents).
@@ -3169,7 +3169,7 @@ func TestChartKataRejectsHostSideComponents(t *testing.T) {
 	}
 }
 
-// The kata shape (what `c8s install --kata` renders) must drop the host-side
+// The kata shape (what `c8s install --cvm-mode=pod` renders) must drop the host-side
 // DaemonSets entirely — their in-guest counterparts ship in kata-guest-base.
 func TestChartKataShapeDropsHostSideComponents(t *testing.T) {
 	out, err := helmTemplateKata(t)
@@ -5172,7 +5172,7 @@ func pullerEnv(t *testing.T, helmOut, name string) string {
 
 // kata.guestImage.debug must repoint the puller at the `<tag>-debug` artifact
 // — the variant whose guest policy allows host log/exec streams (published in
-// lockstep by the kata-guest-base workflow; `c8s install --kata --debug` sets
+// lockstep by the kata-guest-base workflow; `c8s install --cvm-mode=pod --debug` sets
 // the value). Default off: a plain kata install pulls the locked image.
 func TestChartKataGuestImageDebugSelectsDebugTag(t *testing.T) {
 	out, err := helmTemplateKata(t)

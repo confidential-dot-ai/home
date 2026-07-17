@@ -57,6 +57,6 @@ kubectl delete -f samples/confidentialworkload.yaml
 c8s uninstall
 ```
 
-`c8s uninstall` wraps `helm uninstall c8s -n c8s-system`; on a `--kata`
+`c8s uninstall` wraps `helm uninstall c8s -n c8s-system`; on a `--cvm-mode=pod`
 install it also sweeps the kata runtime artifacts off the nodes (see
 [`kata.md`](kata.md#uninstalling)).

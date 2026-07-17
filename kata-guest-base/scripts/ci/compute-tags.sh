@@ -4,7 +4,7 @@
 # `debug_tags` (comma-joined) to GITHUB_OUTPUT. `debug_tags` is every tag
 # with a `-debug` suffix — the debug-policy variant (build.sh Step 5/5,
 # output-debug/) publishes under it in lockstep with the locked image, so
-# `kata.guestImage.debug=true` (`c8s install --kata --debug`) can derive the
+# `kata.guestImage.debug=true` (`c8s install --cvm-mode=pod --debug`) can derive the
 # debug ref from any locked tag.
 #
 # Always publish the immutable, commit-pinned short-SHA tag. Then add exactly one

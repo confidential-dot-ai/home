@@ -117,7 +117,7 @@ Note this is the cluster-side (kubelet) credential: `--resolve-digests` runs
 `crane` on your workstation and uses your local docker login, not this
 Secret.
 
-Under `--kata`, the same Secret also feeds the kata-image-puller's in-pod
+Under `--cvm-mode=pod`, the same Secret also feeds the kata-image-puller's in-pod
 `oras pull` of the kata-guest-base artifact, which reads
 `/root/.docker/config.json` rather than kubelet pull secrets (set
 `kata.guestImage.pullerAuthSecret` if that artifact needs a different

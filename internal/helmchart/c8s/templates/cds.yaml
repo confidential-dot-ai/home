@@ -347,7 +347,7 @@ spec:
   # listener); a Service ClusterIP has no port-15006 endpoint, so the dial
   # times out (see ratls_mesh_tls_dial_failures_total). A pod IP routes
   # straight to the peer VM, where PREROUTING redirects port 15006 to the
-  # local mesh inbound. NodePort is unused under kata anyway — install --kata
+  # local mesh inbound. NodePort is unused under kata anyway — install --cvm-mode=pod
   # disables nriImagePolicy, the only consumer of cds NodePort.
   type: ClusterIP
   clusterIP: None

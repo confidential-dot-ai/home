@@ -33,13 +33,13 @@ flag selects a **mode**, which is a fixed set of `--set` choices.
 | Mode | Flag | One-liner |
 |---|---|---|
 | **base** | *(none)* | Normal Kubernetes. No kata, no per-pod confidentiality. Host-side mesh + attestation + image policy. The dev/baseline shape. |
-| **kata** | `--kata` | Installs the kata runtime + RuntimeClasses **and enforces them**: the webhook *injects* a kata RuntimeClass into every in-scope workload pod, a ValidatingAdmissionPolicy *rejects* non-kata pods, and the host-side mesh/attestation/image-policy move into the guest image. The production "pod-as-CVM" shape — kata is enforcing, there is no kata-without-enforcement mode. |
+| **kata** | `--cvm-mode=pod` | Installs the kata runtime + RuntimeClasses **and enforces them**: the webhook *injects* a kata RuntimeClass into every in-scope workload pod, a ValidatingAdmissionPolicy *rejects* non-kata pods, and the host-side mesh/attestation/image-policy move into the guest image. The production "pod-as-CVM" shape — kata is enforcing, there is no kata-without-enforcement mode. |
 
 ```mermaid
 flowchart LR
     A["c8s install"] --> B{flags}
     B -->|none| BASE["base<br/>host-side everything<br/>no confidentiality"]
-    B -->|"--kata"| KATA["kata (enforcing)<br/>all workloads forced<br/>into kata VMs"]
+    B -->|"--cvm-mode=pod"| KATA["kata (enforcing)<br/>all workloads forced<br/>into kata VMs"]
 ```
 
 There is no distro flag: the host distro (`k8s` vs `rke2`), which picks the
@@ -50,13 +50,13 @@ rke2). An install with `-f` values owns the distro instead: set
 doesn't fit — a mixed cluster cannot be detected and always needs that, plus
 nodeSelectors to partition the install.
 
-The kata-image-puller and node-taint sidecar are on by default under `--kata*`.
+The kata-image-puller and node-taint sidecar are on by default under `--cvm-mode=pod`.
 A single-node / local build can switch either off, and pin the guest image
 tag, through a `-f` values file (`kata.guestImage.enabled=false` /
 `kata.nodeTaint.enabled=false` / `kata.guestImage.tag=<tag>`) — there is no
 dedicated CLI flag for these.
 
-`--kata --debug` points the puller at the `<tag>-debug` guest image —
+`--cvm-mode=pod --debug` points the puller at the `<tag>-debug` guest image —
 identical except the baked guest policy allows host log/exec streams, so
 `kubectl logs` / `kubectl exec` work against kata pods. Container I/O becomes
 host-readable and the launch measurement differs from the locked image; dev
@@ -70,7 +70,7 @@ only (see [`kata.md`](kata.md)).
 "CVM" = `kata-qemu-snp` confidential VM; "in-VM" = baked into the guest image,
 not a cluster resource.
 
-| Component | base | `--kata` | Runs on |
+| Component | base | `--cvm-mode=pod` | Runs on |
 |---|:--:|:--:|---|
 | c8s operator (webhook + controllers) | ✓ | ✓ | host (runc; always webhook-exempt) |
 | MWC `pod-injector` | ✓ | ✓ | cluster (release-tracked resource) |
@@ -91,7 +91,7 @@ not a cluster resource.
 
 Under kata, **every host-side security component (attestation-service,
 ratls-mesh, nri-image-policy) moves *inside* the confidential guest**, where
-the host (adversarial) cannot tamper with it. `c8s install --kata` sets their
+the host (adversarial) cannot tamper with it. `c8s install --cvm-mode=pod` sets their
 `.enabled=false`, and the chart fails the render
 (`kind=enforce_host_components`, `templates/validations.yaml`) if any is left
 enabled alongside `kata.enabled` — the host versions would be a second,
@@ -159,7 +159,7 @@ sequenceDiagram
     participant Op as operator pod
     participant Pods as workloads
 
-    CLI->>K: kubectl apply Namespace (privileged label if --kata)
+    CLI->>K: kubectl apply Namespace (privileged label if --cvm-mode=pod)
     CLI->>Helm: helm upgrade --install --wait
     Note over Helm: normal resources (kind-order)
     Helm->>K: create operator Deployment, kata-deploy, CDS, ...
@@ -209,7 +209,7 @@ flowchart TD
     EX -->|no| CW{"has confidential.ai/cw?"}
     CW -->|yes| GC["inject get-cert<br/>(c8s-cert sidecar)"]
     CW -->|no| RC
-    GC --> RC{"--kata<br/>AND no runtimeClass<br/>AND not hostNet/PID/IPC?"}
+    GC --> RC{"--cvm-mode=pod<br/>AND no runtimeClass<br/>AND not hostNet/PID/IPC?"}
     RC -->|no| DONE["admit"]
     RC -->|yes| INJ["set runtimeClassName<br/>(kata-qemu-snp if cw, else kata-qemu)<br/>+ kata nodeSelector + toleration"]
     INJ --> DONE
@@ -227,7 +227,7 @@ Two independent injections, both keyed off the pod (not a CR):
    blocks until the initial cert is written so downstream containers wait for
    it before launching. (An exec startupProbe cannot gate here: the locked
    kata guest denies `ExecProcessRequest`.)
-2. **runtimeClass** — only under `--kata` (which is enforcing).
+2. **runtimeClass** — only under `--cvm-mode=pod` (which is enforcing).
    `kata-qemu-snp` for `cw`-annotated pods (confidential), `kata-qemu`
    otherwise.
 
@@ -345,15 +345,15 @@ c8s install --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --
 # Kata (enforcing): every workload pod becomes a kata VM, non-kata pods
 # rejected, host-side mesh/attestation/image-policy replaced by their
 # in-guest counterparts.
-c8s install --kata --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm
+c8s install --cvm-mode=pod --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm
 
 # RKE2 host — the distro is detected from the cluster, no extra flag.
-c8s install --kata --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm
+c8s install --cvm-mode=pod --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm
 
 # Single-node / local build (no registry artifact, don't starve the one node).
 # The puller + node-taint are on by default; switch them off via a values file:
 #   kata: {guestImage: {enabled: false}, nodeTaint: {enabled: false}}
-c8s install --kata --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm -f single-node.values.yaml
+c8s install --cvm-mode=pod --workload-ref vllm=<namespace>/deployment/<vllm-deployment>:8000 --upstream vllm -f single-node.values.yaml
 
 # Uninstall: helm uninstall + sweep the kata artifacts off every node.
 c8s uninstall

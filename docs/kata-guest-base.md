@@ -309,7 +309,7 @@ in-guest binaries. On a release tag (`v*`) the same image also gets the
 release version; `latest` moves only on `main`.
 
 Operators select the artifact tag by setting `kata.guestImage.tag` in a values
-file (`c8s install --kata -f values.yaml`). The
+file (`c8s install --cvm-mode=pod -f values.yaml`). The
 `c8s-kata-image-puller` DaemonSet picks that up and pulls accordingly —
 see "How it's consumed in-cluster" in
 [`kata-guest-base/README.md`](../kata-guest-base/README.md).
@@ -324,7 +324,7 @@ supply it to `cds.measurements`, `ratlsMesh.measurements`, or client-side
 
 Every tag has a `-debug` sibling published from the same build whose guest
 policy allows the host log/exec stream RPCs (`kubectl logs`/`exec` work;
-container I/O becomes host-readable). `c8s install --kata --debug` selects
+container I/O becomes host-readable). `c8s install --cvm-mode=pod --debug` selects
 it via `kata.guestImage.debug=true`; its launch measurement differs from
 the locked image, so locked-reference attestation rejects it. See "Debug
 variant" in [`kata-guest-base/README.md`](../kata-guest-base/README.md).
@@ -378,5 +378,5 @@ launch-digest mismatch at attestation time and clients refuse the pod.
 
 - [`kata-guest-base/README.md`](../kata-guest-base/README.md) — the recipe: boot model, what's baked in, build, consume, measure.
 - [`kata-image-policy.md`](kata-image-policy.md) — in-guest per-image enforcement (`policy-monitor`).
-- [`kata.md`](kata.md) — installing and enforcing the kata runtime (`c8s install --kata`).
+- [`kata.md`](kata.md) — installing and enforcing the kata runtime (`c8s install --cvm-mode=pod`).
 - [`install-flows.md`](install-flows.md) — how the two install modes assemble the platform.
