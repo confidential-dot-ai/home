@@ -999,7 +999,9 @@ func appendDistroInstallArgs(helmArgs []string, distro string) []string {
 //
 //	node → generalized node-as-CVM: our own nodes (bare-metal TDX/SNP,
 //	       self-managed) are themselves confidential VMs. Pods run as ordinary
-//	       processes attested via the node's own quote. Cloud-agnostic.
+//	       processes attested via the node's own quote. Cloud-agnostic. The node
+//	       image bakes attestation-api and nri-image-policy, so both are disabled
+//	       here (ratlsMesh is not baked, stays on).
 //	gke  → GKE specifically: Google's managed confidential VMs.
 //
 // GKE is the reason a plain managed→vTPM mapping is wrong: GKE confidential VMs
@@ -1072,6 +1074,16 @@ func appendCvmModeInstallArgs(helmArgs []string, cvmMode, hardwarePlatform strin
 		helmArgs = append(helmArgs,
 			"--set-string", "cds.ratlsPlatform=tdx",
 			"--set-string", "ratlsMesh.platform=tdx",
+		)
+	}
+	// node: the node image bakes host attestation-api and nri-image-policy;
+	// re-rendering them duplicates the baked pair and the baked fail-closed NRI
+	// floor denies the chart copies' own images. ratlsMesh stays: it is not
+	// baked (unlike kata-guest-base).
+	if cvmMode == "node" {
+		helmArgs = append(helmArgs,
+			"--set", "attestationApi.enabled=false",
+			"--set", "nriImagePolicy.enabled=false",
 		)
 	}
 	return helmArgs, nil

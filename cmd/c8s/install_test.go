@@ -993,6 +993,14 @@ func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
 				"--set-string", "ratlsMesh.platform=tdx",
 			)
 		}
+		// node: the node image bakes attestation-api + nri-image-policy, so the
+		// chart copies are skipped (ratlsMesh is not baked, stays on).
+		if mode == "node" {
+			out = append(out,
+				"--set", "attestationApi.enabled=false",
+				"--set", "nriImagePolicy.enabled=false",
+			)
+		}
 		return out
 	}
 	cases := map[string]struct {
