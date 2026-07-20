@@ -19,6 +19,7 @@ import (
 	admissionregv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1512,6 +1513,36 @@ func TestChartKMSGuards(t *testing.T) {
 			t.Fatalf("validation kind = %q, want kms_conflicting_store\n%s", got, out)
 		}
 	})
+}
+
+// The dev store holds a well-known root token, so it must only admit the
+// broker over the network (audit C3) — otherwise any pod that reaches
+// c8s-openbao:8200 bypasses the attestation gate.
+func TestChartKMSStoreNetworkPolicy(t *testing.T) {
+	out, err := helmTemplate(t, kmsArgs()...)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	var np networkingv1.NetworkPolicy
+	if !findDoc(t, out, "NetworkPolicy", "c8s-openbao", &np) {
+		t.Fatalf("dev store rendered no NetworkPolicy\n%s", out)
+	}
+	if np.Spec.PodSelector.MatchLabels["app.kubernetes.io/name"] != "openbao" {
+		t.Errorf("policy must select the store pods, got %v", np.Spec.PodSelector.MatchLabels)
+	}
+	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress {
+		t.Errorf("policy must be ingress-only, got %v", np.Spec.PolicyTypes)
+	}
+	if len(np.Spec.Ingress) != 1 || len(np.Spec.Ingress[0].From) != 1 {
+		t.Fatalf("expected exactly one ingress source, got %+v", np.Spec.Ingress)
+	}
+	from := np.Spec.Ingress[0].From[0]
+	if from.PodSelector == nil || from.PodSelector.MatchLabels["app.kubernetes.io/name"] != "secret-broker" {
+		t.Errorf("ingress must be from broker pods only, got %+v", from)
+	}
+	if from.NamespaceSelector != nil {
+		t.Errorf("ingress must not widen to a namespace selector, got %+v", from.NamespaceSelector)
+	}
 }
 
 // TestChartRejectsBrokerRatlsUnderKata: under kata the in-guest mesh already

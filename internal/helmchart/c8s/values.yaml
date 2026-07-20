@@ -1242,7 +1242,9 @@ secretBroker:
     ## Renewal interval for the broker's own get-cert mesh-identity sidecar.
     renewInterval: "1h"
   ## Deny-by-default release policy, mounted as policy.json. See the secret-broker
-  ## docs (internal/cmds/secretbroker/README.md) for the rule schema.
+  ## docs (internal/cmds/secretbroker/README.md) for the rule schema. allow
+  ## entries may carry a field scope (secret/data/api/db#password) — the broker
+  ## then releases only that field, not the whole KV item.
   releasePolicy:
     rules: []
   openbao:

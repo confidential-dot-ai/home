@@ -195,7 +195,6 @@ func (h AttestHandler) HandleAttest(w http.ResponseWriter, r *http.Request) {
 	// The challenge-bound evidence verified above proves freshness at
 	// issuance but is NOT embeddable — its REPORTDATA includes the consumed
 	// challenge, so re-verification against the bare key would always fail.
-	// See docs/decisions/2026-07-16-ratls-embed-binding.md.
 	certPEM, _, err := h.CA.SignCSR(issuer.SignCSRParams{
 		CSR:             csr,
 		TTL:             issuer.CapTTL(h.CertTTL, issuer.MaxLeafTTL),

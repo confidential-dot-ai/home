@@ -76,13 +76,66 @@ func TestAllowedPathsDenyByDefault(t *testing.T) {
 	}
 }
 
+// allowedFields decides what handleKVRead filters to: an unscoped matching
+// entry grants everything; otherwise the union of the matching entries' fields.
+func TestAllowedFields(t *testing.T) {
+	tests := []struct {
+		name     string
+		allow    []string
+		path     string
+		wantAll  bool
+		wantSet  []string
+		checkSet bool
+	}{
+		{name: "unscoped path grants all fields", allow: []string{"secret/data/api/*"}, path: "secret/data/api/db", wantAll: true},
+		{name: "single field scope", allow: []string{"secret/data/api/*#password"}, path: "secret/data/api/db", wantSet: []string{"password"}, checkSet: true},
+		{name: "multi-field union across entries", allow: []string{"secret/data/api/db#password", "secret/data/api/*#api_key"}, path: "secret/data/api/db", wantSet: []string{"password", "api_key"}, checkSet: true},
+		{name: "unscoped entry wins over scoped", allow: []string{"secret/data/api/db#password", "secret/data/api/db"}, path: "secret/data/api/db", wantAll: true},
+		{name: "non-matching entry ignored", allow: []string{"secret/data/other/*#password"}, path: "secret/data/api/db", checkSet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fields, all := allowedFields(tt.allow, tt.path)
+			if all != tt.wantAll {
+				t.Fatalf("allFields = %v, want %v", all, tt.wantAll)
+			}
+			if tt.checkSet {
+				if len(fields) != len(tt.wantSet) {
+					t.Fatalf("fields = %v, want %v", fields, tt.wantSet)
+				}
+				for _, f := range tt.wantSet {
+					if _, ok := fields[f]; !ok {
+						t.Fatalf("missing field %q in %v", f, fields)
+					}
+				}
+			}
+		})
+	}
+
+	// pathAllowed must match on the path portion, ignoring the field scope.
+	if !pathAllowed([]string{"secret/data/api/*#password"}, "secret/data/api/db") {
+		t.Error("field-scoped entry must still grant its path")
+	}
+}
+
 func TestLoadPolicy(t *testing.T) {
 	dir := t.TempDir()
 
 	good := filepath.Join(dir, "good.json")
-	mustWrite(t, good, `{"rules":[{"workloadId":"api","allow":["secret/data/api/*"]}]}`)
+	mustWrite(t, good, `{"rules":[{"workloadId":"api","allow":["secret/data/api/*","secret/data/api/db#password"]}]}`)
 	if _, err := LoadPolicy(good); err != nil {
 		t.Fatalf("good policy rejected: %v", err)
+	}
+
+	emptyField := filepath.Join(dir, "emptyfield.json")
+	mustWrite(t, emptyField, `{"rules":[{"workloadId":"api","allow":["secret/data/api/db#"]}]}`)
+	if _, err := LoadPolicy(emptyField); err == nil {
+		t.Error("allow entry with a trailing '#' but no field must be rejected")
+	}
+	emptyField2 := filepath.Join(dir, "emptyfield2.json")
+	mustWrite(t, emptyField2, `{"rules":[{"workloadId":"api","allow":["secret/data/api/db#password,"]}]}`)
+	if _, err := LoadPolicy(emptyField2); err == nil {
+		t.Error("allow entry with an empty field in the list must be rejected")
 	}
 
 	empty := filepath.Join(dir, "empty.json")

@@ -254,6 +254,35 @@ func TestMutatePodInjectsPVCLUKSVolume(t *testing.T) {
 	if len(pod.Spec.Containers[0].VolumeDevices) != 0 {
 		t.Errorf("app container must not get raw volumeDevices (%+v)", pod.Spec.Containers[0].VolumeDevices)
 	}
+	// CRITICAL: a pvc= pod must NOT mount host /dev — bind-mounting it clobbers
+	// the CRI-mapped volumeDevice so cryptsetup sees "device does not exist".
+	for _, vm := range openC.VolumeMounts {
+		if vm.MountPath == "/dev" {
+			t.Errorf("pvc= luks-open must not mount host /dev (clobbers the volumeDevice): %+v", openC.VolumeMounts)
+		}
+	}
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "host-dev" {
+			t.Errorf("pvc= pod must not declare the host-dev volume: %+v", pod.Spec.Volumes)
+		}
+	}
+}
+
+// A pod may not mix dev= (local) and pvc= LUKS volumes: they need incompatible
+// /dev setups in the single luks-open container.
+func TestParseLUKSRejectsMixedDevAndPVC(t *testing.T) {
+	secrets := &secretsInjection{Entries: []secretEntry{
+		{Name: "local", Path: "secret/data/api/l", Field: "passphrase"},
+		{Name: "claim", Path: "secret/data/api/c", Field: "passphrase"},
+	}}
+	anns := map[string]string{
+		luksAnnotationPrefix + "local": "dev=/dev/vdb,mount=/a,secret=secret/data/api/l#passphrase",
+		luksAnnotationPrefix + "claim": "pvc=c8s-luks-api-c,mount=/b,secret=secret/data/api/c#passphrase",
+	}
+	_, err := parseLUKSVolumes(anns, secrets)
+	if err == nil || !strings.Contains(err.Error(), "may not mix dev= (local) and pvc=") {
+		t.Fatalf("expected mixed dev=/pvc= rejection, got %v", err)
+	}
 }
 
 // TestMutatePodInjectsMultipleLUKSVolumes proves every LUKS volume lands in the

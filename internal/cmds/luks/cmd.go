@@ -11,8 +11,6 @@
 // confidential.ai/secret-<name>) matching Stage 5's parser. It does NOT
 // modify any workload — printing annotations to stdout is the intended UX,
 // letting the caller pipe them into kubectl / Helm / their GitOps repo.
-//
-// See docs/decisions/2026-07-10-luks-cli.md for the design.
 package luks
 
 import (

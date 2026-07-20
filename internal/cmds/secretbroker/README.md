@@ -47,7 +47,7 @@ case the broker is the documented edge of the trust boundary.
 ```json
 {
   "rules": [
-    { "workloadId": "api", "measurements": ["<sha384-hex>"], "allow": ["secret/data/api/*"] },
+    { "workloadId": "api", "measurements": ["<sha384-hex>"], "allow": ["secret/data/api/*#password"] },
     { "workloadId": "*", "allow": ["secret/data/shared/*"] }
   ]
 }
@@ -57,6 +57,12 @@ A rule matches when every constraint it sets holds; the caller's grant is the
 union of `allow` across matching rules. `*` matches one path segment, `**`
 matches any trailing segments. A measurement-constrained rule never matches in
 `--peer-verify=ca` mode (no measurement available) — fail closed.
+
+Each `allow` entry is a path pattern with an optional field scope,
+`pattern#field[,field]`: the broker filters the KV read down to the named
+fields, so `secret/data/api/db#password` releases only `password` and never the
+rest of the item. An entry with no `#` grants every field at the path; if any
+matching entry is unscoped, the caller gets all fields (a broader grant wins).
 
 ## API surface
 

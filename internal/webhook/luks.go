@@ -91,6 +91,17 @@ func parseLUKSVolumes(annotations map[string]string, secrets *secretsInjection) 
 				errInvalidInjectionAnnotation, lv.Name, lv.SecretName, secretAnnotationPrefix, lv.SecretName)
 		}
 	}
+	// A pod may not mix dev= and pvc= volumes: local (dev=) needs the host /dev
+	// mount, which clobbers a pvc= volumeDevice. They are incompatible in one
+	// luks-open container.
+	if hasLocalLUKSVolume(vols) {
+		for _, lv := range vols {
+			if lv.PVC != "" {
+				return nil, fmt.Errorf("%w: a pod may not mix dev= (local) and pvc= LUKS volumes in one pod (host /dev, required for dev=, clobbers a pvc= volumeDevice)",
+					errInvalidInjectionAnnotation)
+			}
+		}
+	}
 	sort.Slice(vols, func(i, j int) bool { return vols[i].Name < vols[j].Name })
 	return vols, nil
 }
@@ -189,17 +200,34 @@ const (
 	luksDataDir    = "/c8s-luks"     // parent dir; per-volume dirs at /c8s-luks/<name>
 )
 
+// hasLocalLUKSVolume reports whether any LUKS volume is delivered as a host
+// block device (dev=), which needs the host /dev bind-mount to reach it. pvc=
+// volumes instead arrive as a CRI-mapped raw volumeDevice, and MUST NOT get the
+// host /dev mount: bind-mounting host /dev clobbers the volumeDevice node so
+// cryptsetup sees "device does not exist". A privileged container reaches
+// device-mapper without host /dev (cryptsetup creates /dev/mapper/control
+// itself). See docs/pitfalls.md.
+func hasLocalLUKSVolume(vols []luksVolume) bool {
+	for _, v := range vols {
+		if v.Dev != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // injectLUKS adds one init container that opens every requested LUKS volume
 // and mounts each into a per-name subdir under a shared emptyDir. The app
 // containers then mount that same subdir at the operator's requested Mount
 // path. Runs after c8s-secrets-agent-init (so the passphrase file exists).
 //
-// SAFETY: the injected container is privileged and mounts /dev host-wide so
-// cryptsetup can reach the block devices. This is only tolerable under kata
-// (or another CVM shape where "the host" is the guest kernel, which the
-// workload trusts). Without kata / node-as-cvm, an operator granting
-// secrets-inject to a workload effectively grants it a privileged sidecar.
-// The chart refuses that shape (kind=luks_plain_baremetal in validations.yaml).
+// SAFETY: the injected container is privileged. For dev= (local) volumes it
+// also mounts host /dev so cryptsetup can reach the loop device; pvc= volumes
+// get the device via a raw volumeDevice and no host /dev. This is only
+// tolerable under kata (or another CVM shape where "the host" is the guest
+// kernel, which the workload trusts). Without kata / node-as-cvm, an operator
+// granting secrets-inject to a workload effectively grants it a privileged
+// sidecar. The chart refuses that shape (kind=luks_plain_baremetal).
 func injectLUKS(pod *corev1.Pod, eff injection, cfg Config) {
 	if len(eff.LUKS) == 0 {
 		return
@@ -248,17 +276,22 @@ func luksOpenContainer(cfg Config, eff injection) corev1.Container {
 	priv := true
 	f := false
 	var uid, gid int64 = 0, 0
+	mounts := []corev1.VolumeMount{
+		{Name: secretsDataVolume, MountPath: defaultSecretsDir, ReadOnly: true},
+		{Name: luksDataVolume, MountPath: luksDataDir, MountPropagation: mountPropagation(corev1.MountPropagationBidirectional)},
+	}
+	// host /dev only for local (dev=) volumes — it would clobber a pvc=
+	// volumeDevice (see hasLocalLUKSVolume).
+	if hasLocalLUKSVolume(eff.LUKS) {
+		mounts = append(mounts, corev1.VolumeMount{Name: "host-dev", MountPath: "/dev"})
+	}
 	return corev1.Container{
 		Name:            "c8s-luks-open",
 		Image:           cfg.LUKSOpenImage,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Args:            args,
 		VolumeDevices:   devices,
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: secretsDataVolume, MountPath: defaultSecretsDir, ReadOnly: true},
-			{Name: luksDataVolume, MountPath: luksDataDir, MountPropagation: mountPropagation(corev1.MountPropagationBidirectional)},
-			{Name: "host-dev", MountPath: "/dev"},
-		},
+		VolumeMounts:    mounts,
 		SecurityContext: &corev1.SecurityContext{
 			// Privileged is required for cryptsetup ioctls and to create
 			// /dev/mapper nodes. Root is required to open the raw block
@@ -277,16 +310,18 @@ func luksOpenContainer(cfg Config, eff injection) corev1.Container {
 
 func mountPropagation(m corev1.MountPropagationMode) *corev1.MountPropagationMode { return &m }
 
-// The luks-open init container also mounts /dev from the host; the pod
-// spec must carry that volume already, so it's declared here rather than in
-// the container helper (declarations are pod-scoped).
-func ensureLUKSVolumes(pod *corev1.Pod) {
+// ensureLUKSVolumes declares the pod-scoped host /dev volume the luks-open
+// container mounts for local (dev=) volumes. pvc=-only pods get no host /dev
+// (it would clobber their volumeDevice), so the volume is omitted there.
+// The secrets emptyDir is already declared by injectSecrets.
+func ensureLUKSVolumes(pod *corev1.Pod, vols []luksVolume) {
+	if !hasLocalLUKSVolume(vols) {
+		return
+	}
 	ensureVolume(pod, corev1.Volume{
 		Name: "host-dev",
 		VolumeSource: corev1.VolumeSource{
 			HostPath: &corev1.HostPathVolumeSource{Path: "/dev"},
 		},
 	})
-	// The secrets emptyDir is already declared by injectSecrets — the LUKS
-	// container just remounts it (see luksOpenContainer's VolumeMount above).
 }

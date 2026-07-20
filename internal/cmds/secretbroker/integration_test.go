@@ -66,11 +66,18 @@ func openbaoStub(t *testing.T) *httptest.Server {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":{"data":{"password":"s3cr3t"},"metadata":{"version":1}}}`))
+		// Two fields, so field-scoped grants are observably filtered.
+		_, _ = w.Write([]byte(`{"data":{"data":{"password":"s3cr3t","api_key":"k-9"},"metadata":{"version":1}}}`))
 	}))
 }
 
 func newTestBroker(t *testing.T, storeAddr string) http.Handler {
+	return newTestBrokerWithPolicy(t, storeAddr, &Policy{Rules: []Rule{
+		{WorkloadID: "api", Allow: []string{"secret/data/api/*"}},
+	}})
+}
+
+func newTestBrokerWithPolicy(t *testing.T, storeAddr string, policy *Policy) http.Handler {
 	t.Helper()
 	store, err := newVaultClient(config{
 		openbaoAddr:     storeAddr,
@@ -82,9 +89,7 @@ func newTestBroker(t *testing.T, storeAddr string) http.Handler {
 	}
 	b := &broker{
 		verifier: &peerVerifier{mode: peerVerifyCA},
-		policy: &Policy{Rules: []Rule{
-			{WorkloadID: "api", Allow: []string{"secret/data/api/*"}},
-		}},
+		policy:   policy,
 		tokens:   newTokenStore(time.Hour),
 		store:    store,
 		tokenTTL: time.Hour,
@@ -139,6 +144,44 @@ func TestEndToEndKVRead(t *testing.T) {
 	}
 	if got := resp.Data.Data["password"]; got != "s3cr3t" {
 		t.Fatalf("secret not proxied through: got %v", resp.Data.Data)
+	}
+	// Path granted without a field scope → the whole item passes through.
+	if _, ok := resp.Data.Data["api_key"]; !ok {
+		t.Fatalf("unscoped grant should return all fields, got %v", resp.Data.Data)
+	}
+}
+
+// A field-scoped grant ("…#password") must return only that field — the rest
+// of the KV item never crosses the wire (N6).
+func TestKVReadFieldScoped(t *testing.T) {
+	stub := openbaoStub(t)
+	defer stub.Close()
+	router := newTestBrokerWithPolicy(t, stub.URL, &Policy{Rules: []Rule{
+		{WorkloadID: "api", Allow: []string{"secret/data/api/*#password"}},
+	}})
+	api := genCert(t, "api")
+
+	token, code := loginWith(t, router, api)
+	if code != http.StatusOK || token == "" {
+		t.Fatalf("login failed: code=%d", code)
+	}
+	rec := readWith(router, api, token, "secret/data/api/db")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read failed: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp kvResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode read response: %v", err)
+	}
+	if got := resp.Data.Data["password"]; got != "s3cr3t" {
+		t.Fatalf("granted field missing: got %v", resp.Data.Data)
+	}
+	if _, ok := resp.Data.Data["api_key"]; ok {
+		t.Fatalf("field-scoped grant leaked ungranted field: got %v", resp.Data.Data)
+	}
+	// Metadata is non-secret and still passes through.
+	if resp.Data.Metadata["version"] == nil {
+		t.Fatalf("metadata should pass through, got %v", resp.Data.Metadata)
 	}
 }
 

@@ -59,10 +59,9 @@
   by the mesh. In particular --peer-verify=ratls + --measurements=… reads as
   "measurement pinning at the broker" but the pin is actually held by the mesh
   (ratlsMesh.measurements / CDS allowlist).
-  See docs/decisions/2026-07-09-broker-peer-verify-under-kata.md.
 */ -}}
 {{- if and .Values.kata.enabled .Values.secretBroker.enabled (eq .Values.secretBroker.peerVerify "ratls") -}}
-{{- fail "VALIDATION_ERROR kind=broker_ratls_under_kata: secretBroker.peerVerify=ratls is inert under kata.enabled=true — the in-guest ratls-mesh terminates the broker's inbound TLS and enforces caller attestation before the broker sees the request, so the broker never gets to verify the client cert or match measurements. Pin caller measurements at the mesh (ratlsMesh.measurements) or CDS instead, and set secretBroker.peerVerify=ca (identity-only, matches the mesh-delivered peer SAN). See docs/decisions/2026-07-09-broker-peer-verify-under-kata.md." -}}
+{{- fail "VALIDATION_ERROR kind=broker_ratls_under_kata: secretBroker.peerVerify=ratls is inert under kata.enabled=true — the in-guest ratls-mesh terminates the broker's inbound TLS and enforces caller attestation before the broker sees the request, so the broker never gets to verify the client cert or match measurements. Pin caller measurements at the mesh (ratlsMesh.measurements) or CDS instead, and set secretBroker.peerVerify=ca (identity-only, matches the mesh-delivered peer SAN)." -}}
 {{- end -}}
 {{- /*
   The LUKS-open init container the webhook injects is privileged and mounts

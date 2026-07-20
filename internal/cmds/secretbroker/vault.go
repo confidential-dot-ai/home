@@ -139,8 +139,23 @@ func (b *broker) handleKVRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Field scoping: a grant of "…/db#password" hands back only that field, so
+	// the caller never sees the rest of the item over the wire (metadata is
+	// non-secret and passes through). A path granted without a field scope
+	// yields all fields.
+	data := secret.Data
+	if fields, all := allowedFields(sess.allow, fullPath); !all {
+		filtered := make(map[string]any, len(fields))
+		for name := range fields {
+			if v, ok := data[name]; ok {
+				filtered[name] = v
+			}
+		}
+		data = filtered
+	}
+
 	var resp kvResponse
-	resp.Data.Data = secret.Data
+	resp.Data.Data = data
 	resp.Data.Metadata = secret.Metadata
 	writeJSON(w, http.StatusOK, resp)
 	slog.Info("read granted", "workload_id", sess.identity.WorkloadID, "path", fullPath)

@@ -24,9 +24,17 @@ type PeerIdentity struct {
 //     --peer-verify=ca mode, where no measurement is available — fail closed).
 //   - WorkloadID: if non-empty and not "*", must equal the caller's WorkloadID.
 //
-// Allow lists the KV v2 read paths the rule grants (see pathMatch for glob
-// semantics). The union of Allow across all matching rules is the caller's
-// permitted set.
+// Allow lists the KV v2 read grants (see pathMatch for path glob semantics).
+// Each entry is a path pattern optionally suffixed with a field scope:
+//
+//   - "secret/data/api/db"                — every field at the path
+//   - "secret/data/api/db#password"       — only the "password" field
+//   - "secret/data/api/*#password,api_key" — those two fields, any secret under api
+//
+// The broker filters the KV read down to the granted fields (handleKVRead), so
+// a field-scoped grant does not hand the caller the rest of the item. The
+// union of Allow across all matching rules is the caller's permitted set; a
+// path granted without a field scope by any matching entry yields all fields.
 type Rule struct {
 	Measurements []string `json:"measurements,omitempty"`
 	WorkloadID   string   `json:"workloadId,omitempty"`
@@ -58,6 +66,23 @@ func LoadPolicy(path string) (*Policy, error) {
 	for i, r := range p.Rules {
 		if len(r.Allow) == 0 {
 			return nil, fmt.Errorf("policy rule %d grants no paths (allow is empty)", i)
+		}
+		for _, entry := range r.Allow {
+			pat, fields := splitAllowEntry(entry)
+			if pat == "" {
+				return nil, fmt.Errorf("policy rule %d has an allow entry with an empty path (%q)", i, entry)
+			}
+			// A '#' with no usable field is a scoping typo, not "all fields" —
+			// silently widening to all fields would invert the operator's
+			// least-privilege intent, so reject it.
+			if strings.Contains(entry, "#") && len(fields) == 0 {
+				return nil, fmt.Errorf("policy rule %d allow entry %q has a '#' but names no field", i, entry)
+			}
+			for _, f := range fields {
+				if f == "" {
+					return nil, fmt.Errorf("policy rule %d allow entry %q has an empty field name", i, entry)
+				}
+			}
 		}
 		for _, m := range r.Measurements {
 			if normalizeMeasurement(m) == "" {
@@ -102,14 +127,50 @@ func ruleMatches(r Rule, id PeerIdentity) bool {
 	return true
 }
 
-// pathAllowed reports whether reqPath is granted by any glob in allowed.
+// splitAllowEntry separates an allow entry "pattern[#field,field]" into its
+// path pattern and its field scope (nil = all fields at the path).
+func splitAllowEntry(entry string) (pattern string, fields []string) {
+	pattern, rawFields, ok := strings.Cut(entry, "#")
+	if !ok || rawFields == "" {
+		return pattern, nil
+	}
+	for _, f := range strings.Split(rawFields, ",") {
+		fields = append(fields, strings.TrimSpace(f))
+	}
+	return pattern, fields
+}
+
+// pathAllowed reports whether reqPath is granted by any entry in allowed
+// (ignoring field scope — field filtering happens in allowedFields).
 func pathAllowed(allowed []string, reqPath string) bool {
-	for _, pat := range allowed {
+	for _, entry := range allowed {
+		pat, _ := splitAllowEntry(entry)
 		if pathMatch(pat, reqPath) {
 			return true
 		}
 	}
 	return false
+}
+
+// allowedFields returns the field scope for reqPath across all matching allow
+// entries. allFields is true when any matching entry grants the path without a
+// field scope (a broader grant wins, as with allow-lists generally); otherwise
+// fields is the union of the field scopes of the matching entries.
+func allowedFields(allowed []string, reqPath string) (fields map[string]struct{}, allFields bool) {
+	fields = map[string]struct{}{}
+	for _, entry := range allowed {
+		pat, fs := splitAllowEntry(entry)
+		if !pathMatch(pat, reqPath) {
+			continue
+		}
+		if len(fs) == 0 {
+			return nil, true
+		}
+		for _, f := range fs {
+			fields[f] = struct{}{}
+		}
+	}
+	return fields, false
 }
 
 // pathMatch matches a slash-delimited request path against a glob pattern with

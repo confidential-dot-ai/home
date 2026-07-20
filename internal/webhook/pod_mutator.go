@@ -810,7 +810,7 @@ func mutatePod(pod *corev1.Pod, inj *injection, cfg Config) {
 	}
 
 	if len(effective.LUKS) > 0 && cfg.LUKSOpenImage != "" {
-		ensureLUKSVolumes(pod)
+		ensureLUKSVolumes(pod, effective.LUKS)
 		injectLUKS(pod, effective, cfg)
 	}
 

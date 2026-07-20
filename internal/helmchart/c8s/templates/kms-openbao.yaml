@@ -97,4 +97,36 @@ spec:
               {{- toYaml .Values.kms.resources.limits | nindent 14 }}
       nodeSelector:
         kubernetes.io/os: linux
+---
+# Default-deny ingress except from the secret-broker: the dev store holds a
+# well-known root token, so without this any pod that can reach
+# c8s-openbao:{{ .Values.kms.port }} bypasses the attestation gate entirely
+# (audit C3). The broker is the only in-cluster client. Operator writes go
+# through `kubectl port-forward` (kubelet path, on-node — not subject to this
+# policy), as the KMS runbook does; a direct in-cluster dial to the store from
+# anything but the broker is refused. NOTE: this depends on a policy-enforcing
+# CNI (RKE2's Canal does); where the CNI ignores NetworkPolicy it is inert, and
+# the dev store stays dev-only regardless.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kms.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kms.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kms
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kms.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "secret-broker.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: http
 {{- end }}
