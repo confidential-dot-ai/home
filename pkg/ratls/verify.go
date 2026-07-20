@@ -161,7 +161,9 @@ func verifyReport(att *Attestation, policy *VerifyPolicy, expectedReportData [64
 		if evidence == nil {
 			return nil, fmt.Errorf("%w: TDX RA-TLS extension missing evidence envelope", ErrInvalidReport)
 		}
-		if evidence.Platform != string(types.PlatformTdx) {
+		switch evidence.Platform {
+		case string(types.PlatformTdx), string(types.PlatformAzTdx):
+		default:
 			return nil, fmt.Errorf("%w: online verification not implemented for platform %q", ErrUnsupportedTEE, evidence.Platform)
 		}
 	default:
@@ -213,7 +215,7 @@ func verifyEnvelopeOnline(evidence *types.AttestationEvidence, policy *VerifyPol
 	}
 
 	teeType := TEETypeSEVSNP
-	if evidence.Platform == string(types.PlatformTdx) {
+	if evidence.Platform == string(types.PlatformTdx) || evidence.Platform == string(types.PlatformAzTdx) {
 		teeType = TEETypeTDX
 	}
 	result := &VerifyResult{TEEType: teeType}

@@ -995,9 +995,10 @@ func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
 	// Two orthogonal axes:
 	//  --cvm-mode: pod (kata) / node (node-as-CVM) / gke (managed) / aks (vTPM)
 	//  --hardware-platform: sev-snp (/dev/sev-guest) / tdx (/dev/tdx-guest)
-	// pod+node+gke all take either hardware-platform; aks always emits vTPM
-	// (and combining aks with tdx is rejected).
-	build := func(mode string, sevGuest, tdxGuest, tpm string) []string {
+	// pod+node+gke all take either hardware-platform; aks always emits the vTPM
+	// device and rides the Azure vTPM HCL report for both SNP (az-snp) and TDX
+	// (az-tdx).
+	build := func(mode, platform, sevGuest, tdxGuest, tpm string) []string {
 		out := []string{
 			"upgrade",
 			"--set-string", "attestationApi.cvmMode=" + mode,
@@ -1005,9 +1006,10 @@ func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
 			"--set", "attestationApi.teeDevices.tdxGuest=" + tdxGuest,
 			"--set", "attestationApi.teeDevices.tpm=" + tpm,
 		}
-		// TDX (non-aks) also propagates the CPU TEE to the components that name
-		// their RA-TLS platform, or CDS parses the TDX quote as an SNP report.
-		if tdxGuest == "true" {
+		// Any TDX shape — native (/dev/tdx-guest) or Azure vTPM (az-tdx) —
+		// propagates the CPU TEE to the components that name their RA-TLS
+		// platform, or CDS parses the TDX quote as an SNP report.
+		if platform == "tdx" {
 			out = append(out,
 				"--set-string", "cds.ratlsPlatform=tdx",
 				"--set-string", "ratlsMesh.platform=tdx",
@@ -1028,13 +1030,15 @@ func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
 		hardwarePlatform string
 		want             []string
 	}{
-		"pod + sev-snp":  {"pod", "sev-snp", build("pod", "true", "false", "false")},
-		"gke + sev-snp":  {"gke", "sev-snp", build("gke", "true", "false", "false")},
-		"node + sev-snp": {"node", "sev-snp", build("node", "true", "false", "false")},
-		"pod + tdx":      {"pod", "tdx", build("pod", "false", "true", "false")},
-		"gke + tdx":      {"gke", "tdx", build("gke", "false", "true", "false")},
-		"node + tdx":     {"node", "tdx", build("node", "false", "true", "false")},
-		"aks + sev-snp":  {"aks", "sev-snp", build("aks", "false", "false", "true")},
+		"pod + sev-snp":  {"pod", "sev-snp", build("pod", "sev-snp", "true", "false", "false")},
+		"gke + sev-snp":  {"gke", "sev-snp", build("gke", "sev-snp", "true", "false", "false")},
+		"node + sev-snp": {"node", "sev-snp", build("node", "sev-snp", "true", "false", "false")},
+		"pod + tdx":      {"pod", "tdx", build("pod", "tdx", "false", "true", "false")},
+		"gke + tdx":      {"gke", "tdx", build("gke", "tdx", "false", "true", "false")},
+		"node + tdx":     {"node", "tdx", build("node", "tdx", "false", "true", "false")},
+		"aks + sev-snp":  {"aks", "sev-snp", build("aks", "sev-snp", "false", "false", "true")},
+		// az-tdx: Azure vTPM (tpm=true, no guest device) + TDX RA-TLS platform.
+		"aks + tdx (az-tdx)": {"aks", "tdx", build("aks", "tdx", "false", "false", "true")},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1059,17 +1063,25 @@ func TestAppendCvmModeInstallArgsRejectsUnknownHardwarePlatform(t *testing.T) {
 	}
 }
 
-func TestAppendCvmModeInstallArgsRejectsAksWithTdx(t *testing.T) {
-	// AKS is Azure vTPM-backed SEV-SNP; TDX support on AKS would need a
-	// separate device path if it ever ships. Combining these axes silently
-	// would install with mounts that can never be attested; refuse
-	// explicitly instead.
-	_, err := appendCvmModeInstallArgs([]string{"upgrade"}, "aks", "tdx")
-	if err == nil {
-		t.Fatal("appendCvmModeInstallArgs accepted --cvm-mode=aks with --hardware-platform=tdx, want error")
+func TestAppendCvmModeInstallArgsAcceptsAksWithTdx(t *testing.T) {
+	// aks + tdx is the Azure-vTPM TDX (az-tdx) shape: the node's vTPM HCL report
+	// wraps a TD quote, so it needs the vTPM device (tpm=true, no guest device)
+	// and the TDX RA-TLS platform on CDS/mesh — not a refusal.
+	got, err := appendCvmModeInstallArgs([]string{"upgrade"}, "aks", "tdx")
+	if err != nil {
+		t.Fatalf("appendCvmModeInstallArgs(aks, tdx): unexpected error %v", err)
 	}
-	if !strings.Contains(err.Error(), "aks") || !strings.Contains(err.Error(), "tdx") {
-		t.Errorf("error %q should mention both cvm-mode aks and hardware-platform tdx", err.Error())
+	joined := strings.Join(got, " ")
+	for _, want := range []string{
+		"attestationApi.cvmMode=aks",
+		"attestationApi.teeDevices.tpm=true",
+		"attestationApi.teeDevices.tdxGuest=false",
+		"cds.ratlsPlatform=tdx",
+		"ratlsMesh.platform=tdx",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("aks+tdx args missing %q; got %v", want, got)
+		}
 	}
 }
 

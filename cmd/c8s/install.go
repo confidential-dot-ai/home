@@ -1030,9 +1030,11 @@ func appendDistroInstallArgs(helmArgs []string, distro string) []string {
 // `--cvm-mode` (deployment shape) and `--hardware-platform` (CPU TEE) are
 // ORTHOGONAL axes. pod/node/gke pair with either SEV-SNP
 // (--hardware-platform sev-snp, default) or Intel TDX (--hardware-platform
-// tdx). aks uses its own vTPM path regardless, and combining `--cvm-mode aks`
-// with `--hardware-platform tdx` is refused (AKS doesn't expose
-// /dev/tdx-guest to guest workloads).
+// tdx). aks uses the Azure vTPM path regardless of the CPU TEE: the node's
+// vTPM HCL report wraps an SNP report on an SEV-SNP CVM (az-snp) or a TD quote
+// on an Intel TDX CVM (az-tdx). Both are supported; --hardware-platform tdx on
+// aks selects the az-tdx shape (no /dev/tdx-guest needed — the TD quote comes
+// from the vTPM), and the mesh/CDS RA-TLS platform is set to tdx accordingly.
 //
 // Mixed-hardware inside a single cluster (some SNP hosts, some TDX hosts) is
 // out of scope for now — a cluster is one hardware platform. Mixed support
@@ -1054,14 +1056,15 @@ func appendCvmModeInstallArgs(helmArgs []string, cvmMode, hardwarePlatform strin
 	if !slices.Contains(allowedPlatforms, hardwarePlatform) {
 		return nil, fmt.Errorf("--%s must be one of %s, got %q", flagHardwarePlatform, strings.Join(allowedPlatforms, ", "), hardwarePlatform)
 	}
-	if cvmMode == "aks" && hardwarePlatform == "tdx" {
-		return nil, fmt.Errorf("--%s=aks is Azure vTPM-backed SEV-SNP; combining with --%s=tdx is not supported (AKS does not expose /dev/tdx-guest to guest workloads)", flagCvmMode, flagHardwarePlatform)
-	}
 	helmArgs = append(helmArgs, "--set-string", "attestationApi.cvmMode="+cvmMode)
-	// aks: vTPM regardless of --hardware-platform (validated above; only
-	// --hardware-platform sev-snp reaches here)
-	// pod/node/gke + --hardware-platform sev-snp: native /dev/sev-guest
-	// pod/node/gke + --hardware-platform tdx:     native /dev/tdx-guest
+	// Device wiring:
+	//   aks: vTPM (/dev/tpm0) regardless of --hardware-platform. On Azure the
+	//        node *is* the CVM and attestation rides the vTPM HCL report, which
+	//        wraps either an SNP report (az-snp) or a TD quote (az-tdx). AKS
+	//        exposes no /dev/sev-guest or /dev/tdx_guest to the guest, so the
+	//        vTPM is the only evidence source for both SNP and TDX aks nodes.
+	//   pod/node/gke + --hardware-platform sev-snp: native /dev/sev-guest
+	//   pod/node/gke + --hardware-platform tdx:     native /dev/tdx-guest
 	sevGuest, tdxGuest, tpm := "false", "false", "false"
 	switch {
 	case cvmMode == "aks":
@@ -1082,9 +1085,11 @@ func appendCvmModeInstallArgs(helmArgs []string, cvmMode, hardwarePlatform strin
 	// cannot probe /dev/tdx_guest to auto-detect) and the ratls-mesh must be
 	// told `tdx` explicitly, or CDS parses the attestation-api's TDX quote as an
 	// SNP report and crash-loops ("evidence contains neither attestation_report
-	// nor hcl_report"). aks stays on the SNP vTPM path. cds.ratlsPlatform uses
-	// `snp`/`tdx`; ratlsMesh.platform uses `sev-snp`/`tdx`.
-	if cvmMode != "aks" && hardwarePlatform == "tdx" {
+	// nor hcl_report"). This holds for the Azure-vTPM TDX shape (aks + tdx,
+	// i.e. az-tdx) too: the vTPM HCL report carries a TD quote, so CDS and the
+	// mesh must expect the TDX family. cds.ratlsPlatform uses `snp`/`tdx`;
+	// ratlsMesh.platform uses `sev-snp`/`tdx` (both normalize az-tdx -> tdx).
+	if hardwarePlatform == "tdx" {
 		helmArgs = append(helmArgs,
 			"--set-string", "cds.ratlsPlatform=tdx",
 			"--set-string", "ratlsMesh.platform=tdx",
@@ -1699,7 +1704,7 @@ func init() {
 	installCmd.Flags().StringSliceVar(&installWorkloadRefs, flagWorkloadRef, nil, "existing workload to adopt as a c8s confidential workload, as <cw-id>=<namespace>/<kind>/<name>[:<port>]; repeatable. Kind is any resource exposing a pod template at spec.template (deployment, statefulset, daemonset, or an operator CRD such as <kind>.<group>). The optional :<port> is the tls-lb upstream port, needed on the ref --upstream selects")
 	installCmd.Flags().StringVar(&installUpstream, flagUpstream, "", "confidential.ai/cw id of the adopted --workload-ref workload tls-lb routes its catch-all to; derives the mesh-wrapped upstream c8s-<id>.<ns>.svc.cluster.local:<port> from that ref's :<port>. Without this or a verified-https tlsLb.upstream, tls-lb renders no catch-all route until one is attached")
 	installCmd.Flags().StringVar(&installCvmMode, flagCvmMode, "", "CVM deployment shape (REQUIRED; orthogonal to --hardware-platform): pod (per-pod confidential VMs via the Kata runtime — every workload pod is a kata CVM, host-side attestation-api/nri/ratls-mesh served by the in-guest counterparts), node (generalized node-as-CVM: our own TDX/SNP nodes are themselves confidential VMs, pods run as ordinary processes, attestation-api + nri baked into the node image), gke (GKE managed confidential VMs), or aks (vTPM /dev/tpm0)")
-	installCmd.Flags().StringVar(&installHardwarePlatform, flagHardwarePlatform, "sev-snp", "CPU-level TEE hardware (orthogonal to --cvm-mode): sev-snp (default, /dev/sev-guest) or tdx (Intel TDX, /dev/tdx-guest). Ignored when --cvm-mode=aks (Azure vTPM path); combining --cvm-mode=aks with --hardware-platform=tdx is refused")
+	installCmd.Flags().StringVar(&installHardwarePlatform, flagHardwarePlatform, "sev-snp", "CPU-level TEE hardware (orthogonal to --cvm-mode): sev-snp (default, /dev/sev-guest) or tdx (Intel TDX, /dev/tdx-guest). Under --cvm-mode=aks the CPU TEE rides the Azure vTPM: sev-snp selects az-snp and tdx selects az-tdx (no guest device needed — the report comes from /dev/tpm0)")
 	installCmd.Flags().BoolVar(&installKataDebug, "debug", false, "use the kata-guest-base DEBUG guest variant (<tag>-debug): kubectl logs/exec work on kata pods, but container I/O becomes readable by the untrusted host and the launch measurement differs from the locked image. Requires --cvm-mode=pod; development only")
 	installCmd.Flags().BoolVar(&installResolveDigests, "resolve-digests", true, "resolve each c8s component image tag to its registry digest (via crane), pin it, and add the resolved images to the NRI allowlist (enables deriveComponents). On by default; pass --resolve-digests=false when supplying digests via -f")
 	installCmd.Flags().StringVar(&installImagePullSecret, "image-pull-secret", "", "name of an existing registry-credential Secret (kubernetes.io/dockerconfigjson) in the release namespace; the chart appends it to every component's imagePullSecrets, so all pods can pull the c8s images from an authenticated registry (e.g. a private mirror) from first start. The Secret itself is never created or managed by the install — the install fails fast if it is missing or has the wrong type")

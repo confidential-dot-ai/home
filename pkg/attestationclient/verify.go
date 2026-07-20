@@ -106,7 +106,7 @@ func (c Client) VerifyEvidence(ctx context.Context, evidence types.AttestationEv
 	switch evidence.Platform {
 	case string(types.PlatformSnp), string(types.PlatformAzSnp), string(types.PlatformGcpSnp):
 		return c.verifySNPEvidence(ctx, evidence, policy)
-	case string(types.PlatformTdx):
+	case string(types.PlatformTdx), string(types.PlatformAzTdx):
 		return c.verifyTDXEvidence(ctx, evidence, policy)
 	default:
 		return types.VerifyResponse{}, fmt.Errorf("%w: %q", ErrUnsupportedPlatform, evidence.Platform)
@@ -134,11 +134,20 @@ func (c Client) verifySNPEvidence(ctx context.Context, evidence types.Attestatio
 }
 
 func (c Client) verifyTDXEvidence(ctx context.Context, evidence types.AttestationEvidence, policy EvidencePolicy) (types.VerifyResponse, error) {
+	// az-tdx binds the key through the vTPM quote whose nonce is the 48-byte
+	// SHA-384 digest — it must receive exactly those 48 bytes, like az-snp.
+	// Native tdx carries the 64-byte REPORTDATA field in the TD report and
+	// compares all 64.
+	reportData := policy.ExpectedReportData[:]
+	if evidence.Platform == string(types.PlatformAzTdx) {
+		reportData = policy.ExpectedReportData[:sha512.Size384]
+	}
+
 	// The attestation-api surfaces MRTD as claims.launch_digest. Enforce it
 	// client-side just like SNP's LAUNCH_DIGEST. RTMR pinning is deliberately
 	// separate and not yet represented by EvidencePolicy. MinTcb is also
 	// omitted because the c8s TDX request has no minimum-TCB policy field.
-	resp, err := c.VerifyEnforced(ctx, verifyRequest(evidence, policy.ExpectedReportData[:], policy.AllowDebug, nil))
+	resp, err := c.VerifyEnforced(ctx, verifyRequest(evidence, reportData, policy.AllowDebug, nil))
 	if err != nil {
 		return types.VerifyResponse{}, err
 	}

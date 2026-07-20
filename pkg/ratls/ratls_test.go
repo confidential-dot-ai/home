@@ -577,7 +577,7 @@ func embeddedEnvelopeCert(t *testing.T, platform types.Platform, evidence json.R
 		t.Fatal(err)
 	}
 	teeType := TEETypeSEVSNP
-	if platform == types.PlatformTdx {
+	if platform == types.PlatformTdx || platform == types.PlatformAzTdx {
 		teeType = TEETypeTDX
 	}
 	certDER, err := CreateAttestedCert(key, &Attestation{TEEType: teeType, Report: embedded}, nil)
@@ -954,7 +954,10 @@ func TestVerifyCertEmbeddedAzureNegativePaths(t *testing.T) {
 		}
 	})
 
-	t.Run("az-tdx evidence is rejected by online verifier", func(t *testing.T) {
+	t.Run("az-tdx evidence with a mismatched SEV-SNP TEE type is rejected", func(t *testing.T) {
+		// az-tdx is a TDX-family platform; carrying it in a cert that declares
+		// the SEV-SNP TEE type is a family mismatch and must fail closed rather
+		// than be verified under SNP rules.
 		key, _, err := GenerateKeyPair()
 		if err != nil {
 			t.Fatal(err)
@@ -981,6 +984,53 @@ func TestVerifyCertEmbeddedAzureNegativePaths(t *testing.T) {
 			t.Fatalf("got %v, want ErrUnsupportedTEE", err)
 		}
 	})
+}
+
+// TestVerifyCertEmbeddedAzTdxEvidence covers the Azure-vTPM TDX (az-tdx) online
+// path: the vTPM HCL report wraps a TD quote, the mesh peer presents an az-tdx
+// envelope under the TDX TEE type, and the verifier binds the key through the
+// 48-byte vTPM nonce (like az-snp) while enforcing the MRTD as launch digest.
+func TestVerifyCertEmbeddedAzTdxEvidence(t *testing.T) {
+	cert, expectedReportData := embeddedEnvelopeCert(t, types.PlatformAzTdx,
+		json.RawMessage(`{"hcl_report":"fake","td_quote":"fake","tpm_quote":{"message":"fake"}}`))
+	mrtd := bytes.Repeat([]byte{0x42}, sha512.Size384)
+
+	var observed types.VerifyRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&observed); err != nil {
+			t.Fatalf("decode verify request: %v", err)
+		}
+		resp := verifyResponse(mrtd)
+		resp["result"].(map[string]any)["platform"] = string(types.PlatformAzTdx)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	result, err := VerifyCert(cert, &VerifyPolicy{
+		AttestationApiURL: srv.URL,
+		Measurements:      [][]byte{mrtd},
+	}, nil)
+	if err != nil {
+		t.Fatalf("VerifyCert: %v", err)
+	}
+	// az-tdx binds via the 48-byte vTPM nonce, not the full 64-byte REPORTDATA.
+	if got := observed.Params.ExpectedReportData.Bytes(); !bytes.Equal(got, expectedReportData[:sha512.Size384]) {
+		t.Fatalf("expected_report_data = %x (%d bytes), want the 48-byte digest %x", got, len(got), expectedReportData[:sha512.Size384])
+	}
+	if result.TEEType != TEETypeTDX {
+		t.Fatalf("TEEType = %v, want TDX", result.TEEType)
+	}
+	if !bytes.Equal(result.Measurement[:], mrtd) {
+		t.Fatalf("Measurement = %x, want MRTD %x", result.Measurement, mrtd)
+	}
+
+	wrongMRTD := bytes.Repeat([]byte{0x99}, sha512.Size384)
+	_, err = VerifyCert(cert, &VerifyPolicy{AttestationApiURL: srv.URL, Measurements: [][]byte{wrongMRTD}}, nil)
+	if !errors.Is(err, ErrPolicyViolation) {
+		t.Fatalf("wrong MRTD: got %v, want ErrPolicyViolation", err)
+	}
 }
 
 // TestVerifyCertBareSNPUsesAttestationApi covers the bare-metal SNP shape:

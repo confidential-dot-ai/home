@@ -98,10 +98,12 @@ The `report` field carries one of two shapes, auto-detected on parse
 
 - **Bare-metal SNP**: the raw 1184-byte `ATTESTATION_REPORT`. Kept raw so a
   bare-metal report stays extractable by offline SNP verifiers.
-- **Everything else** (`az-snp`, `gcp-snp`, `tdx`): the attestation-api's JSON
-  evidence envelope, forwarded verbatim to `/verify` at handshake time. TDX
-  must use the envelope (c8s deliberately ships no in-process quote parser —
-  see `verify.go`), and its bulky `cc_eventlog` is stripped before embedding.
+- **Everything else** (`az-snp`, `gcp-snp`, `tdx`, `az-tdx`): the attestation-api's
+  JSON evidence envelope, forwarded verbatim to `/verify` at handshake time. Both
+  TDX shapes must use the envelope (c8s deliberately ships no in-process quote
+  parser — see `verify.go`): native `tdx` carries a bulky `cc_eventlog` that is
+  stripped before embedding, while Azure-vTPM `az-tdx` (the TD quote wrapped in the
+  HCL report, alongside the vTPM quote) has no eventlog and is embedded as-is.
   Azure evidence wrapped in a Hyper-V HCL header is normalized back to the raw
   report where needed (`snp_report.go`).
 
