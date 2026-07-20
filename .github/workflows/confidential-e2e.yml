@@ -1,0 +1,40 @@
+name: confidential-e2e
+# merge to main -> integration happens -> issues surfaced: run the c8s e2e
+# inside a measured SEV-SNP CVM for every main merge (boot a fresh RKE2-node
+# CVM, self-discover its launch measurement, install this commit's c8s, prove a
+# confidential workload gets a CDS-issued cert under the enforced digest).
+# Mechanics + rationale (trigger precedent, merge-burst semantics):
+#   confidential-dot-ai/confidential-ci/USING-THE-PRIMITIVE.md
+# This wrapper only decides WHEN. Never pull_request (self-hosted org hardware).
+on:
+  workflow_run:
+    workflows: ["Docker"]      # chain off a completed Docker run so retag-unchanged
+    types: [completed]         # has published this sha's image tags before we install
+  workflow_dispatch:
+    inputs:
+      c8s_ref:
+        description: c8s ref to test (dispatch only; defaults to main)
+        required: false
+        default: main
+
+# Least privilege: the wrapper only reads the repo to dispatch the reusable lane.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
+       (github.event.workflow_run.head_branch == 'main' || startsWith(github.event.workflow_run.head_branch, 'v')))
+    # Reusable lane pinned by commit SHA (bump deliberately when the lane changes);
+    # the trailing @main tag is a human label only.
+    uses: confidential-dot-ai/confidential-ci/.github/workflows/e2e-c8s.yml@cad0dd13ac445188a3bd1641b6506c45658f274f
+    with:
+      c8s_ref: ${{ inputs.c8s_ref || github.event.workflow_run.head_sha }}
