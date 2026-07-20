@@ -10,7 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwk"
+	"github.com/lestrrat-go/httprc/v3"
+	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -58,11 +59,19 @@ func NewJWKSKeyProvider(ctx context.Context, url string, cacheTTL time.Duration,
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	cache := jwk.NewCache(ctx, jwk.WithRefreshWindow(cacheTTL))
-	if err := cache.Register(url,
+	cache, err := jwk.NewCache(ctx, httprc.NewClient())
+	if err != nil {
+		return nil, fmt.Errorf("create JWKS cache: %w", err)
+	}
+	// WithWaitReady(false) keeps Register non-blocking so a JWKS endpoint that
+	// is not up yet degrades to the warn-and-retry below rather than failing
+	// startup. v2's WithFetchWhitelist has no counterpart here and needs none:
+	// a Cache only ever contacts the URLs passed to Register, so pinning the
+	// allowlist to that same URL was already redundant.
+	if err := cache.Register(ctx, url,
 		jwk.WithHTTPClient(client),
-		jwk.WithMinRefreshInterval(cacheTTL),
-		jwk.WithFetchWhitelist(jwk.NewMapWhitelist().Add(url)),
+		jwk.WithMinInterval(cacheTTL),
+		jwk.WithWaitReady(false),
 	); err != nil {
 		return nil, fmt.Errorf("register JWKS url: %w", err)
 	}
@@ -79,17 +88,18 @@ func (p *JWKSKeyProvider) PublicKey(kid string) (*ecdsa.PublicKey, error) {
 		return nil, fmt.Errorf("JWKS verification requires a kid header")
 	}
 	ctx := context.Background()
-	set, err := p.cache.Get(ctx, p.url)
-	if err != nil {
-		return nil, fmt.Errorf("JWKS cache lookup: %w", err)
-	}
-	if key, ok := lookupECDSA(set, kid); ok {
-		return key, nil
+	// A lookup error is not fatal: Lookup reports "not ready" when no fetch has
+	// ever succeeded, and the force-refresh below is how the provider recovers
+	// from that, just as it recovers from a CDS key rotation.
+	if set, err := p.cache.Lookup(ctx, p.url); err == nil {
+		if key, ok := lookupECDSA(set, kid); ok {
+			return key, nil
+		}
 	}
 	if !p.tryForceRefresh(ctx) {
 		return nil, fmt.Errorf("JWKS key not found for kid %q (refresh rate-limited)", kid)
 	}
-	set, err = p.cache.Get(ctx, p.url)
+	set, err := p.cache.Lookup(ctx, p.url)
 	if err != nil {
 		return nil, fmt.Errorf("JWKS cache lookup after refresh: %w", err)
 	}
@@ -132,7 +142,7 @@ func lookupECDSA(set jwk.Set, kid string) (*ecdsa.PublicKey, bool) {
 
 func rawECDSA(key jwk.Key) (*ecdsa.PublicKey, bool) {
 	var pub ecdsa.PublicKey
-	if err := key.Raw(&pub); err != nil {
+	if err := jwk.Export(key, &pub); err != nil {
 		return nil, false
 	}
 	return &pub, true

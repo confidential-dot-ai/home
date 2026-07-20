@@ -2,8 +2,15 @@ name: Set up Go toolchain (c8s)
 description: >-
   Configure the Go toolchain with module caching. The toolchain is derived from
   the module's `go` directive (go.mod) — a single source of truth, with no
-  GO_VERSION pin to drift against go.mod or between workflows. go.mod declares
-  the minor only (go 1.26), so this floats to the latest 1.26.x patch.
+  GO_VERSION pin to drift against go.mod or between workflows.
+
+  The `go` directive carries a patch version (e.g. `go 1.26.3`) because it must
+  be >= the highest directive among our dependencies, and containerd currently
+  forces 1.26.3. That is a floor, not a pin, so CI has no reason to install
+  exactly it. We strip the patch and ask for the minor (`1.26`), which floats to
+  the latest 1.26.x and picks up toolchain security fixes without touching
+  go.mod. The go.mod floor is still satisfied, so GOTOOLCHAIN never has to
+  download a second toolchain.
 
   Run this AFTER actions/checkout: a local (./) composite action cannot perform
   the checkout itself, because the action file must already be on disk before
@@ -20,8 +27,40 @@ inputs:
 runs:
   using: composite
   steps:
+    - id: go-minor
+      shell: bash
+      env:
+        # Via env rather than inline ${{ }} so the path cannot be interpolated
+        # into the script body.
+        GO_VERSION_FILE: ${{ inputs.go-version-file }}
+      run: |
+        set -euo pipefail
+
+        if [[ ! -f "$GO_VERSION_FILE" ]]; then
+          echo "::error::$GO_VERSION_FILE not found" >&2
+          exit 1
+        fi
+
+        # First bare `go` directive; the `require` block's entries are indented,
+        # so anchoring to the line start avoids matching a dependency.
+        directive="$(grep -m1 -E '^go[[:space:]]+[0-9]' "$GO_VERSION_FILE" | awk '{print $2}' || true)"
+        if [[ -z "$directive" ]]; then
+          echo "::error::no 'go' directive found in $GO_VERSION_FILE" >&2
+          exit 1
+        fi
+
+        # 1.26.3 -> 1.26, and 1.26 -> 1.26 if the patch is already absent.
+        minor="$(printf '%s' "$directive" | grep -oE '^[0-9]+\.[0-9]+' || true)"
+        if [[ -z "$minor" ]]; then
+          echo "::error::could not parse go directive '$directive' in $GO_VERSION_FILE" >&2
+          exit 1
+        fi
+
+        echo "version=$minor" >> "$GITHUB_OUTPUT"
+        echo "$GO_VERSION_FILE declares 'go $directive' -> requesting Go $minor (latest patch)"
+
     - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
       with:
-        go-version-file: ${{ inputs.go-version-file }}
+        go-version: ${{ steps.go-minor.outputs.version }}
         cache: true
         cache-dependency-path: ${{ inputs.cache-dependency-path }}

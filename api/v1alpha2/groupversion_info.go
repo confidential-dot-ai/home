@@ -11,14 +11,29 @@
 package v1alpha2
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/scheme"
 )
 
 var (
 	GroupVersion = schema.GroupVersion{Group: "confidential.ai", Version: "v1alpha2"}
 
-	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
 
 	AddToScheme = SchemeBuilder.AddToScheme
 )
+
+// addKnownTypes registers this group-version's types with a scheme. This is the
+// apimachinery builder that controller-runtime's scheme.Builder deprecation
+// points at: the whole reason for that deprecation is to keep api packages
+// importable without dragging in controller-runtime, so the type list lives
+// here rather than behind a Register call in the types file.
+func addKnownTypes(scheme *runtime.Scheme) error {
+	scheme.AddKnownTypes(GroupVersion,
+		&ConfidentialWorkload{},
+		&ConfidentialWorkloadList{},
+	)
+	metav1.AddToGroupVersion(scheme, GroupVersion)
+	return nil
+}

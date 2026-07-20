@@ -51,6 +51,13 @@ func (s staticHandoffEARSource) Current() (string, error) {
 	return strings.TrimSpace(s.ear), nil
 }
 
+// ExpiresAt parses on every read rather than at store time, unlike
+// AtomicHandoffEAR. That keeps this fake a one-field literal and lets tests
+// drive the "expiry unreadable" branch by supplying a non-JWT ear.
+func (s staticHandoffEARSource) ExpiresAt() (time.Time, error) {
+	return unverifiedEARExpiry(strings.TrimSpace(s.ear))
+}
+
 func snapshotFromCA(ca *CA) func() (CASnapshot, bool) {
 	return func() (CASnapshot, bool) {
 		return CASnapshot{
@@ -432,7 +439,9 @@ func TestHandoffReloadsIssuerEARFromFile(t *testing.T) {
 	requesterEAR := handoffTestEARWithKey(t, tokenKey, "allowed_measurement", requesterHandoffKey)
 
 	earSource := &AtomicHandoffEAR{}
-	earSource.Set(activeEAR1)
+	if err := earSource.Set(activeEAR1); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
 
 	hh, err := NewHandoffHandler(HandoffDeps{
 		Logger:              slog.Default(),
@@ -452,7 +461,9 @@ func TestHandoffReloadsIssuerEARFromFile(t *testing.T) {
 	if got := handoffResponseIssuerEAR(t, srv, requesterEAR, requesterHandoffKey); got != activeEAR1 {
 		t.Fatalf("issuer EAR before refresh = %q, want %q", got, activeEAR1)
 	}
-	earSource.Set(activeEAR2)
+	if err := earSource.Set(activeEAR2); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
 	if got := handoffResponseIssuerEAR(t, srv, requesterEAR, requesterHandoffKey); got != activeEAR2 {
 		t.Fatalf("issuer EAR after refresh = %q, want %q", got, activeEAR2)
 	}
@@ -574,12 +585,12 @@ func handoffTestEARWithKey(t *testing.T, tokenKey *ecdsa.PrivateKey, measurement
 	return signJWT(t, tokenKey, claims)
 }
 
-func TestHandoffEARExpiryReadsExpClaim(t *testing.T) {
+func TestUnverifiedEARExpiryReadsExpClaim(t *testing.T) {
 	tokenKey := handoffTestKey(t)
 	teeKey := handoffTestKey(t)
 	token := handoffTestEARWithKey(t, tokenKey, "m", teeKey)
 
-	got, err := HandoffEARExpiry(token)
+	got, err := unverifiedEARExpiry(token)
 	if err != nil {
 		t.Fatalf("handoffEARExpiry: %v", err)
 	}
@@ -589,14 +600,14 @@ func TestHandoffEARExpiryReadsExpClaim(t *testing.T) {
 	}
 }
 
-func TestHandoffEARExpiryRejectsMalformed(t *testing.T) {
+func TestUnverifiedEARExpiryRejectsMalformed(t *testing.T) {
 	for name, token := range map[string]string{
 		"two-parts":   "header.claims",
 		"bad-base64":  "header.!!!.sig",
 		"missing-exp": signJWT(t, handoffTestKey(t), map[string]any{earclaims.IssuedAt: time.Now().Unix()}),
 		"bad-claims":  "header." + base64.RawURLEncoding.EncodeToString([]byte("not json")) + ".sig",
 	} {
-		if _, err := HandoffEARExpiry(token); err == nil {
+		if _, err := unverifiedEARExpiry(token); err == nil {
 			t.Errorf("%s: expected error", name)
 		}
 	}
@@ -726,6 +737,10 @@ type erroringHandoffEARSource struct{}
 
 func (erroringHandoffEARSource) Current() (string, error) {
 	return "", fmt.Errorf("ear source unavailable")
+}
+
+func (erroringHandoffEARSource) ExpiresAt() (time.Time, error) {
+	return time.Time{}, fmt.Errorf("ear source unavailable")
 }
 
 // TestHandoffReturns503BeforeBootstrap proves that a handoff handler whose

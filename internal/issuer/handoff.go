@@ -377,15 +377,9 @@ func (hh *HandoffHandler) wrap(req HandoffRequest, snap CASnapshot, issuerEAR st
 // alerts fail closed instead of preserving a stale positive value.
 func RunHandoffEARExpiryUpdater(ctx context.Context, src HandoffEARSource, interval time.Duration, logger *slog.Logger) {
 	update := func() {
-		ear, err := src.Current()
+		exp, err := src.ExpiresAt()
 		if err != nil {
-			logger.Warn("handoff EAR refresh failed for metrics", "error", err)
-			handoffEARExpirySeconds.Set(-1)
-			return
-		}
-		exp, err := HandoffEARExpiry(ear)
-		if err != nil {
-			logger.Warn("handoff EAR parse failed for metrics", "error", err)
+			logger.Warn("handoff EAR expiry unavailable for metrics", "error", err)
 			handoffEARExpirySeconds.Set(-1)
 			return
 		}

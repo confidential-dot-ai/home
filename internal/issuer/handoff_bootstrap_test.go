@@ -16,59 +16,75 @@ import (
 )
 
 // TestNextRefreshAfter exercises the refresh-cadence math without touching
-// any network state. Each branch matters: a brand-new token (no exp yet)
-// must not stall the loop; a token with very long TTL must be capped so we
-// don't sleep through cluster events; an expired or malformed token must
-// retry quickly.
+// any network state. Each branch matters: a token with very long TTL must be
+// capped so we don't sleep through cluster events, and an already-expired one
+// must retry quickly rather than yield a negative delay.
+//
+// "no readable token" is no longer this function's concern — AtomicHandoffEAR
+// refuses to store a token whose exp it cannot read, so the refresh loop falls
+// back to minHandoffRefresh before it ever gets here. See
+// TestAtomicHandoffEARRejectsUnreadableToken.
 func TestNextRefreshAfter(t *testing.T) {
 	cases := []struct {
 		name       string
-		token      func(t *testing.T) string
+		exp        time.Time
 		wantApprox time.Duration
 		tolerance  time.Duration
 	}{
 		{
-			name:       "empty token",
-			token:      func(*testing.T) string { return "" },
+			name:       "zero expiry",
+			exp:        time.Time{},
 			wantApprox: 30 * time.Second,
 			tolerance:  time.Second,
 		},
 		{
-			name:       "malformed token",
-			token:      func(*testing.T) string { return "not.a.jwt" },
+			name:       "expired token",
+			exp:        time.Now().Add(-time.Minute),
 			wantApprox: 30 * time.Second,
 			tolerance:  time.Second,
 		},
 		{
-			name: "expired token",
-			token: func(t *testing.T) string {
-				return makeUnsignedJWTForTest(t, time.Now().Add(-time.Minute).Unix())
-			},
-			wantApprox: 30 * time.Second,
-			tolerance:  time.Second,
-		},
-		{
-			name: "long-TTL token capped at maxRefresh",
-			token: func(t *testing.T) string {
-				return makeUnsignedJWTForTest(t, time.Now().Add(48*time.Hour).Unix())
-			},
+			name:       "long-TTL token capped at maxHandoffRefresh",
+			exp:        time.Now().Add(48 * time.Hour),
 			wantApprox: time.Hour,
 			tolerance:  time.Second,
 		},
 		{
-			name: "ordinary TTL halved",
-			token: func(t *testing.T) string {
-				return makeUnsignedJWTForTest(t, time.Now().Add(20*time.Minute).Unix())
-			},
+			name:       "ordinary TTL halved",
+			exp:        time.Now().Add(20 * time.Minute),
 			wantApprox: 10 * time.Minute,
 			tolerance:  2 * time.Second,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := nextRefreshAfter(c.token(t))
+			got := nextRefreshAfter(c.exp)
 			if got < c.wantApprox-c.tolerance || got > c.wantApprox+c.tolerance {
 				t.Fatalf("nextRefreshAfter = %v, want ≈ %v", got, c.wantApprox)
+			}
+		})
+	}
+}
+
+// TestAtomicHandoffEARRejectsUnreadableToken pins the invariant that moved the
+// parse to write time: a token whose exp cannot be read is never stored, so a
+// reader can never obtain a token the refresh loop cannot schedule against.
+func TestAtomicHandoffEARRejectsUnreadableToken(t *testing.T) {
+	for name, token := range map[string]string{
+		"empty":       "",
+		"not a jwt":   "not.a.jwt",
+		"missing exp": makeUnsignedJWTWithClaimsForTest(t, `{"iat":0}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := &AtomicHandoffEAR{}
+			if err := a.Set(token); err == nil {
+				t.Fatal("expected Set to reject a token with no readable exp")
+			}
+			if _, err := a.Current(); err == nil {
+				t.Fatal("rejected token must not be observable via Current")
+			}
+			if _, err := a.ExpiresAt(); err == nil {
+				t.Fatal("rejected token must not be observable via ExpiresAt")
 			}
 		})
 	}
@@ -83,13 +99,30 @@ func TestAtomicHandoffEARRoundTrip(t *testing.T) {
 	if _, err := a.Current(); err == nil {
 		t.Fatal("expected unset source to return error")
 	}
-	a.Set("token-1")
+	if _, err := a.ExpiresAt(); err == nil {
+		t.Fatal("expected unset source to return error from ExpiresAt")
+	}
+
+	wantExp := time.Now().Add(time.Hour).Truncate(time.Second)
+	token1 := makeUnsignedJWTForTest(t, wantExp.Unix())
+	if err := a.Set(token1); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
 	got, err := a.Current()
 	if err != nil {
 		t.Fatalf("Current after set: %v", err)
 	}
-	if got != "token-1" {
-		t.Fatalf("Current = %q, want token-1", got)
+	if got != token1 {
+		t.Fatalf("Current = %q, want %q", got, token1)
+	}
+	// The expiry is derived once at Set and must match the token handed back,
+	// not be re-derived per read.
+	gotExp, err := a.ExpiresAt()
+	if err != nil {
+		t.Fatalf("ExpiresAt after set: %v", err)
+	}
+	if !gotExp.Equal(wantExp) {
+		t.Fatalf("ExpiresAt = %v, want %v", gotExp, wantExp)
 	}
 
 	// Concurrent set + Current — race detector catches sliced reads.
@@ -109,8 +142,16 @@ func TestAtomicHandoffEARRoundTrip(t *testing.T) {
 			}
 		}()
 	}
+	// Pre-build the tokens so the loop measures store/load contention rather
+	// than JWT construction.
+	tokens := make([]string, 8)
+	for i := range tokens {
+		tokens[i] = makeUnsignedJWTForTest(t, time.Now().Add(time.Duration(i+1)*time.Hour).Unix())
+	}
 	for i := 0; i < 1000; i++ {
-		a.Set(fmt.Sprintf("token-%d", i))
+		if err := a.Set(tokens[i%len(tokens)]); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
 	}
 	close(stop)
 	wg.Wait()
@@ -254,9 +295,13 @@ func TestLocalHandoffBootstrapRequiresDeps(t *testing.T) {
 
 func makeUnsignedJWTForTest(t *testing.T, exp int64) string {
 	t.Helper()
+	return makeUnsignedJWTWithClaimsForTest(t, fmt.Sprintf(`{"exp":%d,"iat":0}`, exp))
+}
+
+func makeUnsignedJWTWithClaimsForTest(t *testing.T, claims string) string {
+	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256","typ":"JWT"}`))
-	claims := fmt.Sprintf(`{"exp":%d,"iat":0}`, exp)
 	body := base64.RawURLEncoding.EncodeToString([]byte(claims))
-	// Signature is irrelevant for handoffEARExpiry — it parses claims only.
+	// Signature is irrelevant for unverifiedEARExpiry — it parses claims only.
 	return header + "." + body + ".sig"
 }

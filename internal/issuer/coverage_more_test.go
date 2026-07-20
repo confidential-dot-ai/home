@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwk"
+	"github.com/lestrrat-go/jwx/v3/jwk"
 	"golang.org/x/time/rate"
 
 	"github.com/confidential-dot-ai/c8s/internal/earclaims"
@@ -67,9 +67,9 @@ func TestNewCertKeyProviderRejectsNonECDSA(t *testing.T) {
 
 func jwksServer(t *testing.T, kid string, pub *ecdsa.PublicKey) *httptest.Server {
 	t.Helper()
-	key, err := jwk.FromRaw(pub)
+	key, err := jwk.Import(pub)
 	if err != nil {
-		t.Fatalf("jwk.FromRaw: %v", err)
+		t.Fatalf("jwk.Import: %v", err)
 	}
 	if kid != "" {
 		if err := key.Set(jwk.KeyIDKey, kid); err != nil {
