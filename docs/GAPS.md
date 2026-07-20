@@ -136,20 +136,17 @@ final security model.
 ## Browser / out-of-cluster verification
 
 - The `c8s cds-attest` sidecar browser-facing endpoints (`/.well-known/c8s/attestation`,
-  `cds-cert.pem`, `handshake`) and the post-quantum over-encryption channel
+  `handshake`, `tunnel`) and the post-quantum over-encryption channel
   (`pkg/overenc`) are implemented behind the tls-lb nginx front-end (chart flag
   `tlsLb.attest.enabled`); the matching browser client is
   `c8s-verify-js` (contract in `c8s-verify-js/PROTOCOL.md`).
 - The sidecar's live evidence path requires `--attestation-api-url`; per-session
   binding of the over-encryption key into a fresh hardware report is enforced
   there. The `--evidence-fixture` path is DEV ONLY (fixed `report_data`).
-- The default PQ binding commits `report_data` to the X25519/ML-KEM session keys
-  and nonce, but not to the serving SPKI or mesh identity. The public mesh leaf
-  and CA are fetched separately, so an allowed-measurement attacker can copy them
-  without proving possession of a CA-issued key. The in-flight #314 binds the
-  mesh leaf and issuing CA into a domain-separated PQ transcript with per-session
-  proof of possession of the leaf key; until it lands, measurement + CA pins are
-  not cluster authentication.
+- The over-encryption binding is identity-bound: `report_data` commits the
+  session keys, nonce, exact mesh leaf, and issuing mesh CA, with per-session
+  proof of possession of the leaf key. There is no legacy or downgrade binding.
+  The proof is ECDSA, so cluster authentication is not post-quantum.
 - An optional CDS-issued EAR over the bundle (`ear` field) is defined in the
   contract but not yet populated by the LB.
 - The over-encrypted tunnel is not streaming yet. The sidecar buffers each

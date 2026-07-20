@@ -1716,6 +1716,9 @@ func TestChartRendersTLSLBAttestSidecar(t *testing.T) {
 		"--port=8800",
 		"--generation=milan",
 		"--attestation-api-url=http://",
+		"--mesh-identity-cert-file=/tls/cert.pem",
+		"--mesh-identity-key-file=/tls/key.pem",
+		"--mesh-identity-ca-file=/tls/ca.pem",
 		// The baseline mesh-wrapped upstream is a plain-HTTP workload upstream;
 		// the mTLS args render only for an https upstream.
 		"--upstream=http://c8s-infer.c8s-system.svc.cluster.local:8000",
@@ -1728,11 +1731,6 @@ func TestChartRendersTLSLBAttestSidecar(t *testing.T) {
 		if strings.Contains(joined, banned) {
 			t.Fatalf("cds-attest must not set %s for the default http upstream: %v", banned, sidecar.Args)
 		}
-	}
-	// --cds-cert-file must NOT be set: nginx serves /.well-known/c8s/cds-cert.pem
-	// statically (hot-reloaded), while the sidecar would embed a stale copy.
-	if strings.Contains(joined, "--cds-cert-file") {
-		t.Fatalf("cds-attest must not set --cds-cert-file (nginx serves it statically): %v", sidecar.Args)
 	}
 	// The sidecar must not mount the mesh-CA for the default cert.pem trust path.
 	if _, ok := containerVolumeMount(sidecar, "mesh-ca"); ok {

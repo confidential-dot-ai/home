@@ -156,7 +156,13 @@ spec:
             # publicTLS secret it is that cert (mounted below). Re-read per request, so
             # get-cert renewals are picked up.
             - --serving-cert-file={{ include "tls-lb.publicCertPath" . }}
-            # --cds-cert-file intentionally unset: nginx serves the live cert at discovery.cdsCertPath (/.well-known/cds-cert.pem); cds-attest would embed a stale startup copy.
+            # The identity-bound PQ flow must use the TEE-held mesh
+            # credential, never the optional publicTLS Secret: report_data
+            # commits the hybrid session key to this leaf and the sidecar
+            # proves possession with its matching private key.
+            - --mesh-identity-cert-file={{ .Values.tlsLb.tlsMountPath }}/cert.pem
+            - --mesh-identity-key-file={{ .Values.tlsLb.tlsMountPath }}/key.pem
+            - --mesh-identity-ca-file={{ .Values.tlsLb.tlsMountPath }}/ca.pem
             # Terminate over-encryption here and forward to the same workload
             # backend nginx proxies to. An http upstream is plaintext at the
             # app layer; pointed at a headless Service (an adopted workload),
