@@ -795,11 +795,14 @@ ratlsMesh:
     monitoringNamespace: monitoring
 
 nriImagePolicy:
-  ## Host-side NRI image admission. Must be false under kata.enabled — image
-  ## admission is the in-guest policy-monitor in that shape, fed from CDS's
-  ## served allowlist (`c8s install --cvm-mode=pod` sets it). The bootstrapAllowlist
-  ## below still feeds CDS's served seed when this is disabled but kata is on:
-  ## the seed renders whenever host NRI or kata consumes it (see
+  ## Host-side NRI image admission. Its enabled state is bound to the cvmMode
+  ## shape, not free: it MUST be false where another path already admits — under
+  ## kata (the in-guest policy-monitor; enforce_host_components) and under
+  ## cvmMode=node (the node image bakes a fail-closed plugin) — and MUST be true
+  ## otherwise (gke/aks/bare, where host NRI is the only allowlist gate;
+  ## require_host_image_policy). `c8s install` sets it from --cvm-mode. The
+  ## bootstrapAllowlist below still feeds CDS's served seed whenever a consumer
+  ## exists — host NRI, kata's in-guest monitor, or the node-baked plugin (see
   ## c8s.serveAllowlistSeed).
   enabled: true
   ## Host Kubernetes distro for the nri-image-policy installer: k8s | rke2.

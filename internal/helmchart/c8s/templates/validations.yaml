@@ -50,6 +50,19 @@
 {{- fail (printf "VALIDATION_ERROR kind=enforce_host_components: kata.enabled=true requires %s =false. kata is enforcing — every workload runs as a kata CVM, where these host-side components are replaced by their in-guest counterparts in the kata-guest-base image (in-VM ratls routing, in-guest attestation-api on loopback, in-guest policy-monitor image admission). `c8s install --cvm-mode=pod` sets them for you." (join ", " .)) -}}
 {{- end -}}
 {{- end -}}
+{{- /*
+  The mirror of enforce_host_components. Where neither kata nor the node-baked
+  plugin runs, host nri-image-policy is the ONLY image-admission enforcement —
+  the attested allowlist gate. Disabling it there runs confidential workloads
+  with no image admission at all, a silent security downgrade. Two shapes carry
+  their own admission and are exempt: kata (in-guest policy-monitor, which
+  enforce_host_components requires host nri off for) and cvmMode=node (the node
+  image bakes a fail-closed nri-image-policy). So host nri is mandatory in
+  exactly the remaining shapes — non-kata and non-node.
+*/ -}}
+{{- if and (not .Values.kata.enabled) (not .Values.nriImagePolicy.enabled) (ne (.Values.attestationApi.cvmMode | default "baremetal") "node") -}}
+{{- fail "VALIDATION_ERROR kind=require_host_image_policy: nriImagePolicy.enabled=false requires kata.enabled=true or attestationApi.cvmMode=node. On a non-kata, non-node cluster host nri-image-policy is the only image-admission enforcement; disabling it leaves confidential workloads with no attested allowlist gate. Under kata the in-guest policy-monitor replaces it and under cvmMode=node the node image bakes the plugin (`c8s install --cvm-mode=pod` and `--cvm-mode=node` set nriImagePolicy.enabled=false for you)." -}}
+{{- end -}}
 {{- if and .Values.nriImagePolicy.enabled (not .Values.cds.image.digest) -}}
 {{- /* Structured marker (kind=...) lets tests discriminate this fail without substring-matching the prose. */ -}}
 {{- fail "VALIDATION_ERROR kind=cds_image_digest: nriImagePolicy.enabled requires cds.image.digest to be set. The CDS digest is pinned in every plugin's always_allow floor so image policy admits CDS on its own node. A floating tag cannot be admitted by digest. Pass --resolve-digests to c8s install, or set cds.image.digest via -f." -}}

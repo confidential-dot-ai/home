@@ -1121,26 +1121,16 @@ func TestChartManagedRATLSServiceTargetPortsMatchContainerPorts(t *testing.T) {
 // image policy. Pinning without tolerating the dedicated taint leaves CDS
 // Pending, so both must hold.
 func TestChartCDSPinnedToCDSNode(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		args []string
-	}{
-		{"image policy on (default)", nil},
-		{"image policy off", []string{"--set", "nriImagePolicy.enabled=false"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			out, err := helmTemplate(t, tc.args...)
-			if err != nil {
-				t.Fatalf("helm template: %v\n%s", err, out)
-			}
-			spec := renderedDeployment(t, out, "c8s-cds").Spec.Template.Spec
-			if got := spec.NodeSelector["role"]; got != "cds" {
-				t.Errorf("CDS nodeSelector[role] = %q, want %q (CDS must pin to a known node)", got, "cds")
-			}
-			if !tolerates(spec.Tolerations, "dedicated", "cds") {
-				t.Errorf("CDS does not tolerate the dedicated=cds taint; it would stay Pending on a dedicated node: %v", spec.Tolerations)
-			}
-		})
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	spec := renderedDeployment(t, out, "c8s-cds").Spec.Template.Spec
+	if got := spec.NodeSelector["role"]; got != "cds" {
+		t.Errorf("CDS nodeSelector[role] = %q, want %q (CDS must pin to a known node)", got, "cds")
+	}
+	if !tolerates(spec.Tolerations, "dedicated", "cds") {
+		t.Errorf("CDS does not tolerate the dedicated=cds taint; it would stay Pending on a dedicated node: %v", spec.Tolerations)
 	}
 }
 
@@ -1260,20 +1250,37 @@ func TestChartAttestationApiNodePortWiresNRI(t *testing.T) {
 	}
 }
 
-func TestChartAttestationApiNodePortDisabledWithoutNRI(t *testing.T) {
+// On a cluster that is neither kata nor node-baked, host nri-image-policy is the
+// only image-admission enforcement, so disabling it must be rejected — otherwise
+// confidential workloads run with no attested allowlist gate. cvmMode=gke is the
+// representative such cluster (aks/bare behave the same). kata and cvmMode=node
+// carry their own admission and are exempt (enforce_host_components requires nri
+// off under kata; the node image bakes the plugin — TestChartServesAllowlistSeedInNodeMode).
+func TestChartRejectsImagePolicyOffOnNonKata(t *testing.T) {
 	out, err := helmTemplate(t,
+		"--set-string", "attestationApi.cvmMode=gke",
 		"--set", "nriImagePolicy.enabled=false",
-		"--set", "attestationApi.service.nodePort=0",
+	)
+	if err == nil {
+		t.Fatalf("helm template succeeded with nriImagePolicy disabled on a non-kata, non-node cluster, want failure\n%s", out)
+	}
+	if kind := parseValidationErrorKind(out); kind != "require_host_image_policy" {
+		t.Fatalf("validation error kind = %q, want require_host_image_policy\n%s", kind, out)
+	}
+}
+
+// The require_host_image_policy guard exempts cvmMode=node: the node image bakes
+// its own fail-closed nri-image-policy, so nri off there is not an unenforced
+// cluster (unlike gke/aks — TestChartRejectsImagePolicyOffOnNonKata). This is the
+// exact shape `c8s install --cvm-mode=node` produces; the served seed under it is
+// TestChartServesAllowlistSeedInNodeMode.
+func TestChartAllowsImagePolicyOffInNodeMode(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set-string", "attestationApi.cvmMode=node",
+		"--set", "nriImagePolicy.enabled=false",
 	)
 	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	svc := renderedService(t, out, "c8s-attestation-api")
-	if svc.Spec.Type == corev1.ServiceTypeNodePort {
-		t.Fatalf("attestation-api Service type = NodePort with NRI disabled, want no NodePort")
-	}
-	if got := svc.Spec.Ports[0].NodePort; got != 0 {
-		t.Fatalf("attestation-api nodePort = %d with NRI disabled, want 0", got)
+		t.Fatalf("helm template rejected cvmMode=node with nri off, want success (the node image bakes the plugin)\n%s", out)
 	}
 }
 
@@ -1334,7 +1341,6 @@ func TestChartWebhookRendersSecurityKnobs(t *testing.T) {
 		"--set", "webhook.getCert.runAsGroup=0",
 		"--set", "webhook.getCert.runAsNonRoot=false",
 		"--set", "ratlsMesh.enabled=false",
-		"--set", "nriImagePolicy.enabled=false",
 		"--set", "tlsLb.enabled=false",
 	)
 	if err != nil {
@@ -4276,7 +4282,14 @@ func helmTemplateTLSLB(t *testing.T, args ...string) (string, error) {
 		"--set", "attestationApi.image.tag=dev",
 		"--set", "cds.image.tag=dev",
 		"--set", "ratlsMesh.enabled=false",
-		"--set", "nriImagePolicy.enabled=false",
+		// nri-image-policy is mandatory on a non-kata render
+		// (require_host_image_policy); pin its digest + floor so the render is
+		// valid. Output is scoped to the tls-lb templates below, so its
+		// manifests do not appear here.
+		"--set", "nriImagePolicy.image.tag=dev",
+		"--set", "cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001",
+		"--set", "nriImagePolicy.image.digest=" + baseNRIDigest,
+		"--set-string", "nriImagePolicy.bootstrapAllowlist.digests." + baseNRIDigest + "=ghcr.io/confidential-dot-ai/nri-image-policy@" + baseNRIDigest,
 		"--set-string", "tlsLb.upstream.address=vllm:8000",
 		// Secured (https + verify) upstream baseline for the tls-lb subchart
 		// tests, on a bare vllm address. A manual address must be app-TLS now
@@ -4849,28 +4862,6 @@ func TestChartWiresCDSAllowlistSeedFlagAndVolume(t *testing.T) {
 	}
 }
 
-// With host NRI disabled and no kata, nothing consumes CDS's served allowlist,
-// so the seed wiring must drop out entirely.
-func TestChartOmitsCDSSeedWhenNoAllowlistConsumer(t *testing.T) {
-	// The seed is served only when something consumes CDS's allowlist: the host
-	// NRI plugin (nriImagePolicy.enabled), the in-guest policy-monitor (kata), or
-	// the baked node-mode plugin (cvmMode=node). With all three off — a cloud
-	// mode whose host plugin is explicitly disabled — there is no consumer, so
-	// the seed ConfigMap and flag must not render.
-	out, err := helmTemplate(t,
-		"--set-string", "attestationApi.cvmMode=gke",
-		"--set", "nriImagePolicy.enabled=false",
-	)
-	if err != nil {
-		t.Fatalf("helm template: %v\n%s", err, out)
-	}
-	if renderedManifestHasNamedKind(t, out, "ConfigMap", "c8s-cds-allowlist-seed") {
-		t.Fatalf("seed ConfigMap should not render when no allowlist consumer is enabled")
-	}
-	cds := renderedDeploymentContainer(t, out, "c8s-cds", "cds")
-	assertContainerNoArgPrefix(t, "cds", cds.Args, "--allowlist-seed")
-}
-
 // Under kata the host NRI plugin is off, but admission is the in-guest
 // policy-monitor fed from CDS's served allowlist, so the seed must still render.
 // Otherwise adopted --workload-ref digests (in bootstrapAllowlist.digests) never
@@ -4962,7 +4953,13 @@ func renderExampleTLSLBNginxConf() string {
 		"--set", "attestationApi.image.tag=dev",
 		"--set", "cds.image.tag=dev",
 		"--set", "ratlsMesh.enabled=false",
-		"--set", "nriImagePolicy.enabled=false",
+		// nri-image-policy is mandatory on a non-kata render
+		// (require_host_image_policy); pin its digest + floor. The render is
+		// scoped to the tls-lb ConfigMap, so nri manifests do not appear.
+		"--set", "nriImagePolicy.image.tag=dev",
+		"--set", "cds.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001",
+		"--set", "nriImagePolicy.image.digest="+baseNRIDigest,
+		"--set-string", "nriImagePolicy.bootstrapAllowlist.digests."+baseNRIDigest+"=ghcr.io/confidential-dot-ai/nri-image-policy@"+baseNRIDigest,
 		// discovery defaults to enabled; scope this example to route rendering
 		// (discovery's own locations are covered by a dedicated test above).
 		"--set", "tlsLb.discovery.enabled=false",
