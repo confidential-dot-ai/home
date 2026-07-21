@@ -37,4 +37,12 @@ jobs:
     # the trailing @main tag is a human label only.
     uses: ./.github/workflows/e2e-c8s.yml
     with:
-      c8s_ref: ${{ inputs.c8s_ref || github.event.workflow_run.head_sha }}
+      # INTERIM -- pin the KNOWN-GREEN bundle, NOT the merge head. c8s main's
+      # cvmMode=node (#88) dials a node-baked attestation-api on $(HOST_IP):8400
+      # that the current staged rke2 node image does not bake, so main reds until
+      # confos PR#51 (c8s-profile baked-AA node image) is merged + staged.
+      # 70aea72 + attestation-api sha-63a97d3 is the last set proven green here.
+      # REVERT to `${{ inputs.c8s_ref || github.event.workflow_run.head_sha }}`
+      # and drop aa_ref once the baked-AA node image is staged.
+      c8s_ref: 70aea72fac1f3dc7c96e016ecc95667366cf7837
+      aa_ref: sha-63a97d3
