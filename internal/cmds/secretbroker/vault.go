@@ -1,6 +1,7 @@
 package secretbroker
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -74,7 +75,8 @@ func (b *broker) handleCertLogin(w http.ResponseWriter, r *http.Request) {
 	if len(allowed) == 0 {
 		writeVaultError(w, http.StatusForbidden, "no release policy grants access to this workload")
 		slog.Warn("login denied: no policy match",
-			"workload_id", id.WorkloadID, "measurement", measurementLogValue(id.Measurement))
+			"workload_id", id.WorkloadID, "measurement", measurementLogValue(id.Measurement),
+			"workload_digest", workloadDigestLogValue(id.WorkloadDigest))
 		return
 	}
 
@@ -94,6 +96,7 @@ func (b *broker) handleCertLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 	slog.Info("login granted",
 		"workload_id", id.WorkloadID, "measurement", measurementLogValue(id.Measurement),
+		"workload_digest", workloadDigestLogValue(id.WorkloadDigest),
 		"granted_paths", len(allowed))
 }
 
@@ -192,6 +195,15 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 // it as a normal API error.
 func writeVaultError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"errors": []string{msg}})
+}
+
+// workloadDigestLogValue renders the attested workload digest for logs, "(none)"
+// when the caller presented no workload claim.
+func workloadDigestLogValue(d []byte) string {
+	if len(d) == 0 {
+		return "(none)"
+	}
+	return hex.EncodeToString(d)
 }
 
 // measurementLogValue returns a short, safe-to-log form of a measurement.

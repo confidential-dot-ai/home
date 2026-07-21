@@ -1,9 +1,13 @@
 package secretbroker
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/confidential-dot-ai/c8s/pkg/workloadclaims"
 )
 
 func TestPathMatch(t *testing.T) {
@@ -58,6 +62,80 @@ func TestRuleMatchesWorkloadID(t *testing.T) {
 	// match on the empty value.
 	if ruleMatches(Rule{WorkloadID: "api", Allow: []string{"x"}}, PeerIdentity{Measurement: "aabbcc"}) {
 		t.Error("workloadId rule must fail closed for a caller with no WorkloadID")
+	}
+}
+
+// testDigest returns a valid "sha256:" image digest whose last hex pair is b,
+// so different b give distinct-but-well-formed digests.
+func testDigest(b byte) string {
+	return "sha256:" + strings.Repeat("ab", 31) + hexByte(b)
+}
+
+func hexByte(b byte) string {
+	const hexdigits = "0123456789abcdef"
+	return string([]byte{hexdigits[b>>4], hexdigits[b&0xf]})
+}
+
+func TestRuleMatchesWorkloadDigest(t *testing.T) {
+	main := testDigest(0x01)
+	dg, err := workloadclaims.Digest(nil, []string{main})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := Rule{expectedWorkloadDigest: dg, Allow: []string{"secret/data/auth/*"}}
+
+	// Caller presenting the bound attested digest: allow.
+	if !ruleMatches(rule, PeerIdentity{WorkloadDigest: dg}) {
+		t.Error("expected match for the bound workload digest")
+	}
+	// A different attested digest: deny.
+	other := append([]byte(nil), dg...)
+	other[0] ^= 0xff
+	if ruleMatches(rule, PeerIdentity{WorkloadDigest: other}) {
+		t.Error("expected deny for a different workload digest")
+	}
+	// No workload claim at all (ratls caller before its app is admitted, or a
+	// ca leaf carrying no claims): fail closed.
+	if ruleMatches(rule, PeerIdentity{WorkloadID: "auth"}) {
+		t.Error("expected deny when a rule pins a workload but the caller has no digest")
+	}
+}
+
+func TestLoadPolicyWorkloadImagesPrecompute(t *testing.T) {
+	main := testDigest(0x02)
+	path := filepath.Join(t.TempDir(), "policy.json")
+	body := `{"rules":[{"workloadImages":{"main":["` + main + `"]},"allow":["secret/data/auth/db#password"]}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadPolicy(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := workloadclaims.Digest(nil, []string{main})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(p.Rules[0].expectedWorkloadDigest, want) {
+		t.Fatal("LoadPolicy did not precompute the workload digest")
+	}
+}
+
+func TestLoadPolicyWorkloadImagesRejectsBadInput(t *testing.T) {
+	cases := map[string]string{
+		"malformed digest": `{"rules":[{"workloadImages":{"main":["not-a-digest"]},"allow":["secret/data/x"]}]}`,
+		"no main image":    `{"rules":[{"workloadImages":{"init":["` + testDigest(0x03) + `"]},"allow":["secret/data/x"]}]}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "policy.json")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadPolicy(path); err == nil {
+				t.Fatalf("expected LoadPolicy to reject %s", name)
+			}
+		})
 	}
 }
 

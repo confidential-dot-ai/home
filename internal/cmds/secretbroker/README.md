@@ -47,16 +47,35 @@ case the broker is the documented edge of the trust boundary.
 ```json
 {
   "rules": [
+    { "workloadImages": { "main": ["sha256:<hex>"] }, "allow": ["secret/data/api/db#password"] },
     { "workloadId": "api", "measurements": ["<sha384-hex>"], "allow": ["secret/data/api/*#password"] },
     { "workloadId": "*", "allow": ["secret/data/shared/*"] }
   ]
 }
 ```
 
-A rule matches when every constraint it sets holds; the caller's grant is the
-union of `allow` across matching rules. `*` matches one path segment, `**`
-matches any trailing segments. A measurement-constrained rule never matches in
-`--peer-verify=ca` mode (no measurement available) — fail closed.
+A rule matches when every constraint it sets holds (AND); the caller's grant is
+the union of `allow` across matching rules. `*` matches one path segment, `**`
+matches any trailing segments.
+
+Each constraint is bound to a different part of the caller's identity, and each
+fails closed where that part is unavailable:
+
+- `workloadImages` — `{ "init": [...], "main": ["sha256:…"] }`, the container
+  images the workload is admitted to run. The broker hashes them with the same
+  role-partitioned `workloadclaims.Digest` the caller's RA-TLS cert commits to
+  (config-claims, per PR #85/#100) and releases only to the pod whose *whole*
+  attested image set matches. This is the strong, per-workload bind — trustworthy
+  in **both** peer-verify modes (REPORTDATA-bound under `ratls`, CDS-vouched at
+  issuance under `ca`) — and a caller carrying no workload claim is denied. It is
+  the combined role-hash over the full set, not a per-image contains-check; author
+  it with the policy CLI, which resolves image refs to digests for you.
+- `measurements` — the CVM launch digest; only available under `--peer-verify=ratls`,
+  so a measurement-constrained rule never matches under `ca`.
+- `workloadId` — the CDS-issued SAN. Only trustworthy (and only set) under
+  `--peer-verify=ca`, where the mesh CA chain-verified the leaf; under `ratls` the
+  leaf is self-signed, so the SAN is not read as identity and a `workloadId`-scoped
+  rule fails closed. Prefer `workloadImages` for anything security-bearing.
 
 Each `allow` entry is a path pattern with an optional field scope,
 `pattern#field[,field]`: the broker filters the KV read down to the named

@@ -88,19 +88,47 @@ func (v *peerVerifier) Identity(r *http.Request) (PeerIdentity, error) {
 	case peerVerifyRATLS:
 		// An RA-TLS leaf is self-signed and its REPORTDATA binds only the key,
 		// not the SAN — so the SAN is caller-asserted and must NOT be read as
-		// identity here. ratls mode authorizes on the attested measurement only;
-		// a workloadId-scoped rule fails closed for a ratls caller.
+		// identity. The attested identity is the measurement and the config-claims
+		// the same VerifyCert folded into REPORTDATA; a workloadId rule fails closed.
 		res, err := ratls.VerifyCert(cert, v.policy, nil)
 		if err != nil {
 			return PeerIdentity{}, fmt.Errorf("verify client attestation: %w", err)
 		}
 		id.Measurement = hex.EncodeToString(res.Measurement[:])
+		id.WorkloadDigest = workloadDigestFromClaims(res.ConfigClaims)
 	case peerVerifyCA:
 		// RequireAndVerifyClientCert chain-verified the leaf against the mesh CA,
-		// so the SAN is a CDS-vouched identity.
+		// so both the SAN and the config-claims extension are CDS-vouched.
 		id.WorkloadID = workloadIDFromCert(cert)
+		claims, err := ratls.PeerConfigClaims(r.TLS)
+		if err != nil {
+			return PeerIdentity{}, fmt.Errorf("read peer config-claims: %w", err)
+		}
+		id.WorkloadDigest = workloadDigestFromClaims(claims)
 	}
 	return id, nil
+}
+
+// workloadDigestFromClaims returns the attested combined workload digest from a
+// peer's config-claims, or nil when there are no claims or the workload digest
+// is the unset (all-zero) sentinel — e.g. a CDS serving/governance leaf that
+// carries operator/seed digests but no workload. nil never matches a
+// digest-scoped rule, so a claimless caller fails closed.
+func workloadDigestFromClaims(c *ratls.ConfigClaims) []byte {
+	if c == nil || isZeroDigest(c.WorkloadDigest) {
+		return nil
+	}
+	return c.WorkloadDigest
+}
+
+// isZeroDigest reports whether b is empty or all-zero (the unset-claim sentinel).
+func isZeroDigest(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // peerCertFP returns a hex SHA-256 over the caller's leaf client certificate,
