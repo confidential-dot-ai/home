@@ -1678,7 +1678,9 @@ func componentEnabledPredicate(ctx context.Context, chartPath string, setArgs []
 	if err := yaml.Unmarshal(out, &tree); err != nil {
 		return nil, fmt.Errorf("parse chart values: %w", err)
 	}
-	overlaySetArgs(tree, setArgs)
+	if err := overlaySetArgs(tree, setArgs); err != nil {
+		return nil, err
+	}
 	return func(valuePath string) (bool, error) {
 		return boolAtPath(tree, valuePath), nil
 	}, nil
@@ -1687,7 +1689,7 @@ func componentEnabledPredicate(ctx context.Context, chartPath string, setArgs []
 // overlaySetArgs applies the scalar --set/--set-string overrides in setArgs onto
 // tree (--set values are type-coerced, --set-string stay strings). --set-file is
 // skipped: it names a file and never carries a component enable toggle.
-func overlaySetArgs(tree map[string]any, setArgs []string) {
+func overlaySetArgs(tree map[string]any, setArgs []string) error {
 	for i := 0; i+1 < len(setArgs); i += 2 {
 		flag, kv := setArgs[i], setArgs[i+1]
 		eq := strings.IndexByte(kv, '=')
@@ -1695,13 +1697,18 @@ func overlaySetArgs(tree map[string]any, setArgs []string) {
 			continue
 		}
 		path, raw := kv[:eq], kv[eq+1:]
+		var err error
 		switch flag {
 		case "--set":
-			setNested(tree, strings.Split(path, "."), coerce(raw, true))
+			err = setNested(tree, strings.Split(path, "."), coerce(raw, true))
 		case "--set-string":
-			setNested(tree, strings.Split(path, "."), raw)
+			err = setNested(tree, strings.Split(path, "."), raw)
+		}
+		if err != nil {
+			return fmt.Errorf("overlay %s %s: %w", flag, kv, err)
 		}
 	}
+	return nil
 }
 
 // buildDigestArgs appends, for every component, the --set flags that pin both
