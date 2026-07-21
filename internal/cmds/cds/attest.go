@@ -174,10 +174,12 @@ func (h AttestHandler) HandleAttest(w http.ResponseWriter, r *http.Request) {
 
 	// The evidence bound claimsDER (folded into expectedReportData above and
 	// confirmed by VerifyEnforced), so the claims are TEE-attested. Now verify
-	// the requester's init/main digest lists hash to the attested workload
-	// digest and that every listed image is allowlisted, then stamp the claims
-	// on the leaf so peers and `c8s verify` can read the attested workload.
-	if err := h.verifyWorkloadClaims(claimsDER, req.InitContainerDigests, req.ContainerDigests); err != nil {
+	// the requester's init/main (image, argv) tuples hash to BOTH stamped
+	// digests (image-only + image+argv) and that every listed image is
+	// allowlisted, then stamp the claims on the leaf so peers and
+	// `c8s verify` can read the attested workload
+	// (docs/ratls.md).
+	if err := h.verifyWorkloadClaims(claimsDER, req.InitContainers, req.Containers); err != nil {
 		slog.Warn("workload claims rejected", "error", err)
 		attestation.WriteError(w, http.StatusForbidden, types.ErrorCodeCSRDenied, err.Error())
 		return
@@ -249,24 +251,28 @@ func csrRATLSExtensionValue(csr *x509.CertificateRequest) []byte {
 	return nil
 }
 
-// verifyWorkloadClaims checks that the requester's container-digest list
-// matches the attested workload digest and that every listed image is
-// allowlisted (docs/ratls.md). claimsDER nil ⇒ nothing to verify.
-// It fails closed if claims are present but no allowlist store is wired.
-func (h AttestHandler) verifyWorkloadClaims(claimsDER []byte, initDigests, mainDigests []string) error {
+// verifyWorkloadClaims checks that the requester's (image, argv) tuples
+// hash to BOTH the attested WorkloadDigest and WorkloadArgsDigest, and that
+// every listed image is allowlisted
+// (docs/ratls.md). claimsDER nil ⇒ nothing
+// to verify. Fails closed if claims are present but no allowlist store is
+// wired.
+func (h AttestHandler) verifyWorkloadClaims(claimsDER []byte, initContainers, mainContainers []types.AttestedContainer) error {
 	if len(claimsDER) == 0 {
 		return nil
 	}
 	if h.AllowlistStore == nil {
 		return fmt.Errorf("workload claims presented but this CDS cannot verify them")
 	}
-	if _, err := workloadclaims.VerifyWorkloadDigest(claimsDER, initDigests, mainDigests); err != nil {
+	initBC := toBrokerContainers(initContainers)
+	mainBC := toBrokerContainers(mainContainers)
+	if _, err := workloadclaims.VerifyWorkloadDigests(claimsDER, initBC, mainBC); err != nil {
 		return err
 	}
-	for _, d := range append(append([]string{}, initDigests...), mainDigests...) {
-		digest, err := types.ParseDigest(d)
+	for _, c := range append(append([]types.AttestedContainer{}, initContainers...), mainContainers...) {
+		digest, err := types.ParseDigest(c.Image)
 		if err != nil {
-			return fmt.Errorf("container digest %q: %w", d, err)
+			return fmt.Errorf("container image %q: %w", c.Image, err)
 		}
 		allowed, err := h.AllowlistStore.Contains(digest)
 		if err != nil {
@@ -277,6 +283,17 @@ func (h AttestHandler) verifyWorkloadClaims(claimsDER []byte, initDigests, mainD
 		}
 	}
 	return nil
+}
+
+// toBrokerContainers projects the wire tuples onto workloadclaims.Container.
+// Name stays empty — the init/main split already happened caller-side, so
+// role classification is not needed at the digest layer.
+func toBrokerContainers(cs []types.AttestedContainer) []workloadclaims.Container {
+	out := make([]workloadclaims.Container, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, workloadclaims.Container{Digest: c.Image, Args: c.Args})
+	}
+	return out
 }
 
 func (h AttestHandler) caChainPEM() []byte {

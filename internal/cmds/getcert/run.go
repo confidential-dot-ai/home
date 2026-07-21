@@ -318,7 +318,7 @@ func obtainCert(ctx context.Context, cfg config, client attestclient.Client) err
 	}
 
 	slog.Info("requesting certificate from cds", "cds_url", cfg.CDSURL, "san", cfg.SAN, "workload_claims", wc.claimsDER != nil)
-	result, err := client.ObtainCertificateWithClaimsContext(ctx, cfg.AttestationApiURL, string(csrPEM), wc.claimsDER, wc.initDigests, wc.mainDigests)
+	result, err := client.ObtainCertificateWithClaimsContext(ctx, cfg.AttestationApiURL, string(csrPEM), wc.claimsDER, wc.initContainers, wc.mainContainers)
 	if err != nil {
 		return fmt.Errorf("attestation failed: %w", err)
 	}
@@ -327,12 +327,13 @@ func obtainCert(ctx context.Context, cfg config, client attestclient.Client) err
 	return writeOutputs(cfg, keyPEM, result)
 }
 
-// workloadClaimsResult carries the claims DER to bind plus the role-partitioned
-// digest lists to forward to CDS. All nil ⇒ the plain, claims-free flow.
+// workloadClaimsResult carries the claims DER to bind plus the role-
+// partitioned (image, argv) tuples to forward to CDS. All nil ⇒ the plain,
+// claims-free flow (docs/ratls.md).
 type workloadClaimsResult struct {
-	claimsDER   []byte
-	initDigests []string
-	mainDigests []string
+	claimsDER      []byte
+	initContainers []attestclient.AttestedContainer
+	mainContainers []attestclient.AttestedContainer
 }
 
 // workloadClaims fetches this pod's admitted containers from the broker, splits
@@ -362,9 +363,9 @@ func workloadClaims(ctx context.Context, cfg config) (workloadClaimsResult, erro
 	for _, n := range cfg.WorkloadInitContainers {
 		initNames[n] = struct{}{}
 	}
-	initDigests, mainDigests := workloadclaims.Partition(containers, initNames)
+	initContainers, mainContainers := workloadclaims.Partition(containers, initNames)
 
-	claims, err := workloadclaims.BuildConfigClaims(initDigests, mainDigests)
+	claims, err := workloadclaims.BuildConfigClaims(initContainers, mainContainers)
 	if err != nil {
 		return workloadClaimsResult{}, fmt.Errorf("build workload claims: %w", err)
 	}
@@ -372,7 +373,22 @@ func workloadClaims(ctx context.Context, cfg config) (workloadClaimsResult, erro
 	if err != nil {
 		return workloadClaimsResult{}, err
 	}
-	return workloadClaimsResult{claimsDER: ext.Value, initDigests: initDigests, mainDigests: mainDigests}, nil
+	return workloadClaimsResult{
+		claimsDER:      ext.Value,
+		initContainers: toAttestedContainers(initContainers),
+		mainContainers: toAttestedContainers(mainContainers),
+	}, nil
+}
+
+// toAttestedContainers projects the broker's Container tuples onto the
+// attestation-wire shape: name is broker-only (used for the init/main split)
+// and does not travel to CDS. The (image, argv) pair does.
+func toAttestedContainers(cs []workloadclaims.Container) []attestclient.AttestedContainer {
+	out := make([]attestclient.AttestedContainer, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, attestclient.AttestedContainer{Image: c.Digest, Args: c.Args})
+	}
+	return out
 }
 
 // reloadNginx sends SIGHUP to the nginx master process to reload certs.

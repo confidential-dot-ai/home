@@ -374,7 +374,7 @@ func (m *monitor) handleNewContainer(ctx context.Context, dir string) {
 	if m.allowlist.Contains(digest) {
 		m.logger.Info("allow container", "cid", cid, "digest", digest)
 		if m.broker != nil {
-			m.broker.record(cid, containerName(spec.Annotations), digest)
+			m.broker.record(cid, containerName(spec.Annotations), digest, spec.Process.Args)
 		}
 		return
 	}
@@ -433,11 +433,16 @@ func (m *monitor) readConfigJSON(ctx context.Context, path string) (*ociSpec, er
 }
 
 // ociSpec is the subset of the OCI Runtime Spec we care about: the
-// annotations map. We don't pull in opencontainers/runtime-spec
-// because we only need this one field, and json.Unmarshal will
-// silently drop everything else.
+// annotations map (image digest, container name), and the process argv
+// kata-agent will exec (folded into the workload-args commitment —
+// docs/ratls.md). We don't pull in
+// opencontainers/runtime-spec because we only need these fields, and
+// json.Unmarshal will silently drop everything else.
 type ociSpec struct {
 	Annotations map[string]string `json:"annotations"`
+	Process     struct {
+		Args []string `json:"args"`
+	} `json:"process"`
 }
 
 func readOCISpec(path string) (*ociSpec, error) {

@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash"
@@ -115,10 +116,16 @@ const maxResponseBytes = 1 << 20
 
 // Container is one admitted, non-injected container of the calling pod: its
 // name (so get-cert can split it into the init/main role its pod spec
-// declares) and its resolved image digest.
+// declares), its resolved image digest, and the merged argv the runtime will
+// exec (image-config entrypoint+cmd overlaid with pod-spec command+args, as
+// NRI's api.Container.Args or an OCI process.args reports it). Args feeds the
+// per-container leaf in WorkloadArgsDigest (docs/ratls.md);
+// nil is treated as an empty list, never as a "don't bind" sentinel — a
+// missing argv is a bug in the broker path, not a wildcard.
 type Container struct {
-	Name   string `json:"name"`
-	Digest string `json:"digest"`
+	Name   string   `json:"name"`
+	Digest string   `json:"digest"`
+	Args   []string `json:"args"`
 }
 
 // Response is the broker's answer: the admitted, non-injected containers of
@@ -133,6 +140,15 @@ type Response struct {
 const (
 	roleInit = "init\n"
 	roleMain = "main\n"
+)
+
+// Domain-separation prefixes for the (image, argv) commitment
+// (docs/ratls.md). The container-leaf and role-hash
+// prefixes are disjoint from the image-only WorkloadDigest transcript, and
+// from each other, so no cross-format substring can collide.
+const (
+	containerLeafDomain = "c8s/workload/container/v1\n"
+	argsDigestDomain    = "c8s/workload/args/v1\n"
 )
 
 // Digest returns the canonical workload digest (docs/ratls.md):
@@ -183,12 +199,104 @@ func writeImageSet(h hash.Hash, images []string) error {
 	return nil
 }
 
+// containerLeaf returns the length-framed identity commitment for one
+// admitted container (docs/ratls.md):
+//
+//	SHA-256(
+//	    "c8s/workload/container/v1\n"
+//	    "image\n" || canonical(sha256:HEX) || "\n"
+//	    "argv\n"  || uint32-BE(len(argv))
+//	            || (uint32-BE(len(argv[i])) || argv[i])*
+//	            || "\n"
+//	)
+//
+// Length framing at every level makes the preimage unambiguous regardless of
+// what bytes an argv element contains, so no separator-lookalike inside argv
+// can collide with a distinct (image, argv) pair.
+func containerLeaf(imageDigest string, args []string) ([]byte, error) {
+	parsed, err := types.ParseDigest(imageDigest)
+	if err != nil {
+		return nil, fmt.Errorf("workloadclaims: %w", err)
+	}
+	h := sha256.New()
+	h.Write([]byte(containerLeafDomain))
+	h.Write([]byte("image\n"))
+	h.Write([]byte(parsed.String()))
+	h.Write([]byte{'\n'})
+	h.Write([]byte("argv\n"))
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(args)))
+	h.Write(lenBuf[:])
+	for _, a := range args {
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(a)))
+		h.Write(lenBuf[:])
+		h.Write([]byte(a))
+	}
+	h.Write([]byte{'\n'})
+	return h.Sum(nil), nil
+}
+
+// ArgsDigest returns the role-partitioned (image, argv) commitment
+// (docs/ratls.md). Preserves the same order-independent-
+// within-a-role / role-distinguishing-across-roles / whole-set-per-role
+// properties as Digest, but distinguishes two containers that share an image
+// digest and differ only in argv — the busybox motivator. Both sets empty is
+// an error for the same reason it is on Digest.
+func ArgsDigest(initContainers, mainContainers []Container) ([]byte, error) {
+	if len(initContainers) == 0 && len(mainContainers) == 0 {
+		return nil, fmt.Errorf("workloadclaims: no containers to hash")
+	}
+	h := sha256.New()
+	h.Write([]byte(argsDigestDomain))
+	for _, part := range []struct {
+		role       string
+		containers []Container
+	}{{roleInit, initContainers}, {roleMain, mainContainers}} {
+		h.Write([]byte(part.role))
+		leaves := make([][]byte, 0, len(part.containers))
+		for _, c := range part.containers {
+			leaf, err := containerLeaf(c.Digest, c.Args)
+			if err != nil {
+				return nil, err
+			}
+			leaves = append(leaves, leaf)
+		}
+		sort.Slice(leaves, func(i, j int) bool { return bytes.Compare(leaves[i], leaves[j]) < 0 })
+		var prev []byte
+		for _, leaf := range leaves {
+			if bytes.Equal(leaf, prev) {
+				continue
+			}
+			h.Write(leaf)
+			h.Write([]byte{'\n'})
+			prev = leaf
+		}
+	}
+	return h.Sum(nil), nil
+}
+
+// imagesOf projects containers to their image digests, for feeding the
+// image-only Digest alongside ArgsDigest.
+func imagesOf(cs []Container) []string {
+	out := make([]string, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, c.Digest)
+	}
+	return out
+}
+
 // BuildConfigClaims builds the RA-TLS config-claims for a workload from its
-// admitted init and main container image digests (docs/ratls.md):
-// operator-keys and seed are the unset sentinel (a workload does not attest
-// allowlist governance), the workload field is Digest(init, main).
-func BuildConfigClaims(initImages, mainImages []string) (*ratls.ConfigClaims, error) {
-	wd, err := Digest(initImages, mainImages)
+// admitted init and main containers (docs/ratls.md,
+// docs/ratls.md): operator-keys and seed are the unset
+// sentinel (a workload does not attest allowlist governance); WorkloadDigest
+// is the image-only role hash; WorkloadArgsDigest is the (image, argv)
+// per-container role hash. Both are always set together on a workload cert.
+func BuildConfigClaims(initContainers, mainContainers []Container) (*ratls.ConfigClaims, error) {
+	wd, err := Digest(imagesOf(initContainers), imagesOf(mainContainers))
+	if err != nil {
+		return nil, err
+	}
+	ad, err := ArgsDigest(initContainers, mainContainers)
 	if err != nil {
 		return nil, err
 	}
@@ -196,16 +304,19 @@ func BuildConfigClaims(initImages, mainImages []string) (*ratls.ConfigClaims, er
 		OperatorKeysDigest: ratls.UnsetDigest(),
 		SeedDigest:         ratls.UnsetDigest(),
 		WorkloadDigest:     wd,
+		WorkloadArgsDigest: ad,
 	}, nil
 }
 
-// VerifyWorkloadDigest reparses claimsDER and confirms its workload digest
-// equals the role-partitioned digest of the given init/main image lists. It
-// is the CDS-side check that the (untrusted) lists a requester sent are
-// exactly what its evidence-bound claims committed to — so CDS can safely
-// check them against the allowlist. It does NOT check allowlist membership
-// (the caller holds the store). Returns the parsed claims on success.
-func VerifyWorkloadDigest(claimsDER []byte, initImages, mainImages []string) (*ratls.ConfigClaims, error) {
+// VerifyWorkloadDigests reparses claimsDER and confirms that both stamped
+// digests match the given per-role container tuples: WorkloadDigest against
+// the image-only role hash, WorkloadArgsDigest against the (image, argv)
+// role hash (docs/ratls.md). It is the CDS-side check
+// that the (untrusted) tuples a requester sent are exactly what its
+// evidence-bound claims committed to — so CDS can safely allowlist-check the
+// images. It does NOT check allowlist membership (the caller holds the
+// store). Returns the parsed claims on success.
+func VerifyWorkloadDigests(claimsDER []byte, initContainers, mainContainers []Container) (*ratls.ConfigClaims, error) {
 	claims, err := ratls.UnmarshalConfigClaims(claimsDER)
 	if err != nil {
 		return nil, err
@@ -213,18 +324,28 @@ func VerifyWorkloadDigest(claimsDER []byte, initImages, mainImages []string) (*r
 	if !claims.HasWorkload() {
 		return nil, fmt.Errorf("workloadclaims: claims carry no workload digest")
 	}
+	if !claims.HasWorkloadArgs() {
+		return nil, fmt.Errorf("workloadclaims: claims carry no workload-args digest")
+	}
 	// A workload attests only its own images, never allowlist governance
 	// (docs/ratls.md). Reject non-sentinel operator/seed fields so
 	// a CDS-issued leaf can never carry forged governance claims.
 	if claims.HasSeed() || !bytes.Equal(claims.OperatorKeysDigest, ratls.UnsetDigest()) {
 		return nil, fmt.Errorf("workloadclaims: workload claims must not carry operator-keys or seed digests")
 	}
-	want, err := Digest(initImages, mainImages)
+	wantImages, err := Digest(imagesOf(initContainers), imagesOf(mainContainers))
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(claims.WorkloadDigest, want) {
-		return nil, fmt.Errorf("workloadclaims: container digests do not match the attested workload digest")
+	if !bytes.Equal(claims.WorkloadDigest, wantImages) {
+		return nil, fmt.Errorf("workloadclaims: container images do not match the attested workload digest")
+	}
+	wantArgs, err := ArgsDigest(initContainers, mainContainers)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(claims.WorkloadArgsDigest, wantArgs) {
+		return nil, fmt.Errorf("workloadclaims: (image, argv) tuples do not match the attested workload-args digest")
 	}
 	return claims, nil
 }
@@ -316,18 +437,19 @@ func Fetch(ctx context.Context, endpoint string, timeout time.Duration) ([]Conta
 	return out.Containers, nil
 }
 
-// Partition splits a pod's containers into (init images, main images) by name,
-// using initNames as the set of container names the pod spec declares as init
+// Partition splits a pod's containers into (init, main) by name, using
+// initNames as the set of container names the pod spec declares as init
 // containers. A container not in initNames is treated as main. The webhook
 // supplies initNames (it knows the pod spec); get-cert does the split so both
-// broker shapes stay role-agnostic.
-func Partition(containers []Container, initNames map[string]struct{}) (initImages, mainImages []string) {
+// broker shapes stay role-agnostic. The Container struct is preserved
+// intact — argv rides along with the image digest through the split.
+func Partition(containers []Container, initNames map[string]struct{}) (initContainers, mainContainers []Container) {
 	for _, c := range containers {
 		if _, isInit := initNames[c.Name]; isInit {
-			initImages = append(initImages, c.Digest)
+			initContainers = append(initContainers, c)
 		} else {
-			mainImages = append(mainImages, c.Digest)
+			mainContainers = append(mainContainers, c)
 		}
 	}
-	return initImages, mainImages
+	return initContainers, mainContainers
 }

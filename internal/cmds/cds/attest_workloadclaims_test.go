@@ -29,9 +29,29 @@ type fakeStore map[string]bool
 
 func (s fakeStore) Contains(d types.Digest) (bool, error) { return s[d.String()], nil }
 
-func claimsDERFor(t *testing.T, initDigests, mainDigests []string) []byte {
+// asContainers wraps flat image-digest slices in the (image, argv) tuple
+// shape the digest layer now takes. Test argv is a deterministic per-image
+// placeholder so the same slice reused across a test hashes identically on
+// both sides.
+func asContainers(images ...string) []workloadclaims.Container {
+	out := make([]workloadclaims.Container, 0, len(images))
+	for _, img := range images {
+		out = append(out, workloadclaims.Container{Digest: img, Args: []string{"/test", img}})
+	}
+	return out
+}
+
+func asAttestedContainers(images ...string) []types.AttestedContainer {
+	out := make([]types.AttestedContainer, 0, len(images))
+	for _, img := range images {
+		out = append(out, types.AttestedContainer{Image: img, Args: []string{"/test", img}})
+	}
+	return out
+}
+
+func claimsDERFor(t *testing.T, initImages, mainImages []string) []byte {
 	t.Helper()
-	claims, err := workloadclaims.BuildConfigClaims(initDigests, mainDigests)
+	claims, err := workloadclaims.BuildConfigClaims(asContainers(initImages...), asContainers(mainImages...))
 	if err != nil {
 		t.Fatalf("build claims: %v", err)
 	}
@@ -74,20 +94,20 @@ func csrWithBoundClaims(t *testing.T, boundClaims []byte) string {
 // postAttestClaims posts a claims request whose CSR correctly binds claimsDER —
 // so the binding check passes and the request exercises the downstream
 // list/allowlist/role checks.
-func postAttestClaims(t *testing.T, h AttestHandler, challenge string, claimsDER []byte, initDigests, mainDigests []string) *httptest.ResponseRecorder {
+func postAttestClaims(t *testing.T, h AttestHandler, challenge string, claimsDER []byte, initImages, mainImages []string) *httptest.ResponseRecorder {
 	t.Helper()
-	return postAttestClaimsWithCSR(t, h, challenge, csrWithBoundClaims(t, claimsDER), claimsDER, initDigests, mainDigests)
+	return postAttestClaimsWithCSR(t, h, challenge, csrWithBoundClaims(t, claimsDER), claimsDER, initImages, mainImages)
 }
 
-func postAttestClaimsWithCSR(t *testing.T, h AttestHandler, challenge, csrPEM string, claimsDER []byte, initDigests, mainDigests []string) *httptest.ResponseRecorder {
+func postAttestClaimsWithCSR(t *testing.T, h AttestHandler, challenge, csrPEM string, claimsDER []byte, initImages, mainImages []string) *httptest.ResponseRecorder {
 	t.Helper()
 	body, err := json.Marshal(types.AttestRequestBody{
-		Challenge:            challenge,
-		Evidence:             types.AttestationEvidence{Platform: "snp", Evidence: json.RawMessage(`{"test":true}`)},
-		CSR:                  csrPEM,
-		WorkloadClaims:       base64.StdEncoding.EncodeToString(claimsDER),
-		InitContainerDigests: initDigests,
-		ContainerDigests:     mainDigests,
+		Challenge:      challenge,
+		Evidence:       types.AttestationEvidence{Platform: "snp", Evidence: json.RawMessage(`{"test":true}`)},
+		CSR:            csrPEM,
+		WorkloadClaims: base64.StdEncoding.EncodeToString(claimsDER),
+		InitContainers: asAttestedContainers(initImages...),
+		Containers:     asAttestedContainers(mainImages...),
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -197,15 +217,21 @@ func TestAttest_WorkloadClaims_RejectsForgedGovernanceFields(t *testing.T) {
 	h.AllowlistStore = fakeStore{wlDigestA: true}
 
 	digests := []string{wlDigestA}
+	mainCs := asContainers(digests...)
 	wd, err := workloadclaims.Digest(nil, digests)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Valid workload digest, but attacker-chosen governance fields.
+	ad, err := workloadclaims.ArgsDigest(nil, mainCs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Valid workload digests, but attacker-chosen governance fields.
 	forged := &ratls.ConfigClaims{
 		OperatorKeysDigest: bytes.Repeat([]byte{0xEE}, ratls.ClaimsDigestSize),
 		SeedDigest:         bytes.Repeat([]byte{0xDD}, ratls.ClaimsDigestSize),
 		WorkloadDigest:     wd,
+		WorkloadArgsDigest: ad,
 	}
 	ext, err := forged.MarshalExtension()
 	if err != nil {

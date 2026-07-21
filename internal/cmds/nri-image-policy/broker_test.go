@@ -67,11 +67,11 @@ func TestBrokerResolvesPodAndExcludesInjected(t *testing.T) {
 		pod2 = "sandbox-2"
 	)
 	// pod1: get-cert sidecar + two app containers.
-	b.record(cidGetCert, pod1, "c8s-cert", digestOther)
-	b.record(cidApp1, pod1, "app", digestApp)
-	b.record(cidApp2, pod1, "worker", digestApp2)
+	b.record(cidGetCert, pod1, "c8s-cert", digestOther, nil)
+	b.record(cidApp1, pod1, "app", digestApp, nil)
+	b.record(cidApp2, pod1, "worker", digestApp2, nil)
 	// pod2: a different app; must never appear in pod1's answer.
-	b.record(cidOther, pod2, "app", digestOther)
+	b.record(cidOther, pod2, "app", digestOther, nil)
 
 	// The caller is the get-cert process in pod1.
 	writeCgroup(t, procRoot, 4242, cidGetCert)
@@ -91,7 +91,7 @@ func TestBrokerResolvesPodAndExcludesInjected(t *testing.T) {
 func TestBrokerRejectsUntrackedAndZeroPID(t *testing.T) {
 	procRoot := t.TempDir()
 	b := newWorkloadBroker(procRoot)
-	b.record(cidApp1, "sandbox-1", "app", digestApp)
+	b.record(cidApp1, "sandbox-1", "app", digestApp, nil)
 
 	if _, err := digestsOf(b, 0); err == nil {
 		t.Fatal("peer pid 0 accepted (node-CVM must bind the caller)")
@@ -111,9 +111,9 @@ func TestBrokerRejectsNestedVictimCgroup(t *testing.T) {
 	b := newWorkloadBroker(procRoot)
 
 	const pod1, pod2 = "sandbox-1", "sandbox-2"
-	b.record(cidApp1, pod1, "app", digestApp) // victim's app in pod1
-	b.record(cidGetCert, pod2, "c8s-cert", digestOther)
-	b.record(cidApp2, pod2, "app", digestApp2) // attacker's own app in pod2
+	b.record(cidApp1, pod1, "app", digestApp, nil) // victim's app in pod1
+	b.record(cidGetCert, pod2, "c8s-cert", digestOther, nil)
+	b.record(cidApp2, pod2, "app", digestApp2, nil) // attacker's own app in pod2
 
 	// Attacker's process: its real scope is cidGetCert (pod2), with a nested
 	// child cgroup named cidApp1 (pod1's container).
@@ -141,8 +141,8 @@ func TestBrokerRejectsNestedVictimCgroup(t *testing.T) {
 func TestBrokerEvicts(t *testing.T) {
 	procRoot := t.TempDir()
 	b := newWorkloadBroker(procRoot)
-	b.record(cidGetCert, "sandbox-1", "c8s-cert", digestOther)
-	b.record(cidApp1, "sandbox-1", "app", digestApp)
+	b.record(cidGetCert, "sandbox-1", "c8s-cert", digestOther, nil)
+	b.record(cidApp1, "sandbox-1", "app", digestApp, nil)
 	writeCgroup(t, procRoot, 77, cidGetCert)
 
 	b.remove(cidApp1)

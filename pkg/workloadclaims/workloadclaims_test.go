@@ -75,14 +75,81 @@ func TestDigestFailsClosed(t *testing.T) {
 	}
 }
 
+// The busybox motivator (docs/ratls.md): same image,
+// different argv must produce different (image, argv) commitments — otherwise
+// binding the workload to only the image lets a control plane swap what the
+// container executes without detection.
+func TestArgsDigestDistinguishesArgv(t *testing.T) {
+	same := []Container{{Digest: digestA, Args: []string{"sh", "-c", "start-legit"}}}
+	swapped := []Container{{Digest: digestA, Args: []string{"sh", "-c", "start-evil"}}}
+	a, err := ArgsDigest(nil, same)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ArgsDigest(nil, swapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(a, b) {
+		t.Fatal("same image with different argv hashes identically — argv is not folded in")
+	}
+	// The image-only Digest sees them as equal — the whole point of the
+	// separate ArgsDigest is that only it distinguishes them.
+	imgA, _ := Digest(nil, []string{digestA})
+	imgB, _ := Digest(nil, []string{digestA})
+	if !bytes.Equal(imgA, imgB) {
+		t.Fatal("image-only Digest changed for identical images")
+	}
+}
+
+// Argv is order-preserving (it's a sequence, not a set), but the set of
+// containers within a role is still sorted-dedup, and length framing
+// guarantees no in-argv separator can collide with a distinct tuple.
+func TestArgsDigestOrderPreservingWithinArgv(t *testing.T) {
+	forward := []Container{{Digest: digestA, Args: []string{"a", "b"}}}
+	reversed := []Container{{Digest: digestA, Args: []string{"b", "a"}}}
+	f, err := ArgsDigest(nil, forward)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := ArgsDigest(nil, reversed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(f, r) {
+		t.Fatal("argv order does not matter — but it must, argv is a sequence")
+	}
+}
+
+// Length framing: two argvs that only differ in where a separator falls
+// (e.g. ["ab","c"] vs ["a","bc"]) must not collide.
+func TestArgsDigestLengthFramingDefeatsSeparatorAmbiguity(t *testing.T) {
+	left := []Container{{Digest: digestA, Args: []string{"ab", "c"}}}
+	right := []Container{{Digest: digestA, Args: []string{"a", "bc"}}}
+	l, err := ArgsDigest(nil, left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := ArgsDigest(nil, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(l, r) {
+		t.Fatal("argv boundary was lost — length framing is broken")
+	}
+}
+
 func TestPartition(t *testing.T) {
 	containers := []Container{
-		{Name: "setup", Digest: digestA},
-		{Name: "app", Digest: digestB},
+		{Name: "setup", Digest: digestA, Args: []string{"/init"}},
+		{Name: "app", Digest: digestB, Args: []string{"/app"}},
 	}
 	init, main := Partition(containers, map[string]struct{}{"setup": {}})
-	if len(init) != 1 || init[0] != digestA || len(main) != 1 || main[0] != digestB {
+	if len(init) != 1 || init[0].Digest != digestA || len(main) != 1 || main[0].Digest != digestB {
 		t.Fatalf("partition = init %v main %v", init, main)
+	}
+	if len(init[0].Args) != 1 || init[0].Args[0] != "/init" {
+		t.Fatalf("init argv lost through partition: %v", init[0].Args)
 	}
 	// No init names ⇒ everything is main.
 	init, main = Partition(containers, nil)

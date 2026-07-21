@@ -26,13 +26,25 @@ type AttestRequestBody struct {
 	// Empty when the requester binds no claims. CDS folds these exact bytes
 	// into the expected REPORTDATA, so a tampered value fails verification.
 	WorkloadClaims string `json:"workload_claims,omitempty"`
-	// InitContainerDigests and ContainerDigests are the plain image-digest
-	// lists of the pod's non-injected init and main containers. CDS checks
-	// they hash (role-partitioned) to the workload digest in WorkloadClaims —
-	// so neither list nor the init/main split can be swapped — and that each
-	// digest is allowlisted, then issues.
-	InitContainerDigests []string `json:"init_container_digests,omitempty"`
-	ContainerDigests     []string `json:"container_digests,omitempty"`
+	// InitContainers and Containers are the (image digest, argv) tuples of
+	// the pod's non-injected init and main containers. CDS re-derives BOTH
+	// the image-only WorkloadDigest and the (image, argv) WorkloadArgsDigest
+	// from these lists and requires both to match the values in
+	// WorkloadClaims — so neither list, nor the init/main split, nor a
+	// per-container argv can be swapped — and that each image is
+	// allowlisted, then issues (docs/ratls.md).
+	InitContainers []AttestedContainer `json:"init_containers,omitempty"`
+	Containers     []AttestedContainer `json:"containers,omitempty"`
+}
+
+// AttestedContainer is one (image, argv) tuple in an attestation request:
+// the image digest a workload claims to run and the merged argv that will be
+// exec'd for it. CDS treats both as untrusted proposal — the tuple only
+// matters after it hashes to the evidence-bound WorkloadArgsDigest and the
+// image is allowlisted (docs/ratls.md).
+type AttestedContainer struct {
+	Image string   `json:"image"`
+	Args  []string `json:"args,omitempty"`
 }
 
 // AttestKeyRequestBody is the request body for POST /attest-key. Used by

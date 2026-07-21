@@ -391,7 +391,7 @@ func TestWorkloadClaimsWithoutFlagIsClaimFree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.claimsDER != nil || res.initDigests != nil || res.mainDigests != nil {
+	if res.claimsDER != nil || res.initContainers != nil || res.mainContainers != nil {
 		t.Fatalf("no --workload-claims-broker but a claim was produced: %+v", res)
 	}
 }

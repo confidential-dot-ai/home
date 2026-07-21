@@ -21,6 +21,7 @@ func testClaims(t *testing.T) (*ConfigClaims, []byte) {
 		OperatorKeysDigest: bytes.Repeat([]byte{0xAB}, ClaimsDigestSize),
 		SeedDigest:         bytes.Repeat([]byte{0xCD}, ClaimsDigestSize),
 		WorkloadDigest:     UnsetDigest(),
+		WorkloadArgsDigest: UnsetDigest(),
 	}
 	ext, err := claims.MarshalExtension()
 	if err != nil {
@@ -86,6 +87,7 @@ func TestConfigClaimsSentinels(t *testing.T) {
 		OperatorKeysDigest: bytes.Repeat([]byte{1}, ClaimsDigestSize),
 		SeedDigest:         UnsetDigest(),
 		WorkloadDigest:     UnsetDigest(),
+		WorkloadArgsDigest: UnsetDigest(),
 	}
 	ext, err := claims.MarshalExtension()
 	if err != nil {
@@ -111,9 +113,10 @@ func TestConfigClaimsSentinels(t *testing.T) {
 func TestConfigClaimsMarshalRejectsWrongDigestSize(t *testing.T) {
 	full := bytes.Repeat([]byte{1}, ClaimsDigestSize)
 	for name, c := range map[string]*ConfigClaims{
-		"operator-keys": {OperatorKeysDigest: []byte{1, 2}, SeedDigest: full, WorkloadDigest: full},
-		"seed":          {OperatorKeysDigest: full, SeedDigest: []byte{1, 2}, WorkloadDigest: full},
-		"workload":      {OperatorKeysDigest: full, SeedDigest: full, WorkloadDigest: []byte{1, 2}},
+		"operator-keys":  {OperatorKeysDigest: []byte{1, 2}, SeedDigest: full, WorkloadDigest: full, WorkloadArgsDigest: full},
+		"seed":           {OperatorKeysDigest: full, SeedDigest: []byte{1, 2}, WorkloadDigest: full, WorkloadArgsDigest: full},
+		"workload":       {OperatorKeysDigest: full, SeedDigest: full, WorkloadDigest: []byte{1, 2}, WorkloadArgsDigest: full},
+		"workload-args":  {OperatorKeysDigest: full, SeedDigest: full, WorkloadDigest: full, WorkloadArgsDigest: []byte{1, 2}},
 	} {
 		if _, err := c.MarshalExtension(); err == nil {
 			t.Errorf("%s: marshal accepted a wrong-size digest", name)
@@ -125,11 +128,11 @@ func TestUnmarshalConfigClaimsInvalid(t *testing.T) {
 	_, value := testClaims(t)
 
 	full := bytes.Repeat([]byte{1}, ClaimsDigestSize)
-	wrongVersion, err := asn1.Marshal(configClaimsASN1{Version: 2, OperatorKeysDigest: full, SeedDigest: full, WorkloadDigest: full})
+	wrongVersion, err := asn1.Marshal(configClaimsASN1{Version: configClaimsVersion + 1, OperatorKeysDigest: full, SeedDigest: full, WorkloadDigest: full, WorkloadArgsDigest: full})
 	if err != nil {
 		t.Fatal(err)
 	}
-	shortDigest, err := asn1.Marshal(configClaimsASN1{Version: configClaimsVersion, OperatorKeysDigest: []byte{1, 2}, SeedDigest: full, WorkloadDigest: full})
+	shortDigest, err := asn1.Marshal(configClaimsASN1{Version: configClaimsVersion, OperatorKeysDigest: []byte{1, 2}, SeedDigest: full, WorkloadDigest: full, WorkloadArgsDigest: full})
 	if err != nil {
 		t.Fatal(err)
 	}

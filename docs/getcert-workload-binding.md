@@ -18,17 +18,21 @@ section of `docs/ratls.md`.
 
 `get-cert` (the injected `c8s-cert` sidecar) asks a node-local **broker** —
 part of the image-admission component itself (`nri-image-policy` on node-CVM,
-`policy-monitor` on kata), not a standalone service — "what images does my pod
-run?" *without saying who it is*. The broker learns
-the caller's identity from the **kernel** (unix-socket peer credentials), maps
-it to a pod, and returns that pod's admitted container image digests.
-`get-cert` hashes them into one `workloadDigest`, binds it into its CSR's
-attestation evidence, and forwards the plain list to CDS. CDS re-derives the
-hash, confirms every listed image is allowlisted, and stamps the claim onto
-the issued leaf. A relying party can then pin the workload
-(`c8s verify --workload-image sha256:…`) or read a live mesh peer's digest off
-the connection with `ratls.PeerConfigClaims` (docs/ratls.md, "Reading a peer's
-claims").
+`policy-monitor` on kata), not a standalone service — "what containers does
+my pod run?" *without saying who it is*. The broker learns the caller's
+identity from the **kernel** (unix-socket peer credentials), maps it to a
+pod, and returns that pod's admitted containers — each as an
+`(image digest, argv)` tuple, argv being the merged entrypoint+cmd the
+runtime will actually `execve`. `get-cert` hashes them into two commitments
+— `workloadDigest` (image-only) and `workloadArgsDigest` (image+argv,
+per-container) — binds both into its CSR's attestation evidence, and
+forwards the plain tuples to CDS. CDS re-derives both hashes, confirms every
+listed image is allowlisted, and stamps the claim onto the issued leaf. A
+relying party can then pin the workload at either granularity
+(`c8s verify --workload-image sha256:…` for image-only, or
+`c8s verify --workload-spec` for image+argv) or read a live mesh peer's
+digests off the connection with `ratls.PeerConfigClaims` (docs/ratls.md,
+"Reading a peer's claims").
 
 ---
 
@@ -90,6 +94,19 @@ lying one. Binding the claim to what the pod is measured/admitted to run,
 enforced at `/attest`, is the real close, and
 unimplemented (GAPS §Trust model). (Corner 5, Corner 6.)
 
+**What stops "same image, different `command`" from slipping through — the
+busybox case?** The broker records each admitted container's **argv** — the
+merged entrypoint+cmd the runtime will `execve`, after image config and
+pod-spec overrides — alongside its image digest, and get-cert folds argv into
+a per-container leaf inside a second commitment, `workloadArgsDigest`. Same
+image with different argv → different leaf → different digest. A verifier
+that pins with `--workload-spec` (image+argv) catches the swap; a verifier
+that pins only `--workload-image` sees identical image sets and does not —
+the operator picks the granularity. Trust for argv rides the same chain as
+for the image digest: NRI/kata report what they admitted, the broker binds
+the caller by kernel credentials, and CDS re-derives the hash and gates on
+allowlist membership. env is not bound — accepted risk (Corner 3).
+
 **Is the unix socket secured so a malicious pod can't hijack it?** Two separate
 threats:
 
@@ -141,17 +158,19 @@ threats:
    the peer's PID with `getsockopt(SO_PEERCRED)`
    (`pkg/workloadclaims/peercred_linux.go`), resolves that PID to a container
    via `/proc/<pid>/cgroup` (`cgroup.go`), maps container → pod from its own
-   admission record, and returns the pod's **non-injected** container digests
+   admission record, and returns the pod's **non-injected** containers as
+   `{name, image digest, argv}` tuples
    (`internal/cmds/nri-image-policy/broker.go`). Nothing the caller *sent* is
    used for identity.
 
-3. **get-cert folds the containers into one digest, split by role.** It splits
-   the broker's containers into the pod's init set and main set (by the
-   init-container names the webhook passed), and `workloadclaims.Digest`
-   commits to both into a single 32-byte `workloadDigest`; `BuildConfigClaims`
-   puts it in a config-claims extension (operator-keys and seed fields left at
-   the unset sentinel — a workload attests only its own images). (See
-   "Corner 3".)
+3. **get-cert folds the containers into two digests, split by role.** It
+   splits the broker's containers into the pod's init set and main set (by
+   the init-container names the webhook passed), and computes both
+   `workloadDigest` (image-only, `workloadclaims.Digest`) and
+   `workloadArgsDigest` (per-container `(image, argv)` leaves,
+   `workloadclaims.ArgsDigest`). `BuildConfigClaims` puts both in a
+   config-claims extension (operator-keys and seed fields left at the unset
+   sentinel — a workload attests only its own identity). (See "Corner 3".)
 
 4. **get-cert binds the claim into the CSR evidence.** The claims DER is folded
    into the attestation `REPORT_DATA` as a domain-separated, length-framed
@@ -159,7 +178,9 @@ threats:
    `SHA-384("c8s/config-claims/v1\0" || framed(csrPubkey) || framed(claimsDER) || framed(challenge))`,
    `framed(x) = uint64-BE(len(x)) || x` (`pkg/attestclient/client.go`
    `reportDataForCSR`). The `/attest` request carries the evidence, the CSR, the
-   claims DER, **and** the plain init and main digest lists.
+   claims DER, **and** the plain init and main container tuples
+   (`{image, args}` per entry) that both `workloadDigest` and
+   `workloadArgsDigest` were computed over.
 
    get-cert **also embeds a second, nonce-free attestation** over the same
    claims — the same transcript with an empty `framed(nonce)` — as
@@ -175,20 +196,26 @@ threats:
 5. **CDS verifies, gates, and embeds.** It folds the *same* claims bytes into
    the expected `REPORT_DATA` and proves them via the attestation-api
    (`VerifyEnforced` — this is what makes the claim TEE-attested, not just
-   asserted). Only then does it (a) re-derive the role-partitioned digest from
-   the forwarded init/main lists and require it to equal the bound
-   `workloadDigest` — so neither the lists nor the split can be swapped —
-   (b) reject any non-sentinel operator/seed field, and (c) check **each**
-   digest against the allowlist store. All pass ⇒ it signs the leaf and stamps
-   the claims extension onto it
-   (`internal/cmds/cds/attest.go` `verifyWorkloadClaims`, `internal/issuer/sign.go`).
+   asserted). Only then does it (a) re-derive **both** role-partitioned
+   digests from the forwarded init/main tuples and require them to equal the
+   bound `workloadDigest` **and** `workloadArgsDigest` — so neither the
+   tuples, nor any argv, nor the init/main split can be swapped — (b) reject
+   any non-sentinel operator/seed field, and (c) check **each** image against
+   the allowlist store. All pass ⇒ it signs the leaf and stamps the claims
+   extension onto it (`internal/cmds/cds/attest.go` `verifyWorkloadClaims`,
+   `internal/issuer/sign.go`).
 
-6. **The relying party pins.** `c8s verify --workload-image sha256:A
-   --workload-image sha256:B` recomputes the set-hash, folds it into the
-   nonce-free `REPORT_DATA`, and verifies the leaf's embedded RA-TLS evidence
-   (Step 4) against that anchor via the attestation-api — then checks the
-   recomputed digest equals the leaf's attested `workloadDigest`. The pin holds
-   only because the leaf carries evidence bound to those exact claims.
+6. **The relying party pins.** Two granularities, same underlying mechanism.
+   `c8s verify --workload-image sha256:A --workload-image sha256:B`
+   recomputes the image-only set-hash, folds it into the nonce-free
+   `REPORT_DATA`, verifies the leaf's embedded RA-TLS evidence (Step 4)
+   against that anchor, and checks the recomputed digest equals the leaf's
+   attested `workloadDigest`.
+   `c8s verify --workload-spec <path-or-@inline>` does the same with a JSON
+   document that names each container's image and argv, additionally pinning
+   `workloadArgsDigest` when every container's argv is concrete (containers
+   with `args: "*"` fall back to image-only for that container). Either pin
+   holds only because the leaf carries evidence bound to those exact claims.
 
 ---
 
@@ -262,21 +289,68 @@ commits to both:
   runs the setup image as a long-lived main container fails a verifier pinning
   it as init.
 - **Whole-set per role.** You cannot add, drop, or re-role an image without
-  changing the digest. A verifier pins with `--workload-init-image` (init set)
-  and `--workload-image` (main set). One exception weakens this: if the broker
-  cannot resolve an admitted container's image digest, it records an empty
-  digest and omits that container (logged at error, see
-  `recordForBroker`) — the claim then commits a *subset*. A pin-holding
-  verifier still catches the resulting mismatch, but the whole-set guarantee
-  does not hold for an image the broker failed to resolve.
-- **CDS re-derives the same role-partitioned digest** from the forwarded init
-  and main lists and checks every image against the allowlist, so the leaf's
-  compact hash is a faithful commitment to exactly those role sets.
+  changing either digest. A verifier pins with `--workload-init-image`
+  (init set) and `--workload-image` (main set) for image-only, or
+  `--workload-spec` for image+argv (docs/ratls.md, "The workload commitments").
+  One exception weakens this: if the broker cannot resolve an admitted
+  container's image digest, it records an empty digest and omits that
+  container (logged at error, see `recordForBroker`) — the claim then commits
+  a *subset*. A pin-holding verifier still catches the resulting mismatch,
+  but the whole-set guarantee does not hold for an image the broker failed
+  to resolve.
+- **CDS re-derives both role-partitioned digests** from the forwarded init
+  and main tuples and checks every image against the allowlist, so the
+  leaf's compact hashes are a faithful commitment to exactly those role
+  sets — images and argv.
+- **Argv is bound alongside the image, per container.** The claim also
+  commits a `workloadArgsDigest` — a role-partitioned hash whose leaves are
+  `SHA-256(image, argv)` (length-framed at every level so no in-argv byte
+  can collide with a distinct tuple; wire preimage in docs/ratls.md, "The
+  workload commitments"). Same image with different argv produces different
+  leaves and different digests, closing the busybox case where two pod specs
+  differ only in `command`/`args`.
 
 The role split is only as trustworthy as the classification source: the
 init/main assignment comes from the pod spec, which is control-plane data
 (Corner 5). It distinguishes roles *as declared*; it does not by itself defeat
 a control plane that misdeclares them.
+
+### Where argv comes from and what it does not bind
+
+Argv rides the same trust chain as the image digest: whoever admits the
+container reports it, and the broker binds the caller from the kernel
+(Corner 1).
+
+- **node-CVM (NRI)**: `api.Container.Args` on the `CreateContainer` event.
+  Containerd has already merged image-config `Entrypoint`/`Cmd` with pod-spec
+  `command`/`args` overrides into the exact vector it will pass to
+  `execve` — no re-derivation on the broker side.
+- **kata (policy-monitor)**: `process.args` from the OCI runtime spec that
+  kata-agent writes to `/run/kata-containers/<cid>/config.json` before
+  forking init. Also the merged, post-override argv, same shape as NRI's
+  field.
+
+Both sources see argv **after** pod-spec overrides applied — so a control
+plane that ships `busybox` with `command: [malicious]` produces a broker
+record with `args = [malicious]`, and the resulting `workloadArgsDigest`
+diverges from an honest workload's without the attacker having to touch the
+image.
+
+Argv does **not** bind:
+
+- **env vars.** Accepted risk. Env comes from image config + pod spec +
+  downward API + secrets + webhook injection; folding all of it in binds too
+  much (rebinding on secret rotation) or too little (only the image-config
+  subset). A verifier pinning argv on a shell script whose behavior branches
+  on `$X` cannot distinguish two runs with different `$X`. Same limit the
+  image-only pin already has.
+- **files inside the rootfs.** Trust for rootfs contents comes from the image
+  digest (registry-signed), not from argv. argv binds *how* the rootfs is
+  invoked, not what's in it.
+- **argv[0] conventions.** Some runtimes rewrite `argv[0]` (login shells
+  write `-sh`); the commitment is whatever the runtime hands the container.
+  A workload that legitimately runs with argv[0] rewriting has its pin
+  captured that way.
 
 ---
 
@@ -556,10 +630,10 @@ them with `c8s verify --workload-image` (Corner 4).
 
 | Concern | Where |
 |---|---|
-| Digest, broker protocol, peer-cred + cgroup binding | `pkg/workloadclaims/` |
-| node-CVM broker (shallowest-tracked resolution, eviction) | `internal/cmds/nri-image-policy/broker.go` |
-| kata guest broker (single-pod, same unix socket) | `internal/cmds/policymonitor/broker.go` |
-| get-cert fetch → claim → CSR fold (empty-set handling) | `internal/cmds/getcert/run.go`, `pkg/attestclient/client.go` |
+| Both digests (image-only + argv), broker protocol, peer-cred + cgroup binding | `pkg/workloadclaims/` (`Digest`, `ArgsDigest`, `containerLeaf`) |
+| node-CVM broker (records `api.Container.Args`; shallowest-tracked resolution, eviction) | `internal/cmds/nri-image-policy/broker.go` |
+| kata guest broker (records `process.args` from OCI spec; single-pod, same unix socket) | `internal/cmds/policymonitor/broker.go` |
+| get-cert fetch → claim → CSR fold (both digests; empty-set handling) | `internal/cmds/getcert/run.go`, `pkg/attestclient/client.go` |
 | get-cert leaf-embed (nonce-free attestation over the claims) + CDS guard | `pkg/attestclient/ratls.go` (`AttestationExtensionForClaims`), `internal/cmds/cds/attest.go` (`csrCarriesRATLSExtension`) |
-| CDS verify list↔claim + allowlist gate + leaf embed | `internal/cmds/cds/attest.go`, `internal/issuer/sign.go` |
-| verifier pin | `internal/cmds/verify/` (`--workload-image`) |
+| CDS verify tuple↔claim + allowlist gate + leaf embed | `internal/cmds/cds/attest.go`, `internal/issuer/sign.go` |
+| verifier pin | `internal/cmds/verify/` (`--workload-image` / `--workload-init-image` / `--workload-spec`) |

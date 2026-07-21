@@ -113,13 +113,19 @@ func (c Client) ObtainCertificateWithEvidenceContext(ctx context.Context, attest
 	return c.ObtainCertificateWithClaimsContext(ctx, attestationApiURL, csrPEM, nil, nil, nil)
 }
 
+// AttestedContainer mirrors types.AttestedContainer for callers that need
+// the wire shape without pulling the types package (kept as a re-export
+// alias in one place so upstream code has one import).
+type AttestedContainer = types.AttestedContainer
+
 // ObtainCertificateWithClaimsContext is ObtainCertificateWithEvidenceContext
 // that additionally binds an RA-TLS config-claims extension into the evidence
-// REPORTDATA and forwards it (plus the role-partitioned container-digest lists
+// REPORTDATA and forwards it (plus the role-partitioned (image, argv) tuples
 // it commits to) to CDS for verification and leaf embedding
-// (docs/ratls.md). claimsDER nil ⇒ the plain, claims-free flow
-// (byte-identical to before).
-func (c Client) ObtainCertificateWithClaimsContext(ctx context.Context, attestationApiURL, csrPEM string, claimsDER []byte, initDigests, mainDigests []string) (CertificateResult, error) {
+// (docs/ratls.md). claimsDER nil ⇒ the
+// plain, claims-free flow (byte-identical to before); when nil, initContainers
+// and mainContainers must also be nil.
+func (c Client) ObtainCertificateWithClaimsContext(ctx context.Context, attestationApiURL, csrPEM string, claimsDER []byte, initContainers, mainContainers []AttestedContainer) (CertificateResult, error) {
 	ctx = contextOrBackground(ctx)
 
 	// Step 1: get challenge from CDS
@@ -155,9 +161,9 @@ func (c Client) ObtainCertificateWithClaimsContext(ctx context.Context, attestat
 			Platform: asResp.Platform,
 			Evidence: asResp.Evidence,
 		},
-		CSR:                  csrPEM,
-		InitContainerDigests: initDigests,
-		ContainerDigests:     mainDigests,
+		CSR:            csrPEM,
+		InitContainers: initContainers,
+		Containers:     mainContainers,
 	}
 	if len(claimsDER) > 0 {
 		attestReq.WorkloadClaims = base64.StdEncoding.EncodeToString(claimsDER)
@@ -288,12 +294,12 @@ func (c Client) AuthenticateContext(ctx context.Context) (types.ChallengeRespons
 }
 
 type attestRequest struct {
-	Challenge            string         `json:"challenge"`
-	Evidence             attestEvidence `json:"evidence"`
-	CSR                  string         `json:"csr"`
-	WorkloadClaims       string         `json:"workload_claims,omitempty"`
-	InitContainerDigests []string       `json:"init_container_digests,omitempty"`
-	ContainerDigests     []string       `json:"container_digests,omitempty"`
+	Challenge      string              `json:"challenge"`
+	Evidence       attestEvidence      `json:"evidence"`
+	CSR            string              `json:"csr"`
+	WorkloadClaims string              `json:"workload_claims,omitempty"`
+	InitContainers []AttestedContainer `json:"init_containers,omitempty"`
+	Containers     []AttestedContainer `json:"containers,omitempty"`
 }
 
 type attestEvidence struct {

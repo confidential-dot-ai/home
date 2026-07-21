@@ -75,8 +75,10 @@ func TestAttestationExtensionForClaims_BindsFoldedClaims(t *testing.T) {
 		OperatorKeysDigest: ratls.UnsetDigest(),
 		SeedDigest:         ratls.UnsetDigest(),
 		WorkloadDigest:     make([]byte, ratls.ClaimsDigestSize),
+		WorkloadArgsDigest: make([]byte, ratls.ClaimsDigestSize),
 	}
 	claims.WorkloadDigest[0] = 0xAB
+	claims.WorkloadArgsDigest[0] = 0xCD
 	claimsExt, err := claims.MarshalExtension()
 	if err != nil {
 		t.Fatal(err)

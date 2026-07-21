@@ -21,7 +21,10 @@ import (
 var OIDRATLSConfigClaims = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 59888, 1, 3}
 
 // configClaimsVersion is the only claims version this package emits or parses.
-const configClaimsVersion = 1
+// v2 adds workloadArgsDigest (docs/ratls.md). v1 fails
+// closed on parse — a v1-only verifier that treats a v2 claim as satisfied
+// would silently ignore the argv commitment, so we do not accept v1 here.
+const configClaimsVersion = 2
 
 // claimsDomainSep tags the config-claims REPORTDATA transcript
 // (ReportDataForKeyAndClaims), keeping it disjoint from a plain key+nonce
@@ -60,26 +63,35 @@ type ConfigClaims struct {
 	// startup (allowlist.CanonicalDigest), or UnsetDigest when no seed was
 	// configured. Set by CDS.
 	SeedDigest []byte
-	// WorkloadDigest is the canonical digest of the pod's non-injected
-	// container image digests. Set by the workload (get-cert via
+	// WorkloadDigest is the canonical image-only role hash over the pod's
+	// non-injected container image digests. Set by the workload (get-cert via
 	// workloadclaims.BuildConfigClaims), not by CDS.
 	WorkloadDigest []byte
+	// WorkloadArgsDigest is the canonical (image, argv) role hash over the
+	// pod's non-injected containers — the image-only WorkloadDigest with argv
+	// folded in per container, so a workload that swaps only argv still shows
+	// a different identity (docs/ratls.md). Set together
+	// with WorkloadDigest by the workload; either both are set or both carry
+	// UnsetDigest.
+	WorkloadArgsDigest []byte
 }
 
 // configClaimsASN1 is the ASN.1 DER encoding structure (docs/ratls.md,
-// Config-claims).
+// Config-claims; docs/ratls.md for workloadArgsDigest).
 //
 //	C8SConfigClaims ::= SEQUENCE {
 //	    version             INTEGER,
 //	    operatorKeysDigest  OCTET STRING,
 //	    seedDigest          OCTET STRING,
-//	    workloadDigest      OCTET STRING
+//	    workloadDigest      OCTET STRING,
+//	    workloadArgsDigest  OCTET STRING
 //	}
 type configClaimsASN1 struct {
 	Version            int
 	OperatorKeysDigest []byte
 	SeedDigest         []byte
 	WorkloadDigest     []byte
+	WorkloadArgsDigest []byte
 }
 
 // MarshalExtension encodes the claims as a DER-encoded X.509 extension.
@@ -88,9 +100,10 @@ type configClaimsASN1 struct {
 // binding covers exactly what the certificate carries (docs/ratls.md).
 func (c *ConfigClaims) MarshalExtension() (pkix.Extension, error) {
 	for name, d := range map[string][]byte{
-		"operator-keys": c.OperatorKeysDigest,
-		"seed":          c.SeedDigest,
-		"workload":      c.WorkloadDigest,
+		"operator-keys":  c.OperatorKeysDigest,
+		"seed":           c.SeedDigest,
+		"workload":       c.WorkloadDigest,
+		"workload-args":  c.WorkloadArgsDigest,
 	} {
 		if len(d) != ClaimsDigestSize {
 			return pkix.Extension{}, fmt.Errorf("ratls: %s claims digest must be %d bytes, got %d", name, ClaimsDigestSize, len(d))
@@ -101,6 +114,7 @@ func (c *ConfigClaims) MarshalExtension() (pkix.Extension, error) {
 		OperatorKeysDigest: c.OperatorKeysDigest,
 		SeedDigest:         c.SeedDigest,
 		WorkloadDigest:     c.WorkloadDigest,
+		WorkloadArgsDigest: c.WorkloadArgsDigest,
 	})
 	if err != nil {
 		return pkix.Extension{}, fmt.Errorf("ratls: marshal config claims: %w", err)
@@ -124,7 +138,7 @@ func UnmarshalConfigClaims(der []byte) (*ConfigClaims, error) {
 	if raw.Version != configClaimsVersion {
 		return nil, fmt.Errorf("ratls: unsupported config-claims version %d (supported: %d)", raw.Version, configClaimsVersion)
 	}
-	for _, d := range [][]byte{raw.OperatorKeysDigest, raw.SeedDigest, raw.WorkloadDigest} {
+	for _, d := range [][]byte{raw.OperatorKeysDigest, raw.SeedDigest, raw.WorkloadDigest, raw.WorkloadArgsDigest} {
 		if len(d) != ClaimsDigestSize {
 			return nil, fmt.Errorf("ratls: config-claims digest is %d bytes, want %d", len(d), ClaimsDigestSize)
 		}
@@ -133,6 +147,7 @@ func UnmarshalConfigClaims(der []byte) (*ConfigClaims, error) {
 		OperatorKeysDigest: raw.OperatorKeysDigest,
 		SeedDigest:         raw.SeedDigest,
 		WorkloadDigest:     raw.WorkloadDigest,
+		WorkloadArgsDigest: raw.WorkloadArgsDigest,
 	}, nil
 }
 
@@ -144,6 +159,12 @@ func (c *ConfigClaims) HasSeed() bool {
 // HasWorkload reports whether the claims attest a workload digest.
 func (c *ConfigClaims) HasWorkload() bool {
 	return !bytes.Equal(c.WorkloadDigest, unsetDigest)
+}
+
+// HasWorkloadArgs reports whether the claims attest a workload-args digest
+// (docs/ratls.md).
+func (c *ConfigClaims) HasWorkloadArgs() bool {
+	return !bytes.Equal(c.WorkloadArgsDigest, unsetDigest)
 }
 
 // ExtractConfigClaimsBytes returns the raw config-claims extension value from

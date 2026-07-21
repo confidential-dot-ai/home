@@ -48,7 +48,8 @@ type VerifyPolicy struct {
 	// digest byte-equals the pinned value:
 	//   OperatorKeysDigest — operatorauth.KeySetDigest of the expected set
 	//   SeedDigest         — allowlist.CanonicalDigest of the expected seed
-	//   WorkloadDigest     — canonical workload image-digest hash (docs/ratls.md)
+	//   WorkloadDigest     — canonical workload image-only role hash
+	//   WorkloadArgsDigest — canonical (image, argv) role hash
 	// ratls.UnsetDigest() pins "not applicable". Empty = claims are folded
 	// into the REPORTDATA check when present but that field is not enforced.
 	// Only [VerifyCert] can enforce these (claims ride the certificate);
@@ -56,6 +57,7 @@ type VerifyPolicy struct {
 	OperatorKeysDigest []byte
 	SeedDigest         []byte
 	WorkloadDigest     []byte
+	WorkloadArgsDigest []byte
 
 	// AttestationApiURL is the attestation-api whose /verify endpoint performs
 	// all evidence verification: hardware signature chain, REPORTDATA key
@@ -110,7 +112,7 @@ func VerifyAttestation(pub crypto.PublicKey, att *Attestation, policy *VerifyPol
 	if policy.AttestationApiURL == "" {
 		return nil, fmt.Errorf("%w: attestation-api URL is required", ErrInvalidReport)
 	}
-	if len(policy.OperatorKeysDigest) > 0 || len(policy.SeedDigest) > 0 || len(policy.WorkloadDigest) > 0 {
+	if len(policy.OperatorKeysDigest) > 0 || len(policy.SeedDigest) > 0 || len(policy.WorkloadDigest) > 0 || len(policy.WorkloadArgsDigest) > 0 {
 		// Claims ride the certificate, which this path never sees.
 		return nil, fmt.Errorf("%w: config-claims pins require VerifyCert", ErrPolicyViolation)
 	}
@@ -187,6 +189,7 @@ func checkClaimsPins(claimsBytes []byte, policy *VerifyPolicy) error {
 		{"operator-keys", policy.OperatorKeysDigest, func(c *ConfigClaims) []byte { return c.OperatorKeysDigest }},
 		{"allowlist-seed", policy.SeedDigest, func(c *ConfigClaims) []byte { return c.SeedDigest }},
 		{"workload", policy.WorkloadDigest, func(c *ConfigClaims) []byte { return c.WorkloadDigest }},
+		{"workload-args", policy.WorkloadArgsDigest, func(c *ConfigClaims) []byte { return c.WorkloadArgsDigest }},
 	}
 	anyPinned := false
 	for _, p := range pins {

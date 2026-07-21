@@ -331,12 +331,20 @@ component vouches for, folded into the *same* hardware evidence as the key.
 ```text
 OID 1.3.6.1.4.1.59888.1.3  (RA-TLS config-claims extension)
 C8SConfigClaims ::= SEQUENCE {
-    version             INTEGER,
-    operatorKeysDigest  OCTET STRING (32),  -- unset = 32 zero bytes
+    version             INTEGER,               -- 2
+    operatorKeysDigest  OCTET STRING (32),     -- unset = 32 zero bytes
     seedDigest          OCTET STRING (32),
-    workloadDigest      OCTET STRING (32)
+    workloadDigest      OCTET STRING (32),     -- image-only role hash
+    workloadArgsDigest  OCTET STRING (32)      -- (image, argv) role hash
 }
 ```
+
+The two workload commitments in one line: **`workloadDigest`** is a
+role-partitioned hash over admitted image digests (image-only); **`workloadArgsDigest`**
+is the same shape over `SHA-256(image, argv)` leaves per container, so a
+workload that swaps only `command`/`args` (same image, different behavior —
+the busybox case) still flips its attested identity. Detail below in "The
+workload commitments".
 
 **Binding.** The claims DER is folded into REPORTDATA as a domain-separated,
 length-framed transcript —
@@ -362,10 +370,12 @@ verifiers**, not boot-time prevention.
   served `/operator-keys` list against the attested digest. (The `/handoff`
   path commits the operator-key set separately, as a REPORTDATA-bound hash — see
   the CDS regime section above.)
-- **A workload's mesh cert** commits its **container-image digest**: a
-  role-partitioned hash over the pod's admitted init and main image digests
-  (operator/seed unset). Verifiers pin with
-  `c8s verify --workload-init-image/--workload-image`.
+- **A workload's mesh cert** commits its **container-image digest** and its
+  **per-container argv**: a role-partitioned hash over the pod's admitted
+  init and main image digests (`workloadDigest`) plus a role-partitioned
+  hash over `(image, argv)` leaves (`workloadArgsDigest`); operator/seed
+  unset. Verifiers pin with `c8s verify --workload-init-image/--workload-image`
+  (image-only) or `c8s verify --workload-spec` (image+argv).
 
 **How the container digest is obtained and why it can be trusted is its own
 story** — get-cert fetches the pod's admitted images from a node-local broker
@@ -375,6 +385,102 @@ assumptions are in
 **[getcert-workload-binding.md](getcert-workload-binding.md)**. Wire format and
 verification rules live in `pkg/ratls` (`claims.go`, `extension.go`,
 `verify.go`).
+
+### The workload commitments
+
+`workloadDigest` and `workloadArgsDigest` are separate values so a verifier
+can choose the pin granularity — image-only or image+argv — without the
+workload knowing in advance. Both are always emitted together by a workload
+(claims-carrying) cert; both are UnsetDigest on a CDS serving cert (which
+attests governance, not workload identity). CDS rejects a request that sets
+one and not the other.
+
+**`workloadDigest` — image-only role hash** (unchanged from feat/peer-config-claims):
+
+```text
+workloadDigest = SHA-256(
+    "init\n"
+    || sorted-dedup( sha256:HEX || "\n" )*    -- admitted init image digests
+    "main\n"
+    || sorted-dedup( sha256:HEX || "\n" )*    -- admitted main image digests
+)
+```
+
+Order-independent within a role (reschedules don't churn), role-distinguishing
+across roles (`{init:A, main:B}` ≠ `{init:B, main:A}`), whole-set per role
+(adding/dropping/re-roling any image changes it).
+
+**`workloadArgsDigest` — per-container (image, argv) role hash.** Each
+admitted container contributes a length-framed identity leaf:
+
+```text
+leaf(image, argv) = SHA-256(
+    "c8s/workload/container/v1\n"
+    || "image\n" || sha256:HEX || "\n"
+    || "argv\n"  || uint32-BE(len(argv))
+                 || (uint32-BE(len(argv[i])) || argv[i])*
+                 || "\n"
+)
+
+workloadArgsDigest = SHA-256(
+    "c8s/workload/args/v1\n"
+    "init\n"
+    || sorted-dedup( leaf_i || "\n" )*
+    "main\n"
+    || sorted-dedup( leaf_i || "\n" )*
+)
+```
+
+Length framing at every level makes the preimage unambiguous even when argv
+elements contain `\n`, `\0`, or any other separator-lookalike — no two
+distinct `(image, argv)` sequences can collide. The role-hash properties
+above carry over (order-independent within a role, role-distinguishing,
+whole-set-per-role), plus:
+
+- **Argv-distinguishing within a role.** `(busybox, [/init])` and
+  `(busybox, [/exploit])` produce different leaves and different digests
+  even though the image is identical — the busybox case that the image-only
+  hash cannot detect.
+- **Independent from `workloadDigest`.** A pod that swaps only argv (same
+  images) leaves `workloadDigest` unchanged but flips `workloadArgsDigest`.
+
+`workloadArgsDigest` does **not** commit env — accepted risk. Env is set from
+a combination of image config, pod spec, downward API, secrets, and injected
+webhook fields; folding it in would either bind too much (rebinding at every
+secret rotation) or too little (only the image-config subset), and the
+motivating threats fall inside argv. Same limit that the image-only pin
+already has, not made worse or better by the argv commitment.
+
+**Pinning with `--workload-spec` (image + argv).** `c8s verify --workload-spec`
+takes a JSON document that names the expected pod exactly. `args` may be
+`"*"` (or absent) to wildcard that container's argv:
+
+```json
+{
+  "init": [
+    { "image": "sha256:AAA...", "args": ["/init", "--seed"] }
+  ],
+  "main": [
+    { "image": "sha256:BBB...", "args": ["/app", "--serve", ":8080"] },
+    { "image": "sha256:CCC...", "args": "*" }
+  ]
+}
+```
+
+- Every container concrete → verifier re-derives `workloadArgsDigest`, pins
+  it byte-for-byte, and pins `workloadDigest` as a matter of course. Full
+  argv-inclusive check.
+- Any container wildcarded → `workloadArgsDigest` can't be re-derived
+  (no argv, no leaf); verifier degrades to image-only, pinning `workloadDigest`
+  only, and surfaces "workload-args pin: not pinned" in the verdict so the
+  operator doesn't ship a wildcarded spec believing they enforced argv.
+- Source is a filename or an `@inline:<JSON literal>` argument, matching the
+  other c8s CLI conventions.
+
+`--workload-spec` and `--workload-image`/`--workload-init-image` are mutually
+exclusive: the spec already carries images. Which you pick is a decision on
+pin granularity, not on wire-format compatibility — the workload always
+attests both digests.
 
 **Reading a peer's claims.** Pinning answers "is this peer *X*?"; a relying
 party often needs "*which* workload is this?" — to authorize, route, or log.
@@ -388,19 +494,24 @@ connection, and only on one**: never read the extension off a connection your
 verify callback did not admit. Two limits: the CA-path guarantee is *CDS vouched
 at issuance*, not fresh attestation (re-verify the leaf with `VerifyCert` if you
 need freshness); and the honest-workload ceiling above holds — a workload digest
-names what an *honest* peer runs. `WorkloadDigest` is the combined role-hash over
-the pod's *whole* image set (Corner 3), not a per-image value, so an authorizer
-compares it by recomputing `workloadclaims.Digest(init, main)` over the expected
-set — the same call `c8s verify` makes.
+names what an *honest* peer runs. `WorkloadDigest` and `WorkloadArgsDigest`
+are combined role-hashes over the pod's *whole* container set (Corner 3), not
+per-image values, so an authorizer compares them by recomputing
+`workloadclaims.Digest(init, main)` (image-only) or
+`workloadclaims.ArgsDigest(init, main)` (with argv) over the expected set —
+the same calls `c8s verify` makes.
 
 **Cross-implementation note.** Any non-Go verifier (e.g. `c8s-verify-js`) must
-reproduce these byte formats exactly to pin a config-claim: the SHA-384
-REPORTDATA fold above, and the canonical digests it commits — the operator
-key-set digest (`pkg/operatorauth` `KeySetDigest`), the seed digest
-(`pkg/allowlist` `CanonicalDigest`, which is Go `json.Marshal` output, HTML
-escaping included), and the role-partitioned workload digest
-(`pkg/workloadclaims` `Digest`). A one-byte divergence in any of them fails the
-pin. Keep the two implementations tested against shared vectors.
+reproduce these byte formats exactly to pin a config-claim: the schema-v2
+ASN.1 sequence above, the SHA-384 REPORTDATA fold, and the canonical digests
+the sequence commits — the operator key-set digest (`pkg/operatorauth`
+`KeySetDigest`), the seed digest (`pkg/allowlist` `CanonicalDigest`, which is
+Go `json.Marshal` output, HTML escaping included), the role-partitioned
+image-only workload digest (`pkg/workloadclaims` `Digest`), and the
+role-partitioned (image, argv) hash (`pkg/workloadclaims` `ArgsDigest`, with
+the length-framed leaf preimage from "The workload commitments" above). A
+one-byte divergence in any of them fails the pin. Keep the two
+implementations tested against shared vectors.
 
 ## Operation under the two confidential shapes
 

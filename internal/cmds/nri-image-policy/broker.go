@@ -22,7 +22,8 @@ type workloadBroker struct {
 type ctrRec struct {
 	sandboxID string
 	name      string
-	digest    string // canonical sha256:<hex>; "" when unresolved
+	digest    string   // canonical sha256:<hex>; "" when unresolved
+	args      []string // NRI's merged entrypoint+cmd argv (docs/ratls.md)
 }
 
 func newWorkloadBroker(procRoot string) *workloadBroker {
@@ -35,14 +36,18 @@ func newWorkloadBroker(procRoot string) *workloadBroker {
 // record notes an admitted container. Injected containers (the get-cert
 // sidecar and its wait gate) are recorded too but excluded at query time by
 // name (workloadclaims.IsInjectedContainer) — the sidecar attests the app's
-// images, not its own.
-func (b *workloadBroker) record(containerID, sandboxID, name, digest string) {
+// images, not its own. args is NRI's merged argv the runtime will exec,
+// which the (image, argv) commitment folds in (docs/ratls.md).
+func (b *workloadBroker) record(containerID, sandboxID, name, digest string, args []string) {
 	if containerID == "" || sandboxID == "" {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.containers[containerID] = ctrRec{sandboxID: sandboxID, name: name, digest: digest}
+	// Copy args: NRI reuses its slice across events, and the broker holds this
+	// value until eviction — a later mutation upstream must not race the answer.
+	argsCopy := append([]string(nil), args...)
+	b.containers[containerID] = ctrRec{sandboxID: sandboxID, name: name, digest: digest, args: argsCopy}
 }
 
 // remove evicts a container that stopped, so its digest can't linger in a
@@ -94,7 +99,7 @@ func (b *workloadBroker) ContainersForPeer(peerPID int) ([]workloadclaims.Contai
 		if workloadclaims.IsInjectedContainer(rec.name) {
 			continue
 		}
-		out = append(out, workloadclaims.Container{Name: rec.name, Digest: rec.digest})
+		out = append(out, workloadclaims.Container{Name: rec.name, Digest: rec.digest, Args: rec.args})
 	}
 	return out, nil
 }

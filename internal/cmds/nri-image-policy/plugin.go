@@ -171,7 +171,7 @@ func (p *plugin) recordForBroker(ctx context.Context, ctr *api.Container, imageR
 			p.logger.Error("workload-claims: cannot resolve admitted image digest; container will be absent from the workload claim", "image", imageRef, "error", err)
 		}
 	}
-	p.broker.record(ctr.GetId(), ctr.GetPodSandboxId(), ctr.GetName(), digest)
+	p.broker.record(ctr.GetId(), ctr.GetPodSandboxId(), ctr.GetName(), digest, ctr.GetArgs())
 }
 
 // evaluateRule checks whether a pod satisfies a compiled Kubernetes selector.

@@ -32,16 +32,20 @@ func newWorkloadBroker() *workloadBroker {
 	return &workloadBroker{containers: map[string]workloadclaims.Container{}}
 }
 
-// record notes an admitted container's name and digest. Injected containers
-// (the get-cert sidecar and its wait gate) are skipped by name so the workload
-// digest covers only the app's own images.
-func (b *workloadBroker) record(cid, name, digest string) {
+// record notes an admitted container's name, digest, and argv. Injected
+// containers (the get-cert sidecar and its wait gate) are skipped by name so
+// the workload digest covers only the app's own images. args is the merged
+// argv from the container's OCI process.args — what kata-agent will exec —
+// which the (image, argv) commitment folds in
+// (docs/ratls.md).
+func (b *workloadBroker) record(cid, name, digest string, args []string) {
 	if workloadclaims.IsInjectedContainer(name) || digest == "" {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.containers[cid] = workloadclaims.Container{Name: name, Digest: digest}
+	argsCopy := append([]string(nil), args...)
+	b.containers[cid] = workloadclaims.Container{Name: name, Digest: digest, Args: argsCopy}
 }
 
 // ContainersForPeer returns every admitted, non-injected container in the
