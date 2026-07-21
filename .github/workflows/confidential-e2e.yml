@@ -35,6 +35,6 @@ jobs:
        (github.event.workflow_run.head_branch == 'main' || startsWith(github.event.workflow_run.head_branch, 'v')))
     # Reusable lane pinned by commit SHA (bump deliberately when the lane changes);
     # the trailing @main tag is a human label only.
-    uses: confidential-dot-ai/confidential-ci/.github/workflows/e2e-c8s.yml@cad0dd13ac445188a3bd1641b6506c45658f274f
+    uses: ./.github/workflows/e2e-c8s.yml
     with:
       c8s_ref: ${{ inputs.c8s_ref || github.event.workflow_run.head_sha }}

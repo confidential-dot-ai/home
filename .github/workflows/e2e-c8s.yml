@@ -1,0 +1,256 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# CONSUMER: c8s — the flagship payload ("install c8s + prove a cw workload runs")
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# This file owns only WHAT to test (the c8s payload) and WHEN (the trigger).
+# WHERE (boot/attest/teardown a CVM per platform) belongs to the primitive:
+#   .github/workflows/cvm-e2e.yml
+#
+# Adding a platform = adding a matrix row. Adding a DIFFERENT repo's test = a new
+# consumer file with a different payload on the SAME primitive (e.g.
+# attestation-rs: payload = `cargo test --features attest`, flavor: base-cpu).
+#
+# WHY NO OCI PULLS BY <sha> TAG: BOTH c8s publish workflows are PATH-GATED, so
+# a given main commit may have neither artifact under its own sha:
+#  - chart.yml (internal/helmchart/**): a Go-only merge publishes NO chart tag
+#    0.1.0-g<sha> -> helm pull 404s, c8s-system stays empty (failure mode 1).
+#  - docker.yml (source paths): a commit touching neither runs NO Docker at all,
+#    so retag-unchanged never fires and NO :<sha> image tags exist -> pods sit
+#    in ImagePullBackOff (failure mode 2; both observed live on main 70aea72).
+# Resolution, per artifact kind:
+#  - chart: packaged FROM SOURCE at the exact sha (anonymous codeload tarball),
+#    inlined via the HelmChart CR's chartContent.
+#  - images: can't be built from source here — resolve each component to the
+#    NEWEST existing sha tag at-or-before the commit under test (= what that
+#    commit would actually deploy). Under the post-merge trigger this is the
+#    head sha itself, because workflow_run chains off a completed Docker run.
+# No registry credential anywhere in this payload — the whole chain is public.
+name: e2e-c8s
+on:
+  # Reusable: c8s's confidential-e2e.yml wrapper owns triggering (workflow_run
+  # off Docker + dispatch). Vendored from confidential-ci for Phase 0 — a public
+  # repo (c8s) cannot `uses:` a private repo's (confidential-ci) reusable
+  # workflow, so the lane lives here and is called locally (`uses: ./`).
+  workflow_call:
+    inputs:
+      c8s_ref:
+        description: c8s commit to test
+        type: string
+        required: false
+        default: main
+
+concurrency:
+  group: e2e-c8s-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── WHAT: build the c8s payload (the only c8s-specific work) ──────────────
+  payload:
+    runs-on: ubuntu-latest
+    outputs:
+      b64: ${{ steps.build.outputs.b64 }}
+      short: ${{ steps.build.outputs.short }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: confidential-dot-ai/c8s
+          ref: ${{ inputs.c8s_ref || 'main' }}   # push/schedule have no inputs
+          path: c8s
+          fetch-depth: 50                        # the image-tag resolver walks ancestors
+
+      - id: build
+        run: |
+          set -euo pipefail
+          SHORT=$(cd c8s && git rev-parse --short=7 HEAD)
+          FULL=$(cd c8s && git rev-parse HEAD)
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+
+          # IMAGE TAGS: docker.yml is path-gated too — a commit that touches no
+          # source paths triggers NO Docker run, so retag-unchanged never fires
+          # and :<short-sha> tags don't exist for it (found live: main 70aea72 had
+          # NO cds/c8s-operator tags -> ImagePullBackOff). The image a commit X
+          # would actually deploy is "the newest built tag at or before X" — so
+          # resolve each component by walking X's ancestry until a tag exists.
+          # Under the post-merge trigger (workflow_run off Docker) this resolves
+          # to $SHORT on the first probe. Anonymous pulls — the packages are public.
+          resolve_tag(){
+            local comp=$1 tok code
+            tok=$(curl -fsSL "https://ghcr.io/token?scope=repository:confidential-dot-ai/${comp}:pull" | jq -r .token)
+            for sha in $(git -C c8s log --format=%h --abbrev=7 -50); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" \
+                -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
+                "https://ghcr.io/v2/confidential-dot-ai/${comp}/manifests/${sha}")
+              [ "$code" = "200" ] && { echo "$sha"; return; }
+            done
+            echo "::warning::no sha tag found for ${comp} in the last 50 commits — falling back to :main (racy)" >&2
+            echo main
+          }
+          # PLATFORM digest (linux/amd64), not the index digest: the NRI allowlist
+          # floor matches what the runtime resolves — an index digest would reject
+          # the very image it pins (docs/attestation/allowlist multi-arch pitfall).
+          resolve_digest(){
+            local comp=$1 tag=$2 tok m d
+            tok=$(curl -fsSL "https://ghcr.io/token?scope=repository:confidential-dot-ai/${comp}:pull" | jq -r .token)
+            m=$(curl -fsSL -H "Authorization: Bearer $tok"               -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'               "https://ghcr.io/v2/confidential-dot-ai/${comp}/manifests/${tag}")
+            d=$(printf '%s' "$m" | jq -r '.manifests[]? | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest' | head -1)
+            if [ -z "$d" ]; then
+              d=$(curl -fsSI -H "Authorization: Bearer $tok" -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://ghcr.io/v2/confidential-dot-ai/${comp}/manifests/${tag}" | awk '{ gsub("\r","") } tolower($1)=="docker-content-digest:"{ print $2 }')
+            fi
+            [ -n "$d" ] || { echo "::error::no digest for ${comp}:${tag}"; exit 1; }
+            echo "$d"
+          }
+          OPTAG=$(resolve_tag c8s-operator)      # global image.tag: operator + tls-lb init
+          CDSTAG=$(resolve_tag cds)
+          NRITAG=$(resolve_tag nri-image-policy)
+          CDSDIG=$(resolve_digest cds "$CDSTAG")            # nriImagePolicy floor pins CDS by digest
+          NRIDIG=$(resolve_digest nri-image-policy "$NRITAG")  # installer self-allow needs its own
+          # attestation-api is versioned by the attestation-rs repo, NOT c8s — a
+          # c8s-ancestry walk can never find its tags (learned the hard way:
+          # InvalidImageName, run 29473241754). :main is the canonical pointer the
+          # c8s-integration fleet uses; accepted race until c8s pins a digest.
+          AATAG=main
+          echo "resolved image tags: c8s-operator=$OPTAG cds=$CDSTAG attestation-api=$AATAG (chart+values from $SHORT)"
+
+          # c8s chart values — canonical per c8s/docs + the c8s-integration fleet:
+          #  - cds.node.selector/tolerations null : the --single-node effect. The chart
+          #    default pins role=cds, so CDS sits Pending forever on a single node.
+          #  - measurements: RUNTIME_MEASUREMENT  : placeholder. The payload substitutes
+          #    the node's OWN runtime launch digest ($MEAS from the primitive). The image
+          #    manifest's snp_launch_digest is NOT that value (CDS -> measurement_denied).
+          #  - ratlsMesh disabled                 : the L4 mesh proxy needs kernel netfilter
+          #    modules the monolithic guest kernel lacks (base-images ask). nri-image-policy
+          #    is a containerd NRI hook — no netfilter — so it runs (audit mode for now).
+          VALS=$(cat <<EOF | base64 -w0
+          image:
+            tag: "$OPTAG"
+          cds:
+            image:
+              tag: "$CDSTAG"
+              digest: "$CDSDIG"
+            node:
+              selector: null      # null DELETES the key from the merged values (chart
+              tolerations: null   # default incl.) -> renders NO selector. {} counts as
+                                  # "empty" to the template's `default` -> role=cds
+                                  # resurfaces -> CDS Pending (run 29536583462).
+            ratlsPlatform: sev-snp
+            measurements: ["RUNTIME_MEASUREMENT"]
+          attestationApi:
+            image:
+              tag: "$AATAG"
+            cvmMode: node
+            teeDevices:
+              sevGuest: true
+              tdxGuest: false
+              tpm: false
+          ratlsMesh:
+            enabled: false
+          nriImagePolicy:
+            enabled: true          # NRI hook needs no netfilter (that was ratls-mesh's constraint)
+            distro: rke2
+            image:
+              tag: "$NRITAG"
+              digest: "$NRIDIG"
+            policy:
+              mode: audit          # bring-up: log would-be denials, admit all (chart-blessed).
+                                   # enforce needs an operator-keyed allowlist first — roadmap.
+          tlsLb:
+            hostPort:
+              enabled: false
+          EOF
+          )
+          CW=$(base64 -w0 c8s/samples/nginx-confidential-pod.yaml)
+
+          # RENDER GATE: fail chart validation HERE (30s) not in the CVM (20min).
+          printf %s "$VALS" | base64 -d | sed 's/RUNTIME_MEASUREMENT/000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000/' > /tmp/gate-vals.yaml
+          helm template c8s c8s/internal/helmchart/c8s -f /tmp/gate-vals.yaml > /dev/null
+          echo "render gate: chart+values validate clean"
+
+          # ── THE PAYLOAD: runs in-guest as root. Given $K, $MEAS; emits PAYLOAD_OK.
+          cat > payload.sh <<PAYLOAD
+          dl(){ curl -fsSL --retry 3 "\$1" -o "\$2" 2>/dev/null || wget -qO "\$2" "\$1" 2>/dev/null || python3 -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" "\$1" "\$2"; }
+          dl "https://codeload.github.com/confidential-dot-ai/c8s/tar.gz/$FULL" /tmp/src.tgz || { say FAIL_CHART_FETCH; exit 0; }
+          tar -xzf /tmp/src.tgz -C /tmp || { say FAIL_CHART_EXTRACT; exit 0; }
+          CD=\$(echo /tmp/c8s-*/internal/helmchart)
+          tar -czf /tmp/chart.tgz -C "\$CD" c8s || { say FAIL_CHART_PACK; exit 0; }
+          CC=\$(base64 -w0 /tmp/chart.tgz)
+          say CHART_FROM_SOURCE
+          \$K create ns c8s-system >/dev/null 2>&1
+          \$K label ns c8s-system pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/warn=privileged pod-security.kubernetes.io/audit=privileged --overwrite >/dev/null 2>&1 && say NS_LABELED || say FAIL_NS
+          if printf '%s' "\$MEAS" | grep -qE '^[0-9a-fA-F]{96}\$'; then MSED="s/RUNTIME_MEASUREMENT/\$MEAS/"; MMARK=MEAS_ENFORCED; else MSED='s/\["RUNTIME_MEASUREMENT"\]/[]/'; MMARK=MEAS_ACCEPTANY; fi
+          { printf 'apiVersion: helm.cattle.io/v1\nkind: HelmChart\nmetadata:\n  name: c8s\n  namespace: kube-system\nspec:\n  chartContent: %s\n  targetNamespace: c8s-system\n  createNamespace: false\n  valuesContent: |\n' "\$CC"
+            printf %s '$VALS' | base64 -d | sed "\$MSED" | sed 's/^/    /'
+          } | \$K apply -f - 2>&1 | sed 's/^/@@HCAPPLY /;s/\$/@@/'
+          say \$MMARK
+          HOK=0
+          for i in \$(seq 1 45); do
+            s=\$(\$K -n kube-system get job helm-install-c8s -o jsonpath='{.status.succeeded}' 2>/dev/null)
+            echo "@@HJOB \$i succ=\${s:-0}@@"
+            \$K -n kube-system logs job/helm-install-c8s --tail=2 2>/dev/null | sed 's/^/@@HLOG /;s/\$/@@/'
+            [ "\$s" = "1" ] && { HOK=1; say HELM_DONE; break; }
+            sleep 12
+          done
+          if [ "\$HOK" != "1" ]; then
+            \$K -n kube-system get helmchart c8s -o jsonpath='{.status}' 2>&1 | head -c 600 | sed 's/^/@@HCSTATUS /;s/\$/@@/'
+            \$K -n kube-system logs job/helm-install-c8s --tail=40 2>&1 | sed 's/^/@@HLOG /;s/\$/@@/'
+            say FAIL_HELM
+            exit 0
+          fi
+          CDSOK=0
+          for i in \$(seq 1 45); do
+            PODS=\$(\$K -n c8s-system get pods --no-headers 2>&1)
+            printf '%s\n' "\$PODS" | sed 's/^/@@POD /;s/\$/@@/'
+            CDS=\$(printf '%s\n' "\$PODS" | grep '^c8s-cds-' | head -1)
+            echo "@@CDSR \$i: \${CDS:-nopod}@@"
+            printf '%s' "\$CDS" | grep -qE ' 1/1 +Running' && { CDSOK=1; say CDS_READY; break; }
+            printf '%s\n' "\$PODS" | grep -q 'ImagePullBackOff' && IPB=\$((\${IPB:-0}+1)) || IPB=0
+            [ "\$IPB" -ge 5 ] && { \$K -n c8s-system get events --sort-by=.lastTimestamp 2>&1 | grep -i 'pull' | tail -6 | sed 's/^/@@EV /;s/\$/@@/'; say FAIL_IMAGEPULL; exit 0; }
+            sleep 12
+          done
+          # consumption proof: a cw workload must RUN with the CDS-issued cert injected.
+          # Under MEAS_ENFORCED that cert is only issued if the node attests the pinned
+          # measurement — so this IS the enforcement test, not a separate assertion.
+          WOK=0; COK=0
+          if [ "\$CDSOK" != "1" ]; then
+            \$K -n c8s-system logs deploy/c8s-cds --tail=15 2>&1 | sed 's/^/@@CDSLOG /;s/\$/@@/'
+            \$K -n c8s-system logs ds/c8s-attestation-api --tail=8 2>&1 | sed 's/^/@@AALOG /;s/\$/@@/'
+          fi
+          if [ "\$CDSOK" = "1" ]; then
+            printf %s '$CW' | base64 -d | \$K apply -f - 2>&1 | sed 's/^/@@CWAPPLY /;s/\$/@@/'
+            for i in \$(seq 1 60); do
+              DP=\$(\$K -n default get deploy demo-nginx --no-headers 2>&1)
+              echo "@@CWDEP \$i: \$DP@@"
+              printf '%s' "\$DP" | grep -qE ' 1/1 ' && { WOK=1; say WORKLOAD_OK; break; }
+              sleep 10
+            done
+            IC=\$(\$K -n default get pods -l app=demo-nginx -o jsonpath='{.items[0].spec.initContainers[*].name}' 2>/dev/null)
+            echo "@@CWCONTAINERS \${IC:-none}@@"
+            printf '%s' "\$IC" | grep -q 'c8s-cert' && { COK=1; say CERT_INJECTED; }
+            [ "\$WOK" = "1" ] && [ "\$COK" = "1" ] && say PAYLOAD_OK
+            if [ "\$WOK" != "1" ]; then
+              \$K -n default describe pods -l app=demo-nginx 2>&1 | grep -iE 'Warning|Failed|Error|Back-off|Reason' | tail -10 | sed 's/^/@@CWDESC /;s/\$/@@/'
+              \$K -n default logs -l app=demo-nginx -c c8s-cert --tail=10 2>&1 | sed 's/^/@@CERTLOG /;s/\$/@@/'
+            fi
+          fi
+          \$K -n c8s-system get events --sort-by=.lastTimestamp 2>&1 | tail -10 | sed 's/^/@@EV /;s/\$/@@/'
+          PAYLOAD
+          echo "b64=$(base64 -w0 payload.sh)" >> "$GITHUB_OUTPUT"
+
+  # ── WHERE: one call per platform cell; the primitive boots/attests/tears down.
+  #    bare metal (power-cord customers: CW/Nebius/Humain) | cloud (rent-infra:
+  #    Baseten/Modal/RunPod). Adding a cell = adding a row.
+  e2e:
+    needs: payload
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: snp-metal
+            runner: cvm-launcher
+          # - { platform: tdx-metal, runner: cvm-launcher-tdx }  # needs a TDX rke2-node image
+          # - { platform: gke-snp,   runner: ubuntu-latest }        # needs the c8s-fleet provisioner seam
+    uses: ./.github/workflows/cvm-e2e.yml
+    with:
+      platform: ${{ matrix.platform }}
+      runner: ${{ matrix.runner }}
+      flavor: rke2-node
+      payload_b64: ${{ needs.payload.outputs.b64 }}
