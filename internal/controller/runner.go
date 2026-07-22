@@ -68,6 +68,19 @@ type Options struct {
 	GetCertRunAsGroup   int64
 	GetCertRunAsNonRoot bool
 
+	// SecretAgentImage is the OpenBao/Vault Agent image the webhook injects for
+	// pods opting in to secrets injection. Empty disables secrets injection.
+	// SecretAgentCommand is the agent binary ("bao"/"vault"), SecretBrokerURL
+	// the default broker the injected agent dials.
+	SecretAgentImage   string
+	SecretAgentCommand string
+	SecretBrokerURL    string
+
+	// LUKSOpenImage is the container image the webhook injects to open
+	// openbao-gated LUKS volumes for pods carrying confidential.ai/luks-<name>
+	// annotations. Empty disables LUKS injection.
+	LUKSOpenImage string
+
 	// ExcludeNamespaces are namespaces the startup reinject sweep and the
 	// workload-service reconciler skip, on top of the release namespace and
 	// the kube-system family. Mirrors webhook.extraExcluded so the sweep,
@@ -193,6 +206,10 @@ func Run(ctx context.Context, opts Options) error {
 			GetCertRunAsUser:      int64Ptr(opts.GetCertRunAsUser),
 			GetCertRunAsGroup:     int64Ptr(opts.GetCertRunAsGroup),
 			GetCertRunAsNonRoot:   boolPtr(opts.GetCertRunAsNonRoot),
+			SecretAgentImage:      opts.SecretAgentImage,
+			LUKSOpenImage:         opts.LUKSOpenImage,
+			SecretAgentCommand:    opts.SecretAgentCommand,
+			SecretBrokerURL:       opts.SecretBrokerURL,
 			KataEnforce:           opts.KataEnforce,
 			HardwarePlatform:      opts.HardwarePlatform,
 			WorkloadClaimsHostDir: opts.WorkloadClaimsHostDir,

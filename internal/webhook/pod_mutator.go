@@ -164,6 +164,25 @@ type Config struct {
 	GetCertRunAsGroup   *int64
 	GetCertRunAsNonRoot *bool
 
+	// SecretAgentImage is the OpenBao/Vault Agent image injected for pods that
+	// opt in to secrets injection (confidential.ai/secrets-inject). Empty
+	// disables secrets injection.
+	SecretAgentImage string
+
+	// SecretAgentCommand is the agent binary in SecretAgentImage ("bao" for
+	// OpenBao, "vault" for HashiCorp Vault). Empty defaults to "bao".
+	SecretAgentCommand string
+
+	// SecretBrokerURL is the default secret-broker base URL the injected agent
+	// dials (a pod can override with confidential.ai/secrets-broker).
+	SecretBrokerURL string
+
+	// LUKSOpenImage is the container image the webhook injects to open
+	// openbao-gated LUKS volumes (confidential.ai/luks-<name> annotations).
+	// Empty disables LUKS injection. The image must expose `c8s luks-open`
+	// as its entrypoint; the standard c8s-operator image satisfies that.
+	LUKSOpenImage string
+
 	// KataEnforce turns on kata runtimeClass injection. When set, the webhook
 	// injects a runtimeClassName into every in-scope workload pod that does
 	// not already request one. Independent of get-cert injection — a pod with
@@ -222,6 +241,11 @@ type injection struct {
 	// injection). get-cert uses them to split the broker's containers into the
 	// init vs main image sets for the workload digest (docs/ratls.md).
 	InitContainerNames []string
+	// Secrets is non-nil when the pod opts in to secrets injection.
+	Secrets *secretsInjection
+	// LUKS is populated from confidential.ai/luks-<name> annotations. Empty
+	// when the pod requests no encrypted volumes.
+	LUKS []luksVolume
 }
 
 type certSpec struct {
@@ -307,6 +331,12 @@ func parseAnnotations(pod *corev1.Pod) (*injection, error) {
 		return nil, err
 	}
 	if inj.Verbose, err = boolAnnotation(annotations, AnnotationGetCertVerbose); err != nil {
+		return nil, err
+	}
+	if inj.Secrets, err = parseSecretsInjection(annotations); err != nil {
+		return nil, err
+	}
+	if inj.LUKS, err = parseLUKSVolumes(annotations, inj.Secrets); err != nil {
 		return nil, err
 	}
 	if err := inj.validate(); err != nil {
@@ -397,12 +427,18 @@ func hasInjectionDetailAnnotations(annotations map[string]string) bool {
 		AnnotationGetCertRunAsGroup,
 		AnnotationGetCertRunAsNonRoot,
 		AnnotationGetCertVerbose,
+		AnnotationSecretsInject,
+		AnnotationSecretsDir,
+		AnnotationSecretsBroker,
+		AnnotationSecretsRenew,
+		// luks-<name> annotations are variadic so they're handled by
+		// hasLUKSAnnotations() rather than the fixed-name list — see below.
 	} {
 		if annotations[name] != "" {
 			return true
 		}
 	}
-	return false
+	return hasSecretEntryAnnotations(annotations) || hasLUKSAnnotations(annotations)
 }
 
 func (inj *injection) validate() error {
@@ -515,6 +551,17 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 		// req.Namespace, not pod.Namespace: template-created pods reach
 		// admission with an empty metadata.namespace.
 		inj.SAN = workloadSAN(inj.WorkloadID, req.Namespace)
+	}
+	// Fail closed: a pod that asks for secrets must not start without them. If
+	// the operator has no agent image configured, reject rather than admit a
+	// pod whose app would come up missing its secret files.
+	if inj != nil && inj.Secrets != nil && m.cfg.SecretAgentImage == "" {
+		return admission.Errored(http.StatusBadRequest,
+			fmt.Errorf("pod requests secrets injection (%s) but the operator has no --secret-agent-image configured", AnnotationSecretsInject))
+	}
+	if inj != nil && len(inj.LUKS) > 0 && m.cfg.LUKSOpenImage == "" {
+		return admission.Errored(http.StatusBadRequest,
+			fmt.Errorf("pod requests LUKS injection (%s<name>) but the operator has no --luks-open-image configured", luksAnnotationPrefix))
 	}
 
 	// confidential.ai/cw drives both get-cert injection and confidential
@@ -766,6 +813,15 @@ func mutatePod(pod *corev1.Pod, inj *injection, cfg Config) {
 	pod.Spec.InitContainers = injectInitContainers(pod.Spec.InitContainers,
 		certContainer(&effective, cfg), certWaitContainer(&effective, cfg))
 
+	if effective.Secrets != nil && cfg.SecretAgentImage != "" {
+		injectSecrets(pod, effective, cfg)
+	}
+
+	if len(effective.LUKS) > 0 && cfg.LUKSOpenImage != "" {
+		ensureLUKSVolumes(pod, effective.LUKS)
+		injectLUKS(pod, effective, cfg)
+	}
+
 	if pod.Annotations == nil {
 		pod.Annotations = map[string]string{}
 	}
@@ -805,6 +861,11 @@ func certContainer(inj *injection, cfg Config) corev1.Container {
 		"--renew-interval=" + inj.Cert.RenewInterval.String(),
 		"--reload-nginx=" + strconv.FormatBool(inj.Reload.Nginx),
 		"--continue-on-initial-error",
+	}
+	// Secrets injection needs the mesh CA on disk so the injected agent can
+	// trust the broker's CDS-issued serving cert.
+	if inj.Secrets != nil {
+		args = append(args, "--ca-out="+certPath(inj.Cert.Dir, "ca.crt"))
 	}
 	for _, path := range inj.Reload.WatchPaths {
 		args = append(args, "--reload-watch="+path)
@@ -1172,7 +1233,7 @@ func rejectReservedCertVolume(pod *corev1.Pod, volName string) error {
 func mountAll(pod *corev1.Pod, mount corev1.VolumeMount) {
 	add := func(cs []corev1.Container) []corev1.Container {
 		for i := range cs {
-			if containerHasMount(cs[i], mount.Name) {
+			if containerHasMount(cs[i], mount.Name, mount.MountPath) {
 				continue
 			}
 			cs[i].VolumeMounts = append(cs[i].VolumeMounts, mount)
@@ -1183,9 +1244,12 @@ func mountAll(pod *corev1.Pod, mount corev1.VolumeMount) {
 	pod.Spec.InitContainers = add(pod.Spec.InitContainers)
 }
 
-func containerHasMount(c corev1.Container, name string) bool {
+// containerHasMount matches on (volume, mountPath): one volume may be mounted
+// at several paths (per-LUKS-volume subPath mounts), while a reinvocation must
+// not duplicate a mount at the same path.
+func containerHasMount(c corev1.Container, name, mountPath string) bool {
 	for _, m := range c.VolumeMounts {
-		if m.Name == name {
+		if m.Name == name && m.MountPath == mountPath {
 			return true
 		}
 	}
