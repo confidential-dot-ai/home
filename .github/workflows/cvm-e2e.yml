@@ -122,12 +122,11 @@ jobs:
           for vm in $(kubectl -n "$NS" get vm -l ci.confidential.ai/managed=true -o name 2>/dev/null); do
             rid=$(kubectl -n "$NS" get "$vm" -o jsonpath='{.metadata.labels.ci\.confidential\.ai/run-id}' 2>/dev/null)
             orepo=$(kubectl -n "$NS" get "$vm" -o jsonpath='{.metadata.annotations.ci\.confidential\.ai/repo}' 2>/dev/null)
-            # standing runner CVMs (confidential-ci provision-*-cvm.yml,
-            # keep_alive) have a manual lifecycle — never reap them, even
-            # though their owning provision run has long since "completed"
-            # (that check would otherwise kill the shared runner: this exact
-            # reaper, run by the merge of c8s#103, deleted the org's
-            # snp-metal-cvm standing runner on 2026-07-22).
+            # Standing runner CVMs (booted with keep_alive) have a MANUAL
+            # lifecycle: they outlive the run that created them and serve jobs
+            # for other repos. Their provision run completes within minutes, so
+            # the run-status check below would see a live shared runner as an
+            # orphan and delete it mid-job. Skip them entirely.
             standing=$(kubectl -n "$NS" get "$vm" -o jsonpath='{.metadata.labels.ci\.confidential\.ai/standing}' 2>/dev/null)
             [ "$standing" = "true" ] && { echo "keeping $vm (standing runner — manual lifecycle)"; continue; }
             [ -z "$rid" ] && continue
