@@ -60,3 +60,9 @@ c8s uninstall
 `c8s uninstall` wraps `helm uninstall c8s -n c8s-system`; on a `--cvm-mode=pod`
 install it also sweeps the kata runtime artifacts off the nodes (see
 [`kata.md`](kata.md#uninstalling)).
+
+## Next
+
+For the KMS stack — attestation-gated secrets via the OpenBao broker and
+openbao-gated LUKS volumes — follow the dedicated runbook:
+[`KMS_DEMO.md`](KMS_DEMO.md).
