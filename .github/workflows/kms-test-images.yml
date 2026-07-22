@@ -1,0 +1,89 @@
+name: kms-test images
+
+# Branch-scoped image build for integration/kms-all (the combined view of the
+# split KMS PRs). Publishes every c8s component image under a stable
+# `:kms-test` tag so `c8s install --image-tag kms-test` on a test cluster
+# deploys this branch's operator + secret-broker code. Separate from docker.yml
+# (main / v* only) so the branch build doesn't perturb the production pipeline
+# (kata-guest-base, retag-unchanged, semver / :main / :latest wiring).
+#
+# attestation-api is NOT built here — it comes from attestation-rs, so no
+# :kms-test tag exists for it. Install with --resolve-digests=false, or keep
+# attestationApi.enabled=false. See docs/pitfalls.md.
+#
+# Delete this workflow when the split PRs land on main.
+
+on:
+  push:
+    branches: [integration/kms-all]
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - "go.work"
+      - "go.work.sum"
+      - "cmd/**/Dockerfile"
+      - "cmd/nri-image-policy/enable-nri.sh"
+      - "internal/helmchart/c8s/**"
+      - "Makefile"
+      - ".github/workflows/kms-test-images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  TAG: kms-test
+
+jobs:
+  images:
+    name: Build ${{ matrix.binary }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - binary: c8s
+            image: ghcr.io/confidential-dot-ai/c8s-operator
+            dockerfile: cmd/c8s/Dockerfile
+          - binary: cds
+            image: ghcr.io/confidential-dot-ai/cds
+            dockerfile: cmd/cds/Dockerfile
+          - binary: get-cert
+            image: ghcr.io/confidential-dot-ai/get-cert
+            dockerfile: cmd/get-cert/Dockerfile
+          - binary: ratls-mesh
+            image: ghcr.io/confidential-dot-ai/ratls-mesh
+            dockerfile: cmd/ratls-mesh/Dockerfile
+          - binary: nri-image-policy
+            image: ghcr.io/confidential-dot-ai/nri-image-policy
+            dockerfile: cmd/nri-image-policy/Dockerfile
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/setup-go-c8s
+
+      - name: Build Go binary
+        run: make build-c8s
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ matrix.image }}:${{ env.TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
