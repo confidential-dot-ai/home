@@ -188,6 +188,13 @@ func (h AttestHandler) HandleAttest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The leaf's OID .1.1 RA-TLS extension is copied from the client's CSR
+	// (see issuer.SignCSR): the client embeds evidence bound to
+	// SHA-384(pubkey) with no nonce, which is the only form downstream
+	// ratls-mode verifiers (secret-broker --peer-verify=ratls) can re-verify.
+	// The challenge-bound evidence verified above proves freshness at
+	// issuance but is NOT embeddable — its REPORTDATA includes the consumed
+	// challenge, so re-verification against the bare key would always fail.
 	certPEM, _, err := h.CA.SignCSR(issuer.SignCSRParams{
 		CSR:             csr,
 		TTL:             issuer.CapTTL(h.CertTTL, issuer.MaxLeafTTL),
