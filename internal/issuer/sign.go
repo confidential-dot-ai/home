@@ -19,6 +19,7 @@ type SignCSRParams struct {
 	CSR      *x509.CertificateRequest
 	TTL      time.Duration // pre-capped by caller; not clamped here
 	Evidence []byte        // raw attestation evidence; SHA-256 embedded as audit extension
+
 	// ConfigClaimsExt, when set, is the DER value of the RA-TLS config-claims
 	// extension (ratls.OIDRATLSConfigClaims) to stamp on the leaf. The caller
 	// MUST have verified the claims against the requester's evidence and (for
@@ -56,6 +57,11 @@ func (c *CA) SignCSR(p SignCSRParams) (certPEM []byte, serial *big.Int, err erro
 	if err := certutil.AppendAttestationDigest(template, digest[:]); err != nil {
 		return nil, nil, err
 	}
+	// The client's CSR-supplied RA-TLS extension is copied verbatim: only the
+	// client can produce evidence bound to its bare key (no nonce), which is
+	// what downstream ratls-mode verifiers re-verify. The extension is opaque
+	// here — verifiers check it against the leaf's key via the attestation-api,
+	// so a forged or stale extension fails closed at the consumer.
 	copyRATLSExtension(template, p.CSR)
 	if len(p.ConfigClaimsExt) > 0 {
 		template.ExtraExtensions = append(template.ExtraExtensions, pkix.Extension{
