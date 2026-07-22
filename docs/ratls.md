@@ -376,6 +376,24 @@ assumptions are in
 verification rules live in `pkg/ratls` (`claims.go`, `extension.go`,
 `verify.go`).
 
+**Reading a peer's claims.** Pinning answers "is this peer *X*?"; a relying
+party often needs "*which* workload is this?" — to authorize, route, or log.
+`ratls.PeerConfigClaims(*tls.ConnectionState)` returns a verified peer's claims
+off a live connection (an HTTP server passes `r.TLS`), or nil when the peer
+carried none. It reads the leaf extension and does **not** re-verify: a
+completed RA-TLS handshake is the guarantee. The claims are covered on every
+accept path — folded into REPORTDATA on the RA-TLS path, or signed by the mesh
+CA on the CA path (dual mode) — so the accessor is safe on **any accepted
+connection, and only on one**: never read the extension off a connection your
+verify callback did not admit. Two limits: the CA-path guarantee is *CDS vouched
+at issuance*, not fresh attestation (re-verify the leaf with `VerifyCert` if you
+need freshness); and the honest-workload ceiling above holds — a workload digest
+names what an *honest* peer runs. `WorkloadDigest` is the combined role-hash over
+the pod's *whole* image set ([getcert-workload-binding.md](getcert-workload-binding.md),
+"Corner 3"), not a per-image value, so an authorizer
+compares it by recomputing `workloadclaims.Digest(init, main)` over the expected
+set — the same call `c8s verify` makes.
+
 **Cross-implementation note.** Any non-Go verifier (e.g. `c8s-verify-js`) must
 reproduce these byte formats exactly to pin a config-claim: the SHA-384
 REPORTDATA fold above, and the canonical digests it commits — the operator
