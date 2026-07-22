@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/helmchart"
 	"github.com/confidential-dot-ai/c8s/internal/version"
 	"github.com/confidential-dot-ai/c8s/internal/webhook"
+	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
@@ -60,6 +62,7 @@ var (
 
 	installResolveDigests bool
 	installAttestEnabled  bool
+	installMeasurements   []string
 )
 
 // Flag names referenced in more than one place (registration plus a Changed()
@@ -823,28 +826,28 @@ Requires the 'helm' and 'kubectl' CLIs to be on PATH, and 'crane' unless
 	},
 }
 
-// printAttestVerifyHint surfaces how to pin this cluster's launch measurement
-// after an install with the tls-lb attestation sidecar (on by default).
+// printAttestVerifyHint surfaces measurement pinning after an install with the
+// tls-lb attestation sidecar (on by default).
 //
-// In node mode CDS, the ratls-mesh, and the tls-lb sidecar are all pods in the
-// same measured node, so they share ONE launch measurement M. That same M is
-// pinned at three trust boundaries: cds.measurements and ratlsMesh.measurements
-// (the internal mesh — empty by default = accept any attested peer, UNSAFE) and
-// the sidecar's browser/CLI verification (external clients). Install cannot
-// compute M here (it lives in the node image the CVM booted, not the install
-// context) — but `c8s verify` fetches the live quote and RENDERS the M it
-// observed, so one unpinned verify yields the value to pin in all three places.
+// The cluster's launch measurement M is a property of the deployed node image
+// (its manifest.json), known before the cluster runs. --measurements <M> pins it
+// into the internal mesh (cds.measurements + ratlsMesh.measurements) on the
+// install itself; external clients pin the same M when they verify. When
+// --measurements was omitted, the mesh accepts any attested peer (UNSAFE), so
+// the hint says how to fix it.
 func printAttestVerifyHint(w io.Writer, attestEnabled bool) {
 	if !attestEnabled {
 		return
 	}
-	fmt.Fprintln(w, "+ tls-lb attestation sidecar is enabled (/.well-known/c8s/). Pin this")
-	fmt.Fprintln(w, "  cluster's launch measurement M with one unpinned read:")
-	fmt.Fprintln(w, "      c8s verify https://<tls-lb>        # prints the observed M")
-	fmt.Fprintln(w, "  Then enforce that same M at every trust boundary:")
-	fmt.Fprintln(w, "    - clients:  c8s verify https://<tls-lb> --measurements <M>")
-	fmt.Fprintln(w, "    - internal: reinstall -f cds.measurements=[<M>] ratlsMesh.measurements=[<M>]")
-	fmt.Fprintln(w, "  Until pinned, verifiers accept any attested TEE.")
+	if len(installMeasurements) > 0 {
+		fmt.Fprintln(w, "+ tls-lb attestation sidecar enabled; mesh pinned to --measurements.")
+		fmt.Fprintln(w, "  Clients verify with the same M: c8s verify https://<tls-lb> --measurements <M>")
+		return
+	}
+	fmt.Fprintln(w, "+ tls-lb attestation sidecar enabled, but the mesh is UNPINNED (accepts any")
+	fmt.Fprintln(w, "  attested TEE). Pin it with the node image's launch measurement M (its")
+	fmt.Fprintln(w, "  manifest.json): reinstall with --measurements <M>. Clients verify with the")
+	fmt.Fprintln(w, "  same M: c8s verify https://<tls-lb> --measurements <M>.")
 }
 
 // extractChart writes the embedded chart tree to a fresh tmpdir and returns
@@ -1146,6 +1149,40 @@ func appendCvmModeInstallArgs(helmArgs []string, cvmMode, hardwarePlatform strin
 		helmArgs = append(helmArgs,
 			"--set", "attestationApi.enabled=false",
 			"--set", "nriImagePolicy.enabled=false",
+		)
+	}
+	// --measurements pins the expected launch measurement(s) of this cluster's
+	// CVM into both internal trust boundaries in one install: the mesh (and NRI)
+	// dial CDS pinned to it (cds.measurements), and mesh peers pin each other
+	// (ratlsMesh.measurements). The operator supplies M — it is a property of the
+	// deployed node image (its manifest.json), known before the cluster runs — so
+	// the mesh is pinned from first boot rather than accept-any-then-tighten.
+	// Empty = no pinning (UNSAFE, the chart default).
+	//
+	// Parse here, on the shared builder path, so the pinned list is validated
+	// and normalized regardless of which command emitted it — and so the fanned
+	// list matches exactly what was validated (a blank/whitespace entry, e.g.
+	// from a trailing comma, is dropped by the parser, not silently emitted as
+	// an empty pin that would disable pinning at that index).
+	measurements, err := ratls.ParseHexMeasurementsList(installMeasurements)
+	if err != nil {
+		return nil, fmt.Errorf("--measurements: %w", err)
+	}
+	// cds.measurements / ratlsMesh.measurements pin the launch measurement of the
+	// components that speak to CDS. In node/gke/aks the node IS the CVM, so that
+	// is the node image's M — what --measurements takes. In pod mode those
+	// components are the per-pod kata guests (host-side mesh/attestation-api/NRI
+	// are disabled), whose kata-guest-base measurement is a different value; a
+	// node M pinned there would only reject every real peer. Refuse rather than
+	// mis-pin.
+	if len(measurements) > 0 && cvmMode == "pod" {
+		return nil, fmt.Errorf("--measurements pins the node CVM's launch measurement; it does not apply to --cvm-mode=pod (per-pod kata guests are measured separately)")
+	}
+	for i, m := range measurements {
+		hexM := hex.EncodeToString(m)
+		helmArgs = append(helmArgs,
+			"--set-string", fmt.Sprintf("cds.measurements[%d]=%s", i, hexM),
+			"--set-string", fmt.Sprintf("ratlsMesh.measurements[%d]=%s", i, hexM),
 		)
 	}
 	return helmArgs, nil
@@ -1816,6 +1853,7 @@ func init() {
 	installCmd.Flags().BoolVar(&installKataDebug, "debug", false, "use the kata-guest-base DEBUG guest variant (<tag>-debug): kubectl logs/exec work on kata pods, but container I/O becomes readable by the untrusted host and the launch measurement differs from the locked image. Requires --cvm-mode=pod; development only")
 	installCmd.Flags().BoolVar(&installResolveDigests, "resolve-digests", true, "resolve each c8s component image tag to its registry digest (via crane), pin it, and add the resolved images to the NRI allowlist (enables deriveComponents). On by default; pass --resolve-digests=false when supplying digests via -f")
 	installCmd.Flags().BoolVar(&installAttestEnabled, "attest", true, "deploy the tls-lb attestation sidecar serving /.well-known/c8s/ (browser/CLI verification via c8s-verify). On by default; pass --attest=false to omit it")
+	installCmd.Flags().StringSliceVar(&installMeasurements, "measurements", nil, "expected hex launch measurement(s) of this cluster's CVM (repeatable/comma-separated), from the node image's manifest.json. Pins the internal mesh (cds.measurements + ratlsMesh.measurements) on this install; empty = no pinning (UNSAFE). Not valid with --cvm-mode=pod")
 	installCmd.Flags().StringVar(&installImagePullSecret, "image-pull-secret", "", "name of an existing registry-credential Secret (kubernetes.io/dockerconfigjson) in the release namespace; the chart appends it to every component's imagePullSecrets, so all pods can pull the c8s images from an authenticated registry (e.g. a private mirror) from first start. The Secret itself is never created or managed by the install — the install fails fast if it is missing or has the wrong type")
 	installCmd.Flags().StringVar(&installImageTag, "image-tag", "", "component image tag to resolve digests at (default: the CLI build version, or 'main' for an unstamped build). Override to pin a specific branch/tag/release")
 	installCmd.Flags().StringVar(&installOperatorKeys, "operator-keys", "", "path to a PEM bundle of operator EC public keys that authorize `c8s allowlist` writes; sets cds.operatorKeys. Without it, allowlist writes are disabled (reads still served). See the README \"Operator allowlist credentials\"")
