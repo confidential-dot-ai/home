@@ -993,6 +993,12 @@ func TestHostPortConflict(t *testing.T) {
 }
 
 func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
+	// The attestation sidecar is on by default; the arg-builder reads the
+	// package flag, which cobra would set. Mirror that default here.
+	prevAttest := installAttestEnabled
+	installAttestEnabled = true
+	t.Cleanup(func() { installAttestEnabled = prevAttest })
+
 	// Two orthogonal axes:
 	//  --cvm-mode: pod (kata) / node (node-as-CVM) / gke (managed) / aks (vTPM)
 	//  --hardware-platform: sev-snp (/dev/sev-guest) / tdx (/dev/tdx-guest)
@@ -1014,6 +1020,14 @@ func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
 			out = append(out,
 				"--set-string", "cds.ratlsPlatform=tdx",
 				"--set-string", "ratlsMesh.platform=tdx",
+			)
+		}
+		// TDX also overrides the tls-lb attestation sidecar's advertised
+		// platform (chart default snp/genoa) and blanks the AMD-only generation.
+		if platform == "tdx" {
+			out = append(out,
+				"--set-string", "tlsLb.attest.platform=tdx",
+				"--set-string", "tlsLb.attest.generation=",
 			)
 		}
 		// node: the node image bakes attestation-api + nri-image-policy, so the
