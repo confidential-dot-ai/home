@@ -848,21 +848,32 @@ passphrase and the backing file are removed, so the ciphertext is unrecoverable;
 is a dangling mapper/loop (a host-resource leak, worst case exhausts loop devices / blocks
 re-creating a volume of the same name).
 
-**Fix — two parts:**
+**Fixed by belt-and-suspenders** across three seams:
 
-1. *Make `destroy` self-sufficient.* In `destroyLocal` (and the in-use pre-check), close the
-   runtime mapper before detaching the loop: reuse the package's `luksClose` helper on
-   `c8s-<name>` (note: the runtime mapper is `c8s-<name>`, distinct from create.go's transient
-   `c8s-luks-<workload>-<name>`), then `losetup -d`. This lets destroy actually detach, and
-   reaps mappers leaked by an earlier crash. Small, contained.
+1. **Graceful path — preStop on a native sidecar.** `internal/webhook/luks.go`
+   `luksOpenContainer` now emits `c8s-luks-open` as a native sidecar
+   (`restartPolicy: Always`) running `c8s luks-open --stay-alive` (blocks on
+   SIGTERM after opening) with a `preStop` exec of `c8s luks-close
+   --mount-root=/c8s-luks --volume=<name>…`. `internal/cmds/luksclose` unmounts
+   the fs and removes the mapper via `internal/devmapper.Remove` (DM_DEV_REMOVE
+   ioctl — no cryptsetup binary needed).
 
-2. *Prevent the per-pod leak.* Give the injected open a teardown counterpart, gated on kata
-   being off (under kata the guest disposal already handles it). Cleanest k8s-native option:
-   make `c8s-luks-open` (or a dedicated `c8s-luks-close`) a **native sidecar**
-   (`restartPolicy: Always`) with a **preStop** hook running a new `c8s luks-close --name
-   <name>` (umount + `cryptsetup close c8s-<name>`); native sidecars terminate after the app
-   and run preStop on graceful deletion. preStop is skipped on SIGKILL / node crash /
-   `--grace-period=0`, so back it with a **node-side NRI hook** — the c8s NRI plugin already
-   runs on every node and sees `RemovePodSandbox`; have it close any mapper owned by the
-   departing pod. Belt-and-suspenders: preStop for the common path, NRI for the abrupt path,
-   destroy-side close (part 1) for whatever still slips through.
+2. **Abrupt path — NRI reap on RemovePodSandbox.** `internal/cmds/nri-image-policy`
+   subscribes to `Event_REMOVE_POD_SANDBOX` and, for a departing pod carrying
+   `confidential.ai/luks-<name>` annotations, calls `devmapper.Remove("c8s-"+name)`.
+   Covers SIGKILL, node crash, and `--grace-period=0` where preStop is skipped.
+
+3. **Operator path — self-sufficient destroy.** `internal/cmds/luks/destroy.go`
+   `destroyLocal` closes the runtime mapper (`c8s-<name>`) before `losetup -d`
+   so a lingering mapper from an earlier crash gets reaped and the loop can
+   detach cleanly. Best-effort: NotFound is expected on a healthy shutdown.
+
+The three cover disjoint failure modes: preStop wins the common terminate,
+NRI catches the abrupt path, destroy self-heals whatever still slips through.
+None of the three require cryptsetup or dmsetup on the host — everything goes
+through `/dev/mapper/control`.
+
+Under kata, the guest kernel is disposed with the pod and all three are
+harmless no-ops (nothing to close). The extra native-sidecar container slot is
+the only cost; the alternative — a plain init container — leaves no place to
+hang the lifecycle hook.
