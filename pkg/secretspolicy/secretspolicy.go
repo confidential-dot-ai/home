@@ -86,6 +86,9 @@ func (e Entry) resolvedDigest() (string, error) {
 		return "", fmt.Errorf("entry sets both workloadDigest and workloadImages")
 	case e.WorkloadDigest != "":
 		d := strings.ToLower(strings.TrimSpace(e.WorkloadDigest))
+		if d == "" {
+			return "", fmt.Errorf("workloadDigest is empty")
+		}
 		if _, err := hex.DecodeString(d); err != nil {
 			return "", fmt.Errorf("workloadDigest %q is not hex: %w", e.WorkloadDigest, err)
 		}

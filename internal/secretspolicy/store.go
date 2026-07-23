@@ -9,7 +9,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 
@@ -38,7 +37,6 @@ INSERT INTO secrets_policy_version (version)
 
 // OpenStore opens (or creates) a SQLite-backed secrets-policy store at path.
 func OpenStore(path string) (Store, error) {
-	_, statErr := os.Stat(path)
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return Store{}, fmt.Errorf("open secrets-policy db: %w", err)
@@ -47,7 +45,6 @@ func OpenStore(path string) (Store, error) {
 		db.Close()
 		return Store{}, fmt.Errorf("init secrets-policy schema: %w", err)
 	}
-	_ = statErr
 	return Store{db: db}, nil
 }
 

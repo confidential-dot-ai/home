@@ -3,10 +3,10 @@ package secretspolicy
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 
+	"github.com/confidential-dot-ai/c8s/internal/httputil"
 	"github.com/confidential-dot-ai/c8s/pkg/secretspolicy"
 )
 
@@ -161,9 +161,8 @@ func (h Handler) authorize(w http.ResponseWriter, r *http.Request) ([]byte, bool
 	if max <= 0 {
 		max = DefaultMaxWriteBodyBytes
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, max))
-	if err != nil {
-		http.Error(w, "read body", http.StatusBadRequest)
+	body, ok := httputil.ReadCappedBody(w, r, max)
+	if !ok {
 		return nil, false
 	}
 	if h.WriteAuthorizer == nil {
