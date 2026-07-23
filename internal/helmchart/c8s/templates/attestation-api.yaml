@@ -76,12 +76,16 @@ spec:
         checksum/config: {{ include "c8s.attestationApiConfig" (dict "root" .) | sha256sum }}
     spec:
       {{- if eq .Values.attestationApi.cvmMode "node" }}
-      # node-CVM: consumers reach the attestation-api at http://$(HOST_IP):{{ .Values.attestationApi.port }}
-      # (c8s.attestationApiURL) so each pod attests via ITS OWN node's quote.
-      # A chart-deployed pod only answers on the node IP if it is on the host
-      # network — a ClusterIP/NodePort Service can't serve the plain :{{ .Values.attestationApi.port }} the
-      # $(HOST_IP) URL dials. (The baked-node-image shape runs this as a host
-      # service instead; there --node-baked-host-services skips this DaemonSet.)
+      # node-CVM base mode (chart-deployed DS, no --node-baked-host-services):
+      # consumers dial http://$(HOST_IP):{{ .Values.attestationApi.port }} — the
+      # unnumbered {{ .Values.attestationApi.port }} port, NOT the Service's
+      # nodePort — so each pod attests via its own node's quote. Neither
+      # ClusterIP nor NodePort exposes {{ .Values.attestationApi.port }} on the
+      # node IP; only hostNetwork does. Not needed in earlier cvmModes: kata
+      # dials 127.0.0.1 (in-guest attestation-api) and baremetal dials the
+      # ClusterIP DNS name — those don't touch $(HOST_IP). Under
+      # --node-baked-host-services the host image already runs the attestation-api
+      # as a host service and this DaemonSet isn't rendered.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
