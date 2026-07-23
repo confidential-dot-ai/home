@@ -174,6 +174,28 @@ func TestMutatePodInjectsLUKSContainer(t *testing.T) {
 	if !strings.Contains(joined, "--volume=data=/dev/vdb:data:ext4:open") {
 		t.Errorf("volume spec missing from args: %v", openC.Args)
 	}
+
+	// Native sidecar (restartPolicy: Always) so the preStop hook fires on
+	// graceful pod termination. See docs/pitfalls.md — LUKS leak.
+	if openC.RestartPolicy == nil || *openC.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Errorf("c8s-luks-open must be a native sidecar (restartPolicy: Always), got %+v", openC.RestartPolicy)
+	}
+	if !strings.Contains(joined, "--stay-alive") {
+		t.Errorf("c8s-luks-open must pass --stay-alive so the sidecar blocks until preStop, got args %v", openC.Args)
+	}
+
+	// preStop hook exec's `/c8s luks-close --mount-root=/c8s-luks --volume=<name>` for
+	// every LUKS volume the pod owns. Must land as an absolute path — the exec
+	// action bypasses ENTRYPOINT.
+	if openC.Lifecycle == nil || openC.Lifecycle.PreStop == nil || openC.Lifecycle.PreStop.Exec == nil {
+		t.Fatalf("c8s-luks-open must carry a preStop exec hook, got %+v", openC.Lifecycle)
+	}
+	preStopCmd := strings.Join(openC.Lifecycle.PreStop.Exec.Command, " ")
+	for _, want := range []string{"/c8s", "luks-close", "--mount-root=/c8s-luks", "--volume=data"} {
+		if !strings.Contains(preStopCmd, want) {
+			t.Errorf("preStop exec missing %q: %v", want, openC.Lifecycle.PreStop.Exec.Command)
+		}
+	}
 	// App container gets a volume mount at /data
 	found := false
 	for _, vm := range pod.Spec.Containers[0].VolumeMounts {

@@ -1,23 +1,33 @@
 // Package luksopen implements the `c8s luks-open` subcommand: read an
 // openbao-issued passphrase, luksOpen the corresponding block device, mount
 // the decrypted filesystem into a per-pod emptyDir the app container
-// consumes. Runs once per pod as an init container, then exits.
+// consumes.
 //
-// It does not manage lifecycle — the mapper and mount are torn down by
-// containerd when the pod is destroyed (the mount is on an emptyDir, and
-// the mapper node is on /dev which is a hostPath but scoped to the pod's
-// mount namespace only when kata is off; under kata everything is inside
-// the guest, which is disposed with the pod).
+// With --stay-alive (the pod-injected default) the process opens every
+// requested volume and then blocks on SIGTERM/SIGINT — the container runs as
+// a native sidecar so a preStop hook can invoke `c8s luks-close` on graceful
+// termination. Without the flag, the process exits after the last mount
+// (used by tests and one-shot callers).
+//
+// Under kata the guest kernel is disposed with the pod and no explicit close
+// is needed; on node-CVM (kata off) the mapper is a global kernel object that
+// leaks without an explicit close — the preStop is the primary reaper, the
+// nri-image-policy plugin's RemovePodSandbox handler is the abrupt-path
+// backup, and `c8s luks destroy` self-heals what still slips through. See
+// docs/pitfalls.md — LUKS leak.
 package luksopen
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 )
@@ -43,6 +53,8 @@ func NewCmd() *cobra.Command {
 		"parent directory for per-volume mountpoints; each volume mounts at <mount-root>/<name>")
 	flags.StringSliceVar(&cfg.VolumeSpecs, "volume", nil,
 		"volume spec, repeatable: <name>=<dev>:<secretName>:<fstype>:<mode> (mode = open | format-if-empty)")
+	flags.BoolVar(&cfg.StayAlive, "stay-alive", false,
+		"after opening every volume, block on SIGTERM/SIGINT so the container runs as a native sidecar (webhook sets this so the preStop hook can invoke c8s luks-close)")
 	return cmd
 }
 
@@ -51,6 +63,7 @@ type Config struct {
 	SecretsDir  string
 	MountRoot   string
 	VolumeSpecs []string
+	StayAlive   bool
 }
 
 // Volume is a parsed --volume=… flag.
@@ -77,7 +90,21 @@ func Run(cfg Config) error {
 		}
 	}
 	slog.Info("luks-open: all volumes opened and mounted", "count", len(vols))
+	if cfg.StayAlive {
+		blockUntilTerm()
+	}
 	return nil
+}
+
+// blockUntilTerm parks the process until the kubelet SIGTERM (or a manual
+// SIGINT). Returning from Run then exits 0 — which the kubelet expects for a
+// native sidecar completing its shutdown, after preStop has run luks-close.
+func blockUntilTerm() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	slog.Info("luks-open: staying alive as a native sidecar; awaiting SIGTERM")
+	<-ctx.Done()
+	slog.Info("luks-open: SIGTERM received, exiting (preStop should have run luks-close)")
 }
 
 // ParseVolumeSpecs parses each spec of form

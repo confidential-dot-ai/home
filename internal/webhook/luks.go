@@ -216,10 +216,22 @@ func hasLocalLUKSVolume(vols []luksVolume) bool {
 	return false
 }
 
-// injectLUKS adds one init container that opens every requested LUKS volume
-// and mounts each into a per-name subdir under a shared emptyDir. The app
-// containers then mount that same subdir at the operator's requested Mount
-// path. Runs after c8s-secrets-agent-init (so the passphrase file exists).
+// injectLUKS adds one native-sidecar init container that opens every requested
+// LUKS volume, mounts each into a per-name subdir under a shared emptyDir, and
+// stays resident until pod termination so its preStop hook can close the
+// runtime mapper. The app containers then mount that same subdir at the
+// operator's requested Mount path. Runs after c8s-secrets-agent-init (so the
+// passphrase file exists).
+//
+// Native sidecar (restartPolicy: Always + --stay-alive) rather than a plain
+// init container: the plain form exited after opening, leaving no place to
+// hang a lifecycle hook. Under kata the guest kernel is disposed with the pod
+// and the resident process costs a container slot for nothing but preStop; on
+// node-CVM (kata off) the dm-crypt mapper is a global kernel object and the
+// preStop is the only thing that reaps it on graceful deletion. The
+// nri-image-policy plugin covers the abrupt path (SIGKILL / node crash /
+// grace-period=0) via its RemovePodSandbox handler; `c8s luks destroy` reaps
+// whatever still slips through. See docs/pitfalls.md — LUKS leak.
 //
 // SAFETY: the injected container is privileged. For dev= (local) volumes it
 // also mounts host /dev so cryptsetup can reach the loop device; pvc= volumes
@@ -260,15 +272,17 @@ func injectLUKS(pod *corev1.Pod, eff injection, cfg Config) {
 		"c8s-secrets-agent-init", []corev1.Container{luksOpenContainer(cfg, eff)})
 }
 
-// luksOpenContainer runs `c8s luks-open` — one process, all requested
-// volumes at once. Runs privileged, with /dev bind-mounted so cryptsetup
-// can create /dev/mapper/c8s-<name> nodes.
+// luksOpenContainer runs `c8s luks-open --stay-alive` — one process, all
+// requested volumes at once. Runs privileged as a native sidecar so the
+// preStop hook can close the runtime mappers on graceful pod termination.
 func luksOpenContainer(cfg Config, eff injection) corev1.Container {
-	args := []string{"luks-open", "--secrets-dir=" + defaultSecretsDir, "--mount-root=" + luksDataDir}
+	args := []string{"luks-open", "--secrets-dir=" + defaultSecretsDir, "--mount-root=" + luksDataDir, "--stay-alive"}
+	closeArgs := []string{"/c8s", "luks-close", "--mount-root=" + luksDataDir}
 	var devices []corev1.VolumeDevice
 	for _, v := range eff.LUKS {
 		spec := fmt.Sprintf("%s=%s:%s:%s:%s", v.Name, v.devicePath(), v.SecretName, v.FSType, v.Mode)
 		args = append(args, "--volume="+spec)
+		closeArgs = append(closeArgs, "--volume="+v.Name)
 		if v.PVC != "" {
 			devices = append(devices, corev1.VolumeDevice{Name: v.pvcVolumeName(), DevicePath: v.devicePath()})
 		}
@@ -276,6 +290,7 @@ func luksOpenContainer(cfg Config, eff injection) corev1.Container {
 	priv := true
 	f := false
 	var uid, gid int64 = 0, 0
+	always := corev1.ContainerRestartPolicyAlways
 	mounts := []corev1.VolumeMount{
 		{Name: secretsDataVolume, MountPath: defaultSecretsDir, ReadOnly: true},
 		{Name: luksDataVolume, MountPath: luksDataDir, MountPropagation: mountPropagation(corev1.MountPropagationBidirectional)},
@@ -292,6 +307,19 @@ func luksOpenContainer(cfg Config, eff injection) corev1.Container {
 		Args:            args,
 		VolumeDevices:   devices,
 		VolumeMounts:    mounts,
+		// Native sidecar: keeps the process resident so preStop can fire.
+		// Regular containers still start once its process is launched (open
+		// completes synchronously before the --stay-alive block).
+		RestartPolicy: &always,
+		// preStop runs c8s luks-close in the same container (same privileged +
+		// host /dev context). Skipped on SIGKILL / node crash / grace-period=0;
+		// the nri-image-policy plugin's RemovePodSandbox handler is the
+		// belt-and-suspenders for those paths.
+		Lifecycle: &corev1.Lifecycle{
+			PreStop: &corev1.LifecycleHandler{
+				Exec: &corev1.ExecAction{Command: closeArgs},
+			},
+		},
 		SecurityContext: &corev1.SecurityContext{
 			// Privileged is required for cryptsetup ioctls and to create
 			// /dev/mapper nodes. Root is required to open the raw block
