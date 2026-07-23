@@ -2,6 +2,7 @@ package luks
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -28,7 +29,7 @@ func cutColon(s string) (a, b string, ok bool) {
 func runOutput(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%s %v: %w: %s", name, args, err, out)
 	}
 	return string(out), nil
 }

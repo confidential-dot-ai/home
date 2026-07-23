@@ -50,7 +50,7 @@ func TestKVPathShape(t *testing.T) {
 
 func TestValidateCreate(t *testing.T) {
 	base := createConfig{
-		workload: "api", name: "data", mount: "/data",
+		workload: "api", name: "data", mount: "/data", driver: "local",
 		output: "yaml", size: resource.MustParse("1Gi"),
 	}
 	if err := validateCreate(base); err != nil {
@@ -68,6 +68,7 @@ func TestValidateCreate(t *testing.T) {
 		{"zero size", func(c *createConfig) { c.size = resource.MustParse("0") }, "positive"},
 		{"relative mount", func(c *createConfig) { c.mount = "data" }, "absolute"},
 		{"bad output", func(c *createConfig) { c.output = "xml" }, "yaml or json"},
+		{"bad driver", func(c *createConfig) { c.driver = "nfs" }, "local | pvc | csi"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

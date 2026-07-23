@@ -201,6 +201,11 @@ func validateCreate(cfg createConfig) error {
 	if cfg.mount == "" || cfg.mount[0] != '/' {
 		return errors.New("--mount must be an absolute path")
 	}
+	switch cfg.driver {
+	case "local", "pvc", "csi":
+	default:
+		return fmt.Errorf("--driver %q: want local | pvc | csi", cfg.driver)
+	}
 	if cfg.driver == "pvc" {
 		if errs := validation.IsDNS1123Label(cfg.namespace); len(errs) > 0 {
 			return fmt.Errorf("--namespace %q must be a DNS-1123 label: %v", cfg.namespace, errs)
