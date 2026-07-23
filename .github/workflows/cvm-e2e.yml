@@ -199,17 +199,6 @@ jobs:
                       - name: rootdisk
                         disk:
                           bus: virtio
-                          # The rke2 rootfs is a read-only dm-verity image (writes
-                          # go to a tmpfs overlay), so the disk never needs write
-                          # access — and opening it writable takes an EXCLUSIVE
-                          # QEMU image lock. The standing snp-metal-cvm ARC runner
-                          # boots from this same RWO PVC and holds that lock 24/7,
-                          # so a writable ephemeral CVM here fails at qemu with
-                          # `Failed to get "write" lock` and never reaches Running.
-                          # readonly takes a SHARED lock that coexists with the
-                          # runner (verified: this is how the TDX dev host runs two
-                          # VMs off one rootdisk).
-                          readonly: true
                     interfaces:
                       - name: default
                         bridge: {}           # masquerade is broken under SNP
