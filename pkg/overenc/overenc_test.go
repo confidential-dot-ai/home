@@ -52,6 +52,51 @@ func TestHybridChannelRoundTrip(t *testing.T) {
 	}
 }
 
+// channelPair returns an agreed (server, client) channel pair for tests.
+func channelPair(t *testing.T) (server, client *Channel) {
+	t.Helper()
+	nonce := make([]byte, 32)
+	rand.Read(nonce)
+	srv, err := GenerateServerKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCh, hs, err := ClientAgree(srv.Public(), nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCh, err := srv.Agree(hs, nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return serverCh, clientCh
+}
+
+func TestOpenRejectsReplayedRecord(t *testing.T) {
+	serverCh, clientCh := channelPair(t)
+
+	rec, err := clientCh.Seal([]byte("transfer $100"), RequestAAD())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := serverCh.Open(rec, RequestAAD()); err != nil {
+		t.Fatalf("first open failed: %v", err)
+	}
+	// Resubmitting the exact same authenticated record must not decrypt to a
+	// second backend action.
+	if _, err := serverCh.Open(rec, RequestAAD()); err == nil {
+		t.Fatal("replayed record accepted; want rejection")
+	}
+	// A fresh, distinct record from the same channel still opens.
+	rec2, err := clientCh.Seal([]byte("transfer $200"), RequestAAD())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := serverCh.Open(rec2, RequestAAD()); err != nil {
+		t.Fatalf("distinct record rejected: %v", err)
+	}
+}
+
 func TestWrongNonceDerivesDifferentKey(t *testing.T) {
 	n1 := bytes.Repeat([]byte{1}, 32)
 	n2 := bytes.Repeat([]byte{2}, 32)
