@@ -19,6 +19,7 @@ import (
 	admissionregv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1302,6 +1303,296 @@ func TestChartRejectsInvalidAttestationApiNodePortWithNRI(t *testing.T) {
 		t.Fatalf("helm template succeeded, want invalid attestation-api host nodePort failure\n%s", out)
 	}
 	assertHelmFailMessage(t, out, "attestationApi.service.nodePort must be within the Kubernetes NodePort range 30000-32767 when nriImagePolicy.enabled=true (got 0)")
+}
+
+// secretBrokerArgs enables the secret-broker with its minimum required values.
+func secretBrokerArgs(args ...string) []string {
+	return append([]string{
+		"--set", "secretBroker.enabled=true",
+		"--set-string", "secretBroker.openbao.address=https://c8s-openbao.c8s-system.svc:8200",
+	}, args...)
+}
+
+// TestChartSecretBrokerRendersMeshComponent pins the broker's integration with
+// the shared getCertContainers pattern (c8s-cert sidecar + c8s-cert-wait gate)
+// and the operator flags that arm webhook-side secrets/LUKS injection.
+// nri is disabled: the digest-pinned agent image would otherwise trip the
+// uncovered_component_digest guard (covered by its own test below).
+func TestChartSecretBrokerRendersMeshComponent(t *testing.T) {
+	out, err := helmTemplate(t, secretBrokerArgs("--set", "nriImagePolicy.enabled=false")...)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	init := renderedDeploymentInitContainers(t, out, "c8s-secret-broker")
+	for _, name := range []string{"c8s-cert", "c8s-cert-wait"} {
+		if _, ok := findContainer(init, name); !ok {
+			t.Fatalf("secret-broker init container %q missing; have %v", name, containerNames(init))
+		}
+	}
+	dep := renderedDeployment(t, out, "c8s-secret-broker")
+	broker, ok := findContainer(dep.Spec.Template.Spec.Containers, "secret-broker")
+	if !ok {
+		t.Fatalf("secret-broker container missing; have %v", containerNames(dep.Spec.Template.Spec.Containers))
+	}
+	assertContainerArgs(t, broker,
+		"--tls-cert=/etc/c8s/certs/tls.crt",
+		"--openbao-addr=https://c8s-openbao.c8s-system.svc:8200",
+		"--openbao-attested=true",
+	)
+	// The broker derives the mesh CA from ca.crt beside --tls-cert; the chart
+	// must not pass --client-ca (that would let the control plane pick the CA).
+	for _, a := range broker.Args {
+		if strings.HasPrefix(a, "--client-ca") {
+			t.Errorf("chart must not render --client-ca, got %q", a)
+		}
+	}
+	operatorArgs := renderedOperatorArgs(t, out)
+	for _, want := range []string{
+		"--secret-agent-command=bao",
+		"--secret-broker-url=https://c8s-secret-broker.c8s-system.svc:8443",
+	} {
+		if !slices.Contains(operatorArgs, want) {
+			t.Fatalf("operator args missing %q\n%v", want, operatorArgs)
+		}
+	}
+}
+
+// The injected OpenBao agent image is external (not tag-locked to the c8s
+// release) and ships digest-pinned in values, so image-policy enforcement can
+// admit the injected container: the derive path must seed it whenever the
+// broker is enabled, and the fail-closed floor guard must flag it when
+// derivation is off and the floor does not cover it.
+func TestChartAllowlistsSecretAgentImage(t *testing.T) {
+	const (
+		agentDigest = "sha256:00000000000000000000000000000000000000000000000000000000000000d1"
+		agentRepo   = "example.test/openbao"
+	)
+	t.Run("derived seed covers the agent image", func(t *testing.T) {
+		out, err := helmTemplate(t, secretBrokerArgs(
+			"--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true",
+			"--set-string", "secretAgent.image.repository="+agentRepo,
+			"--set-string", "secretAgent.image.digest="+agentDigest,
+		)...)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+		seed, err := pkgallowlist.ParseJSON([]byte(cm.Data["allowlist-seed.json"]))
+		if err != nil {
+			t.Fatalf("seed JSON does not parse: %v", err)
+		}
+		if got, want := seed.Digests[agentDigest], agentRepo+"@"+agentDigest; got != want {
+			t.Errorf("secret-agent seed entry = %q, want %q\nseed: %v", got, want, seed.Digests)
+		}
+	})
+
+	t.Run("fail-closed floor guard flags the uncovered agent digest", func(t *testing.T) {
+		out, err := helmTemplate(t, secretBrokerArgs()...)
+		if err == nil {
+			t.Fatalf("helm template succeeded, want uncovered_component_digest failure\n%s", out)
+		}
+		if got := parseValidationErrorKind(out); got != "uncovered_component_digest" {
+			t.Fatalf("validation kind = %q, want uncovered_component_digest\n%s", got, out)
+		}
+	})
+
+	// enabledPath gating: with the broker disabled (chart default) the pinned
+	// agent digest must be excluded from derivation and the floor guard — a
+	// disabled component's image must never be admitted or demanded.
+	t.Run("disabled broker: agent image neither derived nor guarded", func(t *testing.T) {
+		out, err := helmTemplate(t,
+			"--set", "nriImagePolicy.bootstrapAllowlist.deriveComponents=true",
+			"--set-string", "secretAgent.image.repository="+agentRepo,
+			"--set-string", "secretAgent.image.digest="+agentDigest,
+		)
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		cm := renderedConfigMap(t, out, "c8s-cds-allowlist-seed")
+		seed, err := pkgallowlist.ParseJSON([]byte(cm.Data["allowlist-seed.json"]))
+		if err != nil {
+			t.Fatalf("seed JSON does not parse: %v", err)
+		}
+		if _, ok := seed.Digests[agentDigest]; ok {
+			t.Errorf("secret-agent seed entry present with secretBroker disabled: %v", seed.Digests)
+		}
+	})
+}
+
+// kmsArgs enables the in-chart dev store + broker with no explicit store
+// address — the shape `c8s install --kms` produces. nri is disabled for the
+// same reason as the broker tests (the digest-pinned agent image would trip
+// the uncovered_component_digest guard; coverage has its own test).
+func kmsArgs(args ...string) []string {
+	return append([]string{
+		"--set", "kms.enabled=true",
+		"--set", "secretBroker.enabled=true",
+		"--set", "nriImagePolicy.enabled=false",
+	}, args...)
+}
+
+// TestChartKMSRendersDevStoreAndWiresBroker pins the --kms contract: the dev
+// store renders (Deployment + Service + dev-cred Secret) and the broker's
+// unset openbao settings default to it — in-release address, unattested
+// (plain-HTTP dev store), dev-cred token file.
+func TestChartKMSRendersDevStoreAndWiresBroker(t *testing.T) {
+	out, err := helmTemplate(t, kmsArgs()...)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+
+	store := renderedDeployment(t, out, "c8s-openbao")
+	c := store.Spec.Template.Spec.Containers[0]
+	if want := []string{"server", "-dev"}; !slices.Equal(c.Args, want) {
+		t.Errorf("dev store args = %v, want %v", c.Args, want)
+	}
+	if !strings.Contains(c.Image, "ghcr.io/openbao/openbao@sha256:") {
+		t.Errorf("dev store image = %q, want the digest-pinned secretAgent image", c.Image)
+	}
+	var sec corev1.Secret
+	if !findDoc(t, out, "Secret", "c8s-openbao-dev-cred", &sec) {
+		t.Fatalf("rendered manifest missing dev-cred Secret\n%s", out)
+	}
+	if got := sec.StringData["token"]; got != "root" {
+		t.Errorf("dev-cred token = %q, want root (values default)", got)
+	}
+	renderedService(t, out, "c8s-openbao")
+
+	broker := renderedDeployment(t, out, "c8s-secret-broker")
+	brokerC, ok := findContainer(broker.Spec.Template.Spec.Containers, "secret-broker")
+	if !ok {
+		t.Fatalf("secret-broker container missing; have %v", containerNames(broker.Spec.Template.Spec.Containers))
+	}
+	assertContainerArgs(t, brokerC,
+		"--openbao-addr=http://c8s-openbao.c8s-system.svc:8200",
+		"--openbao-attested=false",
+		"--openbao-token-file=/etc/secret-broker-creds/token",
+	)
+	credWired := false
+	for _, v := range broker.Spec.Template.Spec.Volumes {
+		if v.Secret != nil && v.Secret.SecretName == "c8s-openbao-dev-cred" {
+			credWired = true
+		}
+	}
+	if !credWired {
+		t.Errorf("broker volumes do not mount the dev-cred Secret\n%v", broker.Spec.Template.Spec.Volumes)
+	}
+}
+
+// An explicitly configured credentialSecret must win over the kms dev-cred —
+// operators pointing the broker at their own token keep that wiring even with
+// the dev store deployed.
+func TestChartKMSExplicitCredentialWins(t *testing.T) {
+	out, err := helmTemplate(t, kmsArgs(
+		"--set-string", "secretBroker.openbao.credentialSecret.name=my-cred",
+		"--set-string", "secretBroker.openbao.credentialSecret.key=tok",
+	)...)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	broker := renderedDeployment(t, out, "c8s-secret-broker")
+	brokerC, ok := findContainer(broker.Spec.Template.Spec.Containers, "secret-broker")
+	if !ok {
+		t.Fatalf("secret-broker container missing; have %v", containerNames(broker.Spec.Template.Spec.Containers))
+	}
+	assertContainerArgs(t, brokerC, "--openbao-token-file=/etc/secret-broker-creds/tok")
+	for _, v := range broker.Spec.Template.Spec.Volumes {
+		if v.Secret != nil && v.Secret.SecretName == "c8s-openbao-dev-cred" {
+			t.Errorf("dev-cred Secret mounted despite an explicit credentialSecret")
+		}
+	}
+}
+
+// TestChartKMSGuards: the dev store without a broker is dead weight with a
+// root token lying around; alongside an explicit external address it is a
+// contradiction. Both must fail the render.
+func TestChartKMSGuards(t *testing.T) {
+	t.Run("kms without broker", func(t *testing.T) {
+		out, err := helmTemplate(t, "--set", "kms.enabled=true")
+		if err == nil {
+			t.Fatalf("helm template succeeded, want kms_without_broker failure\n%s", out)
+		}
+		if got := parseValidationErrorKind(out); got != "kms_without_broker" {
+			t.Fatalf("validation kind = %q, want kms_without_broker\n%s", got, out)
+		}
+	})
+	t.Run("kms with explicit store address", func(t *testing.T) {
+		out, err := helmTemplate(t, kmsArgs(
+			"--set-string", "secretBroker.openbao.address=https://external:8200",
+		)...)
+		if err == nil {
+			t.Fatalf("helm template succeeded, want kms_conflicting_store failure\n%s", out)
+		}
+		if got := parseValidationErrorKind(out); got != "kms_conflicting_store" {
+			t.Fatalf("validation kind = %q, want kms_conflicting_store\n%s", got, out)
+		}
+	})
+}
+
+// The dev store holds a well-known root token, so it must only admit the
+// broker over the network (audit C3) — otherwise any pod that reaches
+// c8s-openbao:8200 bypasses the attestation gate.
+func TestChartKMSStoreNetworkPolicy(t *testing.T) {
+	out, err := helmTemplate(t, kmsArgs()...)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	var np networkingv1.NetworkPolicy
+	if !findDoc(t, out, "NetworkPolicy", "c8s-openbao", &np) {
+		t.Fatalf("dev store rendered no NetworkPolicy\n%s", out)
+	}
+	if np.Spec.PodSelector.MatchLabels["app.kubernetes.io/name"] != "openbao" {
+		t.Errorf("policy must select the store pods, got %v", np.Spec.PodSelector.MatchLabels)
+	}
+	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress {
+		t.Errorf("policy must be ingress-only, got %v", np.Spec.PolicyTypes)
+	}
+	if len(np.Spec.Ingress) != 1 || len(np.Spec.Ingress[0].From) != 1 {
+		t.Fatalf("expected exactly one ingress source, got %+v", np.Spec.Ingress)
+	}
+	from := np.Spec.Ingress[0].From[0]
+	if from.PodSelector == nil || from.PodSelector.MatchLabels["app.kubernetes.io/name"] != "secret-broker" {
+		t.Errorf("ingress must be from broker pods only, got %+v", from)
+	}
+	if from.NamespaceSelector != nil {
+		t.Errorf("ingress must not widen to a namespace selector, got %+v", from.NamespaceSelector)
+	}
+}
+
+// TestChartRejectsLUKSWithoutTEEShape: the injected c8s-luks-open container is
+// privileged; without per-pod kata CVMs or a node-as-CVM shape that privilege
+// would land on the real host, so the chart must refuse to arm the webhook.
+func TestChartRejectsLUKSWithoutTEEShape(t *testing.T) {
+	// baremetal (neither kata nor cvmMode=node) with luks armed → rejected.
+	// nri stays enabled (else require_host_image_policy fires first) with
+	// deriveComponents=true (else the digest guard fires first).
+	out, err := helmTemplate(t, secretBrokerArgs(
+		"--set", "luks.enabled=true",
+		"--set-string", "attestationApi.cvmMode=baremetal",
+		"--set", "nriImagePolicy.deriveComponents=true",
+	)...)
+	if err == nil {
+		t.Fatalf("helm template succeeded, want luks_plain_baremetal failure\n%s", out)
+	}
+	if got := parseValidationErrorKind(out); got != "luks_plain_baremetal" {
+		t.Fatalf("validation kind = %q, want luks_plain_baremetal\n%s", got, out)
+	}
+}
+
+// TestChartAllowsLUKSOnBakedNode: a node-as-CVM shape with
+// attestationApi.enabled=false (the baked-node image runs host services) is
+// still confidential, so the guard must NOT reject luks there — it keys on
+// cvmMode, not attestationApi.enabled.
+func TestChartAllowsLUKSOnBakedNode(t *testing.T) {
+	_, err := helmTemplate(t, secretBrokerArgs(
+		"--set", "luks.enabled=true",
+		"--set-string", "attestationApi.cvmMode=node",
+		"--set", "attestationApi.enabled=false",
+		"--set", "nriImagePolicy.enabled=false",
+	)...)
+	if err != nil {
+		t.Fatalf("baked-node LUKS shape (cvmMode=node, attestationApi.enabled=false) must render, got: %v", err)
+	}
 }
 
 // parseValidationErrorKind extracts kind=<id> from helm's stderr when the

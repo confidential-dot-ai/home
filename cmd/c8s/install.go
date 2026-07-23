@@ -48,14 +48,16 @@ var (
 	installGetCertRunAsGroup    int64
 	installGetCertRunAsNonRoot  bool
 
-	installKataDebug        bool
-	installCvmMode          string
-	installHardwarePlatform string
-	installSingleNode       bool
-	installImagePullSecret  string
-	installImageTag         string
-	installOperatorKeys     string
-	installForce            bool
+	installKataDebug             bool
+	installKMS                   bool
+	installCvmMode               string
+	installHardwarePlatform      string
+	installSingleNode            bool
+	installNodeBakedHostServices bool
+	installImagePullSecret       string
+	installImageTag              string
+	installOperatorKeys          string
+	installForce                 bool
 
 	installUpstream     string
 	installWorkloadRefs []string
@@ -93,6 +95,9 @@ type c8sComponent struct {
 	valuePrefix string // values path, e.g. "cds.image" (renders {repository}@{digest})
 	repository  string // values.yaml default repository resolved against
 	enabledPath string // values path guarding the render, e.g. "attestationApi.enabled" ("" = always rendered)
+	// externalImage: built outside c8s, so --image-tag rewriting and digest
+	// resolution both skip it (e.g. ghcr.io/openbao/openbao).
+	externalImage bool
 }
 
 // chartComponents reads the component set from the chart at chartPath via
@@ -133,7 +138,13 @@ func chartComponents(ctx context.Context, chartPath string) ([]c8sComponent, err
 		}
 		// enabledPath is optional; absent/empty means the component always renders.
 		enabledPath, _ := m["enabledPath"].(string)
-		comps = append(comps, c8sComponent{valuePrefix: valuePath, repository: repo, enabledPath: enabledPath})
+		external, _ := m["externalImage"].(bool)
+		comps = append(comps, c8sComponent{
+			valuePrefix:   valuePath,
+			repository:    repo,
+			enabledPath:   enabledPath,
+			externalImage: external,
+		})
 	}
 	return comps, nil
 }
@@ -1141,11 +1152,15 @@ func appendCvmModeInstallArgs(helmArgs []string, cvmMode, hardwarePlatform strin
 			"--set-string", "tlsLb.attest.generation=",
 		)
 	}
-	// node: the node image bakes host attestation-api and nri-image-policy;
-	// re-rendering them duplicates the baked pair and the baked fail-closed NRI
-	// floor denies the chart copies' own images. ratlsMesh stays: it is not
-	// baked (unlike kata-guest-base).
-	if cvmMode == "node" {
+	// node-CVM has two shapes. Default (generic CVM node — Azure CVM,
+	// self-managed bare-metal SNP/TDX, GKE CVM, the KMS demo): nothing is baked,
+	// so the chart deploys the host attestation-api DaemonSet + nri-image-policy
+	// plugin (install-flows.md "base mode"). --node-baked-host-services is the
+	// other shape: a pre-baked measured node OS image already runs both as host
+	// services, so re-rendering them duplicates the pair and the baked
+	// fail-closed NRI floor denies the chart copies' own images — skip them.
+	// ratlsMesh is never baked (unlike kata-guest-base), so it always renders.
+	if cvmMode == "node" && installNodeBakedHostServices {
 		helmArgs = append(helmArgs,
 			"--set", "attestationApi.enabled=false",
 			"--set", "nriImagePolicy.enabled=false",
@@ -1249,6 +1264,20 @@ func appendKataInstallArgs(helmArgs []string, cvmMode string, debug bool) []stri
 		helmArgs = append(helmArgs, "--set", "kata.guestImage.debug=true")
 	}
 	return helmArgs
+}
+
+// appendKMSInstallArgs translates --kms into helm --set values: the in-chart
+// dev-mode OpenBao plus the secret-broker that fronts it (kms.enabled without
+// the broker fails the render — the store is only reachable through the
+// broker). Dev/demo only; see the kms block in values.yaml.
+func appendKMSInstallArgs(helmArgs []string, kms bool) []string {
+	if !kms {
+		return helmArgs
+	}
+	return append(helmArgs,
+		"--set", "kms.enabled=true",
+		"--set", "secretBroker.enabled=true",
+	)
 }
 
 // preflightImagePullSecret reads the Secret --image-pull-secret names (absent
@@ -1800,6 +1829,10 @@ func overlaySetArgs(tree map[string]any, setArgs []string) error {
 // assembly is testable without a registry.
 func buildDigestArgs(helmArgs []string, tag string, components []c8sComponent, resolve func(ref string) (string, error), enabled func(valuePath string) (bool, error)) ([]string, error) {
 	for _, c := range components {
+		// Images built outside c8s are not published at the c8s CI tag.
+		if c.externalImage {
+			continue
+		}
 		// Skip components the effective config disables: they never render, so
 		// resolving their tag is pointless and aborts a valid install if that
 		// baked-only image (e.g. attestationApi under --cvm-mode=node) is
@@ -1848,9 +1881,11 @@ func init() {
 	installCmd.Flags().BoolVar(&installSingleNode, "single-node", false, "single-node / single-CVM cluster: clear the dedicated-CDS-node selector and taint toleration so every node is CDS-eligible (no role=cds label or dedicated node needed). Sets cds.node.selector={} and cds.node.tolerations=[]")
 	installCmd.Flags().StringSliceVar(&installWorkloadRefs, flagWorkloadRef, nil, "existing workload to adopt as a c8s confidential workload, as <cw-id>=<namespace>/<kind>/<name>[:<port>]; repeatable. Kind is any resource exposing a pod template at spec.template (deployment, statefulset, daemonset, or an operator CRD such as <kind>.<group>). The optional :<port> is the tls-lb upstream port, needed on the ref --upstream selects")
 	installCmd.Flags().StringVar(&installUpstream, flagUpstream, "", "confidential.ai/cw id of the adopted --workload-ref workload tls-lb routes its catch-all to; derives the mesh-wrapped upstream c8s-<id>.<ns>.svc.cluster.local:<port> from that ref's :<port>. Without this or a verified-https tlsLb.upstream, tls-lb renders no catch-all route until one is attached")
-	installCmd.Flags().StringVar(&installCvmMode, flagCvmMode, "", "CVM deployment shape (REQUIRED; orthogonal to --hardware-platform): pod (per-pod confidential VMs via the Kata runtime — every workload pod is a kata CVM, host-side attestation-api/nri/ratls-mesh served by the in-guest counterparts), node (generalized node-as-CVM: our own TDX/SNP nodes are themselves confidential VMs, pods run as ordinary processes, attestation-api + nri baked into the node image), gke (GKE managed confidential VMs), or aks (vTPM /dev/tpm0)")
+	installCmd.Flags().StringVar(&installCvmMode, flagCvmMode, "", "CVM deployment shape (REQUIRED; orthogonal to --hardware-platform): pod (per-pod confidential VMs via the Kata runtime — every workload pod is a kata CVM, host-side attestation-api/nri/ratls-mesh served by the in-guest counterparts), node (generalized node-as-CVM: the TDX/SNP nodes are themselves confidential VMs, pods run as ordinary processes; the chart deploys the host attestation-api + nri-image-policy unless --node-baked-host-services says the node image bakes them), gke (GKE managed confidential VMs), or aks (vTPM /dev/tpm0)")
 	installCmd.Flags().StringVar(&installHardwarePlatform, flagHardwarePlatform, "sev-snp", "CPU-level TEE hardware (orthogonal to --cvm-mode): sev-snp (default, /dev/sev-guest) or tdx (Intel TDX, /dev/tdx-guest). Under --cvm-mode=aks the CPU TEE rides the Azure vTPM: sev-snp selects az-snp and tdx selects az-tdx (no guest device needed — the report comes from /dev/tpm0)")
 	installCmd.Flags().BoolVar(&installKataDebug, "debug", false, "use the kata-guest-base DEBUG guest variant (<tag>-debug): kubectl logs/exec work on kata pods, but container I/O becomes readable by the untrusted host and the launch measurement differs from the locked image. Requires --cvm-mode=pod; development only")
+	installCmd.Flags().BoolVar(&installKMS, "kms", false, "deploy an in-chart dev-mode OpenBao and the secret-broker fronting it (sets kms.enabled and secretBroker.enabled). In-memory store, root token in a plain Secret — dev/demo only; production points secretBroker.openbao.address at an external store instead")
+	installCmd.Flags().BoolVar(&installNodeBakedHostServices, "node-baked-host-services", false, "(--cvm-mode=node only) the node OS image bakes the host attestation-api and nri-image-policy as host services, so skip the chart's DaemonSet/plugin copies to avoid duplicating them. Off by default: on a generic CVM node (bare-metal SNP/TDX, the KMS demo) nothing is baked and the chart must deploy them (install-flows.md base mode)")
 	installCmd.Flags().BoolVar(&installResolveDigests, "resolve-digests", true, "resolve each c8s component image tag to its registry digest (via crane), pin it, and add the resolved images to the NRI allowlist (enables deriveComponents). On by default; pass --resolve-digests=false when supplying digests via -f")
 	installCmd.Flags().BoolVar(&installAttestEnabled, "attest", true, "deploy the tls-lb attestation sidecar serving /.well-known/c8s/ (browser/CLI verification via c8s-verify). On by default; pass --attest=false to omit it")
 	installCmd.Flags().StringSliceVar(&installMeasurements, "measurements", nil, "expected hex launch measurement(s) of this cluster's CVM (repeatable/comma-separated), from the node image's manifest.json. Pins the internal mesh (cds.measurements + ratlsMesh.measurements) on this install; empty = no pinning (UNSAFE). Not valid with --cvm-mode=pod")

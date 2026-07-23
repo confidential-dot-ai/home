@@ -72,6 +72,14 @@ spec:
             {{- if and .Values.nriImagePolicy.enabled (not .Values.kata.enabled) }}
             - --workload-claims-host-dir={{ .Values.nriImagePolicy.hostPaths.runtimeDir }}
             {{- end }}
+            {{- if .Values.secretBroker.enabled }}
+            - --secret-agent-image={{ include "secret-broker.agentImage" . }}
+            - --secret-agent-command={{ .Values.secretAgent.command }}
+            - --secret-broker-url=https://{{ include "secret-broker.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.secretBroker.port }}
+            {{- if .Values.luks.enabled }}
+            - --luks-open-image={{ include "c8s.luksOpenImage" . }}
+            {{- end }}
+            {{- end }}
             {{- range .Values.operator.extraArgs }}
             - {{ . | quote }}
             {{- end }}

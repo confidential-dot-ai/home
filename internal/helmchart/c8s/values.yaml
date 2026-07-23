@@ -1,12 +1,17 @@
 ## The c8s component image set: the single source the chart and `c8s install`
 ## both enumerate from, so adding a component is one edit here.
-##   - valuePath:   dotted path to the component's image object (repository/
-##                  tag/digest live there).
-##   - enabledPath: dotted path to its deploy toggle ("" = always deployed); a
-##                  disabled component is neither derived into the NRI allowlist
-##                  nor coverage-checked.
-##   - cdsExempt:   cds is always seeded via its self-entry (independent of
-##                  deriveComponents), so the fail-closed coverage guard skips it.
+##   - valuePath:     dotted path to the component's image object (repository/
+##                    tag/digest live there).
+##   - enabledPath:   dotted path to its deploy toggle ("" = always deployed); a
+##                    disabled component is neither derived into the NRI allowlist
+##                    nor coverage-checked.
+##   - cdsExempt:     cds is always seeded via its self-entry (independent of
+##                    deriveComponents), so the fail-closed coverage guard skips it.
+##   - externalImage: true for images built outside the c8s repo (e.g.
+##                    ghcr.io/openbao/openbao — its own version stream). `c8s
+##                    install` does not force --image-tag over them and does not
+##                    resolve their digest from the c8s CI tag. They still count
+##                    for NRI allowlist derivation.
 ## Consumed by the c8s.components helper (NRI allowlist derivation + render
 ## guard) and by `c8s install` (digest resolution, via `helm show values`).
 c8sComponents:
@@ -25,6 +30,10 @@ c8sComponents:
   - valuePath: nriImagePolicy.image
     enabledPath: nriImagePolicy.enabled
     cdsExempt: false
+  - valuePath: secretAgent.image
+    enabledPath: secretBroker.enabled
+    cdsExempt: false
+    externalImage: true
 
 ## Operator container image. The same image runs every c8s mode that
 ## doesn't need extra OS bins: controller manager and injected get-cert.
@@ -1197,6 +1206,119 @@ tlsLb:
   tlsMountPath: "/tls"
 
 ## Common pod-level security knobs.
+## secret-broker: the attestation-gated OpenBao/Vault proxy (whitepaper §5.6.4).
+## It fronts a backing OpenBao/Vault, releasing KV secrets to attested workloads
+## whose CDS-issued identity/measurement matches releasePolicy. Workloads opt in
+## per-pod with confidential.ai/secrets-inject (+ confidential.ai/secret-<name>),
+## which makes the operator inject the secretAgent below. Disabled by default.
+secretBroker:
+  enabled: false
+  replicas: 1
+  port: 8443
+  imagePullSecrets: []
+  service:
+    type: ClusterIP
+  ## Callers are verified by X.509 chain to the CDS mesh CA — CDS is the trust
+  ## root, and it checked the caller's attestation at issuance. Identity is read
+  ## from the CDS-vouched leaf (SAN + config-claims); there is no per-caller
+  ## measurement pin at the broker.
+  certProvisioning:
+    ## Renewal interval for the broker's own get-cert mesh-identity sidecar.
+    renewInterval: "1h"
+  ## Deny-by-default release policy, mounted as policy.json. See the secret-broker
+  ## docs (internal/cmds/secretbroker/README.md) for the rule schema. allow
+  ## entries may carry a field scope (secret/data/api/db#password) — the broker
+  ## then releases only that field, not the whole KV item.
+  releasePolicy:
+    rules: []
+  openbao:
+    ## Base URL of the backing OpenBao/Vault, e.g.
+    ## https://c8s-openbao.c8s-system.svc:8200 (required when enabled).
+    address: ""
+    ## Require the store to present a valid TEE attestation (RA-TLS). Set false
+    ## for an external/managed store, where the broker becomes the trust edge.
+    attested: true
+    measurements: []
+    ## How the broker authenticates to OpenBao: "token" or "approle".
+    authMethod: token
+    roleId: ""
+    ## A pre-existing Secret holding the broker's OpenBao credential. Mounted as a
+    ## file (kept out of argv). For "token" the key holds the token; for "approle"
+    ## it holds the secret_id. Empty leaves the broker unauthenticated (configure
+    ## before use, or front an in-TCB OpenBao that trusts the broker's mesh cert).
+    credentialSecret:
+      name: ""
+      key: token
+  nodeSelector: {}
+  tolerations: []
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+
+## The OpenBao/Vault Agent the webhook injects into secrets-enabled pods. It
+## auto-auths to the broker with the pod's mesh cert and templates secrets into
+## an in-memory file the app reads unchanged.
+secretAgent:
+  image:
+    repository: ghcr.io/openbao/openbao
+    ## openbao 2.5.5. Bump: crane digest ghcr.io/openbao/openbao:<version>.
+    digest: "sha256:6150c4a6b62067db6141c8da7a6a6b5763f4f47c315343d0c848b40fecdfd452"
+    tag: ""
+    pullPolicy: IfNotPresent
+  ## Agent binary in the image: "bao" for OpenBao, "vault" for HashiCorp Vault.
+  command: bao
+
+## Dev-mode KMS: an in-chart OpenBao dev server the secret-broker fronts,
+## for demo/dev clusters (`c8s install --kms`). In-memory storage (data lost
+## on pod restart), no seal, root token in a plain k8s Secret — NEVER
+## production. Production runs an external (eventually attested) store and
+## leaves this disabled. Requires secretBroker.enabled; conflicts with an
+## explicit secretBroker.openbao.address (see validations.yaml).
+## Runs the secretAgent.image (same openbao image/digest), so the derived
+## NRI allowlist already covers it.
+kms:
+  enabled: false
+  port: 8200
+  ## Dev root token, rendered into the <release>-openbao-dev-cred Secret and
+  ## wired to the broker when secretBroker.openbao.credentialSecret is unset.
+  devRootToken: root
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+## LUKS integration — openbao-gated encrypted volumes. A workload pod attaches
+## an encrypted block device by annotation
+## (confidential.ai/luks-<name>: dev=/dev/vdX,mount=/data,secret=secret/data/…#field);
+## the webhook injects a privileged init container that reads the passphrase
+## the injected Vault Agent has already templated to /vault/secrets/<name>,
+## luksOpens the device, and mounts the decrypted filesystem for the app.
+##
+## Requires secretBroker.enabled=true (the passphrase must flow through the
+## broker) and secrets-inject=true on the pod.
+##
+## Image defaults to the c8s-operator image — it already ships `c8s luks-open`
+## as one of its subcommands. Override if you want to run luks-open from a
+## dedicated (e.g. cryptsetup-only) image.
+luks:
+  # Opt-in, like secretBroker/kms: enabling it arms the privileged c8s-luks-open
+  # webhook injection (see the luks_plain_baremetal validation).
+  enabled: false
+  image:
+    ## Empty repository = fall back to the operator image (.Values.image), which
+    ## exposes `c8s luks-open`. Set here for a dedicated image.
+    repository: ""
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+
 podSecurityContext:
   fsGroup: 65532
   runAsNonRoot: true

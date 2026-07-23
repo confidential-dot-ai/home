@@ -168,6 +168,9 @@ func buildValueArgs(ctx context.Context, cmd *cobra.Command, chartPath string, c
 	// (e.g. 0640 -> 640).
 	if !installResolveDigests {
 		for _, c := range components {
+			if c.externalImage {
+				continue
+			}
 			setArgs = append(setArgs, "--set-string", c.valuePrefix+".tag="+imageTag)
 		}
 	}
@@ -186,6 +189,7 @@ func buildValueArgs(ctx context.Context, cmd *cobra.Command, chartPath string, c
 	}
 	setArgs = appendKataInstallArgs(setArgs, installCvmMode, installKataDebug)
 	setArgs = appendSingleNodeInstallArgs(setArgs, installSingleNode)
+	setArgs = appendKMSInstallArgs(setArgs, installKMS)
 	// --upstream derives a c8s-<id>.<ns>.svc.cluster.local address; the chart
 	// recognizes that headless-Service shape as mesh-wrapped and admits plaintext
 	// http. Empty means "not plumbed" so an operator's -f (or the chart's
@@ -392,9 +396,11 @@ func init() {
 	renderValuesCmd.Flags().StringVar(&renderValuesDistro, "distro", "", "host Kubernetes distro (k8s | rke2) — install autodetects this from the cluster; render-values has no cluster, so pass it explicitly when you need it pinned. Unset leaves the chart default")
 	renderValuesCmd.Flags().BoolVar(&installSingleNode, "single-node", false, "single-node / single-CVM cluster: clear the dedicated-CDS-node selector and toleration (cds.node.selector={}, cds.node.tolerations=[])")
 	renderValuesCmd.Flags().StringVar(&installCvmMode, flagCvmMode, "", "CVM deployment shape (REQUIRED; orthogonal to --hardware-platform): pod (per-pod kata CVMs; disables host-side ratls-mesh/attestation-api/nri-image-policy) or node (generalized node-as-CVM native TEE device) or gke (GKE managed CVMs) or aks (vTPM /dev/tpm0)")
+	renderValuesCmd.Flags().BoolVar(&installNodeBakedHostServices, "node-baked-host-services", false, "(--cvm-mode=node only) the node OS image bakes the host attestation-api and nri-image-policy as host services, so skip the chart's DaemonSet/plugin copies to avoid duplicating them. Off by default: on a generic CVM node (bare-metal SNP/TDX, the KMS demo) nothing is baked and the chart must deploy them (install-flows.md base mode)")
 	renderValuesCmd.Flags().StringVar(&installHardwarePlatform, flagHardwarePlatform, "sev-snp", "CPU-level TEE hardware (orthogonal to --cvm-mode): sev-snp (default, /dev/sev-guest) or tdx (Intel TDX, /dev/tdx-guest). Ignored when --cvm-mode=aks")
 	renderValuesCmd.Flags().StringSliceVar(&installMeasurements, "measurements", nil, "expected hex launch measurement(s) of this cluster's CVM (repeatable/comma-separated), from the node image's manifest.json. Emits cds.measurements + ratlsMesh.measurements; empty = no pinning (UNSAFE). Not valid with --cvm-mode=pod")
 	renderValuesCmd.Flags().BoolVar(&installKataDebug, "debug", false, "use the kata-guest-base DEBUG image variant (requires --cvm-mode=pod)")
+	renderValuesCmd.Flags().BoolVar(&installKMS, "kms", false, "emit the dev-mode in-chart OpenBao values (kms.enabled=true, secretBroker.enabled=true). Dev/demo only: in-memory OpenBao (data lost on pod restart), no seal, static root token in a k8s Secret. Production runs an external (eventually attested) store and leaves this off")
 	renderValuesCmd.Flags().StringSliceVar(&installWorkloadRefs, flagWorkloadRef, nil, "adopted workload as <cw-id>=<namespace>/<kind>/<name>[:<port>]; repeatable. Used here only to derive --upstream's address (render-values patches nothing)")
 	renderValuesCmd.Flags().StringVar(&installUpstream, flagUpstream, "", "confidential.ai/cw id of the adopted --workload-ref workload tls-lb routes its catch-all to; derives tlsLb.upstream.address c8s-<id>.<ns>.svc.cluster.local:<port> from that ref's :<port>")
 	renderValuesCmd.Flags().BoolVar(&installResolveDigests, "resolve-digests", true, "resolve each component image tag to its registry digest (via crane), pin it, and enable the NRI allowlist derivation")

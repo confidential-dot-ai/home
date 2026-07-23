@@ -63,6 +63,19 @@
 {{- if and (not .Values.kata.enabled) (not .Values.nriImagePolicy.enabled) (ne (.Values.attestationApi.cvmMode | default "baremetal") "node") -}}
 {{- fail "VALIDATION_ERROR kind=require_host_image_policy: nriImagePolicy.enabled=false requires kata.enabled=true or attestationApi.cvmMode=node. On a non-kata, non-node cluster host nri-image-policy is the only image-admission enforcement; disabling it leaves confidential workloads with no attested allowlist gate. Under kata the in-guest policy-monitor replaces it and under cvmMode=node the node image bakes the plugin (`c8s install --cvm-mode=pod` and `--cvm-mode=node` set nriImagePolicy.enabled=false for you)." -}}
 {{- end -}}
+{{- /*
+  The LUKS-open init container the webhook injects is privileged and mounts
+  /dev host-wide (cryptsetup needs the raw block device). That is tolerable
+  only when "the host" it touches is itself inside a TEE boundary: per-pod
+  kata CVMs (kata.enabled) or node-as-CVM shapes (host attestation-api
+  enabled). With neither, a luks-<name> annotation converts secrets-inject
+  into a privileged container on the real host — refuse to arm the webhook.
+  The webhook is armed only when the operator renders --luks-open-image,
+  i.e. secretBroker.enabled && luks.enabled (see operator.yaml).
+*/ -}}
+{{- if and .Values.secretBroker.enabled .Values.luks.enabled (not .Values.kata.enabled) (ne (.Values.attestationApi.cvmMode | default "baremetal") "node") -}}
+{{- fail "VALIDATION_ERROR kind=luks_plain_baremetal: luks.enabled=true but the cluster is neither kata (kata.enabled) nor node-as-CVM (attestationApi.cvmMode=node). The injected c8s-luks-open init container is privileged and mounts /dev; without per-pod kata CVMs or a node-as-CVM shape that privilege lands on the real host, so a luks-<name> annotation would grant workloads host access. Set luks.enabled=false, or install a confidential shape (`c8s install --cvm-mode=pod` for kata, or `--cvm-mode=node`). Note: a baked-node shape sets attestationApi.enabled=false yet is still node-as-CVM — this guard keys on cvmMode, not attestationApi.enabled." -}}
+{{- end -}}
 {{- if and .Values.nriImagePolicy.enabled (not .Values.cds.image.digest) -}}
 {{- /* Structured marker (kind=...) lets tests discriminate this fail without substring-matching the prose. */ -}}
 {{- fail "VALIDATION_ERROR kind=cds_image_digest: nriImagePolicy.enabled requires cds.image.digest to be set. The CDS digest is pinned in every plugin's always_allow floor so image policy admits CDS on its own node. A floating tag cannot be admitted by digest. Pass --resolve-digests to c8s install, or set cds.image.digest via -f." -}}
@@ -116,4 +129,17 @@
 {{- else -}}
 {{- include "tls-lb.requireSecuredBackend" (dict "protocol" $tlsLB.upstream.protocol "tls" $tlsLB.upstream.tls "address" $tlsLB.upstream.address "label" "tlsLb.upstream" "kind" "tlslb_unsecured_upstream" "suggest" "To reach a confidential workload adopt it with --workload-ref <id>=<ns>/<kind>/<name>:<port> and pass --upstream <id> (the mesh wraps that plaintext hop in attested mTLS); ") -}}
 {{- end -}}
+{{- end -}}
+{{- /*
+  Dev-mode KMS (kms.enabled) sanity. The dev store exists solely for the
+  secret-broker to front — without the broker it is dead weight with a root
+  token lying around. And an explicit secretBroker.openbao.address alongside
+  it is a contradiction: an external store AND a managed dev store, with the
+  broker only speaking to the former. Fail both shapes at render.
+*/ -}}
+{{- if and .Values.kms.enabled (not .Values.secretBroker.enabled) -}}
+{{- fail "VALIDATION_ERROR kind=kms_without_broker: kms.enabled=true requires secretBroker.enabled=true — the dev store is only reachable through the attestation-gated broker. `c8s install --kms` sets both." -}}
+{{- end -}}
+{{- if and .Values.kms.enabled .Values.secretBroker.openbao.address -}}
+{{- fail "VALIDATION_ERROR kind=kms_conflicting_store: kms.enabled=true deploys an in-chart dev OpenBao and points the broker at it, but secretBroker.openbao.address is also set. Unset the address to use the dev store, or drop --kms / kms.enabled to use the external store." -}}
 {{- end -}}

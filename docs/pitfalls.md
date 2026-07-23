@@ -656,3 +656,43 @@ are not regular files), so the RO mount still prevents a socket-file swap
 without blocking the connect. The same-process broker unit tests cannot catch
 this (listener and client share a UID); `TestListenUnixSetsModeAndGroup` and
 `TestWorkloadClaims_InjectsBrokerSupplementalGroup` guard the two halves.
+
+## `c8s install --resolve-digests` walks `attestation-api` at the c8s CI tag, but its image is built out-of-repo
+
+`cmd/c8s/install.go` (`chartComponents`, `appendResolvedDigestArgs`),
+`internal/helmchart/c8s/values.yaml` (`c8sComponents`)
+
+`c8s install --resolve-digests` (default on) reads every `c8sComponents` entry
+from `values.yaml` and hits GHCR for `<repository>:<--image-tag>` on each one.
+`attestation-api` is in that list (deploy toggle
+`attestationApi.enabled`), but its image is built by
+`github.com/confidential-dot-ai/attestation-rs`, not by this repo's `docker.yml`
+matrix. So a branch install pinned to a c8s-side CI tag (e.g.
+`kms-test` from `.github/workflows/kms-test-images.yml`) fails on
+`crane digest ghcr.io/confidential-dot-ai/attestation-api:kms-test` — the tag
+does not exist on that side.
+
+Two paths out until `attestation-api` is built in-repo (or `c8sComponents`
+gains a per-entry `resolveFrom` for a separate tag stream):
+
+- `c8s install --resolve-digests=false --image-tag <c8s-side-tag>` — the CLI
+  sets `.tag=<c8s-side-tag>` on every entry (skipping any with
+  `externalImage: true`) and does not shell out to `crane`. The chart still
+  boots; the digest floor is not pinned, so this is dev/test only.
+- Or hand-retag `attestation-api:main → :<c8s-side-tag>` (`crane tag`),
+  which needs a PAT with write scope for that package.
+
+## The openbao image needs CHOWN+SETGID+SETUID — `drop: ALL` alone crashloops it
+
+`internal/helmchart/c8s/templates/kms-openbao.yaml` (container securityContext)
+
+The `ghcr.io/openbao/openbao` entrypoint starts as root, chowns its data
+dirs, and `su-exec`s down to the service user. Under `capabilities.drop: ALL`
+that dies instantly with `su-exec: setgroups: Operation not permitted` — the
+pod crashloops before a single log line from openbao itself. The dev-KMS
+template drops ALL and adds back exactly `CHOWN`, `SETGID`, `SETUID` (still a
+subset of the runtime default set; `allowPrivilegeEscalation: false` is fine —
+su-exec uses the caps, not setuid binaries). Anything running this image with
+a hardened securityContext needs the same floor. The injected secrets *agent*
+runs the same image but as `bao agent` under the pod's own user — it never
+su-execs, so this floor does not apply there.

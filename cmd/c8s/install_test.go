@@ -207,6 +207,22 @@ func TestAppendKataInstallArgsNonPodModeIsNoOp(t *testing.T) {
 	}
 }
 
+func TestAppendKMSInstallArgsDisabledIsNoOp(t *testing.T) {
+	got := appendKMSInstallArgs([]string{"upgrade"}, false)
+	assertArgsEqual(t, got, []string{"upgrade"})
+}
+
+func TestAppendKMSInstallArgsEnablesStoreAndBroker(t *testing.T) {
+	// --kms deploys the dev store AND the broker fronting it — the chart's
+	// kms_without_broker validation rejects the store alone.
+	got := appendKMSInstallArgs([]string{"upgrade"}, true)
+	assertArgsEqual(t, got, []string{
+		"upgrade",
+		"--set", "kms.enabled=true",
+		"--set", "secretBroker.enabled=true",
+	})
+}
+
 func TestAppendKataInstallArgsPodModeIsEnforcing(t *testing.T) {
 	// --cvm-mode=pod is enforcing: alongside the kata stack it must turn off the
 	// host-side components whose function runs inside the kata-guest-base
@@ -1030,14 +1046,9 @@ func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
 				"--set-string", "tlsLb.attest.generation=",
 			)
 		}
-		// node: the node image bakes attestation-api + nri-image-policy, so the
-		// chart copies are skipped (ratlsMesh is not baked, stays on).
-		if mode == "node" {
-			out = append(out,
-				"--set", "attestationApi.enabled=false",
-				"--set", "nriImagePolicy.enabled=false",
-			)
-		}
+		// By default the chart deploys the host attestation-api + nri-image-policy
+		// in every mode (generic CVM node / base mode). The node-baked shape that
+		// skips them is behind --node-baked-host-services, covered separately.
 		return out
 	}
 	cases := map[string]struct {
@@ -1063,6 +1074,31 @@ func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
 			}
 			assertArgsEqual(t, got, tc.want)
 		})
+	}
+}
+
+func TestAppendCvmModeInstallArgsNodeBakedHostServicesSkipsChartCopies(t *testing.T) {
+	// --node-baked-host-services (node only): the node image bakes the host
+	// attestation-api + nri-image-policy, so the chart copies are skipped
+	// (ratlsMesh is not baked, stays on).
+	defer func(prev bool) { installNodeBakedHostServices = prev }(installNodeBakedHostServices)
+	installNodeBakedHostServices = true
+
+	got, err := appendCvmModeInstallArgs([]string{"upgrade"}, "node", "sev-snp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !slices.Contains(got, "attestationApi.enabled=false") || !slices.Contains(got, "nriImagePolicy.enabled=false") {
+		t.Fatalf("--node-baked-host-services on node did not skip the chart copies; args = %v", got)
+	}
+
+	// The flag is node-only: it must NOT skip anything under aks/gke/pod.
+	gotAks, err := appendCvmModeInstallArgs([]string{"upgrade"}, "aks", "sev-snp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if slices.Contains(gotAks, "attestationApi.enabled=false") {
+		t.Fatalf("--node-baked-host-services leaked into aks mode; args = %v", gotAks)
 	}
 }
 
@@ -1396,6 +1432,7 @@ func TestChartComponentsFromValues(t *testing.T) {
 		"cds.image":            "ghcr.io/confidential-dot-ai/cds",
 		"ratlsMesh.image":      "ghcr.io/confidential-dot-ai/ratls-mesh",
 		"nriImagePolicy.image": "ghcr.io/confidential-dot-ai/nri-image-policy",
+		"secretAgent.image":    "ghcr.io/openbao/openbao",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("chart components = %v, want %v", got, want)
