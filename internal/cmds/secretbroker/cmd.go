@@ -56,7 +56,7 @@ func NewCmd() *cobra.Command {
 	// Caller (workload) verification. CDS is the trust root: callers are
 	// verified by X.509 chain to the CDS mesh CA, and identity is read from the
 	// CDS-issued leaf (SAN + config-claims).
-	flags.StringVar(&cfg.clientCA, "client-ca", "", "PEM CA bundle callers' certs must chain to (the CDS mesh CA) (required)")
+	flags.StringVar(&cfg.clientCA, "client-ca", "", "override the CA bundle callers' certs must chain to (default: ca.crt beside --tls-cert, the get-cert mesh CA)")
 	flags.StringVar(&cfg.attestationApiURL, "attestation-api-url", "", "attestation-api URL used to verify an attested OpenBao (--openbao-attested)")
 
 	// Release policy.
@@ -84,7 +84,6 @@ func NewCmd() *cobra.Command {
 
 	_ = cmd.MarkFlagRequired("tls-cert")
 	_ = cmd.MarkFlagRequired("tls-key")
-	_ = cmd.MarkFlagRequired("client-ca")
 	_ = cmd.MarkFlagRequired("policy")
 	_ = cmd.MarkFlagRequired("openbao-addr")
 

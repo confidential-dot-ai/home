@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 )
@@ -22,14 +23,20 @@ type peerVerifier struct{}
 // buildServerTLS constructs the broker's TLS config and the peerVerifier. The
 // server certificate is the injected get-cert sidecar's cert (the shared
 // c8s-certs tmpfs), so stock agents trust the broker via their configured CA
-// bundle. Callers are verified by X.509 chain to the CDS mesh CA (--client-ca).
+// bundle. Callers are verified by X.509 chain to the CDS mesh CA, which comes
+// from the same get-cert mount (ca.crt beside --tls-cert) unless --client-ca
+// overrides it.
 func buildServerTLS(cfg config) (*tls.Config, *peerVerifier, error) {
 	srvCert, err := tls.LoadX509KeyPair(cfg.tlsCert, cfg.tlsKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load server cert: %w", err)
 	}
 
-	pool, err := loadCAPool(cfg.clientCA)
+	caPath := cfg.clientCA
+	if caPath == "" {
+		caPath = filepath.Join(filepath.Dir(cfg.tlsCert), "ca.crt")
+	}
+	pool, err := loadCAPool(caPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -106,15 +113,15 @@ func workloadIDFromCert(cert *x509.Certificate) string {
 
 func loadCAPool(path string) (*x509.CertPool, error) {
 	if path == "" {
-		return nil, fmt.Errorf("--client-ca is required (the CDS mesh CA)")
+		return nil, fmt.Errorf("mesh CA path is empty")
 	}
 	pem, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read --client-ca: %w", err)
+		return nil, fmt.Errorf("read mesh CA %q: %w", path, err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("--client-ca: no certificates parsed")
+		return nil, fmt.Errorf("mesh CA %q: no certificates parsed", path)
 	}
 	return pool, nil
 }

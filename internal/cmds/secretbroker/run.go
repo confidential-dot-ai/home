@@ -93,9 +93,6 @@ func resolveCredentialFiles(cfg *config) error {
 }
 
 func validateConfig(cfg config) error {
-	if cfg.clientCA == "" {
-		return fmt.Errorf("--client-ca is required (the CDS mesh CA)")
-	}
 	if cfg.openbaoToken != "" && cfg.openbaoRoleID != "" {
 		return fmt.Errorf("--openbao-token and --openbao-approle-role-id are mutually exclusive")
 	}
