@@ -298,21 +298,17 @@ func obtainCert(ctx context.Context, cfg config, client attestclient.Client) err
 		return err
 	}
 
-	// When binding a workload claim, embed a nonce-free RA-TLS attestation
-	// extension over the same claims into the CSR. CDS copies it onto the leaf,
-	// so `c8s verify --workload-image` can check the leaf's config-claims
-	// against hardware evidence — without it the leaf is verifiable only by CA
-	// chain (docs/ratls.md).
-	var csrExts []pkix.Extension
-	if wc.claimsDER != nil {
-		ext, err := client.AttestationExtensionForClaims(ctx, cfg.AttestationApiURL, &privateKey.PublicKey, wc.claimsDER)
-		if err != nil {
-			return fmt.Errorf("build workload attestation extension: %w", err)
-		}
-		csrExts = append(csrExts, ext)
+	// Always embed a nonce-free RA-TLS .1.1 extension so a downstream ratls-mode
+	// verifier (secret-broker --peer-verify=ratls) can re-verify the leaf. When
+	// the pod binds a workload claim the extension covers the claims too
+	// (`c8s verify --workload-image`); with no claim it binds the bare key — the
+	// same nonce-free embed the mesh client uses (docs/ratls.md).
+	ext, err := client.AttestationExtensionForClaims(ctx, cfg.AttestationApiURL, &privateKey.PublicKey, wc.claimsDER)
+	if err != nil {
+		return fmt.Errorf("build RA-TLS attestation extension: %w", err)
 	}
 
-	csrPEM, err := createCSR(privateKey, cfg.SAN, csrExts...)
+	csrPEM, err := createCSR(privateKey, cfg.SAN, ext)
 	if err != nil {
 		return err
 	}
@@ -654,15 +650,9 @@ func writeOutputs(cfg config, keyPEM []byte, result attestclient.CertificateResu
 		slog.Warn("ephemeral key used but --key-out not set, private key will be lost")
 	}
 
-	if cfg.OutPath != "" {
-		if err := fileutil.WriteAtomic(cfg.OutPath, []byte(result.Certificate), 0644); err != nil {
-			return fmt.Errorf("failed to write cert to %s: %w", cfg.OutPath, err)
-		}
-		slog.Info("certificate written", "path", cfg.OutPath)
-	} else {
-		fmt.Print(result.Certificate)
-	}
-
+	// The CA bundle lands before the cert: the cert file is the readiness
+	// sentinel c8s-cert-wait probes, so consumers gated on it (the injected
+	// secrets agent) must find the CA already on disk.
 	if cfg.CAOutPath != "" {
 		caPEM, err := caBundleFromChain([]byte(result.Certificate))
 		if err != nil {
@@ -672,6 +662,15 @@ func writeOutputs(cfg config, keyPEM []byte, result attestclient.CertificateResu
 			return fmt.Errorf("failed to write mesh CA to %s: %w", cfg.CAOutPath, err)
 		}
 		slog.Info("mesh CA bundle written", "path", cfg.CAOutPath)
+	}
+
+	if cfg.OutPath != "" {
+		if err := fileutil.WriteAtomic(cfg.OutPath, []byte(result.Certificate), 0644); err != nil {
+			return fmt.Errorf("failed to write cert to %s: %w", cfg.OutPath, err)
+		}
+		slog.Info("certificate written", "path", cfg.OutPath)
+	} else {
+		fmt.Print(result.Certificate)
 	}
 
 	if cfg.DiscoveryOutPath != "" {

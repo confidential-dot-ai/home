@@ -1150,9 +1150,17 @@ tlsLb:
   # over-encryption handshake) and nginx reverse-proxies `/.well-known/c8s/` to
   # it on loopback. The static CDS/mesh-CA certs are still served by nginx via
   # `discovery`. The browser client is lunal-dev/c8s-verify-js (wire contract:
-  # c8s-verify-js/PROTOCOL.md). Defaults off; pin measurements before exposing.
+  # c8s-verify-js/PROTOCOL.md).
+  #
+  # On by default: the sidecar only publishes a signed quote of its own TEE, so
+  # exposing it does not weaken the server. Trust is established on the CLIENT,
+  # which must pin expected launch measurements (`c8s verify --measurements`,
+  # c8s-verify-js config) — an unpinned verifier accepting any TEE is a client
+  # misconfiguration, not a server exposure. `platform`/`generation` below default
+  # to AMD; `c8s install` overrides them from --hardware-platform (tdx blanks the
+  # AMD-only generation), so both TEEs advertise correctly out of the box.
   attest:
-    enabled: false
+    enabled: true
     # -- Loopback port the sidecar listens on; nginx proxies `/.well-known/c8s/`
     # to 127.0.0.1 on this port.
     port: 8800

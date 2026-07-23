@@ -993,6 +993,12 @@ func TestHostPortConflict(t *testing.T) {
 }
 
 func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
+	// The attestation sidecar is on by default; the arg-builder reads the
+	// package flag, which cobra would set. Mirror that default here.
+	prevAttest := installAttestEnabled
+	installAttestEnabled = true
+	t.Cleanup(func() { installAttestEnabled = prevAttest })
+
 	// Two orthogonal axes:
 	//  --cvm-mode: pod (kata) / node (node-as-CVM) / gke (managed) / aks (vTPM)
 	//  --hardware-platform: sev-snp (/dev/sev-guest) / tdx (/dev/tdx-guest)
@@ -1014,6 +1020,14 @@ func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
 			out = append(out,
 				"--set-string", "cds.ratlsPlatform=tdx",
 				"--set-string", "ratlsMesh.platform=tdx",
+			)
+		}
+		// TDX also overrides the tls-lb attestation sidecar's advertised
+		// platform (chart default snp/genoa) and blanks the AMD-only generation.
+		if platform == "tdx" {
+			out = append(out,
+				"--set-string", "tlsLb.attest.platform=tdx",
+				"--set-string", "tlsLb.attest.generation=",
 			)
 		}
 		// node: the node image bakes attestation-api + nri-image-policy, so the
@@ -1055,6 +1069,60 @@ func TestAppendCvmModeInstallArgsSetsAttestationApiValue(t *testing.T) {
 func TestAppendCvmModeInstallArgsRejectsUnknownMode(t *testing.T) {
 	if _, err := appendCvmModeInstallArgs([]string{"upgrade"}, "azure", "sev-snp"); err == nil {
 		t.Fatal("appendCvmModeInstallArgs accepted an unknown --cvm-mode, want error")
+	}
+}
+
+// --measurements fans each M into both mesh pin points, indexed, so the operator
+// pins the internal mesh on the install itself. A blank entry (e.g. from a
+// trailing comma) is dropped, not emitted as an empty index, and the emitted
+// indices are contiguous over the validated list.
+func TestAppendCvmModeInstallArgsMeasurements(t *testing.T) {
+	prev := installMeasurements
+	defer func() { installMeasurements = prev }()
+	m0, m1 := strings.Repeat("aa", 48), strings.Repeat("bb", 48)
+	installMeasurements = []string{m0, "", m1} // blank middle entry
+
+	got, err := appendCvmModeInstallArgs([]string{"upgrade"}, "node", "tdx")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{
+		"cds.measurements[0]=" + m0, "ratlsMesh.measurements[0]=" + m0,
+		"cds.measurements[1]=" + m1, "ratlsMesh.measurements[1]=" + m1,
+	} {
+		if !slices.Contains(got, want) {
+			t.Errorf("args missing %q; got %v", want, got)
+		}
+	}
+	// The blank must not produce an empty index-2 pin.
+	for _, bad := range []string{"cds.measurements[2]=", "ratlsMesh.measurements[2]="} {
+		if slices.Contains(got, bad) {
+			t.Errorf("blank entry leaked an empty pin %q; got %v", bad, got)
+		}
+	}
+}
+
+func TestAppendCvmModeInstallArgsRejectsBadMeasurement(t *testing.T) {
+	prev := installMeasurements
+	defer func() { installMeasurements = prev }()
+	installMeasurements = []string{"not-hex"}
+	if _, err := appendCvmModeInstallArgs([]string{"upgrade"}, "node", "tdx"); err == nil {
+		t.Fatal("appendCvmModeInstallArgs accepted a malformed measurement, want error")
+	}
+}
+
+// --measurements pins the node CVM's measurement, which is meaningless in pod
+// mode (per-pod kata guests are measured separately) — reject it.
+func TestAppendCvmModeInstallArgsRejectsMeasurementsInPodMode(t *testing.T) {
+	prev := installMeasurements
+	defer func() { installMeasurements = prev }()
+	installMeasurements = []string{strings.Repeat("aa", 48)}
+	if _, err := appendCvmModeInstallArgs([]string{"upgrade"}, "pod", "tdx"); err == nil {
+		t.Fatal("appendCvmModeInstallArgs accepted --measurements in pod mode, want error")
+	}
+	// Same value in node mode is fine.
+	if _, err := appendCvmModeInstallArgs([]string{"upgrade"}, "node", "tdx"); err != nil {
+		t.Fatalf("node mode should accept --measurements: %v", err)
 	}
 }
 

@@ -69,6 +69,28 @@ jobs:
       has_retag: ${{ steps.docker-matrix.outputs.has_retag }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # A component filter that names a directory which does not exist matches
+      # NOTHING, so paths-filter reports that component unchanged, the build is
+      # skipped, and retag-unchanged aliases :main onto the new sha anyway. The
+      # published tag then lies about its contents. That is not hypothetical:
+      # this filter pointed at internal/cmds/nriimagepolicy, which was correct
+      # when written, until the package dir was renamed to nri-image-policy and
+      # the filter did not move with it. For two months plugin-only commits
+      # never rebuilt the image and :main resolved to a stale binary. Nothing
+      # failed loudly; it surfaced downstream as a cluster whose NRI plugin
+      # would not start. A rename is the expected way to break these, so fail
+      # closed here rather than trusting the glob to stay true.
+      - name: paths-filter globs must reference real directories
+        run: |
+          set -euo pipefail
+          missing=0
+          for p in $(grep -oE '(cmd|internal/cmds)/[A-Za-z0-9_.-]+/\*\*' \
+                       .github/workflows/docker.yml | sed 's|/\*\*$||' | sort -u); do
+            if [ -d "$p" ]; then echo "ok      $p"; else echo "MISSING $p"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || {
+            echo "::error::docker.yml paths-filter references a directory that does not exist: the component would be classed unchanged and silently skip its image build"
+            exit 1; }
       # Skip on workflow_dispatch: a manual run has no before/after diff base for
       # paths-filter to compute against, and we fan out to every component anyway
       # (docker-build-matrix.sh treats workflow_dispatch like a tag push). With
@@ -107,7 +129,7 @@ jobs:
             ratls-mesh:
               - '{cmd/ratls-mesh/**,internal/cmds/ratlsmesh/**}'
             nri-image-policy:
-              - '{cmd/nri-image-policy/**,internal/cmds/nriimagepolicy/**}'
+              - '{cmd/nri-image-policy/**,internal/cmds/nri-image-policy/**}'
       - name: Build Docker matrix
         id: docker-matrix
         env:

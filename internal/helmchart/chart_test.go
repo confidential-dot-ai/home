@@ -1699,6 +1699,25 @@ func TestChartTLSLBServiceType(t *testing.T) {
 	}
 }
 
+// With no adopted workload the upstream address is empty; the sidecar must
+// render without any --upstream* flag (its echo backend takes over) instead
+// of a scheme-only "--upstream=http://" that crash-loops the container.
+func TestChartTLSLBAttestSidecarNoUpstream(t *testing.T) {
+	out, err := helmTemplate(t,
+		"--set", "tlsLb.attest.enabled=true",
+		"--set-string", "tlsLb.upstream.address=",
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	sidecar := renderedDeploymentContainer(t, out, "c8s-tls-lb", "cds-attest")
+	for _, arg := range sidecar.Args {
+		if strings.HasPrefix(arg, "--upstream") {
+			t.Fatalf("cds-attest must omit %q when no upstream address is set: %v", arg, sidecar.Args)
+		}
+	}
+}
+
 func TestChartRendersTLSLBAttestSidecar(t *testing.T) {
 	out, err := helmTemplate(t,
 		"--set", "tlsLb.attest.enabled=true",
@@ -1783,13 +1802,23 @@ func TestChartRendersTLSLBAttestSidecar(t *testing.T) {
 		}
 	}
 
-	// Default off: no sidecar, no well-known proxy.
-	offOut, err := helmTemplate(t)
+	// Default on: the sidecar and its well-known proxy render without any
+	// attest override.
+	defOut, err := helmTemplate(t)
 	if err != nil {
-		t.Fatalf("helm template (defaults): %v\n%s", err, offOut)
+		t.Fatalf("helm template (defaults): %v\n%s", err, defOut)
+	}
+	if !strings.Contains(defOut, "name: cds-attest") || !strings.Contains(defOut, "location /.well-known/c8s/ {") {
+		t.Fatal("cds-attest sidecar should render by default (tlsLb.attest.enabled defaults true)")
+	}
+
+	// Explicit opt-out: no sidecar, no well-known proxy.
+	offOut, err := helmTemplate(t, "--set", "tlsLb.attest.enabled=false")
+	if err != nil {
+		t.Fatalf("helm template (attest disabled): %v\n%s", err, offOut)
 	}
 	if strings.Contains(offOut, "name: cds-attest") || strings.Contains(offOut, "location /.well-known/c8s/ {") {
-		t.Fatal("cds-attest sidecar should not render when tlsLb.attest.enabled is false")
+		t.Fatal("cds-attest sidecar should not render when tlsLb.attest.enabled=false")
 	}
 }
 
@@ -4982,6 +5011,7 @@ func renderExampleTLSLBNginxConf() string {
 		// discovery defaults to enabled; scope this example to route rendering
 		// (discovery's own locations are covered by a dedicated test above).
 		"--set", "tlsLb.discovery.enabled=false",
+		"--set", "tlsLb.attest.enabled=false",
 		"--set-string", "tlsLb.upstream.address=vllm:8000",
 		"--set", "tlsLb.upstream.protocol=https",
 		"--set", "tlsLb.upstream.tls.verify=true",

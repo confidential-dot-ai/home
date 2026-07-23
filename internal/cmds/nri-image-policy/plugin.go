@@ -144,11 +144,11 @@ func (p *plugin) Configure(ctx context.Context, config, runtime, version string)
 
 // RemoveContainer evicts a stopped container from the workload-claims broker.
 // Only subscribed when the broker is enabled (see Configure).
-func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) ([]*api.ContainerUpdate, error) {
+func (p *plugin) RemoveContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
 	if p.broker != nil {
 		p.broker.remove(ctr.GetId())
 	}
-	return nil, nil
+	return nil
 }
 
 // recordForBroker resolves a container's admitted image digest and records it

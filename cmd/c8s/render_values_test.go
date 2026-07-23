@@ -42,6 +42,38 @@ func TestValueArgsToTreeNestsDottedKeys(t *testing.T) {
 	}
 }
 
+func TestValueArgsToTreeBuildsListFromIndexedKeys(t *testing.T) {
+	got, err := valueArgsToTree([]string{
+		"--set-string", "cds.measurements[0]=aa",
+		"--set-string", "cds.measurements[1]=bb",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := map[string]any{
+		"cds": map[string]any{"measurements": []any{"aa", "bb"}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v (indexed keys must nest as a list, not a scalar key)", got, want)
+	}
+}
+
+// A '[' that is not a clean trailing key[n] is outside the grammar and must
+// error at runtime, not silently become a literal map key — so a mis-emitting
+// builder fails loudly rather than writing a bogus key.
+func TestValueArgsToTreeRejectsMalformedIndex(t *testing.T) {
+	for _, kv := range []string{
+		"a.b[0].c=x",  // index mid-path
+		"a.b[=x",      // unterminated
+		"a.b[x]=x",    // non-numeric
+		"a.b[0][1]=x", // nested index
+	} {
+		if _, err := valueArgsToTree([]string{"--set-string", kv}); err == nil {
+			t.Errorf("valueArgsToTree(%q) = nil error, want a grammar error", kv)
+		}
+	}
+}
+
 func TestValueArgsToTreeCoercesSetTypes(t *testing.T) {
 	// --set typing mirrors helm strvals: null/bool/int are coerced, the rest
 	// stay strings. --set-string never coerces.
@@ -299,11 +331,11 @@ func TestWriteComputedValuesProducesReadableFile(t *testing.T) {
 
 // coerceSafeValueArg is the value-arg grammar valueArgsToTree / coerce actually
 // handle: a single `dotted.path=value` token whose path segments are
-// [A-Za-z0-9.] only — no list indexing (`foo[0]`), no escaped dots (`a\.b`), no
-// comma-joined multi-values (`a=1,b=2`). valueArgsToTree's doc explicitly opts
-// out of helm's full --set grammar on the promise that buildValueArgs never
-// emits those shapes.
-var coerceSafeValueArg = regexp.MustCompile(`^[A-Za-z0-9.]+=[^,]*$`)
+// [A-Za-z0-9.], optionally with a single trailing list index (`foo.bar[0]`).
+// Still excluded: escaped dots (`a\.b`), comma-joined multi-values (`a=1,b=2`),
+// nested indices. valueArgsToTree's doc opts out of the rest of helm's --set
+// grammar on the promise that buildValueArgs never emits those shapes.
+var coerceSafeValueArg = regexp.MustCompile(`^[A-Za-z0-9.]+(\[[0-9]+\])?=[^,]*$`)
 
 // TestBuildValueArgsStaysWithinParserGrammar is the lockstep guard between the
 // emitter (buildValueArgs / buildDigestArgs) and the parser (valueArgsToTree /
@@ -335,19 +367,22 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 	prev := struct {
 		crds, singleNode, debug, resolveDigests bool
 		secret, cvm, upstream, operatorKeys     string
-		workloadRefs                            []string
-	}{installCRDs, installSingleNode, installKataDebug, installResolveDigests, installImagePullSecret, installCvmMode, installUpstream, installOperatorKeys, slices.Clone(installWorkloadRefs)}
+		workloadRefs, measurements              []string
+	}{installCRDs, installSingleNode, installKataDebug, installResolveDigests, installImagePullSecret, installCvmMode, installUpstream, installOperatorKeys, slices.Clone(installWorkloadRefs), slices.Clone(installMeasurements)}
 	defer func() {
 		installCRDs, installSingleNode, installKataDebug, installResolveDigests = prev.crds, prev.singleNode, prev.debug, prev.resolveDigests
 		installImagePullSecret, installCvmMode = prev.secret, prev.cvm
 		installUpstream = prev.upstream
 		installOperatorKeys = prev.operatorKeys
 		installWorkloadRefs = prev.workloadRefs
+		installMeasurements = prev.measurements
 	}()
 	// Drive every value-producing toggle. --install-crds=false exercises the
 	// non-default CRD path; --resolve-digests=false keeps crane off PATH (the
 	// digest-arg shape is covered separately via buildDigestArgs below).
-	// --cvm-mode=pod --debug exercises the kata stack args.
+	// --cvm-mode=pod --debug exercises the kata stack args. --measurements
+	// (node mode — it is rejected in pod mode) exercises the one indexed key[i]=
+	// form the builder emits; asserted in a second pass below.
 	installCRDs, installSingleNode, installKataDebug, installResolveDigests = false, true, true, false
 	installImagePullSecret, installCvmMode = "regcred", "pod"
 	installWorkloadRefs = []string{"infer=workloads/deployment/vllm:8000"}
@@ -392,6 +427,24 @@ func TestBuildValueArgsStaysWithinParserGrammar(t *testing.T) {
 	keys, _ := tree["cds"].(map[string]any)["operatorKeys"].(string)
 	if keys == installOperatorKeys || !strings.Contains(keys, "BEGIN PUBLIC KEY") {
 		t.Fatalf("cds.operatorKeys = %q, want the PEM content of %s", keys, installOperatorKeys)
+	}
+
+	// Second pass: node mode with --measurements exercises the indexed key[i]=
+	// form (rejected in pod mode above). Its args must also stay within the
+	// grammar and round-trip to a list.
+	installCvmMode = "node"
+	installMeasurements = []string{strings.Repeat("ab", 48)}
+	mArgs, err := appendCvmModeInstallArgs(nil, installCvmMode, installHardwarePlatform)
+	if err != nil {
+		t.Fatalf("appendCvmModeInstallArgs (node + measurements): %v", err)
+	}
+	for i := 0; i < len(mArgs); i += 2 {
+		if kv := mArgs[i+1]; !coerceSafeValueArg.MatchString(kv) {
+			t.Errorf("measurement arg %q is outside the grammar", kv)
+		}
+	}
+	if _, err := valueArgsToTree(mArgs); err != nil {
+		t.Fatalf("measurement args failed to parse: %v", err)
 	}
 }
 
