@@ -5293,34 +5293,6 @@ func TestChartKataGuestImageDebugSelectsDebugTag(t *testing.T) {
 	}
 }
 
-// GPU in-guest registry auth: "" inherits the non-GPU setting (the GPU guest
-// bakes the same auth.json), "none" forces anonymous, anything else wins
-// verbatim — the contract documented on kata.gpu.guestImage.registryAuth.
-func TestChartKataGpuRegistryAuthInheritance(t *testing.T) {
-	gpuAuth := func(t *testing.T, args ...string) string {
-		t.Helper()
-		out, err := helmTemplateKata(t, args...)
-		if err != nil {
-			t.Fatalf("helm template: %v\n%s", err, out)
-		}
-		puller := renderedDaemonSet(t, out, "c8s-kata-deploy-image-puller-nvidia")
-		pc, ok := findContainer(puller.Spec.Template.Spec.Containers, "reconcile")
-		if !ok {
-			t.Fatalf("GPU puller missing reconcile container")
-		}
-		return envValue(pc.Env, "REGISTRY_AUTH")
-	}
-	if got := gpuAuth(t); got != "file:///run/image-security/auth.json" {
-		t.Errorf("default GPU REGISTRY_AUTH = %q, want the inherited non-GPU baked-auth path", got)
-	}
-	if got := gpuAuth(t, "--set-string", "kata.gpu.guestImage.registryAuth=none"); got != "" {
-		t.Errorf(`registryAuth=none GPU REGISTRY_AUTH = %q, want "" (anonymous)`, got)
-	}
-	if got := gpuAuth(t, "--set-string", "kata.gpu.guestImage.registryAuth=kbs:///default/creds/gpu"); got != "kbs:///default/creds/gpu" {
-		t.Errorf("explicit registryAuth GPU REGISTRY_AUTH = %q, want the verbatim override", got)
-	}
-}
-
 // kata.guestImage.debug must vary the GPU guest tag in lockstep with the
 // non-GPU one: CI publishes `<tag>-nvidia` and `<tag>-nvidia-debug` together
 // (kata-guest-base.yml build job, build.sh Step 6) — see

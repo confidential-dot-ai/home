@@ -40,8 +40,6 @@
 #                   Default false = puller strips both so a leaked hand-patch
 #                   or a debug-variant install-then-normal-reinstall doesn't
 #                   silently ship a guest that streams its journal to the host.
-#   REGISTRY_AUTH   in-guest workload registry auth source (file://
-#                   baked path or kbs:// URI); empty = anonymous    [optional]
 #   ORAS_INSECURE   "true" to pull over plain HTTP (local mirror)   [optional]
 #
 # Usage: pull-and-configure.sh [check]
@@ -60,7 +58,6 @@ case "${SHIM_NAME}" in
     *) echo "ERROR: SHIM_NAME must be qemu-snp, qemu-tdx, qemu-nvidia-gpu-snp, or qemu-nvidia-gpu-tdx (got '${SHIM_NAME}')" >&2; exit 1 ;;
 esac
 KATA_DEBUG="${KATA_DEBUG:-false}"
-REGISTRY_AUTH="${REGISTRY_AUTH:-}"
 GPU_PCIE_ROOT_PORT="${GPU_PCIE_ROOT_PORT:-}"
 GPU_DEFAULT_MEMORY="${GPU_DEFAULT_MEMORY:-}"
 # pcie_root_port is load-bearing for the GPU shim: VFIO cold-plug attaches
@@ -114,7 +111,7 @@ dropin="${dropin_dir}/50-c8s.toml"
 # clusters do NOT pick up new kata-guest-base artifacts".
 # gen= versions the generator itself: bump it whenever the emitted TOML
 # changes shape, so nodes with unchanged inputs still rewrite.
-config_fingerprint="gen=1|registry=${REGISTRY}|tag=${TAG}|dir=${HOST_IMG_DIR}|shim=${SHIM_NAME}|debug=${KATA_DEBUG}|auth=${REGISTRY_AUTH}|pcie=${GPU_PCIE_ROOT_PORT}|mem=${GPU_DEFAULT_MEMORY}|base_params=${base_kernel_params}"
+config_fingerprint="gen=2|registry=${REGISTRY}|tag=${TAG}|dir=${HOST_IMG_DIR}|shim=${SHIM_NAME}|debug=${KATA_DEBUG}|pcie=${GPU_PCIE_ROOT_PORT}|mem=${GPU_DEFAULT_MEMORY}|base_params=${base_kernel_params}"
 marker="# c8s-config: ${config_fingerprint}"
 
 out_dir="${HOST_IMG_DIR}/base"
@@ -223,10 +220,8 @@ echo "  Writing ${dropin}"
 #                             folds the resulting hash into the launch
 #                             measurement (SNP kernel-hashes / TDX RTMR[1])
 #     shared_fs = "none"   -> no virtio-fs into the confidential guest
-#     kernel_params        -> appended to kata-runtime's built-in defaults;
-#                             carries agent.image_registry_auth pointing the
-#                             in-guest CDH at its guest-pull auth source
-#                             (baked auth.json at /run/image-security/auth.json)
+#     kernel_params        -> the stock shim toml's params, preserved verbatim
+#                             (re-emitted so a drop-in rewrite can't clobber them)
 #     default_vcpus/maxvcpus = 1 -> SNP-ONLY (both SNP shims, CPU and GPU).
 #                             Pins the boot-time VMSA count so the launch
 #                             digest is stable across pods. No pin on the TDX
@@ -276,15 +271,12 @@ tmp="${dropin}.c8s-tmp"
     # stock toml's load-bearing params (qemu-tdx: cgroup_no_v1=all
     # systemd.unified_cgroup_hierarchy=1; qemu-nvidia-gpu-*: cgroup_no_v1=all
     # pci=realloc pci=nocrs pci=assign-busses nvrc.smi.srs=1 — dropping
-    # cgroup_no_v1 kills the NVRC-exec'd kata-agent at startup). Read the
-    # base value and append ours to it. A live session once saw drop-in
-    # kernel_params edits not reach the qemu -append line — unexplained; see
-    # docs/pitfalls.md "Guest kernel params" — but the config semantics make
-    # this preservation load-bearing whenever the drop-in IS honored, so it
-    # stays.
-    if [ -n "${REGISTRY_AUTH}" ]; then
-        printf 'kernel_params = "%s agent.image_registry_auth=%s"\n' "${base_kernel_params}" "${REGISTRY_AUTH}"
-    elif [ -n "${base_kernel_params}" ]; then
+    # cgroup_no_v1 kills the NVRC-exec'd kata-agent at startup). Re-emit the
+    # base value verbatim. A live session once saw drop-in kernel_params edits
+    # not reach the qemu -append line — unexplained; see docs/pitfalls.md
+    # "Guest kernel params" — but the config semantics make this preservation
+    # load-bearing whenever the drop-in IS honored, so it stays.
+    if [ -n "${base_kernel_params}" ]; then
         printf 'kernel_params = "%s"\n' "${base_kernel_params}"
     fi
     case "${SHIM_NAME}" in

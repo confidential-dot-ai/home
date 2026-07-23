@@ -253,25 +253,23 @@ re-applies the patch whenever it drifts; readiness tracks "patch present". Do no
 "simplify" it back to a one-shot initContainer + `pause` — that reintroduces the
 clobber. Verified: clobbering the config self-heals in ~24s.
 
-## Private workload images need registry creds in TWO places under guest-pull
+## Guest-pull fetches workload image layers anonymously
 
 `internal/helmchart/c8s/templates/kata.yaml` (`EXPERIMENTAL_SETUP_SNAPSHOTTER`),
 `internal/helmchart/c8s/files/scripts/pull-and-configure.sh`
 
 The confidential shims route through the nydus-snapshotter that kata-deploy
 installs (`nydus-for-kata-tee`, guest-pull mode), so the host never pulls the
-workload's **layers** — but containerd's CRI still **resolves** the image on
-the host (manifest + config fetch) before the guest pulls the data. For a
-private image (a tenant workload, or a private mirror of the c8s components)
-that resolution is anonymous and 401s (`failed to resolve ...: unauthorized`)
-unless `serviceAccount.imagePullSecrets` supplies creds. So a guest-pull
-workload needs creds in **two** places: the host (an image-pull Secret, for
-resolution) **and** the guest (`agent.image_registry_auth`, set by the puller
-— see pull-and-configure.sh). When the c8s components themselves come from a
-private mirror the host side is one flag: create the Secret once and pass
-`c8s install --image-pull-secret <name>` (or set `imagePullSecret` via
-values) to wire it into every component's `imagePullSecrets` at install time
-— see docs/QUICKSTART.md "Private registry credentials".
+workload's **layers** — the kata-agent fetches them *inside* the guest, and
+that pull is **anonymous** (there is no in-guest registry-auth path). A
+workload image must therefore be pullable without credentials: public, or on a
+registry the guest reaches anonymously. A private image — a tenant workload, or
+a private mirror of the c8s components — 401s the in-guest layer fetch; the
+stock c8s component images are public, so the default install is unaffected.
+Note containerd's CRI still **resolves** the manifest on the host first, so an
+image whose registry gates even manifest resolution also needs
+`serviceAccount.imagePullSecrets` — but that host-side Secret does not
+authenticate the guest's layer pull.
 
 ## cds cannot reach Ready as runc on a host that is not an SNP guest
 
@@ -389,41 +387,7 @@ helm upgrade c8s … --set kata.guestImage.pullerAuthSecret=ghcr-puller-creds
 **This is operator-side, not TCB-relevant.** The credential never enters the
 guest and is not part of the SNP launch measurement. Rotation is a Secret
 update + puller DaemonSet restart — no re-attestation, no kata-guest-base
-rebuild, no re-pinned digest. Contrast `kata.guestImage.registryAuth` and the
-baked `ghcr-auth.json` (see next section), both of which **do** move the
-measurement.
-
-## `ghcr-auth.json`: staging in-guest pull credentials bakes them into the measured rootfs
-
-`kata-guest-base/extra/etc/c8s/ghcr-auth.json` is the docker auth.json baked
-into the dm-verity guest rootfs that kata's `experimental_force_guest_pull`
-hands to CDH/image-rs for in-guest workload pulls. It is **generated at build
-time** by `kata-guest-base/scripts/fetch.sh`: stock builds bake an empty
-`{"auths":{}}` — the c8s images are public, so anonymous guest-pull works —
-and a pre-staged file (credentials for a **private mirror**) is baked as-is.
-At boot, tmpfiles (`extra/etc/tmpfiles.d/c8s.conf`) copies it to
-`/run/image-security/auth.json`, the `file://` path named by
-`agent.image_registry_auth` on the guest kernel cmdline (the puller appends
-that from `kata.guestImage.registryAuth`, which **defaults** to
-`file:///run/image-security/auth.json` — see
-`internal/helmchart/c8s/values.yaml`).
-
-It is gitignored (`kata-guest-base/.gitignore`): it is build output, and a
-pre-staged file holds a credential — **never commit it.** If you do stage
-real credentials, keep in mind:
-
-1. **The credential is inside the SNP launch measurement.** The file's bytes
-   are part of the dm-verity root, exactly like `bootstrap-allowlist.json`. So
-   **rotating the credential changes the measurement** and requires an image
-   rebuild + re-pinned digest. Use a read-only, pull-scoped token — anyone who
-   can dump the (attested) image contents can read it.
-2. **The secret-free alternative:** leave the baked auths empty and set
-   `kata.guestImage.registryAuth` to a `kbs://` URI so CDH fetches the
-   auth.json from the Key Broker Service *after* the guest attests — no
-   credential in the image at all.
-3. **A hand-placed `ghcr-auth.json` is preserved.** `fetch.sh` never
-   overwrites a non-empty file, so a pre-staged credential survives re-runs —
-   check what is staged before a build you intend to publish.
+rebuild, no re-pinned digest.
 
 ## Bump `KATA_SRC_COMMIT` in lockstep with `KATA_VERSION`
 

@@ -18,13 +18,6 @@
 */}}
 {{- $pullerAuthSecret := .Values.kata.guestImage.pullerAuthSecret | default .Values.imagePullSecret -}}
 {{- $gpuShim := include "c8s.kataGpuShimName" . -}}
-{{- /* GPU in-guest registry auth: "" inherits the non-GPU setting (the GPU
-     guest bakes the same auth.json), "none" forces anonymous, anything else
-     is used verbatim. See values.yaml kata.gpu.guestImage.registryAuth. */ -}}
-{{- $gpuRegistryAuth := .Values.kata.gpu.guestImage.registryAuth | default .Values.kata.guestImage.registryAuth -}}
-{{- if eq $gpuRegistryAuth "none" -}}
-{{- $gpuRegistryAuth = "" -}}
-{{- end -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -78,11 +71,6 @@ spec:
               value: {{ include "c8s.kataGuestImageNvidiaTag" . | quote }}
             - name: HOST_IMG_DIR
               value: "/host{{ .Values.kata.gpu.guestImage.hostPath }}"
-            # In-guest registry auth: inherits kata.guestImage.registryAuth by
-            # default (the GPU guest bakes the same auth.json as the non-GPU
-            # one); see the $gpuRegistryAuth resolution at the top.
-            - name: REGISTRY_AUTH
-              value: {{ $gpuRegistryAuth | quote }}
             - name: ORAS_INSECURE
               value: {{ .Values.kata.guestImage.insecure | quote }}
             # Target the platform's confidential-GPU runtime, not qemu-snp.

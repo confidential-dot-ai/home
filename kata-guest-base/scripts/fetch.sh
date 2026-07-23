@@ -301,20 +301,4 @@ echo "==> bootstrap allowlist: ${ALLOWLIST_DST}"
     printf 'allowlist_c8s_operator_digest: %s\n' "${C8S_OPERATOR_DIGEST}"
 } >> "${EXTRA_DIR}/usr/local/share/c8s/.kata-guest-base-baked"
 
-# --- In-guest registry auth for guest-pull ------------------------------
-#
-# Baked at /etc/c8s/ghcr-auth.json; tmpfiles copies it to the
-# /run/image-security/auth.json path the in-guest CDH reads. Empty by
-# default — the c8s images are public, so anonymous guest-pull works. A
-# pre-staged file (e.g. private-mirror creds) is baked as-is; it becomes
-# part of the measured rootfs — see docs/pitfalls.md "ghcr-auth.json".
-GHCR_AUTH_DST="${EXTRA_DIR}/etc/c8s/ghcr-auth.json"
-mkdir -p "$(dirname "${GHCR_AUTH_DST}")"
-if [[ -s "${GHCR_AUTH_DST}" ]]; then
-    echo "==> ghcr-auth.json: keeping pre-staged ${GHCR_AUTH_DST} (baked into the measured rootfs)"
-else
-    ( umask 077; printf '{"auths":{}}\n' > "${GHCR_AUTH_DST}" )
-    echo "==> ghcr-auth.json: baked empty auths (anonymous guest-pull)"
-fi
-
 echo "==> Done. Run scripts/build.sh next."

@@ -28,10 +28,3 @@ extra/usr/local/bin/
 # .template is the source of truth; this materialised copy is a build
 # artifact (its digests go stale) and is regenerated on every build.
 extra/etc/c8s/bootstrap-allowlist.json
-
-# In-guest registry auth for guest-pull: a docker auth.json baked into the
-# dm-verity rootfs. GENERATED at build time by scripts/fetch.sh — empty in
-# stock builds; a pre-staged file (private-mirror creds) may hold a real
-# credential, so it is NEVER source-controlled. See docs/pitfalls.md
-# "ghcr-auth.json" + README.md "Guest-pull registry auth".
-extra/etc/c8s/ghcr-auth.json

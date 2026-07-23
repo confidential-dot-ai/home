@@ -360,7 +360,7 @@ kata:
 ```
 
 The `<tag>-nvidia` guest image reuses `kata.guestImage.{repository,insecure,
-registryAuth,pullerAuthSecret}` — same registry and credentials as the non-GPU
+pullerAuthSecret}` — same registry and credentials as the non-GPU
 image, with a `-nvidia` tag suffix. `kata.guestImage.debug` drives both
 pullers: `--cvm-mode=pod --debug` switches the non-GPU image to `<tag>-debug` and the
 GPU image to `<tag>-nvidia-debug` in the same install (see "`--debug` and the
