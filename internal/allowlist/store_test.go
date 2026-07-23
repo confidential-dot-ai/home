@@ -423,3 +423,24 @@ func TestRestoreSnapshotRejectsInvalidState(t *testing.T) {
 		t.Fatal("RestoreSnapshot accepted nil digests")
 	}
 }
+
+func TestContains(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	present := mustParseDigest(t, digestA)
+	absent := mustParseDigest(t, digestB)
+	if err := store.Add(present, "ghcr.io/x/a:v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if ok, err := store.Contains(present); err != nil || !ok {
+		t.Fatalf("Contains(present) = %t, %v; want true, nil", ok, err)
+	}
+	if ok, err := store.Contains(absent); err != nil || ok {
+		t.Fatalf("Contains(absent) = %t, %v; want false, nil", ok, err)
+	}
+}

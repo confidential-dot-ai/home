@@ -147,7 +147,12 @@ func VerifyCert(cert *x509.Certificate, policy *VerifyPolicy, nonce []byte) (*Ve
 		return nil, fmt.Errorf("%w: attestation-api URL is required", ErrInvalidReport)
 	}
 
-	claimsBytes := ExtractConfigClaimsBytes(cert)
+	claimsBytes, claimsPresent := configClaimsExtension(cert)
+	if claimsPresent && len(claimsBytes) == 0 {
+		// An empty value would fall through to the claims-free binding while
+		// still looking claims-bearing to anyone gating on extension presence.
+		return nil, fmt.Errorf("%w: config-claims extension present but empty", ErrInvalidReport)
+	}
 	if err := checkClaimsPins(claimsBytes, policy); err != nil {
 		return nil, err
 	}

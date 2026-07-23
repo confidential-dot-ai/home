@@ -102,9 +102,12 @@ it:
   bootstrap, and gate ingress exposure on a passing verify.
 - **A rotated-out config stays claimable until cert expiry.** After changing
   operator keys or the seed, the previous serving cert (and its claims)
-  remains replayable until its RA-TLS TTL (`cds.ratlsCertTTL`) runs out. A
-  config change also fails handoff by design (claims must byte-match), so a
-  rotation rolls a fresh CA lineage rather than inheriting the old one.
+  remains replayable until its RA-TLS TTL (`cds.ratlsCertTTL`) runs out. An
+  operator-key change also fails handoff by design (the key-set hash is bound
+  into handoff REPORTDATA), so a key rotation rolls a fresh CA lineage rather
+  than inheriting the old one. A seed-only change does not gate handoff — the
+  seed digest rides the serving-cert claims, not the handoff exchange — and is
+  caught only by verifiers pinning `--allowlist-seed`.
 
 This was a deliberate stop-gap to ship `c8s allowlist` without standing up a
 PKI. **Longer term** we want a CA + short-lived operator certificates (chain

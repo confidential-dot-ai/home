@@ -2,6 +2,7 @@ package allowlist
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -122,12 +123,18 @@ func (s *Store) ListAll() (string, map[types.Digest]string, error) {
 // CDS /attest handler to gate workload-digest claims (docs/ratls.md): a
 // workload's images must be allowlisted for its identity to bind them.
 func (s *Store) Contains(digest types.Digest) (bool, error) {
-	_, digests, err := s.ListAll()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var one int
+	err := s.db.QueryRow("SELECT 1 FROM allowlist WHERE digest = ?", digest.String()).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
-	_, ok := digests[digest]
-	return ok, nil
+	return true, nil
 }
 
 // queryAll reads all rows under the lock and returns them as a slice.

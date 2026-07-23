@@ -237,12 +237,16 @@ type operatorKeysReport struct {
 	fingerprints []string
 	digest       []byte // KeySetDigest of the served list (nil when not fetched)
 	note         string // non-empty when keys are absent/unavailable, explains why
+	fetchErr     error  // non-nil when the fetch was attempted and failed
 }
 
 // gatherOperatorKeys fetches the CDS-pinned operator key fingerprints for
 // kind=cds network targets. The fetch is bound to the attested serving cert
-// (see fetchOperatorKeyFingerprints); any failure degrades to a note — the
-// attestation verdict itself never depends on this section.
+// (see fetchOperatorKeyFingerprints). A failed fetch degrades to a note for
+// claims-free targets, but records fetchErr so applyClaimsPolicy can fail the
+// verdict when the evidence binds config-claims: the served-vs-attested key
+// cross-check is mandatory there, and an endpoint erroring on /operator-keys
+// must not dodge it.
 func gatherOperatorKeys(ctx context.Context, cfg config, ev *evidence) operatorKeysReport {
 	if cfg.kind != "cds" || cfg.url == "" {
 		return operatorKeysReport{}
@@ -256,7 +260,7 @@ func gatherOperatorKeys(ctx context.Context, cfg config, ev *evidence) operatorK
 	}
 	fps, digest, note, err := fetchOperatorKeyFingerprints(ctx, baseURL, cfg.server, ev.certSHA256, cfg.timeout)
 	if err != nil {
-		return operatorKeysReport{note: "not fetched: " + err.Error()}
+		return operatorKeysReport{note: "not fetched: " + err.Error(), fetchErr: err}
 	}
 	return operatorKeysReport{fingerprints: fps, digest: digest, note: note}
 }
@@ -376,8 +380,11 @@ func expectedSeedDigest(cfg config) ([]byte, error) {
 		return seed.CanonicalDigest()
 	case cfg.allowlistSeedDigest != "":
 		digest, err := hex.DecodeString(strings.TrimPrefix(strings.TrimSpace(cfg.allowlistSeedDigest), "sha256:"))
-		if err != nil || len(digest) != ratls.ClaimsDigestSize {
-			return nil, fmt.Errorf("--allowlist-seed-digest must be %d hex bytes", ratls.ClaimsDigestSize)
+		if err != nil {
+			return nil, fmt.Errorf("--allowlist-seed-digest is not valid hex: %w", err)
+		}
+		if len(digest) != ratls.ClaimsDigestSize {
+			return nil, fmt.Errorf("--allowlist-seed-digest decodes to %d bytes, want a SHA-256 digest (%d hex chars, optionally sha256:-prefixed)", len(digest), 2*ratls.ClaimsDigestSize)
 		}
 		return digest, nil
 	default:
@@ -515,7 +522,9 @@ type Outcome struct {
 // the claims are proven by the evidence newOutcome already judged, so nothing
 // here can rescue a failed verification (docs/ratls.md).
 func applyClaimsPolicy(oc *Outcome, ev *evidence, policy *ratls.VerifyPolicy, opKeys operatorKeysReport) {
-	if ev.configClaims != nil {
+	// Surface digests only when the hardware evidence verified: "attested" must
+	// never label extension bytes whose binding was not proven.
+	if oc.Verified && ev.configClaims != nil {
 		oc.OperatorKeysAttestedDigest = hex.EncodeToString(ev.configClaims.OperatorKeysDigest)
 		if ev.configClaims.HasSeed() {
 			oc.SeedAttestedDigest = hex.EncodeToString(ev.configClaims.SeedDigest)
@@ -551,7 +560,13 @@ func applyClaimsPolicy(oc *Outcome, ev *evidence, policy *ratls.VerifyPolicy, op
 		fail("attested workload digest %x does not match the --workload-image set (%x)", ev.configClaims.WorkloadDigest, policy.WorkloadDigest)
 	}
 	// The served key list must be the set the measured code attested to
-	// loading; a mismatch means MITM on the fetch or a CDS bug.
+	// loading; a mismatch means MITM on the fetch or a CDS bug. A failed fetch
+	// fails closed too: an endpoint erroring on /operator-keys must not dodge
+	// a mandatory cross-check (a 404 is not an error — it maps to the
+	// empty-set digest in fetchOperatorKeyFingerprints).
+	if ev.configClaims != nil && opKeys.fetchErr != nil {
+		fail("could not fetch /operator-keys to cross-check the attested operator-key set: %v", opKeys.fetchErr)
+	}
 	if ev.configClaims != nil && len(opKeys.digest) > 0 && !bytes.Equal(opKeys.digest, ev.configClaims.OperatorKeysDigest) {
 		fail("served /operator-keys digest %x does not match the attested config-claims digest %x", opKeys.digest, ev.configClaims.OperatorKeysDigest)
 	}
