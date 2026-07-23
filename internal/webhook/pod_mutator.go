@@ -564,6 +564,15 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 		return admission.Errored(http.StatusBadRequest,
 			fmt.Errorf("pod requests LUKS injection (%s<name>) but the operator has no --luks-open-image configured", luksAnnotationPrefix))
 	}
+	// The injected agent + luks-open dial the broker with the get-cert mesh
+	// cert, and injection only runs when GetCertImage is set (getCertNeeded
+	// below). Without it the pod would be admitted unmutated — its app starting
+	// with no secrets — so a secrets/LUKS request with no --get-cert-image must
+	// fail closed too, not just the missing agent/luks images above.
+	if inj != nil && (inj.Secrets != nil || len(inj.LUKS) > 0) && m.cfg.GetCertImage == "" {
+		return admission.Errored(http.StatusBadRequest,
+			fmt.Errorf("pod requests secrets/LUKS injection but the operator has no --get-cert-image configured (the injected agent needs the get-cert mesh cert)"))
+	}
 
 	// confidential.ai/cw drives both get-cert injection and confidential
 	// class selection: a pod that opts in to a c8s workload identity also

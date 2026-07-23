@@ -251,6 +251,47 @@ func TestHandleFailsClosedWhenAgentImageMissing(t *testing.T) {
 	}
 }
 
+// A secrets request must fail closed when --get-cert-image is empty: injection
+// is gated behind GetCertImage, so otherwise the pod is admitted unmutated and
+// the app starts with no secrets.
+func TestHandleFailsClosedWhenGetCertImageMissing(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	// SecretAgentImage set, but GetCertImage empty (injection never runs).
+	m := &podMutator{
+		decoder: admission.NewDecoder(scheme),
+		cfg: Config{
+			SecretAgentImage:  "ghcr.io/openbao/openbao:test",
+			CDSURL:            "http://cds.c8s-system.svc:8443",
+			AttestationApiURL: "http://attestation-api.c8s-system.svc:8400",
+			CertDir:           "/etc/c8s/certs",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			AnnotationWorkload:            "api",
+			AnnotationSecretsInject:       "true",
+			secretAnnotationPrefix + "db": "secret/data/api/db#password",
+		}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+	raw, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := m.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{Namespace: "default", Object: runtime.RawExtension{Raw: raw}},
+	})
+	if resp.Allowed {
+		t.Fatal("expected admission denied when secrets requested but no get-cert-image configured")
+	}
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "get-cert-image") {
+		t.Fatalf("expected a clear error mentioning get-cert-image, got %#v", resp.Result)
+	}
+}
+
 // --- helpers ---
 
 func containerNames(cs []corev1.Container) []string {
