@@ -3,7 +3,9 @@ package ratls
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
@@ -333,5 +335,68 @@ func TestVerifyCertFoldsClaims(t *testing.T) {
 	}
 	if !bytes.Equal(observedERD, want[:]) {
 		t.Fatalf("expected_report_data = %x, want folded %x", observedERD, want[:])
+	}
+}
+
+// TestVerifyCertUnpinnedSurvivesClaimsVersionSkew locks in the invariant that
+// binding verification never parses the claims (see UnmarshalConfigClaims): a
+// peer on a future claims version, correctly bound into REPORTDATA, must still
+// complete a handshake with a verifier that pins nothing. Adding a parse to
+// VerifyCert would turn a version skew into a dead mesh link.
+func TestVerifyCertUnpinnedSurvivesClaimsVersionSkew(t *testing.T) {
+	future, err := asn1.Marshal(configClaimsASN1{
+		Version:            configClaimsVersion + 1,
+		OperatorKeysDigest: bytes.Repeat([]byte{0xAB}, ClaimsDigestSize),
+		SeedDigest:         bytes.Repeat([]byte{0xCD}, ClaimsDigestSize),
+		WorkloadDigest:     unsetDigest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key, _, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportData, err := ReportDataForKeyAndClaims(&key.PublicKey, future, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	att := &Attestation{TEEType: TEETypeSEVSNP, Report: fakeSNPReport(reportData)}
+	attExt, err := att.MarshalExtension()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, src := testAttestedCert(t, nil)
+	tmpl := &x509.Certificate{
+		SerialNumber: src.SerialNumber,
+		Subject:      src.Subject,
+		NotBefore:    src.NotBefore,
+		NotAfter:     src.NotAfter,
+		ExtraExtensions: []pkix.Extension{
+			attExt,
+			{Id: OIDRATLSConfigClaims, Value: future},
+		},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	measurement := bytes.Repeat([]byte{0x42}, SNPMeasurementSize)
+	var observedERD []byte
+	srv := newCapturingVerifySrv(t, measurement, &observedERD)
+	defer srv.Close()
+
+	if _, err := VerifyCert(cert, &VerifyPolicy{
+		AttestationApiURL: srv.URL,
+		Measurements:      [][]byte{measurement},
+	}, nil); err != nil {
+		t.Fatalf("VerifyCert rejected a validly-bound future claims version: %v", err)
 	}
 }

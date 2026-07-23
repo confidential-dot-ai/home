@@ -25,8 +25,10 @@ it to a pod, and returns that pod's admitted container image digests.
 `get-cert` hashes them into one `workloadDigest`, binds it into its CSR's
 attestation evidence, and forwards the plain list to CDS. CDS re-derives the
 hash, confirms every listed image is allowlisted, and stamps the claim onto
-the issued leaf. A relying party can then pin the workload:
-`c8s verify --workload-image sha256:…`.
+the issued leaf. A relying party can then pin the workload
+(`c8s verify --workload-image sha256:…`) or read a live mesh peer's digest off
+the connection with `ratls.PeerConfigClaims` (docs/ratls.md, "Reading a peer's
+claims").
 
 ---
 

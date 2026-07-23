@@ -122,6 +122,13 @@ jobs:
           for vm in $(kubectl -n "$NS" get vm -l ci.confidential.ai/managed=true -o name 2>/dev/null); do
             rid=$(kubectl -n "$NS" get "$vm" -o jsonpath='{.metadata.labels.ci\.confidential\.ai/run-id}' 2>/dev/null)
             orepo=$(kubectl -n "$NS" get "$vm" -o jsonpath='{.metadata.annotations.ci\.confidential\.ai/repo}' 2>/dev/null)
+            # Standing runner CVMs (booted with keep_alive) have a MANUAL
+            # lifecycle: they outlive the run that created them and serve jobs
+            # for other repos. Their provision run completes within minutes, so
+            # the run-status check below would see a live shared runner as an
+            # orphan and delete it mid-job. Skip them entirely.
+            standing=$(kubectl -n "$NS" get "$vm" -o jsonpath='{.metadata.labels.ci\.confidential\.ai/standing}' 2>/dev/null)
+            [ "$standing" = "true" ] && { echo "keeping $vm (standing runner — manual lifecycle)"; continue; }
             [ -z "$rid" ] && continue
             [ "$rid" = "${{ github.run_id }}" ] && continue
             # age fallback: our runs are capped well under 3h, so anything older is
@@ -192,6 +199,17 @@ jobs:
                       - name: rootdisk
                         disk:
                           bus: virtio
+                          # The rke2 rootfs is a read-only dm-verity image (writes
+                          # go to a tmpfs overlay), so the disk never needs write
+                          # access — and opening it writable takes an EXCLUSIVE
+                          # QEMU image lock. The standing snp-metal-cvm ARC runner
+                          # boots from this same RWO PVC and holds that lock 24/7,
+                          # so a writable ephemeral CVM here fails at qemu with
+                          # `Failed to get "write" lock` and never reaches Running.
+                          # readonly takes a SHARED lock that coexists with the
+                          # runner (verified: this is how the TDX dev host runs two
+                          # VMs off one rootdisk).
+                          readonly: true
                     interfaces:
                       - name: default
                         bridge: {}           # masquerade is broken under SNP
