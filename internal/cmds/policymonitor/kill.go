@@ -170,7 +170,7 @@ func findCgroupDir(root, containerID string) (string, error) {
 	if containerID == "" {
 		return "", errors.New("empty container id")
 	}
-	var found string
+	var matches []string
 	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			// Permission-denied on a sibling slice (an unreadable systemd
@@ -193,15 +193,27 @@ func findCgroupDir(root, containerID string) (string, error) {
 			return nil
 		}
 		if cgroupDirMatchesCID(d.Name(), containerID) {
-			found = path
-			return filepath.SkipAll
+			matches = append(matches, path)
 		}
 		return nil
 	})
 	if walkErr != nil {
 		return "", walkErr
 	}
-	return found, nil
+	switch len(matches) {
+	case 0:
+		return "", nil
+	case 1:
+		return matches[0], nil
+	default:
+		// Ambiguity: more than one cgroup matches this id. The previous code
+		// returned the first depth-first match, so a container id that also
+		// matched an unrelated cgroup could redirect the SIGKILL onto that
+		// unrelated cgroup (H-02). A running denied container owns exactly one
+		// cgroup, so any collision shows up as a second match here; refuse to
+		// guess rather than terminate the wrong one.
+		return "", fmt.Errorf("ambiguous container id %q matches %d cgroups: %v", containerID, len(matches), matches)
+	}
 }
 
 // cgroupDirMatchesCID reports whether a cgroup directory basename identifies
@@ -210,10 +222,14 @@ func findCgroupDir(root, containerID string) (string, error) {
 //   - systemd scope:            cri-containerd-<cid>.scope, crio-<cid>.scope,
 //     or <cid>.scope
 //
-// containerID is a 64-hex (or similarly high-entropy) kata container id, so a
-// suffix match cannot credibly collide with an unrelated cgroup — the same
-// argument findCgroupDir already relies on for the exact-match case.
+// Only these exact shapes count. The earlier form accepted any basename ending
+// in "-<cid>", so an unrelated cgroup whose name merely ended that way matched —
+// letting a short or adversarially chosen id redirect the kill onto an
+// unrelated scope (H-02). Enumerate the vendor prefixes kata-agent actually
+// emits instead of accepting an arbitrary one.
 func cgroupDirMatchesCID(basename, containerID string) bool {
 	name := strings.TrimSuffix(basename, ".scope")
-	return name == containerID || strings.HasSuffix(name, "-"+containerID)
+	return name == containerID ||
+		name == "cri-containerd-"+containerID ||
+		name == "crio-"+containerID
 }

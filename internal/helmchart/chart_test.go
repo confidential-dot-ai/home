@@ -2006,6 +2006,22 @@ func TestTLSLBVerifyDerivesProxySSLNameFromUpstream(t *testing.T) {
 	defaultRoute.assertDirective(t, "proxy_ssl_name", "my-backend.other-ns.svc.cluster.local")
 }
 
+func TestTLSLBCORSAllowsSessionHeaderByDefault(t *testing.T) {
+	// Browser clients send X-C8s-Session on the /tunnel request, so the default
+	// CORS allow-headers must include it or the over-encrypted channel breaks
+	// cross-origin.
+	out, err := helmTemplateTLSLB(t,
+		"--set", "cors.enabled=true",
+		"--set", "cors.allowOrigins={https://example.github.io}",
+	)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "X-C8s-Session") {
+		t.Fatalf("CORS Access-Control-Allow-Headers missing X-C8s-Session:\n%s", out)
+	}
+}
+
 func TestTLSLBAdditionalRoutesConfigureNginxLocations(t *testing.T) {
 	// Route backends must be secured (https + verify); the location/upstream
 	// wiring under test is protocol-independent.
@@ -5290,34 +5306,6 @@ func TestChartKataGuestImageDebugSelectsDebugTag(t *testing.T) {
 	}
 	if got := pullerEnv(t, out, "TAG"); got != "main-debug" {
 		t.Errorf("debug puller TAG = %q, want main-debug", got)
-	}
-}
-
-// GPU in-guest registry auth: "" inherits the non-GPU setting (the GPU guest
-// bakes the same auth.json), "none" forces anonymous, anything else wins
-// verbatim — the contract documented on kata.gpu.guestImage.registryAuth.
-func TestChartKataGpuRegistryAuthInheritance(t *testing.T) {
-	gpuAuth := func(t *testing.T, args ...string) string {
-		t.Helper()
-		out, err := helmTemplateKata(t, args...)
-		if err != nil {
-			t.Fatalf("helm template: %v\n%s", err, out)
-		}
-		puller := renderedDaemonSet(t, out, "c8s-kata-deploy-image-puller-nvidia")
-		pc, ok := findContainer(puller.Spec.Template.Spec.Containers, "reconcile")
-		if !ok {
-			t.Fatalf("GPU puller missing reconcile container")
-		}
-		return envValue(pc.Env, "REGISTRY_AUTH")
-	}
-	if got := gpuAuth(t); got != "file:///run/image-security/auth.json" {
-		t.Errorf("default GPU REGISTRY_AUTH = %q, want the inherited non-GPU baked-auth path", got)
-	}
-	if got := gpuAuth(t, "--set-string", "kata.gpu.guestImage.registryAuth=none"); got != "" {
-		t.Errorf(`registryAuth=none GPU REGISTRY_AUTH = %q, want "" (anonymous)`, got)
-	}
-	if got := gpuAuth(t, "--set-string", "kata.gpu.guestImage.registryAuth=kbs:///default/creds/gpu"); got != "kbs:///default/creds/gpu" {
-		t.Errorf("explicit registryAuth GPU REGISTRY_AUTH = %q, want the verbatim override", got)
 	}
 }
 

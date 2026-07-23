@@ -121,9 +121,7 @@ Under `--cvm-mode=pod`, the same Secret also feeds the kata-image-puller's in-po
 `oras pull` of the kata-guest-base artifact, which reads
 `/root/.docker/config.json` rather than kubelet pull secrets (set
 `kata.guestImage.pullerAuthSecret` if that artifact needs a different
-credential). The one pull this does **not** cover (see docs/pitfalls.md):
-guest-side workload image pulls inside kata CVMs
-(`agent.image_registry_auth`).
+credential).
 
 On kata clusters, also raise kubelet's `runtime-request-timeout` (default
 2 m): the effective ceiling on kata pod creation is `min(kubelet timeout,

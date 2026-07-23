@@ -124,6 +124,62 @@ func TestHandleNewContainer_NoDigestAnnotation_Denies(t *testing.T) {
 	}
 }
 
+func TestHandleNewContainer_UnreadableConfigDenies(t *testing.T) {
+	// config.json exists but cannot be read as a file (a directory in its
+	// place): the bundle is clearly present but its digest is undeterminable,
+	// so the monitor must fail closed (deny+kill) rather than let it run (H-01).
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+	m.configReadDeadline = 50 * time.Millisecond
+	cid := "unreadable-config"
+	dir := filepath.Join(watchDir, cid)
+	if err := os.MkdirAll(filepath.Join(dir, "config.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	m.handleNewContainer(context.Background(), dir)
+
+	if calls := killer.snapshot(); len(calls) != 1 {
+		t.Fatalf("expected deny+kill on present-but-unreadable config.json, got %d calls: %+v", len(calls), calls)
+	}
+}
+
+func TestHandleNewContainer_AbsentConfigSkips(t *testing.T) {
+	// An absent config.json (a non-container watch entry, or a bundle not yet
+	// written) must be skipped, not killed — killing infrastructure dirs would
+	// be a false positive (H-01 scope boundary).
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+	m.configReadDeadline = 50 * time.Millisecond
+	cid := "shared"
+	if err := os.MkdirAll(filepath.Join(watchDir, cid), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	m.handleNewContainer(context.Background(), filepath.Join(watchDir, cid))
+
+	if calls := killer.snapshot(); len(calls) != 0 {
+		t.Fatalf("expected no kill for an absent config.json, got %d calls: %+v", len(calls), calls)
+	}
+}
+
+func TestHandleNewContainer_MalformedConfigDenies(t *testing.T) {
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+	m.configReadDeadline = 50 * time.Millisecond
+	cid := "bad-config"
+	dir := filepath.Join(watchDir, cid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte("{ not valid json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m.handleNewContainer(context.Background(), dir)
+
+	if calls := killer.snapshot(); len(calls) != 1 {
+		t.Fatalf("expected deny+kill on malformed config.json, got %d calls: %+v", len(calls), calls)
+	}
+}
+
 func TestHandleNewContainer_SandboxSkipped(t *testing.T) {
 	// The pod sandbox (pause) container carries container-type=sandbox and
 	// no image digest. kata runs the measured baked pause for it, so

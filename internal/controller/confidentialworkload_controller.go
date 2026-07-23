@@ -17,6 +17,33 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/webhook"
 )
 
+// resolveWorkloadCWID maps the CW's spec.workloadRef to the cw id stamped on
+// the referenced workload's pod template (confidential.ai/cw). That id — not
+// the CW object's own metadata.name — is what the webhook writes onto member
+// pods, so aggregating by it lets a CW whose name differs from the workload's
+// cw id still select its pods (M-09: the declared workloadRef was previously
+// ignored, and matching used cw.Name). Falls back to cw.Name when the ref is
+// unset/unsupported, the workload is gone or unreadable, or it carries no cw
+// id — preserving the prior behavior for the common name==id case.
+func (r *ConfidentialWorkloadReconciler) resolveWorkloadCWID(ctx context.Context, cw *v1alpha2.ConfidentialWorkload) string {
+	ref := cw.Spec.WorkloadRef
+	obj := newWorkloadObject(ref.Kind)
+	if obj == nil || ref.Name == "" {
+		return cw.Name
+	}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: cw.Namespace, Name: ref.Name}, obj); err != nil {
+		return cw.Name
+	}
+	tmpl := podTemplate(obj)
+	if tmpl == nil {
+		return cw.Name
+	}
+	if id := tmpl.Annotations[webhook.AnnotationWorkload]; id != "" {
+		return id
+	}
+	return cw.Name
+}
+
 // statusMirrorRequeue keeps the per-pod summary loosely current without
 // hammering the API server. The reconciler watches CW only (not pods), so
 // pod-readiness transitions are picked up at this cadence.
@@ -44,10 +71,12 @@ func (r *ConfidentialWorkloadReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{}, fmt.Errorf("list pods: %w", err)
 	}
 
+	matchID := r.resolveWorkloadCWID(ctx, &cw)
+
 	summary := v1alpha2.AttestationSummary{}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if pod.Annotations[webhook.AnnotationWorkload] != cw.Name {
+		if pod.Annotations[webhook.AnnotationWorkload] != matchID {
 			continue
 		}
 		summary.Total++

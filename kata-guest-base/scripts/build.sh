@@ -219,19 +219,6 @@ done
 [[ -f "${EXTRA_DIR}/etc/c8s/bootstrap-allowlist.json" ]] || die "bootstrap-allowlist.json not staged — run scripts/fetch.sh (with IMAGE_TAG or *_DIGEST env vars) first."
 [[ -f "${EXTRA_DIR}/etc/kata-opa/default-policy.rego" ]] || die "default-policy.rego missing from overlay."
 
-# In-guest GHCR registry auth for private guest-pull. fetch.sh bakes this
-# from READ_PRIVATE_GHCR_TOKEN; tmpfiles copies it to
-# /run/image-security/auth.json, the file:// path the kata cmdline names
-# (agent.image_registry_auth, set by the puller). If build.sh is run
-# standalone without fetch.sh, bake an empty auth set so that path still
-# resolves — anonymous pulls, no credential in the measured rootfs.
-GHCR_AUTH_FILE="${EXTRA_DIR}/etc/c8s/ghcr-auth.json"
-if [[ ! -s "${GHCR_AUTH_FILE}" ]]; then
-    echo "    NOTE: ${GHCR_AUTH_FILE} not staged by fetch.sh — baking empty auths (anonymous guest-pull)." >&2
-    mkdir -p "$(dirname "${GHCR_AUTH_FILE}")"
-    ( umask 077; printf '{"auths":{}}\n' > "${GHCR_AUTH_FILE}" )
-fi
-
 # A prior run's images must not survive to publish time: CI pushes the output
 # dirs verbatim (oras push ./*), and on a persistent runner the root-owned
 # artifacts dodge actions/checkout's git clean. Wipe them up front —

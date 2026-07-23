@@ -72,7 +72,13 @@ var workloadServiceKinds = []v1alpha2.WorkloadKind{
 // newWorkload returns the typed object for r.Kind, or nil for kinds the
 // reconciler does not support (rejected at SetupWithManager time).
 func (r *WorkloadServiceReconciler) newWorkload() client.Object {
-	switch r.Kind {
+	return newWorkloadObject(r.Kind)
+}
+
+// newWorkloadObject returns the typed workload object for kind, or nil for a
+// kind outside the ConfidentialWorkload-mirrored set.
+func newWorkloadObject(kind v1alpha2.WorkloadKind) client.Object {
+	switch kind {
 	case v1alpha2.WorkloadKindDeployment:
 		return &appsv1.Deployment{}
 	case v1alpha2.WorkloadKindStatefulSet:

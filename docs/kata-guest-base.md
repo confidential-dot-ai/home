@@ -171,19 +171,8 @@ This is the mechanism every reference to "guest-pull" in these docs
 points back to; the host-visibility limits during the transport are
 covered in [G3](kata-image-policy.md#g3--image-content-is-visible-to-the-host-during-the-guest-pull).
 
-The c8s images are public, so the in-guest pull needs no credential of its
-own. For workload images that do require auth (a private mirror of the c8s
-containers, private tenant images), the kata-agent reads credentials via
-`agent.image_registry_auth=file:///run/image-security/auth.json` on the
-guest kernel cmdline (the puller appends this from
-`kata.guestImage.registryAuth`, which defaults to that path). The file is a
-docker auth.json baked into the dm-verity rootfs at build time — empty in
-stock builds, real credentials when pre-staged for a private mirror — and
-copied onto the tmpfs path at boot. Staged credentials become part of the
-measured root; the tradeoff and the secret-free `kbs://` alternative are
-documented in [`kata-guest-base/README.md`](../kata-guest-base/README.md)
-("Guest-pull registry auth") and [`pitfalls.md`](pitfalls.md)
-("ghcr-auth.json").
+The c8s images are public, so the in-guest pull is anonymous and needs no
+credential of its own.
 
 ## In-guest image-policy enforcement
 

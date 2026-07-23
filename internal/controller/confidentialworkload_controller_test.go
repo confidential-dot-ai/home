@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -74,6 +75,43 @@ func getCW(t *testing.T, c client.Client, ns, name string) *v1alpha2.Confidentia
 		t.Fatalf("get ConfidentialWorkload %s/%s: %v", ns, name, err)
 	}
 	return &cw
+}
+
+func TestConfidentialWorkloadResolvesWorkloadRefCWID(t *testing.T) {
+	const ns = "tenant"
+	// The referenced workload's pods carry cw id "api-id", which differs from
+	// the CW object's own name "cw-name". Matching on cw.Name (the pre-fix
+	// behavior) would count the wrong pod; resolving spec.workloadRef finds the
+	// real member pods (M-09).
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "api-deploy", Namespace: ns},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{webhook.AnnotationWorkload: "api-id"},
+				},
+			},
+		},
+	}
+	cw := &v1alpha2.ConfidentialWorkload{
+		ObjectMeta: metav1.ObjectMeta{Name: "cw-name", Namespace: ns, Generation: 1},
+		Spec: v1alpha2.ConfidentialWorkloadSpec{
+			WorkloadRef: v1alpha2.WorkloadRef{Kind: v1alpha2.WorkloadKindDeployment, Name: "api-deploy"},
+		},
+	}
+	// Two member pods carry the workload's cw id; a decoy pod carries the CW
+	// object name and must NOT be counted.
+	p1 := cwPod("p1", ns, "api-id", true)
+	p2 := cwPod("p2", ns, "api-id", false)
+	decoy := cwPod("decoy", ns, "cw-name", true)
+
+	r := cwReconcilerFor(cw, dep, p1, p2, decoy)
+	cwReconcile(t, r, ns, "cw-name")
+
+	sum := getCW(t, r.Client, ns, "cw-name").Status.AttestationSummary
+	if sum == nil || sum.Total != 2 || sum.Attested != 1 {
+		t.Fatalf("summary = %#v, want Total=2 Attested=1 (matched via workloadRef cw id, decoy excluded)", sum)
+	}
 }
 
 func TestConfidentialWorkloadReconcileNotFoundIsNoOp(t *testing.T) {

@@ -29,6 +29,21 @@ set -eu
 
 echo "==> c8s kata sweep starting"
 
+# Independent guard mirroring cmd/c8s/uninstall.go's validateSweepPath: the
+# GUEST_IMAGE_DIR* values come from Helm release values and are deleted with
+# `rm -rf /host<dir>`, so a hostile or malformed value ("", "/", "..", "/host")
+# would otherwise destroy the mounted host filesystem. Refuse to sweep anything
+# that is not a dedicated c8s guest-image directory strictly under /var/lib/c8s.
+assert_safe_guest_dir() {
+  case "$1" in
+    */../* | *..) echo "refusing to sweep guest image dir containing '..': '$1'" >&2; exit 1 ;;
+  esac
+  case "$1" in
+    /var/lib/c8s/?*) : ;;
+    *) echo "refusing to sweep unsafe guest image dir (must be under /var/lib/c8s): '$1'" >&2; exit 1 ;;
+  esac
+}
+
 CONTAINERD_DIR="/host${HOST_CONTAINERD_DIR}"
 config_changed=0
 
@@ -63,6 +78,7 @@ rm -f /host/usr/local/bin/containerd-shim-kata-*-v2
 # 3. The kata-guest-base artifact the image-puller pulled (hardened kernel +
 #    dm-verity rootfs, multi-GB). Nothing else cleans this up — kata-deploy
 #    never knew about it, and the puller has no uninstall path.
+assert_safe_guest_dir "${GUEST_IMAGE_DIR}"
 if [ -d "/host${GUEST_IMAGE_DIR}" ]; then
   rm -rf "/host${GUEST_IMAGE_DIR}"
   echo "guest image dir removed: ${GUEST_IMAGE_DIR}"
@@ -74,6 +90,7 @@ fi
 #     dir (see GUEST_IMAGE_DIR_NVIDIA above; empty -> step skipped).
 GUEST_IMAGE_DIR_NVIDIA="${GUEST_IMAGE_DIR_NVIDIA:-}"
 if [ -n "${GUEST_IMAGE_DIR_NVIDIA}" ]; then
+  assert_safe_guest_dir "${GUEST_IMAGE_DIR_NVIDIA}"
   if [ -d "/host${GUEST_IMAGE_DIR_NVIDIA}" ]; then
     rm -rf "/host${GUEST_IMAGE_DIR_NVIDIA}"
     echo "nvidia guest image dir removed: ${GUEST_IMAGE_DIR_NVIDIA}"

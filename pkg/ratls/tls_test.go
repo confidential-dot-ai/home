@@ -780,6 +780,154 @@ func TestDualVerifyPeerCallback_BothFail(t *testing.T) {
 	}
 }
 
+func TestDualVerifyPeerCallback_CASignedEnforcesClaimPins(t *testing.T) {
+	caKey, caCert := generateCACert(t)
+	shared := newSharedCACerts([]*x509.Certificate{caCert})
+
+	// makeLeaf builds a CA-signed leaf, optionally carrying a config-claims
+	// extension (nil = none).
+	makeLeaf := func(t *testing.T, ext []byte) []byte {
+		t.Helper()
+		leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(400),
+			Subject:      pkix.Name{CommonName: "workload"},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(time.Hour),
+			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		}
+		if ext != nil {
+			tmpl.ExtraExtensions = []pkix.Extension{{Id: OIDRATLSConfigClaims, Value: ext}}
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &leafKey.PublicKey, caKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return der
+	}
+	claimsExt := func(t *testing.T, operatorKeys []byte) []byte {
+		t.Helper()
+		c := &ConfigClaims{
+			OperatorKeysDigest: operatorKeys,
+			SeedDigest:         UnsetDigest(),
+			WorkloadDigest:     UnsetDigest(),
+		}
+		ext, err := c.MarshalExtension()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ext.Value
+	}
+
+	pinned := bytes.Repeat([]byte{0x11}, ClaimsDigestSize)
+	verify := dualVerifyPeerCallback(&VerifyPolicy{OperatorKeysDigest: pinned}, shared)
+
+	t.Run("missing claims rejected", func(t *testing.T) {
+		if err := verify([][]byte{makeLeaf(t, nil)}, nil); err == nil {
+			t.Fatal("CA-signed leaf without config-claims accepted despite a configured pin")
+		}
+	})
+	t.Run("mismatched claims rejected", func(t *testing.T) {
+		wrong := bytes.Repeat([]byte{0x22}, ClaimsDigestSize)
+		if err := verify([][]byte{makeLeaf(t, claimsExt(t, wrong))}, nil); err == nil {
+			t.Fatal("CA-signed leaf with mismatched operator-keys digest accepted")
+		}
+	})
+	t.Run("matching claims accepted", func(t *testing.T) {
+		if err := verify([][]byte{makeLeaf(t, claimsExt(t, pinned))}, nil); err != nil {
+			t.Fatalf("CA-signed leaf with matching pin rejected: %v", err)
+		}
+	})
+	t.Run("no pin accepts CA-signed", func(t *testing.T) {
+		v := dualVerifyPeerCallback(&VerifyPolicy{}, shared)
+		if err := v([][]byte{makeLeaf(t, nil)}, nil); err != nil {
+			t.Fatalf("CA-signed leaf rejected when no pin configured: %v", err)
+		}
+	})
+}
+
+// TestDualVerifyPeerCallback_RequireCAEvidence covers the production trust mode:
+// a valid CA chain is no longer sufficient — the leaf's embedded RA-TLS evidence
+// (issuer copies the requester's nonce-free .1.1 extension onto the leaf) is
+// re-verified per connection, catching a CA compromise or wrong issuance policy.
+func TestDualVerifyPeerCallback_RequireCAEvidence(t *testing.T) {
+	caKey, caCert := generateCACert(t)
+	shared := newSharedCACerts([]*x509.Certificate{caCert})
+	measurement := bytes.Repeat([]byte{0x42}, SNPMeasurementSize)
+	srv := newMockedVerifySrv(t, verifyResponse(measurement))
+	defer srv.Close()
+
+	// caSignedLeaf builds a CA-signed leaf over key, optionally carrying the
+	// RA-TLS .1.1 evidence extension.
+	caSignedLeaf := func(t *testing.T, key *ecdsa.PrivateKey, ratlsExt *pkix.Extension) []byte {
+		t.Helper()
+		tmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(500),
+			Subject:      pkix.Name{CommonName: "workload"},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(time.Hour),
+			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		}
+		if ratlsExt != nil {
+			tmpl.ExtraExtensions = []pkix.Extension{*ratlsExt}
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &key.PublicKey, caKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return der
+	}
+	freshKey := func(t *testing.T) *ecdsa.PrivateKey {
+		t.Helper()
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+
+	// A CA-signed leaf carrying evidence bound to its own key (the shape the
+	// issuer produces by copying the requester's .1.1 extension).
+	key, att := testKeyAndAttestation(t)
+	ext, err := att.MarshalExtension()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafWithEvidence := caSignedLeaf(t, key, &ext)
+
+	t.Run("accepts CA leaf with re-verifiable evidence", func(t *testing.T) {
+		policy := &VerifyPolicy{AttestationApiURL: srv.URL, Measurements: [][]byte{measurement}, RequireCAEvidence: true}
+		if err := dualVerifyPeerCallback(policy, shared)([][]byte{leafWithEvidence}, nil); err != nil {
+			t.Fatalf("valid CA leaf with embedded evidence rejected: %v", err)
+		}
+	})
+
+	t.Run("rejects CA leaf without embedded evidence", func(t *testing.T) {
+		policy := &VerifyPolicy{AttestationApiURL: srv.URL, Measurements: [][]byte{measurement}, RequireCAEvidence: true}
+		if err := dualVerifyPeerCallback(policy, shared)([][]byte{caSignedLeaf(t, freshKey(t), nil)}, nil); err == nil {
+			t.Fatal("CA leaf without embedded evidence accepted in production mode")
+		}
+	})
+
+	t.Run("rejects CA leaf whose measurement is not pinned", func(t *testing.T) {
+		other := bytes.Repeat([]byte{0x99}, SNPMeasurementSize)
+		policy := &VerifyPolicy{AttestationApiURL: srv.URL, Measurements: [][]byte{other}, RequireCAEvidence: true}
+		if err := dualVerifyPeerCallback(policy, shared)([][]byte{leafWithEvidence}, nil); err == nil {
+			t.Fatal("CA leaf with an unpinned launch measurement accepted in production mode")
+		}
+	})
+
+	t.Run("legacy mode still accepts CA leaf without evidence", func(t *testing.T) {
+		policy := &VerifyPolicy{AttestationApiURL: srv.URL} // RequireCAEvidence: false
+		if err := dualVerifyPeerCallback(policy, shared)([][]byte{caSignedLeaf(t, freshKey(t), nil)}, nil); err != nil {
+			t.Fatalf("legacy CA-only mode rejected a CA-signed leaf: %v", err)
+		}
+	})
+}
+
 func TestSwapProvider(t *testing.T) {
 	// Create a server TLS config with fakeAttestFunc.
 	cfg := testServerConfig()

@@ -65,6 +65,12 @@ func ParseJSON(data []byte) (*Allowlist, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid digest format: %q (expected sha256:<64 hex chars>)", digest)
 			}
+			// Case-variant source keys collapse to one canonical key; which
+			// image value survived would depend on map iteration order, making
+			// CanonicalDigest nondeterministic for the same input bytes.
+			if _, dup := canonical[parsed.String()]; dup {
+				return nil, fmt.Errorf("duplicate digest %s (case-variant keys canonicalize to the same entry)", parsed.String())
+			}
 			canonical[parsed.String()] = image
 		}
 		wl.Digests = canonical

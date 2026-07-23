@@ -5,6 +5,7 @@ package policymonitor
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -107,10 +108,37 @@ func TestCgroupDirMatchesCID(t *testing.T) {
 		{"other-" + cid[:20], false},                // partial id must not match
 		{"deadbeef", false},
 		{"", false},
+		// An arbitrary vendor prefix must NOT match: the old suffix rule
+		// (HasSuffix(name, "-"+cid)) accepted these, letting an unrelated cgroup
+		// redirect the kill (H-02).
+		{"evil-" + cid + ".scope", false},
+		{"foo-" + cid, false},
 	} {
 		if got := cgroupDirMatchesCID(tc.name, cid); got != tc.want {
 			t.Errorf("cgroupDirMatchesCID(%q) = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestFindCgroupDir_AmbiguousMatchRejected(t *testing.T) {
+	// A running container owns exactly one cgroup, so two matches mean the id
+	// collides with an unrelated cgroup. findCgroupDir must refuse rather than
+	// SIGKILL whichever it hits first (H-02).
+	root := t.TempDir()
+	cid := "b790433fdb4f223a51940bae06c1cd54d73377fc3ea45c4fa5c7ea3bd4b6c829"
+	flat := filepath.Join(root, cid)
+	scope := filepath.Join(root, "system.slice", "cri-containerd-"+cid+".scope")
+	for _, d := range []string{flat, scope} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := findCgroupDir(root, cid)
+	if err == nil {
+		t.Fatalf("findCgroupDir returned %q with nil error; want an ambiguity error", got)
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("error = %v, want it to mention ambiguity", err)
 	}
 }
 

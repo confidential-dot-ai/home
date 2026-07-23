@@ -87,13 +87,16 @@ type configClaimsASN1 struct {
 // REPORTDATA and the bytes CreateAttestedCert embeds are identical — the
 // binding covers exactly what the certificate carries (docs/ratls.md).
 func (c *ConfigClaims) MarshalExtension() (pkix.Extension, error) {
-	for name, d := range map[string][]byte{
-		"operator-keys": c.OperatorKeysDigest,
-		"seed":          c.SeedDigest,
-		"workload":      c.WorkloadDigest,
+	for _, f := range []struct {
+		name string
+		d    []byte
+	}{
+		{"operator-keys", c.OperatorKeysDigest},
+		{"seed", c.SeedDigest},
+		{"workload", c.WorkloadDigest},
 	} {
-		if len(d) != ClaimsDigestSize {
-			return pkix.Extension{}, fmt.Errorf("ratls: %s claims digest must be %d bytes, got %d", name, ClaimsDigestSize, len(d))
+		if len(f.d) != ClaimsDigestSize {
+			return pkix.Extension{}, fmt.Errorf("ratls: %s claims digest must be %d bytes, got %d", f.name, ClaimsDigestSize, len(f.d))
 		}
 	}
 	value, err := asn1.Marshal(configClaimsASN1{
@@ -129,6 +132,17 @@ func UnmarshalConfigClaims(der []byte) (*ConfigClaims, error) {
 			return nil, fmt.Errorf("ratls: config-claims digest is %d bytes, want %d", len(d), ClaimsDigestSize)
 		}
 	}
+	// encoding/asn1 tolerates extra elements inside the SEQUENCE and
+	// non-minimal encodings; requiring the input to round-trip byte-exactly
+	// keeps "parses as v1" equivalent to "is the one v1 encoding", so no two
+	// distinct extension values yield the same ConfigClaims.
+	reencoded, err := asn1.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("ratls: re-encode config claims: %w", err)
+	}
+	if !bytes.Equal(reencoded, der) {
+		return nil, fmt.Errorf("ratls: config-claims extension is not the exact v%d encoding (%d bytes, canonical is %d)", configClaimsVersion, len(der), len(reencoded))
+	}
 	return &ConfigClaims{
 		OperatorKeysDigest: raw.OperatorKeysDigest,
 		SeedDigest:         raw.SeedDigest,
@@ -151,10 +165,19 @@ func (c *ConfigClaims) HasWorkload() bool {
 // what the REPORTDATA preimage folds in — verification hashes exactly what the
 // certificate carries, then parses only when claims semantics are needed.
 func ExtractConfigClaimsBytes(cert *x509.Certificate) []byte {
+	value, _ := configClaimsExtension(cert)
+	return value
+}
+
+// configClaimsExtension returns the config-claims extension value and whether
+// the extension is present at all. The distinction matters to VerifyCert: a
+// present-but-empty extension is rejected there rather than silently treated
+// as claims-free, so extension presence always implies a bound value.
+func configClaimsExtension(cert *x509.Certificate) ([]byte, bool) {
 	for _, ext := range cert.Extensions {
 		if ext.Id.Equal(OIDRATLSConfigClaims) {
-			return ext.Value
+			return ext.Value, true
 		}
 	}
-	return nil
+	return nil, false
 }
