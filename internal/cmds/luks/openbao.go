@@ -59,10 +59,33 @@ func kvMetaPath(workload, name string) string {
 // POST /v1/<mount>/data/<path> {"data": {...}}; see
 // https://developer.hashicorp.com/vault/api-docs/secret/kv/kv-v2.
 func (b *bao) putPassphrase(ctx context.Context, workload, name string, passphrase []byte) error {
+	// cas=0 makes this a create-only write: KV v2 rejects it if any version
+	// already exists at the path, so `create` never overwrites (and later
+	// destroys, via rollback) a passphrase it did not just create.
 	body, _ := json.Marshal(map[string]any{
-		"data": map[string]any{"passphrase": string(passphrase)},
+		"data":    map[string]any{"passphrase": string(passphrase)},
+		"options": map[string]any{"cas": 0},
 	})
-	return b.do(ctx, http.MethodPost, kvPath(workload, name), body, nil)
+	if err := b.do(ctx, http.MethodPost, kvPath(workload, name), body, nil); err != nil {
+		if isCASConflict(err) {
+			return errVolumeExists
+		}
+		return err
+	}
+	return nil
+}
+
+// errVolumeExists reports that a KV entry already exists at the volume's path,
+// so the create-only putPassphrase was rejected.
+var errVolumeExists = errors.New("passphrase already exists at this OpenBao path")
+
+// isCASConflict reports whether err is a KV v2 check-and-set rejection — the
+// cas=0 create-only write hitting an existing key, which openbao returns as
+// HTTP 400 with a "check-and-set" message.
+func isCASConflict(err error) bool {
+	var he *httpError
+	return errors.As(err, &he) && he.status == http.StatusBadRequest &&
+		strings.Contains(he.body, "check-and-set")
 }
 
 // readMetadata returns the KV v2 metadata for a volume. Used by `show` to

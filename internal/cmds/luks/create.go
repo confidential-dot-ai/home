@@ -142,14 +142,18 @@ func runCreate(ctx context.Context, bf *baoFlags, cfg createConfig) error {
 		return err
 	}
 	if err := client.putPassphrase(ctx, cfg.workload, cfg.name, passphrase); err != nil {
+		if errors.Is(err, errVolumeExists) {
+			return fmt.Errorf("openbao already holds a passphrase for %s/luks-%s — refusing to overwrite; `c8s luks destroy` it first", cfg.workload, cfg.name)
+		}
 		return fmt.Errorf("openbao KV write: %w", err)
 	}
 
 	// 3. Provision the backing device.
 	prov, err := provision(ctx, cfg, passphrase)
 	if err != nil {
-		// Roll back the KV entry so a retry gets a fresh passphrase and doesn't
-		// see stale versions. Best-effort; log on failure.
+		// The KV write above was create-only (cas=0), so this entry is one this
+		// call just created — safe to roll it back so a retry gets a fresh
+		// passphrase. Best-effort; log on failure.
 		_ = client.deleteVolume(ctx, cfg.workload, cfg.name)
 		return err
 	}

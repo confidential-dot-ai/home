@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -185,6 +186,24 @@ func TestBaoKVLifecycle(t *testing.T) {
 	// metadata read now 404s
 	if _, err := c.readMetadata(ctx, "api", "data"); err == nil || !isNotFound(err) {
 		t.Errorf("after delete: want not-found error, got %v", err)
+	}
+}
+
+// putPassphrase is a create-only (cas=0) write: a KV v2 cas conflict on an
+// existing entry must surface as errVolumeExists so create refuses to overwrite
+// (and never rolls back / destroys) a passphrase it did not create.
+func TestPutPassphraseCASConflict(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/data/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"errors":["check-and-set parameter did not match the current version"]}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	err := newBao(srv.URL, "root").putPassphrase(context.Background(), "api", "data", []byte("s3cr3t"))
+	if !errors.Is(err, errVolumeExists) {
+		t.Fatalf("cas conflict: got %v, want errVolumeExists", err)
 	}
 }
 
