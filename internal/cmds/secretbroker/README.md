@@ -17,21 +17,22 @@ the broker.
  │   auth=cert (the c8s cert)     │ (broker │  policy check    │────►│  default, or │
  │   address=https://broker:8443  │  ends   │  Vault translate │     │  external)   │
  └───────────────────────────────┘  TLS)   └──────────────────┘     └──────────────┘
-   caller measurement/identity is read off the CDS-issued client cert
+   caller identity is read off the CDS-issued client cert
 ```
 
 ## Trust flow
 
-1. **Caller verification** happens at the TLS layer (`--peer-verify`):
-   - `ratls` (default, production): the caller's client cert carries a TEE
-     attestation report; the broker verifies the hardware chain and the launch
-     measurement against `--measurements`. Needs SEV-SNP/TDX (or the in-cluster
-     attestation-api for az-snp).
-   - `ca`: the client cert is verified by X.509 chain to the CDS mesh CA
-     (`--client-ca`) and identity is taken from the cert SAN. Use where the CDS
-     issuance decision is the trust anchor, and for the hardware-free demo.
+CDS is the single trust root. The broker does not re-verify hardware evidence
+at the handshake; it trusts the CDS mesh CA's issuance decision, exactly as
+every other c8s dataplane component does.
+
+1. **Caller verification** happens at the TLS layer: the caller's mesh client
+   cert is verified by X.509 chain to the CDS mesh CA (`--client-ca`), and
+   identity is read off the CDS-vouched leaf — the SAN (`workloadId`) and the
+   config-claims (`workloadDigest`). CDS verified the caller's attestation when
+   it issued that leaf.
 2. **Policy check** (`--policy`, deny-by-default): a JSON file maps
-   `(measurement | workloadId)` to the KV paths they may read.
+   `(workloadId | workloadImages)` to the KV paths they may read.
 3. **Token mint**: on `cert/login` the broker mints a short-TTL token **bound to
    the caller's client cert** (a token cannot be replayed on a different cert).
 4. **Brokered read**: the broker authenticates to OpenBao with its own identity
@@ -48,7 +49,7 @@ case the broker is the documented edge of the trust boundary.
 {
   "rules": [
     { "workloadImages": { "main": ["sha256:<hex>"] }, "allow": ["secret/data/api/db#password"] },
-    { "workloadId": "api", "measurements": ["<sha384-hex>"], "allow": ["secret/data/api/*#password"] },
+    { "workloadId": "api", "allow": ["secret/data/api/*#password"] },
     { "workloadId": "*", "allow": ["secret/data/shared/*"] }
   ]
 }
@@ -63,19 +64,15 @@ fails closed where that part is unavailable:
 
 - `workloadImages` — `{ "init": [...], "main": ["sha256:…"] }`, the container
   images the workload is admitted to run. The broker hashes them with the same
-  role-partitioned `workloadclaims.Digest` the caller's RA-TLS cert commits to
+  role-partitioned `workloadclaims.Digest` the caller's mesh cert commits to
   (config-claims, per PR #85/#100) and releases only to the pod whose *whole*
-  attested image set matches. This is the strong, per-workload bind — trustworthy
-  in **both** peer-verify modes (REPORTDATA-bound under `ratls`, CDS-vouched at
-  issuance under `ca`) — and a caller carrying no workload claim is denied. It is
-  the combined role-hash over the full set, not a per-image contains-check; author
-  it with the policy CLI, which resolves image refs to digests for you.
-- `measurements` — the CVM launch digest; only available under `--peer-verify=ratls`,
-  so a measurement-constrained rule never matches under `ca`.
-- `workloadId` — the CDS-issued SAN. Only trustworthy (and only set) under
-  `--peer-verify=ca`, where the mesh CA chain-verified the leaf; under `ratls` the
-  leaf is self-signed, so the SAN is not read as identity and a `workloadId`-scoped
-  rule fails closed. Prefer `workloadImages` for anything security-bearing.
+  attested image set matches. This is the strong, per-workload bind — CDS-vouched
+  at issuance — and a caller carrying no workload claim is denied. It is the
+  combined role-hash over the full set, not a per-image contains-check; author it
+  with the policy CLI, which resolves image refs to digests for you.
+- `workloadId` — the CDS-issued SAN. The mesh CA chain-verified the leaf, so the
+  SAN is CDS-vouched; a `workloadId`-scoped rule fails closed for a caller that
+  presents no SAN. Prefer `workloadImages` for anything security-bearing.
 
 Each `allow` entry is a path pattern with an optional field scope,
 `pattern#field[,field]`: the broker filters the KV read down to the named
@@ -122,8 +119,6 @@ Enable the broker in the chart and point it at a backing store:
 ```yaml
 secretBroker:
   enabled: true
-  peerVerify: ratls            # measurement-gated (needs TEE); "ca" for the mesh-CA path
-  measurements: ["<sha384>"]   # callers accepted in ratls mode
   releasePolicy:
     rules:
       - { workloadId: api, allow: ["secret/data/api/*"] }
@@ -155,6 +150,6 @@ C8S=./build/c8s ./scripts/secret-broker-demo.sh   # needs `bao` on PATH too
 Implemented and tested: the broker, the `secret-agent-config` renderer, the
 webhook agent injection, and the Helm wiring. Validated hardware-free against a
 real OpenBao (broker + unmodified `bao agent` → templated file). Pending a TEE
-cluster: on-hardware `--peer-verify=ratls`, and live in-cluster injection
-ordering. Future: scoped/least-privilege OpenBao tokens (the broker uses one
-identity today), KV v1, and dynamic/transit engines.
+cluster: live in-cluster injection ordering. Future: scoped/least-privilege
+OpenBao tokens (the broker uses one identity today), KV v1, and dynamic/transit
+engines.

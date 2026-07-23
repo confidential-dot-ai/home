@@ -32,24 +32,6 @@ func TestPathMatch(t *testing.T) {
 	}
 }
 
-func TestRuleMatchesMeasurementGating(t *testing.T) {
-	measRule := Rule{Measurements: []string{"AABBCC"}, Allow: []string{"secret/data/x"}}
-
-	// ratls-mode caller with matching measurement (note: normalized to lower).
-	if !ruleMatches(measRule, PeerIdentity{Measurement: "aabbcc", WorkloadID: "api"}) {
-		t.Error("expected match for correct measurement")
-	}
-	// Wrong measurement: deny.
-	if ruleMatches(measRule, PeerIdentity{Measurement: "ddeeff"}) {
-		t.Error("expected deny for wrong measurement")
-	}
-	// ca-mode caller (no measurement) against a measurement-constrained rule:
-	// must fail closed.
-	if ruleMatches(measRule, PeerIdentity{WorkloadID: "api"}) {
-		t.Error("expected deny when rule requires measurement but caller has none")
-	}
-}
-
 func TestRuleMatchesWorkloadID(t *testing.T) {
 	if !ruleMatches(Rule{WorkloadID: "*", Allow: []string{"x"}}, PeerIdentity{WorkloadID: "anything"}) {
 		t.Error("wildcard workloadId should match any caller")
@@ -57,10 +39,9 @@ func TestRuleMatchesWorkloadID(t *testing.T) {
 	if ruleMatches(Rule{WorkloadID: "api", Allow: []string{"x"}}, PeerIdentity{WorkloadID: "evil"}) {
 		t.Error("workloadId mismatch should deny")
 	}
-	// A ratls-mode caller carries no WorkloadID (the self-signed SAN is not read
-	// as identity), so a workloadId-scoped rule must fail closed rather than
-	// match on the empty value.
-	if ruleMatches(Rule{WorkloadID: "api", Allow: []string{"x"}}, PeerIdentity{Measurement: "aabbcc"}) {
+	// A caller carrying no WorkloadID (no SAN) must fail closed against a
+	// workloadId-scoped rule rather than match on the empty value.
+	if ruleMatches(Rule{WorkloadID: "api", Allow: []string{"x"}}, PeerIdentity{}) {
 		t.Error("workloadId rule must fail closed for a caller with no WorkloadID")
 	}
 }

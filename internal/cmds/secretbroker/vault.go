@@ -75,7 +75,7 @@ func (b *broker) handleCertLogin(w http.ResponseWriter, r *http.Request) {
 	if len(allowed) == 0 {
 		writeVaultError(w, http.StatusForbidden, "no release policy grants access to this workload")
 		slog.Warn("login denied: no policy match",
-			"workload_id", id.WorkloadID, "measurement", measurementLogValue(id.Measurement),
+			"workload_id", id.WorkloadID,
 			"workload_digest", workloadDigestLogValue(id.WorkloadDigest))
 		return
 	}
@@ -95,7 +95,7 @@ func (b *broker) handleCertLogin(w http.ResponseWriter, r *http.Request) {
 	resp.Auth.Metadata = map[string]string{"workload_id": id.WorkloadID}
 	writeJSON(w, http.StatusOK, resp)
 	slog.Info("login granted",
-		"workload_id", id.WorkloadID, "measurement", measurementLogValue(id.Measurement),
+		"workload_id", id.WorkloadID,
 		"workload_digest", workloadDigestLogValue(id.WorkloadDigest),
 		"granted_paths", len(allowed))
 }
@@ -204,15 +204,4 @@ func workloadDigestLogValue(d []byte) string {
 		return "(none)"
 	}
 	return hex.EncodeToString(d)
-}
-
-// measurementLogValue returns a short, safe-to-log form of a measurement.
-func measurementLogValue(m string) string {
-	if m == "" {
-		return "(none)"
-	}
-	if len(m) > 16 {
-		return m[:16] + "…"
-	}
-	return m
 }

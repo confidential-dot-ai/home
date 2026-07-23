@@ -2,12 +2,12 @@
 // "Secrets Manager Proxy" from the whitepaper (§4.3, §5.6.4). It sits inside
 // the trust boundary, speaks a subset of the Vault/OpenBao HTTP API so that
 // unmodified Vault/OpenBao Agent + CSI tooling can talk to it, authenticates
-// the calling workload by its attestation-rooted identity (RA-TLS measurement
-// or CDS-issued mesh cert), applies a per-secret release policy, and brokers
-// the request to a vanilla OpenBao (or HashiCorp Vault) instance.
+// the calling workload by its CDS-issued mesh identity, applies a per-secret
+// release policy, and brokers the request to a vanilla OpenBao (or HashiCorp
+// Vault) instance.
 //
 // The external store never sees the workload directly — only the broker's
-// identity after attestation and policy pass.
+// identity after the CDS identity check and policy pass.
 package secretbroker
 
 import (
@@ -24,21 +24,6 @@ const (
 	defaultHTTPMaxHeaderBytes    = 1 << 20
 )
 
-// peerVerifyRATLS and peerVerifyCA are the two peer-verification modes.
-//
-//   - ratls: the caller's client cert carries a TEE attestation report; the
-//     broker verifies the hardware chain and the launch measurement against
-//     --measurements. This is the production, measurement-gated mode and needs
-//     real TEE hardware (or the in-cluster attestation-api).
-//   - ca: the caller's client cert is verified by X.509 chain to the CDS mesh
-//     CA, and identity is taken from the cert SAN. Use where the CDS issuance
-//     decision is the trust anchor, and for the hardware-free demo/integration
-//     harness.
-const (
-	peerVerifyRATLS = "ratls"
-	peerVerifyCA    = "ca"
-)
-
 // NewCmd returns the cobra subcommand.
 func NewCmd() *cobra.Command {
 	var cfg config
@@ -48,9 +33,9 @@ func NewCmd() *cobra.Command {
 		Long: "secret-broker fronts a vanilla OpenBao/Vault instance with an " +
 			"attestation gate. It speaks a subset of the Vault HTTP API so " +
 			"unmodified Vault/OpenBao Agent and CSI tooling work unchanged, " +
-			"authenticates the caller by its CDS-issued RA-TLS identity, and " +
-			"releases secrets only when the caller's measurement/identity " +
-			"matches the release policy.",
+			"authenticates the caller by its CDS-issued mesh identity, and " +
+			"releases secrets only when the caller's identity matches the " +
+			"release policy.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return run(cfg)
 		},
@@ -68,11 +53,11 @@ func NewCmd() *cobra.Command {
 	flags.StringVar(&cfg.tlsCert, "tls-cert", "", "PEM server certificate the broker presents to callers (required)")
 	flags.StringVar(&cfg.tlsKey, "tls-key", "", "PEM private key for --tls-cert (required)")
 
-	// Caller (workload) verification.
-	flags.StringVar(&cfg.peerVerify, "peer-verify", peerVerifyRATLS, "how to verify caller client certs: ratls (measurement-gated, needs TEE) or ca (chain to CDS mesh CA)")
-	flags.StringVar(&cfg.clientCA, "client-ca", "", "PEM CA bundle callers' certs must chain to in --peer-verify=ca mode (the CDS mesh CA)")
-	flags.StringSliceVar(&cfg.measurements, "measurements", nil, "SHA-384 hex launch measurements accepted from callers in --peer-verify=ratls mode (empty = accept any TEE measurement, UNSAFE)")
-	flags.StringVar(&cfg.attestationApiURL, "attestation-api-url", "", "attestation-api URL for online RA-TLS verification (az-snp); also used to verify an attested OpenBao")
+	// Caller (workload) verification. CDS is the trust root: callers are
+	// verified by X.509 chain to the CDS mesh CA, and identity is read from the
+	// CDS-issued leaf (SAN + config-claims).
+	flags.StringVar(&cfg.clientCA, "client-ca", "", "PEM CA bundle callers' certs must chain to (the CDS mesh CA) (required)")
+	flags.StringVar(&cfg.attestationApiURL, "attestation-api-url", "", "attestation-api URL used to verify an attested OpenBao (--openbao-attested)")
 
 	// Release policy.
 	flags.StringVar(&cfg.policyFile, "policy", "", "path to the JSON release policy (required); deny-by-default")
@@ -99,6 +84,7 @@ func NewCmd() *cobra.Command {
 
 	_ = cmd.MarkFlagRequired("tls-cert")
 	_ = cmd.MarkFlagRequired("tls-key")
+	_ = cmd.MarkFlagRequired("client-ca")
 	_ = cmd.MarkFlagRequired("policy")
 	_ = cmd.MarkFlagRequired("openbao-addr")
 
@@ -113,9 +99,7 @@ type config struct {
 	tlsCert string
 	tlsKey  string
 
-	peerVerify        string
 	clientCA          string
-	measurements      []string
 	attestationApiURL string
 
 	policyFile string

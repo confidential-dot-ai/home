@@ -10,23 +10,16 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/workloadclaims"
 )
 
-// PeerIdentity is the attestation-rooted identity the broker derives from a
-// verified caller TLS connection:
+// PeerIdentity is the CDS-rooted identity the broker derives from a verified
+// caller TLS connection. The caller's mesh leaf is chain-verified against the
+// CDS mesh CA, so both fields are CDS-vouched:
 //
-//   - Measurement: lowercase-hex SHA-384 launch digest. Set only in
-//     --peer-verify=ratls mode, where the hardware chain has been verified.
-//   - WorkloadID: the caller's CDS-issued SAN. Set only in --peer-verify=ca
-//     mode, where the mesh CA chain-verified the leaf. An RA-TLS leaf is
-//     self-signed and its REPORTDATA binds only the key, not the SAN, so in
-//     ratls mode the SAN is caller-asserted and is left unset — a
-//     workloadId-scoped rule fails closed there.
+//   - WorkloadID: the caller's CDS-issued SAN.
 //   - WorkloadDigest: the attested combined role-hash of the caller's admitted
-//     container images (workloadclaims.Digest), read off the leaf's config-claims.
-//     Bound by the evidence REPORTDATA in ratls mode and CDS-vouched at issuance
-//     in ca mode, so it is the one identity trustworthy in BOTH modes. nil when
-//     the caller presented no workload claim.
+//     container images (workloadclaims.Digest), read off the leaf's
+//     config-claims and CDS-vouched at issuance. nil when the caller presented
+//     no workload claim.
 type PeerIdentity struct {
-	Measurement    string
 	WorkloadID     string
 	WorkloadDigest []byte
 }
@@ -34,12 +27,8 @@ type PeerIdentity struct {
 // Rule is one entry in the release policy. A rule matches a PeerIdentity when
 // every constraint it sets is satisfied (AND):
 //
-//   - Measurements: if non-empty, the caller's measurement must be one of these
-//     (a rule that constrains on measurement can therefore never match in
-//     --peer-verify=ca mode, where no measurement is available — fail closed).
 //   - WorkloadID: if non-empty and not "*", must equal the caller's WorkloadID
-//     (never matches in --peer-verify=ratls mode, where WorkloadID is unset —
-//     fail closed).
+//     (the CDS-issued SAN).
 //   - WorkloadImages: if set, the caller's attested WorkloadDigest must equal the
 //     combined role-hash of these init/main image digests (workloadclaims.Digest).
 //     This is the pod-identity bind: only the workload whose whole admitted image
@@ -58,7 +47,6 @@ type PeerIdentity struct {
 // union of Allow across all matching rules is the caller's permitted set; a
 // path granted without a field scope by any matching entry yields all fields.
 type Rule struct {
-	Measurements   []string        `json:"measurements,omitempty"`
 	WorkloadID     string          `json:"workloadId,omitempty"`
 	WorkloadImages *WorkloadImages `json:"workloadImages,omitempty"`
 	Allow          []string        `json:"allow"`
@@ -123,11 +111,6 @@ func LoadPolicy(path string) (*Policy, error) {
 				}
 			}
 		}
-		for _, m := range r.Measurements {
-			if normalizeMeasurement(m) == "" {
-				return nil, fmt.Errorf("policy rule %d has an empty measurement", i)
-			}
-		}
 		if r.WorkloadImages != nil {
 			if len(r.WorkloadImages.Main) == 0 {
 				return nil, fmt.Errorf("policy rule %d workloadImages names no main image", i)
@@ -158,21 +141,6 @@ func (p *Policy) AllowedPaths(id PeerIdentity) []string {
 }
 
 func ruleMatches(r Rule, id PeerIdentity) bool {
-	if len(r.Measurements) > 0 {
-		if id.Measurement == "" {
-			return false
-		}
-		found := false
-		for _, m := range r.Measurements {
-			if normalizeMeasurement(m) == id.Measurement {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
 	if r.WorkloadID != "" && r.WorkloadID != "*" && r.WorkloadID != id.WorkloadID {
 		return false
 	}
@@ -259,10 +227,4 @@ func pathMatch(pattern, path string) bool {
 		}
 	}
 	return len(pat) == len(seg)
-}
-
-// normalizeMeasurement lowercases and trims a hex measurement, returning "" for
-// blank input. Kept local so the policy package does not pull in the issuer.
-func normalizeMeasurement(m string) string {
-	return strings.ToLower(strings.TrimSpace(m))
 }

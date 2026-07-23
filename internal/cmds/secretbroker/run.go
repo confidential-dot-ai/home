@@ -92,13 +92,8 @@ func resolveCredentialFiles(cfg *config) error {
 }
 
 func validateConfig(cfg config) error {
-	switch cfg.peerVerify {
-	case peerVerifyRATLS, peerVerifyCA:
-	default:
-		return fmt.Errorf("--peer-verify must be %q or %q", peerVerifyRATLS, peerVerifyCA)
-	}
-	if cfg.peerVerify == peerVerifyCA && cfg.clientCA == "" {
-		return fmt.Errorf("--peer-verify=ca requires --client-ca")
+	if cfg.clientCA == "" {
+		return fmt.Errorf("--client-ca is required (the CDS mesh CA)")
 	}
 	if cfg.openbaoToken != "" && cfg.openbaoRoleID != "" {
 		return fmt.Errorf("--openbao-token and --openbao-approle-role-id are mutually exclusive")
@@ -124,21 +119,14 @@ func validateConfig(cfg config) error {
 }
 
 // logStartup records the effective posture and emits loud warnings for the
-// UNSAFE-outside-development configurations (empty measurement allowlists).
+// UNSAFE-outside-development configurations (empty store measurement allowlist).
 func logStartup(cfg config, addr string, ruleCount int) {
 	slog.Info("secret-broker listening (TLS)",
 		"addr", addr,
-		"peer_verify", cfg.peerVerify,
 		"openbao_addr", cfg.openbaoAddr,
 		"openbao_attested", cfg.openbaoAttested,
 		"policy_rules", ruleCount,
 	)
-	if cfg.peerVerify == peerVerifyRATLS && len(cfg.measurements) == 0 {
-		slog.Warn("--measurements empty: accepting any TEE measurement from callers. UNSAFE outside development.")
-	}
-	if cfg.peerVerify == peerVerifyCA {
-		slog.Warn("--peer-verify=ca: callers are authorized by CDS-issued identity (SAN), not by re-verified measurement. Use ratls mode in production.")
-	}
 	if cfg.openbaoAttested && len(cfg.openbaoMeasurements) == 0 {
 		slog.Warn("--openbao-measurements empty: accepting any TEE measurement from the store. UNSAFE outside development.")
 	}

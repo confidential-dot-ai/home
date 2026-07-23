@@ -88,7 +88,7 @@ func newTestBrokerWithPolicy(t *testing.T, storeAddr string, policy *Policy) htt
 		t.Fatal(err)
 	}
 	b := &broker{
-		verifier: &peerVerifier{mode: peerVerifyCA},
+		verifier: &peerVerifier{},
 		policy:   policy,
 		tokens:   newTokenStore(time.Hour),
 		store:    store,

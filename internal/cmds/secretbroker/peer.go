@@ -12,71 +12,43 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 )
 
-// peerVerifier derives an attestation-rooted PeerIdentity from a verified TLS
-// connection, according to the configured --peer-verify mode.
-type peerVerifier struct {
-	mode   string
-	policy *ratls.VerifyPolicy // ratls mode only
-}
+// peerVerifier derives a CDS-rooted PeerIdentity from a verified caller TLS
+// connection. CDS is the single trust root: the caller's mesh leaf is
+// chain-verified against the CDS mesh CA, and identity is read from the leaf
+// (SAN + CDS-vouched config-claims). CDS verified the caller's attestation at
+// issuance, so the broker does not re-verify hardware evidence at the handshake.
+type peerVerifier struct{}
 
-// buildServerTLS constructs the broker's TLS config and the matching
-// peerVerifier. The server certificate is always loaded from files (in-cluster:
-// the injected get-cert sidecar's c8s-certs tmpfs; demo: a generated cert), so
-// stock agents trust the broker via their configured CA bundle. The two modes
-// differ only in how the *caller's* client cert is verified.
+// buildServerTLS constructs the broker's TLS config and the peerVerifier. The
+// server certificate is always loaded from files (in-cluster: the injected
+// get-cert sidecar's c8s-certs tmpfs; demo: a generated cert), so stock agents
+// trust the broker via their configured CA bundle. Callers are verified by
+// X.509 chain to the CDS mesh CA (--client-ca).
 func buildServerTLS(cfg config) (*tls.Config, *peerVerifier, error) {
 	srvCert, err := tls.LoadX509KeyPair(cfg.tlsCert, cfg.tlsKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load server cert: %w", err)
 	}
 
+	pool, err := loadCAPool(cfg.clientCA)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{srvCert},
 		MinVersion:   tls.VersionTLS13,
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
-
-	switch cfg.peerVerify {
-	case peerVerifyCA:
-		pool, err := loadCAPool(cfg.clientCA)
-		if err != nil {
-			return nil, nil, err
-		}
-		tlsCfg.ClientCAs = pool
-		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
-		return tlsCfg, &peerVerifier{mode: peerVerifyCA}, nil
-
-	case peerVerifyRATLS:
-		ms, err := parseMeasurementsBytes(cfg.measurements)
-		if err != nil {
-			return nil, nil, fmt.Errorf("--measurements: %w", err)
-		}
-		policy := &ratls.VerifyPolicy{Measurements: ms, AttestationApiURL: cfg.attestationApiURL}
-		// Enforce attestation at the handshake; the handler re-derives the
-		// measurement value from the (already-verified) peer cert.
-		tlsCfg.ClientAuth = tls.RequireAnyClientCert
-		tlsCfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return fmt.Errorf("secret-broker: no client certificate")
-			}
-			cert, err := x509.ParseCertificate(rawCerts[0])
-			if err != nil {
-				return fmt.Errorf("secret-broker: parse client cert: %w", err)
-			}
-			if _, err := ratls.VerifyCert(cert, policy, nil); err != nil {
-				return fmt.Errorf("secret-broker: client attestation failed: %w", err)
-			}
-			return nil
-		}
-		return tlsCfg, &peerVerifier{mode: peerVerifyRATLS, policy: policy}, nil
-
-	default:
-		return nil, nil, fmt.Errorf("--peer-verify must be %q or %q, got %q", peerVerifyRATLS, peerVerifyCA, cfg.peerVerify)
-	}
+	return tlsCfg, &peerVerifier{}, nil
 }
 
-// Identity derives the caller's PeerIdentity from an already-handshaked
-// request. It must only be called for requests that presented a verified
-// client certificate (the TLS config guarantees this).
+// Identity derives the caller's PeerIdentity from an already-handshaked request.
+// It must only be called for requests that presented a verified client
+// certificate (the TLS config guarantees this). RequireAndVerifyClientCert
+// chain-verified the leaf against the mesh CA, so both the SAN and the
+// config-claims extension are CDS-vouched.
 func (v *peerVerifier) Identity(r *http.Request) (PeerIdentity, error) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		return PeerIdentity{}, fmt.Errorf("no client certificate")
@@ -84,34 +56,12 @@ func (v *peerVerifier) Identity(r *http.Request) (PeerIdentity, error) {
 	cert := r.TLS.PeerCertificates[0]
 
 	var id PeerIdentity
-	switch v.mode {
-	case peerVerifyRATLS:
-		// An RA-TLS leaf is self-signed and its REPORTDATA binds only the key,
-		// not the SAN — so the SAN is caller-asserted and must NOT be read as
-		// identity. The attested identity is the measurement and the config-claims
-		// the same VerifyCert folded into REPORTDATA; a workloadId rule fails closed.
-		res, err := ratls.VerifyCert(cert, v.policy, nil)
-		if err != nil {
-			return PeerIdentity{}, fmt.Errorf("verify client attestation: %w", err)
-		}
-		id.Measurement = hex.EncodeToString(res.Measurement[:])
-		// VerifyCert authenticated the claims by folding them into REPORTDATA on
-		// this same leaf, which satisfies PeerConfigClaims' acceptance invariant.
-		claims, err := ratls.PeerConfigClaims(r.TLS)
-		if err != nil {
-			return PeerIdentity{}, fmt.Errorf("read peer config-claims: %w", err)
-		}
-		id.WorkloadDigest = workloadDigestFromClaims(claims)
-	case peerVerifyCA:
-		// RequireAndVerifyClientCert chain-verified the leaf against the mesh CA,
-		// so both the SAN and the config-claims extension are CDS-vouched.
-		id.WorkloadID = workloadIDFromCert(cert)
-		claims, err := ratls.PeerConfigClaims(r.TLS)
-		if err != nil {
-			return PeerIdentity{}, fmt.Errorf("read peer config-claims: %w", err)
-		}
-		id.WorkloadDigest = workloadDigestFromClaims(claims)
+	id.WorkloadID = workloadIDFromCert(cert)
+	claims, err := ratls.PeerConfigClaims(r.TLS)
+	if err != nil {
+		return PeerIdentity{}, fmt.Errorf("read peer config-claims: %w", err)
 	}
+	id.WorkloadDigest = workloadDigestFromClaims(claims)
 	return id, nil
 }
 
@@ -157,7 +107,7 @@ func workloadIDFromCert(cert *x509.Certificate) string {
 
 func loadCAPool(path string) (*x509.CertPool, error) {
 	if path == "" {
-		return nil, fmt.Errorf("--peer-verify=ca requires --client-ca")
+		return nil, fmt.Errorf("--client-ca is required (the CDS mesh CA)")
 	}
 	pem, err := os.ReadFile(path)
 	if err != nil {

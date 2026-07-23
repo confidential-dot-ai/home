@@ -203,7 +203,7 @@ func (c *vaultClient) do(ctx context.Context, method, path, token string, body i
 func parseMeasurementsBytes(hexes []string) ([][]byte, error) {
 	var out [][]byte
 	for _, h := range hexes {
-		h = normalizeMeasurement(h)
+		h = strings.ToLower(strings.TrimSpace(h))
 		if h == "" {
 			continue
 		}
