@@ -388,3 +388,32 @@ func TestKataSweepDaemonSetK8sDisablesRKE2Prep(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateSweepPath(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		path       string
+		allowEmpty bool
+		wantErr    bool
+	}{
+		{"default guest image", "/var/lib/c8s/kata-images", false, false},
+		{"default nvidia image", "/var/lib/c8s/kata-images-nvidia", true, false},
+		{"nested under prefix", "/var/lib/c8s/x/y", false, false},
+		{"empty not allowed", "", false, true},
+		{"empty allowed", "", true, false},
+		{"root", "/", false, true},
+		{"host mount", "/host", false, true},
+		{"prefix itself", "/var/lib/c8s", false, true},
+		{"sibling of prefix", "/var/lib/c8s-evil/x", false, true},
+		{"relative", "var/lib/c8s/x", false, true},
+		{"traversal", "/var/lib/c8s/../../etc", false, true},
+		{"trailing slash not clean", "/var/lib/c8s/kata-images/", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateSweepPath("field", tc.path, tc.allowEmpty)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateSweepPath(%q, allowEmpty=%v) error = %v, wantErr = %v", tc.path, tc.allowEmpty, err, tc.wantErr)
+			}
+		})
+	}
+}

@@ -334,12 +334,22 @@ func (m *monitor) handleNewContainer(ctx context.Context, dir string) {
 
 	spec, err := m.readConfigJSON(ctx, configPath)
 	if err != nil {
-		// "Not yet present" is the common case if the CREATE was for
-		// the directory and config.json hasn't been written yet —
-		// readConfigJSON already retries up to configReadDeadline.
-		// Anything that reaches here is a real failure (parse error,
-		// permission, missing-for-too-long).
-		m.logger.Warn("read config.json failed", "cid", cid, "path", configPath, "error", err)
+		// A config.json that EXISTS but cannot be read or parsed (malformed
+		// JSON, permission games, a directory in its place) means we cannot
+		// determine the image digest for a container that clearly has a bundle.
+		// Fail closed: deny (kill) rather than let it run unmonitored — an
+		// attacker must not be able to evade the allowlist by mangling the
+		// spec. When the file is simply absent (the common non-container watch
+		// entry such as kata's "shared" dir, or a bundle whose config.json has
+		// not been written yet), we skip: killing there would be a false
+		// positive on infrastructure directories. The delayed-write/cgroup race
+		// is tracked separately (persistent pending state, audit H-01/PR 07).
+		if _, statErr := os.Stat(configPath); statErr == nil {
+			m.logger.Warn("deny container: config.json present but unreadable/malformed", "cid", cid, "path", configPath, "error", err)
+			m.kill(cid)
+			return
+		}
+		m.logger.Warn("skip: config.json absent (not a container bundle, or not written yet)", "cid", cid, "path", configPath, "error", err)
 		return
 	}
 

@@ -96,6 +96,10 @@ func TestApplyClaimsPolicy(t *testing.T) {
 		{"unparseable claims", &evidence{claimsErr: errTest("unsupported config-claims version 9")}, &ratls.VerifyPolicy{}, operatorKeysReport{}, false},
 		{"served list matches attested", &evidence{configClaims: claims}, &ratls.VerifyPolicy{}, operatorKeysReport{digest: claims.OperatorKeysDigest}, true},
 		{"served list contradicts attested", &evidence{configClaims: claims}, &ratls.VerifyPolicy{}, operatorKeysReport{digest: otherDigest}, false},
+		// A CDS erroring on /operator-keys must not dodge the mandatory
+		// served-vs-attested cross-check.
+		{"key fetch failed with claims", &evidence{configClaims: claims}, &ratls.VerifyPolicy{}, operatorKeysReport{fetchErr: errTest("/operator-keys returned 500")}, false},
+		{"key fetch failed without claims", &evidence{}, &ratls.VerifyPolicy{}, operatorKeysReport{fetchErr: errTest("/operator-keys returned 500")}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -138,6 +142,10 @@ func TestApplyClaimsPolicy(t *testing.T) {
 		if oc.Error != "hardware chain invalid" {
 			t.Fatalf("original failure reason was overwritten: %q", oc.Error)
 		}
+		// Unproven extension bytes must not be labeled "attested".
+		if oc.OperatorKeysAttestedDigest != "" || oc.SeedAttestedDigest != "" || oc.WorkloadAttestedDigest != "" {
+			t.Fatalf("claims digests surfaced on a failed hardware verdict: %q %q %q", oc.OperatorKeysAttestedDigest, oc.SeedAttestedDigest, oc.WorkloadAttestedDigest)
+		}
 	})
 }
 
@@ -147,6 +155,9 @@ func TestExpectedSeedDigestFlags(t *testing.T) {
 	}
 	if _, err := expectedSeedDigest(config{allowlistSeedDigest: "zz"}); err == nil {
 		t.Fatal("malformed hex digest accepted")
+	}
+	if _, err := expectedSeedDigest(config{allowlistSeedDigest: "abcd"}); err == nil {
+		t.Fatal("wrong-length hex digest accepted")
 	}
 	digest, err := expectedSeedDigest(config{allowlistSeedDigest: "sha256:" + hex.EncodeToString(bytes.Repeat([]byte{0xAB}, 32))})
 	if err != nil || !bytes.Equal(digest, bytes.Repeat([]byte{0xAB}, 32)) {

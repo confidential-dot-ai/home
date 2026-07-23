@@ -18,6 +18,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"sync"
 )
 
 const (
@@ -161,9 +162,24 @@ type Record struct {
 	CT []byte `cbor:"ct" json:"ct"`
 }
 
+// maxTrackedNonces bounds the per-channel anti-replay set. A verification
+// session exchanges a small number of records, so this is far above any
+// legitimate use while capping memory an over-eager or hostile client could
+// force. Once reached, Open fails closed (the session must be re-established).
+const maxTrackedNonces = 4096
+
 // Channel is a symmetric over-encryption channel; both ends hold an identical key.
 type Channel struct {
 	aead cipher.AEAD
+
+	// seen records the IV of every record this end has successfully opened, so
+	// a captured record replayed by the (untrusted) TLS terminator is rejected
+	// instead of decrypting to a second authenticated backend action or a stale
+	// response. Only authenticated records are recorded, so forged traffic
+	// cannot fill it. The wire format is unchanged (browser interop), so this is
+	// exact-record replay protection, not full sequence/ordering enforcement.
+	mu   sync.Mutex
+	seen map[string]struct{}
 }
 
 // RequestAAD is the additional-authenticated-data domain separator for request
@@ -184,7 +200,8 @@ func (c *Channel) Seal(plaintext, aad []byte) (Record, error) {
 	return Record{IV: iv, CT: ct}, nil
 }
 
-// Open decrypts and authenticates a record.
+// Open decrypts and authenticates a record, rejecting any record whose IV this
+// channel has already opened (exact-record replay).
 func (c *Channel) Open(rec Record, aad []byte) ([]byte, error) {
 	if len(rec.IV) != ivBytes {
 		return nil, fmt.Errorf("overenc: IV must be %d bytes", ivBytes)
@@ -193,5 +210,21 @@ func (c *Channel) Open(rec Record, aad []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("overenc: authentication failed: %w", err)
 	}
+	// Only authenticated records reach here, so a forged record cannot poison
+	// the set, and a genuine record's IV is unique per Seal — a repeat means the
+	// same authenticated record was submitted twice (a replay).
+	key := string(rec.IV)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.seen == nil {
+		c.seen = make(map[string]struct{})
+	}
+	if _, dup := c.seen[key]; dup {
+		return nil, fmt.Errorf("overenc: replayed record rejected")
+	}
+	if len(c.seen) >= maxTrackedNonces {
+		return nil, fmt.Errorf("overenc: channel record limit reached; re-establish the session")
+	}
+	c.seen[key] = struct{}{}
 	return pt, nil
 }

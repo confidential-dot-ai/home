@@ -18,11 +18,20 @@ import (
 // DefaultCertDir is controller-runtime's webhook-server default.
 const DefaultCertDir = "/tmp/k8s-webhook-server/serving-certs"
 
-// ServingTLSTTL bounds how long a bootstrapped serving cert is valid for.
-// The operator re-mints on each start, so in practice rotation is driven by
-// pod restarts. Leaf certs chain to the mesh CA and must be re-issued in
-// sync with CA rotations too.
+// ServingTLSTTL bounds how long a bootstrapped serving cert (the leaf) is valid
+// for. The operator re-mints it before expiry in-process (see the cert-rotator
+// runnable in the controller runner), so the webhook no longer depends on a pod
+// restart to stay valid — an unrotated leaf would otherwise expire and, with a
+// fail-closed admission webhook, block all in-scope Pod creation.
 const ServingTLSTTL = 30 * 24 * time.Hour
+
+// WebhookCATTL is the validity of the webhook's ephemeral CA. It is long-lived
+// so the CA bundle patched onto the MutatingWebhookConfiguration stays stable
+// for the operator pod's lifetime while short-lived leaves rotate under it —
+// keeping caBundle churn (and the leaf/bundle mismatch it can cause during a
+// rollout) out of the steady state. The CA is still re-minted on operator
+// restart, which re-patches the bundle.
+const WebhookCATTL = 10 * 365 * 24 * time.Hour
 
 // BootstrapServingCert mints a webhook serving cert from the mesh CA and
 // writes it into certDir. Hostnames must include every DNS name the API

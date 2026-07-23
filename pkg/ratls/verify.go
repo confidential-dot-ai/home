@@ -72,6 +72,22 @@ type VerifyPolicy struct {
 	// AttestationVerifyTimeout bounds online attestation-api verification.
 	// If unset, a conservative default is used.
 	AttestationVerifyTimeout time.Duration
+
+	// RequireCAEvidence selects the production trust mode for the dual CA /
+	// RA-TLS peer verifier (dualVerifyPeerCallback). When false (default), a
+	// peer whose leaf chains to a configured CA is accepted on the CA chain
+	// alone (config-claims pins are still enforced) — the legacy/dev mode that
+	// eases rolling upgrades and CA rotation. When true, a valid CA chain is no
+	// longer sufficient: the leaf must ALSO carry re-verifiable RA-TLS evidence
+	// (issuer.SignCSR copies the requester's nonce-free .1.1 extension onto the
+	// leaf), which is re-verified per connection so a CA compromise or wrong
+	// issuance policy is caught at the peer rather than trusted from the chain.
+	// The embedded evidence is nonce-free by construction (bound to the leaf
+	// key and claims, no per-connection nonce); connection liveness comes from
+	// the TLS 1.3 proof-of-possession of the leaf key. Set by the production
+	// profile; a self-signed RA-TLS peer is unaffected (it always verifies its
+	// evidence via the fallback path).
+	RequireCAEvidence bool
 }
 
 // VerifyResult contains the verified attestation claims extracted from the cert.
@@ -147,7 +163,12 @@ func VerifyCert(cert *x509.Certificate, policy *VerifyPolicy, nonce []byte) (*Ve
 		return nil, fmt.Errorf("%w: attestation-api URL is required", ErrInvalidReport)
 	}
 
-	claimsBytes := ExtractConfigClaimsBytes(cert)
+	claimsBytes, claimsPresent := configClaimsExtension(cert)
+	if claimsPresent && len(claimsBytes) == 0 {
+		// An empty value would fall through to the claims-free binding while
+		// still looking claims-bearing to anyone gating on extension presence.
+		return nil, fmt.Errorf("%w: config-claims extension present but empty", ErrInvalidReport)
+	}
 	if err := checkClaimsPins(claimsBytes, policy); err != nil {
 		return nil, err
 	}

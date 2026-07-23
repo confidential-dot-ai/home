@@ -226,7 +226,7 @@ context.
 {{- if default false $cors.enabled -}}
 {{- $origins := default (list) $cors.allowOrigins -}}
 {{- $methods := join ", " (default (list "GET" "POST" "OPTIONS") $cors.allowMethods) -}}
-{{- $headers := join ", " (default (list "Authorization" "Content-Type") $cors.allowHeaders) -}}
+{{- $headers := join ", " (default (list "Authorization" "Content-Type" "X-C8s-Session") $cors.allowHeaders) -}}
 {{- $exposeHeaders := default (list) $cors.exposeHeaders -}}
 {{- $credentials := ternary "true" "" (default false $cors.allowCredentials) }}
 map $http_origin $cors_origin {
@@ -296,7 +296,7 @@ enabled. Caller nindents into a `location {}` block.
 {{- define "tls-lb.corsLocationDirectives" -}}
 {{- $cors := default dict . -}}
 {{- $methods := join ", " (default (list "GET" "POST" "OPTIONS") $cors.allowMethods) -}}
-{{- $headers := join ", " (default (list "Authorization" "Content-Type") $cors.allowHeaders) -}}
+{{- $headers := join ", " (default (list "Authorization" "Content-Type" "X-C8s-Session") $cors.allowHeaders) -}}
 {{- $maxAge := default 600 $cors.maxAge }}
 proxy_hide_header Access-Control-Allow-Origin;
 proxy_hide_header Access-Control-Allow-Methods;

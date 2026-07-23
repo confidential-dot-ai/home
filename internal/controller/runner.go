@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -270,10 +271,11 @@ func confidentialWorkloadCRDAvailable(dc serverResourcesForGroupVersion) (bool, 
 // webhook and patches the CA bundle onto the MutatingWebhookConfiguration
 // so the API server trusts the webhook.
 //
-// The CA is ephemeral — re-minted on every operator restart. That's fine
-// for the admission webhook (a request path, not a durable trust anchor):
-// the restart re-patches the bundle and the API server starts trusting the
-// new cert.
+// The CA is ephemeral — re-minted on every operator restart — but long-lived
+// (webhook.WebhookCATTL), so the patched bundle stays stable while short-lived
+// serving leaves rotate under it. A rotator runnable re-mints the leaf before
+// it expires; without it the leaf's ~30-day validity would lapse and, with a
+// fail-closed webhook, block all in-scope Pod creation until a restart.
 func bootstrapWebhookPKI(ctx context.Context, mgr ctrl.Manager, opts Options) error {
 	if opts.WebhookConfigName == "" {
 		return nil
@@ -293,7 +295,7 @@ func bootstrapWebhookPKI(ctx context.Context, mgr ctrl.Manager, opts Options) er
 		fmt.Sprintf("%s.%s.svc.cluster.local", svcName, svcNS),
 	}
 
-	ca, err := issuer.NewCA(fmt.Sprintf("%s webhook", svcName), webhook.ServingTLSTTL)
+	ca, err := issuer.NewCA(fmt.Sprintf("%s webhook", svcName), webhook.WebhookCATTL)
 	if err != nil {
 		return fmt.Errorf("mint webhook CA: %w", err)
 	}
@@ -309,7 +311,48 @@ func bootstrapWebhookPKI(ctx context.Context, mgr ctrl.Manager, opts Options) er
 		return fmt.Errorf("build bootstrap client: %w", err)
 	}
 	caPEM := certutil.EncodeCertPEM(ca.Cert.Raw)
-	return webhook.PatchCABundle(ctx, c, opts.WebhookConfigName, caPEM)
+	if err := webhook.PatchCABundle(ctx, c, opts.WebhookConfigName, caPEM); err != nil {
+		return err
+	}
+
+	// Keep the leaf fresh in-process. The CA is stable, so the patched bundle
+	// keeps validating rotated leaves without a re-patch.
+	rotator := webhookCertRotator(ca, hostnames, webhook.DefaultCertDir, webhook.ServingTLSTTL,
+		mgr.GetLogger().WithName("webhook-cert-rotator"))
+	if err := mgr.Add(manager.RunnableFunc(rotator)); err != nil {
+		return fmt.Errorf("add webhook cert rotator: %w", err)
+	}
+	return nil
+}
+
+// webhookCertRotator re-issues the webhook serving leaf before it expires.
+// It re-mints at ~2/3 of the leaf TTL so a failed attempt has ~1/3 TTL of
+// runway (the previous leaf stays valid) to retry on a short interval. The CA
+// is unchanged, so no caBundle re-patch is needed.
+func webhookCertRotator(ca *issuer.CA, hostnames []string, certDir string, leafTTL time.Duration, logger logr.Logger) manager.RunnableFunc {
+	return func(ctx context.Context) error {
+		interval := leafTTL * 2 / 3
+		retry := time.Hour
+		if retry >= interval {
+			retry = interval / 2
+		}
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-timer.C:
+				if err := webhook.BootstrapServingCert(ca, hostnames, certDir); err != nil {
+					logger.Error(err, "webhook serving-cert rotation failed; retrying soon", "retry", retry)
+					timer.Reset(retry)
+					continue
+				}
+				logger.Info("rotated webhook serving cert", "next", interval)
+				timer.Reset(interval)
+			}
+		}
+	}
 }
 
 func boolPtr(v bool) *bool {
