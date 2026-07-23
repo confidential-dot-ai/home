@@ -503,31 +503,8 @@ kata:
     ## docs/pitfalls.md "kata-guest-base puller credentials".
     ##
     ## NOTE: this is a HOST-SIDE operator credential — NOT in the TCB / SNP
-    ## launch measurement, and unrelated to `registryAuth` below (which IS in
-    ## the measurement, baked into the guest rootfs, and authenticates in-guest
-    ## workload pulls). Rotating this Secret is a plain DS restart; rotating
-    ## `registryAuth` requires a kata-guest-base rebuild + re-pinned digest.
+    ## launch measurement. Rotating this Secret is a plain DS restart.
     pullerAuthSecret: ""
-    ## In-guest workload registry auth source. When set, the puller appends
-    ## `agent.image_registry_auth=<this>` to the kata-qemu-snp guest kernel
-    ## cmdline so the in-guest CDH can authenticate guest-pulls.
-    ##   - file:///run/image-security/auth.json  DEFAULT: the docker auth.json
-    ##     baked into the dm-verity-measured rootfs at build time and copied to
-    ##     this tmpfs path early in boot. Stock guest-base builds bake empty
-    ##     auths (anonymous — the c8s images are public); a build with
-    ##     pre-staged credentials (private mirror) authenticates out of the
-    ##     box, with the credential inside the measured rootfs (see
-    ##     kata-guest-base/README.md "Guest-pull registry auth" +
-    ##     docs/pitfalls.md "ghcr-auth.json").
-    ##   - kbs:///<repo>/<type>/<tag>  Secret-free: CDH fetches the docker
-    ##     auth.json from the Key Broker Service AFTER the guest attests, so no
-    ##     credential is baked into the image. Preferred for private mirrors
-    ##     once a KBS is wired.
-    ##   - ""  anonymous pulls (public images only) — the puller omits the
-    ##     cmdline param entirely.
-    ## NOTE: the cmdline is measured, so changing this value moves the SNP
-    ## launch measurement — re-predict reference values when overriding.
-    registryAuth: "file:///run/image-security/auth.json"
     ## puller image (oras + a shell). Pinned by digest — the puller writes
     ## into a privileged host path so a repointed tag would be code execution
     ## on the node. The `tag` is kept for human readability; the digest is
@@ -567,10 +544,6 @@ kata:
       ## Host dir the GPU puller writes into — sibling of
       ## kata.guestImage.hostPath; both swept on `c8s uninstall`.
       hostPath: /var/lib/c8s/kata-images-nvidia
-      ## In-guest workload registry auth for GPU pods. "" inherits
-      ## kata.guestImage.registryAuth; "none" forces anonymous; anything else
-      ## is used verbatim (file:// or kbs://).
-      registryAuth: ""
       ## PCIe root ports QEMU pre-allocates for VFIO cold-plug — one per
       ## passed-through GPU; the stock SNP-GPU config ships 0, i.e.
       ## passthrough disabled (the chart refuses to render 0). 8 = a full HGX

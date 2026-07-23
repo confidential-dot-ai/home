@@ -111,8 +111,6 @@ spec:
               value: {{ include "c8s.kataGuestImageTag" . | quote }}
             - name: HOST_IMG_DIR
               value: "/host{{ .Values.kata.guestImage.hostPath }}"
-            - name: REGISTRY_AUTH
-              value: {{ .Values.kata.guestImage.registryAuth | quote }}
             - name: ORAS_INSECURE
               value: {{ .Values.kata.guestImage.insecure | quote }}
             # Shim to configure: qemu-snp on SNP hosts, qemu-tdx on TDX hosts.
