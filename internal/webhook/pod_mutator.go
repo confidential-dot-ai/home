@@ -548,6 +548,14 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 	}
 
 	if getCertNeeded {
+		// ensureVolume keeps a pre-declared same-named volume rather than
+		// overwriting it, so a pod that declares the reserved cert volume as a
+		// hostPath/PVC/disk-backed emptyDir would have its private keys written
+		// to persistent, host-visible storage outside the TEE memory boundary.
+		// Reject anything but the expected memory-backed emptyDir.
+		if err := rejectReservedCertVolume(pod, inj.withDefaults(m.cfg).Cert.Volume); err != nil {
+			return admission.Errored(http.StatusBadRequest, err)
+		}
 		l.Info("injecting c8s get-cert containers", "workload", inj.WorkloadID)
 		mutatePod(pod, inj, m.cfg)
 	}
@@ -1138,6 +1146,27 @@ func rejectReservedCertContainer(pod *corev1.Pod) error {
 
 func isReservedCertName(name string) bool {
 	return name == reservedCertContainerName || name == reservedCertWaitContainerName
+}
+
+// rejectReservedCertVolume denies a pod that pre-declares the reserved cert
+// volume as anything other than the expected memory-backed emptyDir (see
+// certsVolume). ensureVolume keeps an existing same-named volume instead of
+// overwriting it, so without this guard an author could point the cert volume
+// at a hostPath, PVC, or disk-backed emptyDir and have the injected sidecar
+// write private keys to persistent, host-visible storage outside the TEE
+// memory boundary. Omitting the volume is fine — the webhook injects it.
+func rejectReservedCertVolume(pod *corev1.Pod, volName string) error {
+	for i := range pod.Spec.Volumes {
+		v := &pod.Spec.Volumes[i]
+		if v.Name != volName {
+			continue
+		}
+		if v.EmptyDir == nil || v.EmptyDir.Medium != corev1.StorageMediumMemory {
+			return fmt.Errorf("%w: volume %q is reserved for the injected in-memory cert store; it must be a memory-backed emptyDir (medium: Memory) or omitted",
+				errInvalidInjectionAnnotation, volName)
+		}
+	}
+	return nil
 }
 
 func mountAll(pod *corev1.Pod, mount corev1.VolumeMount) {

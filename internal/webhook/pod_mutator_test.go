@@ -990,6 +990,68 @@ func TestHandleRejectsReservedCertContainerName(t *testing.T) {
 	}
 }
 
+func TestHandleRejectsReservedCertVolumeCollision(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	m := &podMutator{
+		decoder: admission.NewDecoder(scheme),
+		cfg: Config{
+			GetCertImage: "ghcr.io/confidential-dot-ai/c8s-operator:test",
+			CDSURL:       "http://cds.c8s-system.svc:8443",
+			CertDir:      "/etc/c8s/certs",
+		},
+	}
+	// The default reserved cert volume name (see withDefaults / certsVolume).
+	const certVol = "c8s-certs"
+	hostPathType := corev1.HostPathDirectory
+
+	handle := func(t *testing.T, vol corev1.Volume) admission.Response {
+		t.Helper()
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app"}},
+				Volumes:    []corev1.Volume{vol},
+			},
+		}
+		raw, err := json.Marshal(pod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m.Handle(context.Background(), admission.Request{
+			AdmissionRequest: admissionv1.AdmissionRequest{Namespace: "default", Object: runtime.RawExtension{Raw: raw}},
+		})
+	}
+
+	rejected := map[string]corev1.Volume{
+		"hostPath": {Name: certVol, VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{Path: "/tmp/leak", Type: &hostPathType}}},
+		"disk-backed emptyDir": {Name: certVol, VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{}}}, // Medium "" == node disk
+	}
+	for name, vol := range rejected {
+		t.Run("rejects "+name, func(t *testing.T) {
+			resp := handle(t, vol)
+			if resp.Allowed {
+				t.Fatalf("Handle admitted a cw pod whose reserved cert volume is %s; want denial", name)
+			}
+			if resp.Result == nil || !strings.Contains(resp.Result.Message, "reserved") {
+				t.Fatalf("denial message = %+v, want it to mention the reserved volume", resp.Result)
+			}
+		})
+	}
+
+	t.Run("accepts memory emptyDir", func(t *testing.T) {
+		resp := handle(t, corev1.Volume{Name: certVol, VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}})
+		if !resp.Allowed {
+			t.Fatalf("Handle denied a cw pod with a correct memory-backed cert volume: %+v", resp.Result)
+		}
+	})
+}
+
 // TestHandleInjectsDespitePresetInjectedMarker proves the
 // confidential.ai/c8s-injected marker no longer suppresses injection: a pod
 // that presets it (with no real sidecar) is still given the c8s-cert sidecar,
