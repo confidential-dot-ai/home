@@ -305,12 +305,12 @@ func ReportDataForKeyWithContext(pub crypto.PublicKey, nonce, context []byte) ([
 	}
 
 	h := sha512.New384()
-	_, _ = h.Write([]byte("c8s-report-data-context-v1\x00"))
+	h.Write([]byte("c8s-report-data-context-v1\x00"))
 	for _, field := range [][]byte{keyBytes, nonce, context} {
 		var size [8]byte
 		binary.BigEndian.PutUint64(size[:], uint64(len(field)))
-		_, _ = h.Write(size[:])
-		_, _ = h.Write(field)
+		h.Write(size[:])
+		h.Write(field)
 	}
 	copy(reportData[:], h.Sum(nil))
 	return reportData, nil

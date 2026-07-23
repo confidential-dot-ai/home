@@ -110,8 +110,17 @@ func (r *Rotator) PublicKey(kid string) (*ecdsa.PublicKey, error) {
 	if r.active != nil && r.active.kid == kid {
 		return &r.active.key.PublicKey, nil
 	}
+	// A retiring key is only trusted until its overlap deadline. Eviction from
+	// r.retiring happens on the next rotate(), which with default settings is
+	// ~720h away while the overlap is ~25h — so without this deadline check a
+	// retired (possibly compromised) key would keep verifying tokens for weeks
+	// past its configured retirement. Reject it at lookup time instead.
+	now := time.Now()
 	for _, k := range r.retiring {
 		if k.kid == kid {
+			if !now.Before(k.notAfterT) {
+				return nil, fmt.Errorf("token-signer key for kid %q is retired (past overlap deadline)", kid)
+			}
 			return &k.key.PublicKey, nil
 		}
 	}
@@ -198,7 +207,14 @@ func (r *Rotator) rebuildJWKS() {
 			keys = append(keys, jwk)
 		}
 	}
+	// Only publish retiring keys that are still within their overlap window, so
+	// the JWKS never advertises a key past its retirement deadline (mirrors the
+	// deadline check in PublicKey).
+	now := time.Now()
 	for _, k := range r.retiring {
+		if !now.Before(k.notAfterT) {
+			continue
+		}
 		if jwk, err := jwks.FromPublicKey(&k.key.PublicKey); err == nil {
 			keys = append(keys, jwk)
 		}

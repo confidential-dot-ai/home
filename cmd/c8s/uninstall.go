@@ -454,7 +454,53 @@ func filterKataPods(lines []string) []string {
 // runs kata-sweep.sh as an init container on each node, the CLI waits for it
 // to complete everywhere (rollout status blocks until every pod has passed
 // init), then deletes it.
+// sweepGuestImagePrefix is the only host directory tree the kata sweep is
+// allowed to recursively delete. The guest-image host paths come from Helm
+// release values (kata.guestImage.hostPath, kata.gpu.guestImage.hostPath); the
+// sweep concatenates them below /host and runs `rm -rf`, so a hostile or
+// malformed value like "", "/", "..", or "/host" would otherwise destroy the
+// mounted host filesystem. The chart's defaults live under this prefix
+// (/var/lib/c8s/kata-images{,-nvidia}); kata-sweep.sh re-checks the same
+// invariant as an independent guard.
+const sweepGuestImagePrefix = "/var/lib/c8s"
+
+// validateSweepPath rejects a guest-image host path that is not a dedicated
+// c8s directory strictly beneath sweepGuestImagePrefix. allowEmpty is true for
+// the optional GPU path (empty ⇒ the sweep skips it). A rejected custom path
+// fails safe: the operator is told to remove that directory manually rather
+// than have the privileged sweep delete an unvetted location.
+func validateSweepPath(field, p string, allowEmpty bool) error {
+	if p == "" {
+		if allowEmpty {
+			return nil
+		}
+		return fmt.Errorf("%s is empty; refusing to run the privileged host sweep", field)
+	}
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("%s %q is not an absolute path; refusing to sweep", field, p)
+	}
+	if filepath.Clean(p) != p {
+		return fmt.Errorf("%s %q is not a clean path (has '..', '.', or redundant separators); refusing to sweep", field, p)
+	}
+	if p == sweepGuestImagePrefix || !strings.HasPrefix(p, sweepGuestImagePrefix+"/") {
+		return fmt.Errorf("%s %q must be a directory under %s/; the c8s sweep refuses to recursively delete anything else (remove a custom location manually)", field, p, sweepGuestImagePrefix)
+	}
+	return nil
+}
+
 func runKataSweep(ctx context.Context, namespace, release string, cfg kataUninstallConfig) error {
+	// The sweep launches a privileged DaemonSet that recursively deletes the
+	// guest-image dirs below the mounted host root. Validate those release-
+	// derived paths before doing anything destructive so a hostile/malformed
+	// value cannot turn the sweep into host destruction (defense in depth with
+	// the guard inside kata-sweep.sh).
+	if err := validateSweepPath("kata.guestImage.hostPath", cfg.GuestImageHostPath, false); err != nil {
+		return err
+	}
+	if err := validateSweepPath("kata.gpu.guestImage.hostPath", cfg.GuestImageNvidiaHostPath, true); err != nil {
+		return err
+	}
+
 	// The kata-deploy preStop cleanup and the image-puller's reconcile loop
 	// both race the sweep (the puller re-pulls a guest image it sees
 	// missing), so wait for their pods to be fully gone first. A no-op when

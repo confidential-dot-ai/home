@@ -177,6 +177,61 @@ func TestRun_Rotation(t *testing.T) {
 	}
 }
 
+// TestPublicKey_RetiringKeyExpires proves that a retiring key is rejected once
+// it passes its overlap deadline, even if a later rotation has not yet evicted
+// it from the retiring set. Without the lookup-time deadline check a retired
+// (possibly compromised) key would keep verifying tokens until the next
+// rotation — with defaults ~720h, far beyond the ~25h overlap policy.
+func TestPublicKey_RetiringKeyExpires(t *testing.T) {
+	keyPEM, err := earsigner.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	swapped := make(chan struct{}, 1)
+	r, err := earsigner.NewRotator(earsigner.RotatorConfig{
+		Interval: 200 * time.Millisecond,
+		Overlap:  10 * time.Millisecond,
+		Jitter:   0,
+		Logger:   discardLogger(),
+	}, keyPEM, func(_ *ecdsa.PrivateKey, _ string) {
+		select {
+		case swapped <- struct{}{}:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("NewRotator: %v", err)
+	}
+	initialKid := firstKid(t, r)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+
+	// Wait for the first rotation (which retires the initial key), then stop the
+	// loop so no subsequent rotation can evict it — isolating the lookup-time
+	// deadline check from eviction.
+	select {
+	case <-swapped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for first rotation")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+
+	// The initial key was retired with a 10ms overlap; wait well past it.
+	time.Sleep(100 * time.Millisecond)
+
+	if _, err := r.PublicKey(initialKid); err == nil {
+		t.Error("PublicKey accepted a retiring key past its overlap deadline")
+	}
+}
+
 // --- helpers ---
 
 type jwkEntry struct {

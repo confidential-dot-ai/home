@@ -52,3 +52,17 @@ func TestCanonicalDigestIgnoresFormatting(t *testing.T) {
 		t.Fatal("different content produced the same canonical digest")
 	}
 }
+
+// Two case-variant spellings of the same digest are distinct JSON keys that
+// collapse to one canonical entry; which image value survived would depend on
+// map iteration order, so CanonicalDigest of the very same bytes would differ
+// between runs. ParseJSON must reject the input instead (fail closed).
+func TestParseJSONRejectsCaseVariantDuplicateDigests(t *testing.T) {
+	const lower = "sha256:abababababababababababababababababababababababababababababababab"
+	const upper = "sha256:ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"
+
+	_, err := ParseJSON([]byte(`{"version":"1","digests":{"` + lower + `":"ghcr.io/x/a:v1","` + upper + `":"ghcr.io/x/b:v1"}}`))
+	if err == nil {
+		t.Fatal("case-variant duplicate digest keys accepted")
+	}
+}

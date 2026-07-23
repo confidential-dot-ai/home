@@ -135,12 +135,26 @@ func TestUnmarshalConfigClaimsInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// encoding/asn1 ignores extra elements inside the SEQUENCE, so without the
+	// exact-encoding check two byte-distinct extensions would parse to the same
+	// ConfigClaims (an attested covert channel).
+	smuggledField, err := asn1.Marshal(struct {
+		Version            int
+		OperatorKeysDigest []byte
+		SeedDigest         []byte
+		WorkloadDigest     []byte
+		Extra              []byte
+	}{configClaimsVersion, full, full, full, []byte("smuggled")})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for name, der := range map[string][]byte{
 		"garbage":        []byte("not asn1"),
 		"trailing bytes": append(append([]byte{}, value...), 0x00),
 		"wrong version":  wrongVersion,
 		"short digest":   shortDigest,
+		"smuggled field": smuggledField,
 	} {
 		if _, err := UnmarshalConfigClaims(der); err == nil {
 			t.Errorf("%s: unmarshal accepted invalid claims", name)
@@ -398,5 +412,110 @@ func TestVerifyCertUnpinnedSurvivesClaimsVersionSkew(t *testing.T) {
 		Measurements:      [][]byte{measurement},
 	}, nil); err != nil {
 		t.Fatalf("VerifyCert rejected a validly-bound future claims version: %v", err)
+	}
+}
+
+// TestVerifyCertStrippedClaimsFlipsToPlainBinding pins the downgrade defense:
+// re-minting a cert without the claims extension must flip the verifier to the
+// plain SHA-384(pubkey) formula, which differs from the folded transcript the
+// evidence actually binds — so a strip attempt fails the hardware REPORTDATA
+// check rather than silently verifying claims-free.
+func TestVerifyCertStrippedClaimsFlipsToPlainBinding(t *testing.T) {
+	claims, claimsValue := testClaims(t)
+	key, att := testKeyAndAttestation(t)
+
+	withClaims, err := CreateAttestedCert(key, att, &CertOptions{ConfigClaims: claims})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripped, err := CreateAttestedCert(key, att, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	folded, err := ReportDataForKeyAndClaims(&key.PublicKey, claimsValue, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := ReportDataForKey(&key.PublicKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if folded == plain {
+		t.Fatal("folded and plain bindings coincide; the downgrade check below proves nothing")
+	}
+
+	measurement := bytes.Repeat([]byte{0x42}, SNPMeasurementSize)
+	var observedERD []byte
+	srv := newCapturingVerifySrv(t, measurement, &observedERD)
+	defer srv.Close()
+	policy := &VerifyPolicy{AttestationApiURL: srv.URL, Measurements: [][]byte{measurement}}
+
+	for name, tc := range map[string]struct {
+		certDER []byte
+		want    [64]byte
+	}{
+		"claims-bearing cert verifies against the folded transcript": {withClaims, folded},
+		"stripped cert verifies against the plain formula":           {stripped, plain},
+	} {
+		cert, err := x509.ParseCertificate(tc.certDER)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := VerifyCert(cert, policy, nil); err != nil {
+			t.Fatalf("%s: VerifyCert: %v", name, err)
+		}
+		if !bytes.Equal(observedERD, tc.want[:]) {
+			t.Fatalf("%s: expected_report_data = %x, want %x", name, observedERD, tc.want[:])
+		}
+	}
+}
+
+// TestVerifyCertRejectsEmptyClaimsExtension: a present-but-empty extension
+// must not be conflated with "no claims" — it would ride the certificate
+// entirely outside the REPORTDATA binding while looking claims-bearing to
+// anyone gating on extension presence.
+func TestVerifyCertRejectsEmptyClaimsExtension(t *testing.T) {
+	key, _, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportData, err := ReportDataForKey(&key.PublicKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	att := &Attestation{TEEType: TEETypeSEVSNP, Report: fakeSNPReport(reportData)}
+	attExt, err := att.MarshalExtension()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, src := testAttestedCert(t, nil)
+	tmpl := &x509.Certificate{
+		SerialNumber: src.SerialNumber,
+		Subject:      src.Subject,
+		NotBefore:    src.NotBefore,
+		NotAfter:     src.NotAfter,
+		ExtraExtensions: []pkix.Extension{
+			attExt,
+			{Id: OIDRATLSConfigClaims, Value: nil},
+		},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	measurement := bytes.Repeat([]byte{0x42}, SNPMeasurementSize)
+	var observedERD []byte
+	srv := newCapturingVerifySrv(t, measurement, &observedERD)
+	defer srv.Close()
+
+	if _, err := VerifyCert(cert, &VerifyPolicy{AttestationApiURL: srv.URL, Measurements: [][]byte{measurement}}, nil); err == nil {
+		t.Fatal("VerifyCert accepted a present-but-empty config-claims extension")
 	}
 }
