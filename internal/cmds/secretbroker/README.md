@@ -35,9 +35,20 @@ every other c8s dataplane component does.
    `(workloadId | workloadImages)` to the KV paths they may read.
 3. **Token mint**: on `cert/login` the broker mints a short-TTL token **bound to
    the caller's client cert** (a token cannot be replayed on a different cert).
-4. **Brokered read**: the broker authenticates to OpenBao with its own identity
-   (`--openbao-token` or AppRole) and returns the KV v2 value. The store never
-   sees the workload — only the broker.
+4. **Brokered read**: the broker authenticates to OpenBao and returns the KV v2
+   value. The store never sees the workload — only the broker.
+
+The broker authenticates to OpenBao one of three ways (`secretBroker.openbao.authMethod`):
+
+- **`cert`** (default, recommended): the broker presents its own mesh cert
+  (`--tls-cert`/`--tls-key`) to OpenBao's TLS cert auth backend
+  (`--openbao-cert-auth`). That key lives in the `c8s-certs` tmpfs, never in
+  etcd, so — unlike a `token`/AppRole bearer credential in a k8s Secret — the
+  untrusted control plane cannot read it from etcd and bypass the broker. The
+  store must trust the CDS mesh CA in a cert-auth role.
+- **`token` / `approle`**: a bearer credential read from a mounted Secret
+  (`--openbao-token-file` / `--openbao-approle-secret-id-file`). Simpler, but the
+  credential is etcd-readable — use only where that is acceptable.
 
 `--openbao-attested` (default `true`) requires the store to present a valid TEE
 attestation (RA-TLS); set it `false` for an external/managed store, in which

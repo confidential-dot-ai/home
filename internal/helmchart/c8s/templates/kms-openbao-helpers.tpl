@@ -56,6 +56,20 @@ false
 Both helpers read operator Helm values only — never pod annotations — so the
 control plane cannot rewrite the credential source at admission time.
 */}}
+
+{{/*
+Effective store auth method. The in-chart dev store (kms.enabled) is plain-HTTP
+with a root token, so it only supports "token" regardless of the configured
+default; an external/attested store uses the configured method ("cert",
+"approle", or "token").
+*/}}
+{{- define "secret-broker.openbaoAuthMethod" -}}
+{{- if .Values.kms.enabled -}}
+token
+{{- else -}}
+{{- .Values.secretBroker.openbao.authMethod -}}
+{{- end -}}
+{{- end }}
 {{- define "secret-broker.openbaoCredName" -}}
 {{- if .Values.secretBroker.openbao.credentialSecret.name -}}
 {{- .Values.secretBroker.openbao.credentialSecret.name -}}

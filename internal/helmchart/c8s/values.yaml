@@ -1239,13 +1239,20 @@ secretBroker:
     ## for an external/managed store, where the broker becomes the trust edge.
     attested: true
     measurements: []
-    ## How the broker authenticates to OpenBao: "token" or "approle".
-    authMethod: token
+    ## How the broker authenticates to OpenBao: "cert", "token", or "approle".
+    ## "cert" (recommended) uses the broker's own mesh cert against OpenBao's TLS
+    ## cert auth backend — no bearer credential is stored in a k8s Secret, so the
+    ## untrusted control plane cannot lift it from etcd. Requires the store to
+    ## trust the CDS mesh CA in a cert-auth role (see the KMS runbook). "token"
+    ## and "approle" read a bearer credential from credentialSecret below.
+    authMethod: cert
+    ## Optional OpenBao cert-auth role name (empty = any role the cert matches).
+    certRole: ""
     roleId: ""
-    ## A pre-existing Secret holding the broker's OpenBao credential. Mounted as a
-    ## file (kept out of argv). For "token" the key holds the token; for "approle"
-    ## it holds the secret_id. Empty leaves the broker unauthenticated (configure
-    ## before use, or front an in-TCB OpenBao that trusts the broker's mesh cert).
+    ## A pre-existing Secret holding the broker's OpenBao credential — used only
+    ## by "token"/"approle". Mounted as a file (kept out of argv). For "token"
+    ## the key holds the token; for "approle" it holds the secret_id. Not needed
+    ## (and not mounted) under "cert".
     credentialSecret:
       name: ""
       key: token

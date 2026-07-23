@@ -93,14 +93,28 @@ func resolveCredentialFiles(cfg *config) error {
 }
 
 func validateConfig(cfg config) error {
-	if cfg.openbaoToken != "" && cfg.openbaoRoleID != "" {
-		return fmt.Errorf("--openbao-token and --openbao-approle-role-id are mutually exclusive")
+	// Exactly one store-auth method.
+	methods := 0
+	if cfg.openbaoToken != "" {
+		methods++
 	}
-	if cfg.openbaoToken == "" && cfg.openbaoRoleID == "" {
-		return fmt.Errorf("set --openbao-token or --openbao-approle-role-id")
+	if cfg.openbaoRoleID != "" {
+		methods++
+	}
+	if cfg.openbaoCertAuth {
+		methods++
+	}
+	if methods == 0 {
+		return fmt.Errorf("set one of --openbao-token, --openbao-approle-role-id, or --openbao-cert-auth")
+	}
+	if methods > 1 {
+		return fmt.Errorf("--openbao-token, --openbao-approle-role-id, and --openbao-cert-auth are mutually exclusive")
 	}
 	if cfg.openbaoRoleID != "" && cfg.openbaoSecretID == "" {
 		return fmt.Errorf("--openbao-approle-role-id requires --openbao-approle-secret-id")
+	}
+	if cfg.openbaoCertRole != "" && !cfg.openbaoCertAuth {
+		return fmt.Errorf("--openbao-cert-role requires --openbao-cert-auth")
 	}
 	if cfg.tokenTTL <= 0 {
 		return fmt.Errorf("--token-ttl must be positive")

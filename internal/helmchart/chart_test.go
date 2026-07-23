@@ -1357,6 +1357,32 @@ func TestChartSecretBrokerRendersMeshComponent(t *testing.T) {
 	}
 }
 
+// With the default authMethod (cert) and an external store, the broker
+// authenticates with its mesh cert and mounts NO credential Secret — there is
+// no bearer token in etcd for the control plane to lift.
+func TestChartSecretBrokerCertAuthNoSecret(t *testing.T) {
+	out, err := helmTemplate(t, secretBrokerArgs("--set", "nriImagePolicy.enabled=false")...)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	dep := renderedDeployment(t, out, "c8s-secret-broker")
+	broker, ok := findContainer(dep.Spec.Template.Spec.Containers, "secret-broker")
+	if !ok {
+		t.Fatalf("secret-broker container missing; have %v", containerNames(dep.Spec.Template.Spec.Containers))
+	}
+	assertContainerArgs(t, broker, "--openbao-cert-auth=true")
+	for _, a := range broker.Args {
+		if strings.HasPrefix(a, "--openbao-token") || strings.HasPrefix(a, "--openbao-approle") {
+			t.Errorf("cert auth must not pass a bearer credential, got %q", a)
+		}
+	}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Secret != nil {
+			t.Errorf("cert auth must mount no credential Secret, got volume %q -> %s", v.Name, v.Secret.SecretName)
+		}
+	}
+}
+
 // The injected OpenBao agent image is external (not tag-locked to the c8s
 // release) and ships digest-pinned in values, so image-policy enforcement can
 // admit the injected container: the derive path must seed it whenever the

@@ -68,11 +68,16 @@ func NewCmd() *cobra.Command {
 	flags.StringVar(&cfg.openbaoCA, "openbao-ca", "", "PEM CA bundle for the OpenBao TLS endpoint (empty = system roots)")
 	flags.BoolVar(&cfg.openbaoAttested, "openbao-attested", true, "require the OpenBao endpoint to present a valid TEE attestation (RA-TLS); set false for an external/managed store")
 	flags.StringSliceVar(&cfg.openbaoMeasurements, "openbao-measurements", nil, "SHA-384 hex launch measurements accepted for an attested OpenBao (empty = accept any TEE measurement, UNSAFE)")
-	flags.StringVar(&cfg.openbaoToken, "openbao-token", "", "static token the broker uses to authenticate to OpenBao (mutually exclusive with --openbao-approle-*)")
+	flags.StringVar(&cfg.openbaoToken, "openbao-token", "", "static token the broker uses to authenticate to OpenBao (mutually exclusive with --openbao-approle-* / --openbao-cert-auth)")
 	flags.StringVar(&cfg.openbaoTokenFile, "openbao-token-file", "", "read the static OpenBao token from this file (keeps it out of argv; e.g. a mounted Secret)")
 	flags.StringVar(&cfg.openbaoRoleID, "openbao-approle-role-id", "", "AppRole role_id the broker uses to authenticate to OpenBao")
 	flags.StringVar(&cfg.openbaoSecretID, "openbao-approle-secret-id", "", "AppRole secret_id the broker uses to authenticate to OpenBao")
 	flags.StringVar(&cfg.openbaoSecretIDFile, "openbao-approle-secret-id-file", "", "read the AppRole secret_id from this file (keeps it out of argv)")
+	// Cert auth: the broker authenticates to OpenBao's TLS cert backend with its
+	// own mesh cert (--tls-cert/--tls-key), so no bearer credential is stored in
+	// a k8s Secret.
+	flags.BoolVar(&cfg.openbaoCertAuth, "openbao-cert-auth", false, "authenticate to OpenBao with the broker's mesh cert (TLS cert auth) instead of a token/AppRole; no k8s Secret needed")
+	flags.StringVar(&cfg.openbaoCertRole, "openbao-cert-role", "", "optional OpenBao cert-auth role name (empty = any role the cert matches)")
 
 	// HTTP server hardening.
 	flags.Int64Var(&cfg.maxRequestSize, "max-request-size", 65536, "max request body bytes")
@@ -113,6 +118,8 @@ type config struct {
 	openbaoRoleID       string
 	openbaoSecretID     string
 	openbaoSecretIDFile string
+	openbaoCertAuth     bool
+	openbaoCertRole     string
 
 	maxRequestSize    int64
 	readTimeout       time.Duration
