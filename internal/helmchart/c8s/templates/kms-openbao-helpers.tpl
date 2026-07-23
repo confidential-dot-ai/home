@@ -52,6 +52,10 @@ false
 {{- end -}}
 {{- end }}
 
+{{/*
+Both helpers read operator Helm values only — never pod annotations — so the
+control plane cannot rewrite the credential source at admission time.
+*/}}
 {{- define "secret-broker.openbaoCredName" -}}
 {{- if .Values.secretBroker.openbao.credentialSecret.name -}}
 {{- .Values.secretBroker.openbao.credentialSecret.name -}}
