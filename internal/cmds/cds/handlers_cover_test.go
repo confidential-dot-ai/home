@@ -22,6 +22,7 @@ import (
 
 	"github.com/confidential-dot-ai/c8s/internal/allowlist"
 	"github.com/confidential-dot-ai/c8s/internal/issuer"
+	pkgallowlist "github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
@@ -146,7 +147,7 @@ func TestAttest_RejectsMalformedWorkloadClaimsEncoding(t *testing.T) {
 func TestAttest_WorkloadClaims_RejectsGarbageRATLSExtension(t *testing.T) {
 	mock := newMockAttestationApi(t, "x")
 	h := newTestAttestHandler(t, mock.URL, nil)
-	h.AllowlistStore = fakeStore{wlDigestA: true}
+	h.AllowlistStore = floorStore(wlDigestA)
 
 	csrPEM, _ := generateCSRWithRATLSExtension(t, []byte("garbage-extension"))
 	digests := []string{wlDigestA}
@@ -200,6 +201,10 @@ type errStore struct{}
 
 func (errStore) Contains(types.Digest) (bool, error) {
 	return false, errors.New("store unavailable")
+}
+
+func (errStore) LoadAll() (*pkgallowlist.Allowlist, string, error) {
+	return nil, "", errors.New("store unavailable")
 }
 
 func TestVerifyWorkloadClaims_FailsClosedOnStoreError(t *testing.T) {

@@ -11,8 +11,53 @@ import (
 	"testing"
 	"time"
 
+	allowlistpkg "github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
+	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
+
+// mustParseDigest parses a canonical digest or fails the test.
+func mustParseDigest(t *testing.T, s string) types.Digest {
+	t.Helper()
+	d, err := types.ParseDigest(s)
+	if err != nil {
+		t.Fatalf("ParseDigest(%q): %v", s, err)
+	}
+	return d
+}
+
+// writeConfigJSONArgs writes a config.json carrying both annotations and the
+// container's effective process.args.
+func writeConfigJSONArgs(t *testing.T, watchDir, cid string, annotations map[string]string, args []string) {
+	t.Helper()
+	dir := filepath.Join(watchDir, cid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(ociSpec{Annotations: annotations, Process: &ociProcess{Args: args}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// exactEntrypointOverlay builds a workload overlay pinning wlDigest to an exact
+// entrypoint (cmd unconstrained).
+func exactEntrypointOverlay(t *testing.T, wlDigest string, entrypoint []string) *allowlistpkg.Allowlist {
+	t.Helper()
+	return &allowlistpkg.Allowlist{
+		Schema: allowlistpkg.Schema,
+		Workloads: map[string]allowlistpkg.Workload{
+			"w": {Containers: []allowlistpkg.Container{{
+				Digest:  mustParseDigest(t, wlDigest),
+				Command: allowlistpkg.ArgvPolicy{Policy: allowlistpkg.PolicyExact, Argv: entrypoint},
+				Args:    allowlistpkg.ArgvPolicy{Policy: allowlistpkg.PolicyAny},
+			}}},
+		},
+	}
+}
 
 // writeConfigJSON synthesises an OCI spec config.json with the given
 // annotations and writes it under <watchDir>/<cid>/config.json.
@@ -66,6 +111,7 @@ func newTestMonitor(t *testing.T, allowlistEntries []string) (*monitor, *fakeKil
 		},
 		logger:             logger,
 		allowlist:          a,
+		overlay:            &policyOverlay{},
 		killer:             killer,
 		configReadDeadline: 200 * time.Millisecond,
 		configReadInterval: 10 * time.Millisecond,
@@ -87,6 +133,106 @@ func TestHandleNewContainer_AllowedDigest(t *testing.T) {
 
 	if calls := killer.snapshot(); len(calls) != 0 {
 		t.Fatalf("unexpected kill calls: %+v", calls)
+	}
+}
+
+// A baked floor digest is admitted regardless of the effective argv.
+func TestHandleNewContainer_FloorDigestAdmitsAnyArgv(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:" + digest})
+
+	cid := "floor-weird-argv"
+	writeConfigJSONArgs(t, watchDir, cid, map[string]string{
+		"io.kubernetes.cri.container-type": "container",
+		"io.kubernetes.cri.image-name":     "ghcr.io/confidential-dot-ai/assam@sha256:" + digest,
+	}, []string{"/bin/anything", "--wild"})
+
+	m.handleNewContainer(context.Background(), filepath.Join(watchDir, cid))
+
+	if calls := killer.snapshot(); len(calls) != 0 {
+		t.Fatalf("floor digest should admit any argv, got kills: %+v", calls)
+	}
+}
+
+// A workload digest (not on the floor) is admitted when the effective argv
+// satisfies the overlay's entrypoint policy.
+func TestHandleNewContainer_WorkloadArgvMatchAdmits(t *testing.T) {
+	floor := strings.Repeat("a", 64)
+	wl := strings.Repeat("b", 64)
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:" + floor})
+	m.overlay.apply(exactEntrypointOverlay(t, "sha256:"+wl, []string{"/bin/app"}), 1)
+
+	cid := "wl-match"
+	writeConfigJSONArgs(t, watchDir, cid, map[string]string{
+		"io.kubernetes.cri.container-type": "container",
+		"io.kubernetes.cri.image-name":     "ghcr.io/tenant/app@sha256:" + wl,
+	}, []string{"/bin/app", "--serve"})
+
+	m.handleNewContainer(context.Background(), filepath.Join(watchDir, cid))
+
+	if calls := killer.snapshot(); len(calls) != 0 {
+		t.Fatalf("matching argv should admit workload digest, got kills: %+v", calls)
+	}
+}
+
+// A workload digest whose effective argv violates the overlay policy is killed.
+func TestHandleNewContainer_WorkloadArgvMismatchKills(t *testing.T) {
+	floor := strings.Repeat("a", 64)
+	wl := strings.Repeat("b", 64)
+	m, killer, watchDir := newTestMonitor(t, []string{"sha256:" + floor})
+	m.overlay.apply(exactEntrypointOverlay(t, "sha256:"+wl, []string{"/bin/app"}), 1)
+
+	cid := "wl-mismatch"
+	writeConfigJSONArgs(t, watchDir, cid, map[string]string{
+		"io.kubernetes.cri.container-type": "container",
+		"io.kubernetes.cri.image-name":     "ghcr.io/tenant/app@sha256:" + wl,
+	}, []string{"/bin/evil"})
+
+	m.handleNewContainer(context.Background(), filepath.Join(watchDir, cid))
+
+	calls := killer.snapshot()
+	if len(calls) != 1 || calls[0] != cid {
+		t.Fatalf("non-matching argv should kill workload container, got: %+v", calls)
+	}
+}
+
+// The overlay honors epoch anti-rollback: a lower version is ignored, so the
+// argv policy applied at the higher version still governs.
+func TestPolicyOverlayAntiRollback(t *testing.T) {
+	wl := "sha256:" + strings.Repeat("b", 64)
+	o := &policyOverlay{}
+	if !o.apply(exactEntrypointOverlay(t, wl, []string{"/bin/app"}), 5) {
+		t.Fatal("apply of version 5 rejected")
+	}
+	if o.apply(exactEntrypointOverlay(t, wl, []string{"/bin/other"}), 3) {
+		t.Fatal("rolled-back version 3 was applied")
+	}
+	if o.version != 5 {
+		t.Fatalf("version = %d, want 5 (rollback ignored)", o.version)
+	}
+	// The version-5 policy still governs: /bin/app matches, /bin/other does not.
+	if !o.index().AdmitsContainer(wl, []string{"/bin/app"}) {
+		t.Fatal("version-5 argv policy dropped by rollback attempt")
+	}
+	if o.index().AdmitsContainer(wl, []string{"/bin/other"}) {
+		t.Fatal("rolled-back argv policy took effect")
+	}
+}
+
+// A guest reboot / process restart is a fresh overlay (version 0), so it trusts
+// the first pull whatever its version — even one below a prior lifetime's.
+// Rollback protection is per-process-lifetime; state re-syncs from CDS.
+func TestPolicyOverlayTrustsFirstVersionAfterRestart(t *testing.T) {
+	wl := "sha256:" + strings.Repeat("b", 64)
+	prior := &policyOverlay{}
+	prior.apply(exactEntrypointOverlay(t, wl, []string{"/bin/app"}), 9)
+
+	fresh := &policyOverlay{}
+	if !fresh.apply(exactEntrypointOverlay(t, wl, []string{"/bin/other"}), 3) {
+		t.Fatal("fresh overlay must trust the first version seen after a restart")
+	}
+	if fresh.version != 3 {
+		t.Fatalf("version = %d, want 3", fresh.version)
 	}
 }
 

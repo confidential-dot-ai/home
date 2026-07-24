@@ -8,10 +8,10 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/attestclient"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
-	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
 // CAProvisionConfig configures how CDS obtains its mesh CA at startup.
@@ -44,9 +44,9 @@ type CAProvisionConfig struct {
 	// into both sides' handoff attestations.
 	OperatorKeysHash string
 	// RestoreAllowlist atomically installs the peer's encrypted allowlist
-	// snapshot before CDS serves. Required when PeerURL is set, so adoption
-	// cannot preserve the CA while silently resetting runtime policy state.
-	RestoreAllowlist func(version string, digests map[types.Digest]string) error
+	// snapshot (floor and workloads) before CDS serves. Required when PeerURL is
+	// set, so adoption cannot preserve the CA while resetting runtime policy.
+	RestoreAllowlist func(version string, al *allowlist.Allowlist) error
 }
 
 // caPuller adopts a CA from the configured peer. It is a seam so the
@@ -101,7 +101,12 @@ func provisionCA(ctx context.Context, cfg CAProvisionConfig, logger *slog.Logger
 	if material.ParentCert != nil || len(material.Bundle) > 1 {
 		return nil, false, fmt.Errorf("peer %s handed off a chained or multi-cert CA (parent=%t, bundle=%d certs); adoption supports a single self-signed mesh CA", cfg.PeerURL, material.ParentCert != nil, len(material.Bundle))
 	}
-	if err := cfg.RestoreAllowlist(material.AllowlistVersion, material.Allowlist); err != nil {
+	floor := make(map[string]string, len(material.Allowlist))
+	for d, img := range material.Allowlist {
+		floor[d.String()] = img
+	}
+	snapshot := &allowlist.Allowlist{Schema: allowlist.Schema, Digests: floor, Workloads: material.Workloads}
+	if err := cfg.RestoreAllowlist(material.AllowlistVersion, snapshot); err != nil {
 		return nil, false, fmt.Errorf("restore allowlist snapshot from peer %s: %w", cfg.PeerURL, err)
 	}
 	return &CA{Cert: material.CACert, Key: material.CAKey}, true, nil

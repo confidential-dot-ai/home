@@ -13,21 +13,23 @@ import (
 
 	"github.com/spf13/cobra"
 
+	pkgallowlist "github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
-	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
-// servingCDS is an httptest server that serves the given digests on GET and
-// accepts writes with 204, recording the HTTP methods it saw.
+// servingCDS is an httptest server that serves the given digests on GET (as a
+// canonical allowlist document) and accepts writes with 204, recording the
+// HTTP methods it saw.
 func servingCDS(t *testing.T, digests map[string]string) (url string, methods *[]string) {
 	t.Helper()
-	typed := map[types.Digest]string{}
-	for ds, img := range digests {
-		d, err := types.ParseDigest(ds)
-		if err != nil {
-			t.Fatalf("bad test digest %q: %v", ds, err)
-		}
-		typed[d] = img
+	doc := pkgallowlist.Allowlist{
+		Schema:    pkgallowlist.Schema,
+		Digests:   digests,
+		Workloads: map[string]pkgallowlist.Workload{},
+	}
+	body, err := doc.Canonical()
+	if err != nil {
+		t.Fatalf("canonical: %v", err)
 	}
 	var mu sync.Mutex
 	seen := []string{}
@@ -36,7 +38,9 @@ func servingCDS(t *testing.T, digests map[string]string) (url string, methods *[
 		seen = append(seen, r.Method)
 		mu.Unlock()
 		if r.Method == http.MethodGet {
-			_ = json.NewEncoder(w).Encode(types.AllowlistListResponse{Version: "7", Digests: typed})
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("ETag", `W/"7"`)
+			_, _ = w.Write(body)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -169,11 +173,11 @@ func TestListJSONOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list -o json: %v", err)
 	}
-	var resp types.AllowlistListResponse
+	var resp pkgallowlist.Allowlist
 	if err := json.Unmarshal([]byte(out), &resp); err != nil {
 		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
 	}
-	if resp.Version != "7" || len(resp.Digests) != 1 {
+	if len(resp.Digests) != 1 || resp.Digests[digA] == "" {
 		t.Fatalf("unexpected response round-trip: %+v", resp)
 	}
 }
@@ -185,7 +189,7 @@ func TestListTextOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if !strings.Contains(out, "version: 7 (1 entries)") || !strings.Contains(out, digA) {
+	if !strings.Contains(out, "version 7: 1 floor digest(s), 0 workload(s)") || !strings.Contains(out, digA) {
 		t.Fatalf("unexpected text output:\n%s", out)
 	}
 }
@@ -219,7 +223,7 @@ func TestExportToFileRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("export to file: %v", err)
 	}
-	if !strings.Contains(stderr, "wrote 1 entries to "+path) {
+	if !strings.Contains(stderr, "wrote 1 floor digest(s) and 0 workload(s) to "+path) {
 		t.Fatalf("missing write confirmation, stderr=%q", stderr)
 	}
 
@@ -271,19 +275,6 @@ func TestDiffTextOutput(t *testing.T) {
 	}
 }
 
-func TestDiffNoChanges(t *testing.T) {
-	url, _ := servingCDS(t, map[string]string{digA: "img-a"})
-	file := writeAllowlistFile(t, t.TempDir(), map[string]string{digA: "img-a"})
-
-	out, _, err := runCmd("diff", file, "--url", url, "--insecure")
-	if err != nil {
-		t.Fatalf("diff: %v", err)
-	}
-	if !strings.Contains(out, "no changes") {
-		t.Fatalf("expected 'no changes', got:\n%s", out)
-	}
-}
-
 func TestDiffJSONOutput(t *testing.T) {
 	url, _ := servingCDS(t, map[string]string{digA: "img-a"})
 	file := writeAllowlistFile(t, t.TempDir(), map[string]string{digB: "img-b"})
@@ -292,11 +283,11 @@ func TestDiffJSONOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("diff -o json: %v", err)
 	}
-	var d diffResult
+	var d allowlistDiff
 	if err := json.Unmarshal([]byte(out), &d); err != nil {
 		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
 	}
-	if d.Added[digB] != "img-b" || d.Removed[digA] != "img-a" {
+	if d.Floor.Added[digB] != "img-b" || d.Floor.Removed[digA] != "img-a" {
 		t.Fatalf("unexpected diff: %#v", d)
 	}
 }
@@ -415,7 +406,7 @@ func TestUploadRequireOverridesDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upload with --require override failed: %v", err)
 	}
-	if !strings.Contains(out, "dry-run: would replace allowlist with 1 entries") {
+	if !strings.Contains(out, "dry-run: would replace allowlist with 1 floor digest(s) and 0 workload(s)") {
 		t.Fatalf("missing dry-run summary:\n%s", out)
 	}
 

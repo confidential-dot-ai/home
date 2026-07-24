@@ -57,10 +57,15 @@ func newRouter(deps dependencies) http.Handler {
 		r.Method(http.MethodPost, "/handoff", deps.protected(http.HandlerFunc(deps.HandoffHandler.HandleHandoff)))
 	}
 
+	// GET is unauthenticated (RA-TLS integrity only); every mutation goes
+	// through allowlistWrite (operator-JWT auth in the handler + rate limit +
+	// 1 MiB body cap).
 	r.Get("/allowlist", deps.AllowlistHandler.HandleList)
-	r.Method(http.MethodPost, "/allowlist", deps.protected(http.HandlerFunc(deps.AllowlistHandler.HandleAdd)))
-	r.Method(http.MethodPut, "/allowlist", deps.protected(http.HandlerFunc(deps.AllowlistHandler.HandleReplace)))
-	r.Method(http.MethodDelete, "/allowlist", deps.protected(http.HandlerFunc(deps.AllowlistHandler.HandleDelete)))
+	r.Method(http.MethodPut, "/allowlist", deps.allowlistWrite(http.HandlerFunc(deps.AllowlistHandler.HandleReplaceAll)))
+	r.Method(http.MethodPost, "/allowlist/digests", deps.allowlistWrite(http.HandlerFunc(deps.AllowlistHandler.HandleAddDigest)))
+	r.Method(http.MethodDelete, "/allowlist/digests", deps.allowlistWrite(http.HandlerFunc(deps.AllowlistHandler.HandleDeleteDigests)))
+	r.Method(http.MethodPut, "/allowlist/workloads/{name}", deps.allowlistWrite(http.HandlerFunc(deps.AllowlistHandler.HandlePutWorkload)))
+	r.Method(http.MethodDelete, "/allowlist/workloads/{name}", deps.allowlistWrite(http.HandlerFunc(deps.AllowlistHandler.HandleDeleteWorkload)))
 
 	r.Get("/ca", handleCA(deps.CACertPEM))
 	r.Get("/operator-keys", handleOperatorKeys(deps.OperatorKeysPEM))
@@ -68,12 +73,21 @@ func newRouter(deps dependencies) http.Handler {
 	return r
 }
 
+// allowlistWriteBodyCap bounds an allowlist mutation body. A workload document
+// dwarfs a digest line, so it is far larger than MaxRequestSize.
+const allowlistWriteBodyCap int64 = 1 << 20
+
 // protected wraps a write handler with per-source-IP rate limiting and the
 // request-body cap. Used for the endpoints an unauthenticated caller can hit
-// before any signature check: attestation issuance and allowlist mutations
-// (each junk allowlist write costs up to one ECDSA verify per pinned key).
+// before any signature check: attestation issuance (each junk write costs up to
+// one ECDSA verify per pinned key).
 func (deps dependencies) protected(next http.Handler) http.Handler {
 	return issuer.RateLimitMiddleware(deps.RateLimiter, capBody(deps.MaxRequestSize, next))
+}
+
+// allowlistWrite is protected with the larger allowlist body cap.
+func (deps dependencies) allowlistWrite(next http.Handler) http.Handler {
+	return issuer.RateLimitMiddleware(deps.RateLimiter, capBody(allowlistWriteBodyCap, next))
 }
 
 func capBody(max int64, next http.Handler) http.Handler {

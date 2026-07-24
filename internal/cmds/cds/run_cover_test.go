@@ -200,7 +200,7 @@ func TestRun_ServesAndShutsDownOnSIGTERM(t *testing.T) {
 	api := newHealthyAttestationApi(t)
 
 	seedPath := filepath.Join(t.TempDir(), "seed.json")
-	seedJSON := `{"version":"1","digests":{"` + digestA + `":"ghcr.io/x/cds:v1"}}`
+	seedJSON := `{"schema":"c8s.allowlist/v1","digests":{"` + digestA + `":"ghcr.io/x/cds:v1"}}`
 	if err := os.WriteFile(seedPath, []byte(seedJSON), 0o600); err != nil {
 		t.Fatalf("write seed: %v", err)
 	}

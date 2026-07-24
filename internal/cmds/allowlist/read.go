@@ -1,36 +1,34 @@
 package allowlist
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"sort"
+	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
 	pkgallowlist "github.com/confidential-dot-ai/c8s/pkg/allowlist"
-	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
 func newListCmd(o *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
-		Short: "List the current allowlist",
+		Short: "List the current allowlist floor and workload entries",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := o.validate(); err != nil {
-				return err
-			}
-			c, err := o.client(ctx(cmd))
+			al, version, err := o.fetch(ctx(cmd))
 			if err != nil {
 				return err
 			}
-			resp, err := c.List(ctx(cmd))
-			if err != nil {
-				return err
+			if o.output == "json" {
+				return writeJSON(cmd.OutOrStdout(), al)
 			}
-			return printAllowlist(cmd.OutOrStdout(), o.output, resp)
+			printAllowlistText(cmd.OutOrStdout(), al, version)
+			return nil
 		},
 	}
 }
@@ -38,23 +36,15 @@ func newListCmd(o *options) *cobra.Command {
 func newExportCmd(o *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "export [file]",
-		Short: "Write the current allowlist to a file (default stdout) for backup or re-upload",
+		Short: "Write the full allowlist as canonical JSON (default stdout) for backup or re-upload",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := o.validate(); err != nil {
-				return err
-			}
-			c, err := o.client(ctx(cmd))
+			al, _, err := o.fetch(ctx(cmd))
 			if err != nil {
 				return err
 			}
-			resp, err := c.List(ctx(cmd))
-			if err != nil {
-				return err
-			}
-			// Always the canonical allowlist JSON so the file round-trips with
-			// `upload` and cds --allowlist-seed.
-			data, err := json.MarshalIndent(resp, "", "  ")
+			// Canonical bytes round-trip with `upload` and cds --allowlist-seed.
+			data, err := al.Canonical()
 			if err != nil {
 				return err
 			}
@@ -64,7 +54,8 @@ func newExportCmd(o *options) *cobra.Command {
 				if err := os.WriteFile(args[0], data, 0o644); err != nil {
 					return fmt.Errorf("write %q: %w", args[0], err)
 				}
-				fmt.Fprintf(cmd.ErrOrStderr(), "wrote %d entries to %s\n", len(resp.Digests), args[0])
+				fmt.Fprintf(cmd.ErrOrStderr(), "wrote %d floor digest(s) and %d workload(s) to %s\n",
+					len(al.Digests), len(al.Workloads), args[0])
 				return nil
 			}
 			_, err = cmd.OutOrStdout().Write(data)
@@ -74,132 +65,207 @@ func newExportCmd(o *options) *cobra.Command {
 }
 
 func newDiffCmd(o *options) *cobra.Command {
-	return &cobra.Command{
+	var exitCode bool
+	cmd := &cobra.Command{
 		Use:   "diff <file>",
 		Short: "Show how an allowlist file differs from the live allowlist",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := o.validate(); err != nil {
-				return err
-			}
 			desired, err := loadAllowlistFile(args[0])
 			if err != nil {
 				return err
 			}
-			c, err := o.client(ctx(cmd))
+			live, _, err := o.fetch(ctx(cmd))
 			if err != nil {
 				return err
 			}
-			resp, err := c.List(ctx(cmd))
-			if err != nil {
+			d := diffAllowlists(live, desired)
+			if err := printDiff(cmd.OutOrStdout(), o.output, d); err != nil {
 				return err
 			}
-			d := computeDiff(toStringMap(resp.Digests), desired.Digests)
-			return printDiff(cmd.OutOrStdout(), o.output, d)
+			if exitCode && !d.empty() {
+				cmd.SilenceErrors = true
+				return errDifferences
+			}
+			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&exitCode, "exit-code", false, "exit non-zero when the file and the live allowlist differ")
+	return cmd
 }
+
+// errDifferences is the sentinel `diff --exit-code` returns when the file and
+// the live allowlist differ; SilenceErrors keeps it from printing.
+var errDifferences = fmt.Errorf("allowlist differs")
 
 // --- shared helpers ---
 
-// loadAllowlistFile reads and validates an allowlist JSON file (version +
-// digests map), the same format `export` writes and cds --allowlist-seed reads.
+// fetch builds the CDS client and returns the live allowlist and its version.
+func (o *options) fetch(ctx context.Context) (*pkgallowlist.Allowlist, string, error) {
+	if err := o.validate(); err != nil {
+		return nil, "", err
+	}
+	c, err := o.client(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	return c.List(ctx)
+}
+
+// loadAllowlistFile reads and validates a full allowlist JSON file — the format
+// `export` writes and cds --allowlist-seed reads.
 func loadAllowlistFile(path string) (*pkgallowlist.Allowlist, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read allowlist file %q: %w", path, err)
 	}
-	wl, err := pkgallowlist.ParseJSON(data)
+	al, err := pkgallowlist.ParseJSON(data)
 	if err != nil {
 		return nil, fmt.Errorf("parse allowlist file %q: %w", path, err)
 	}
-	return wl, nil
+	return al, nil
 }
 
-func toStringMap(m map[types.Digest]string) map[string]string {
-	out := make(map[string]string, len(m))
-	for d, img := range m {
-		out[d.String()] = img
+func writeJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+// --- text rendering ---
+
+func printAllowlistText(w io.Writer, al *pkgallowlist.Allowlist, version string) {
+	fmt.Fprintf(w, "version %s: %d floor digest(s), %d workload(s)\n\n", version, len(al.Digests), len(al.Workloads))
+	printFloorTable(w, al.Digests)
+	fmt.Fprintln(w)
+	printWorkloadTable(w, al.Workloads)
+}
+
+func printFloorTable(w io.Writer, digests map[string]string) {
+	fmt.Fprintf(w, "floor (%d):\n", len(digests))
+	if len(digests) == 0 {
+		return
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "DIGEST\tIMAGE")
+	for _, d := range sortedKeys(digests) {
+		fmt.Fprintf(tw, "%s\t%s\n", d, digests[d])
+	}
+	tw.Flush()
+}
+
+func printWorkloadTable(w io.Writer, workloads map[string]pkgallowlist.Workload) {
+	fmt.Fprintf(w, "workloads (%d):\n", len(workloads))
+	if len(workloads) == 0 {
+		return
+	}
+	names := make([]string, 0, len(workloads))
+	for name := range workloads {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tINIT\tCTRS\tCOMMAND/ARGS\tPATHS")
+	for _, name := range names {
+		wl := workloads[name]
+		command, args, paths := summarizeWorkload(wl)
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%s\t%s\n", name, len(wl.InitContainers), len(wl.Containers),
+			"command="+command+" args="+args, paths)
+	}
+	tw.Flush()
+}
+
+// summarizeWorkload aggregates the command policies, args policies, and path
+// grant/deny counts across every container (init and main) in an entry.
+func summarizeWorkload(w pkgallowlist.Workload) (command, args, paths string) {
+	commandSet, argsSet := map[string]bool{}, map[string]bool{}
+	var readN, writeN, anyN int
+	for _, c := range allContainers(w) {
+		commandSet[argvPolicyName(c.Command)] = true
+		argsSet[argvPolicyName(c.Args)] = true
+		switch c.Paths.Policy {
+		case pkgallowlist.PolicyAllow:
+			readN += len(c.Paths.Read)
+			writeN += len(c.Paths.Write)
+		case pkgallowlist.PolicyAny:
+			anyN++
+		}
+	}
+	pathStr := fmt.Sprintf("R=%d W=%d", readN, writeN)
+	if anyN > 0 {
+		pathStr += fmt.Sprintf(" any=%d", anyN)
+	}
+	return joinSet(commandSet), joinSet(argsSet), pathStr
+}
+
+// allContainers returns the init containers followed by the main containers.
+func allContainers(w pkgallowlist.Workload) []pkgallowlist.Container {
+	out := make([]pkgallowlist.Container, 0, len(w.InitContainers)+len(w.Containers))
+	out = append(out, w.InitContainers...)
+	out = append(out, w.Containers...)
+	return out
+}
+
+func argvPolicyName(p pkgallowlist.ArgvPolicy) string {
+	if p.Policy == "" {
+		return pkgallowlist.PolicyDeny
+	}
+	return p.Policy
+}
+
+func joinSet(set map[string]bool) string {
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := ""
+	for i, k := range keys {
+		if i > 0 {
+			out += ","
+		}
+		out += k
 	}
 	return out
 }
 
-type changedEntry struct {
-	From string `json:"from"`
-	To   string `json:"to"`
-}
-
-type diffResult struct {
-	Added   map[string]string       `json:"added"`
-	Removed map[string]string       `json:"removed"`
-	Changed map[string]changedEntry `json:"changed"`
-}
-
-func (d diffResult) empty() bool {
-	return len(d.Added) == 0 && len(d.Removed) == 0 && len(d.Changed) == 0
-}
-
-// computeDiff reports what applying desired over current would change.
-func computeDiff(current, desired map[string]string) diffResult {
-	d := diffResult{
-		Added:   map[string]string{},
-		Removed: map[string]string{},
-		Changed: map[string]changedEntry{},
+// argvSummary renders one argv policy for diff output.
+func argvSummary(p pkgallowlist.ArgvPolicy) string {
+	switch p.Policy {
+	case pkgallowlist.PolicyExact:
+		return "exact[" + shellJoin(p.Argv) + "]"
+	case pkgallowlist.PolicyAny:
+		return "any"
+	default:
+		return "deny"
 	}
-	for digest, image := range desired {
-		cur, ok := current[digest]
-		switch {
-		case !ok:
-			d.Added[digest] = image
-		case cur != image:
-			d.Changed[digest] = changedEntry{From: cur, To: image}
+}
+
+func pathSummary(p pkgallowlist.PathPolicy) string {
+	switch p.Policy {
+	case pkgallowlist.PolicyAny:
+		return "any"
+	case pkgallowlist.PolicyAllow:
+		return fmt.Sprintf("allow(r=%d,w=%d)", len(p.Read), len(p.Write))
+	default:
+		return "deny"
+	}
+}
+
+// containerSummary renders one container's policy triple, e.g.
+// "command=exact[/bin/sh -c] args=any paths=deny".
+func containerSummary(c pkgallowlist.Container) string {
+	return fmt.Sprintf("command=%s args=%s paths=%s", argvSummary(c.Command), argvSummary(c.Args), pathSummary(c.Paths))
+}
+
+func shellJoin(argv []string) string {
+	out := ""
+	for i, a := range argv {
+		if i > 0 {
+			out += " "
 		}
+		out += a
 	}
-	for digest, image := range current {
-		if _, ok := desired[digest]; !ok {
-			d.Removed[digest] = image
-		}
-	}
-	return d
-}
-
-func printAllowlist(w io.Writer, format string, resp types.AllowlistListResponse) error {
-	if format == "json" {
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		return enc.Encode(resp)
-	}
-	images := toStringMap(resp.Digests)
-	fmt.Fprintf(w, "version: %s (%d entries)\n", resp.Version, len(images))
-	for _, digest := range sortedKeys(images) {
-		fmt.Fprintf(w, "%s  %s\n", digest, images[digest])
-	}
-	return nil
-}
-
-func printDiff(w io.Writer, format string, d diffResult) error {
-	if format == "json" {
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		return enc.Encode(d)
-	}
-	if d.empty() {
-		fmt.Fprintln(w, "no changes")
-		return nil
-	}
-	for _, digest := range sortedKeys(d.Added) {
-		fmt.Fprintf(w, "+ %s  %s\n", digest, d.Added[digest])
-	}
-	for _, digest := range sortedKeys(d.Removed) {
-		fmt.Fprintf(w, "- %s  %s\n", digest, d.Removed[digest])
-	}
-	changedKeys := make([]string, 0, len(d.Changed))
-	for k := range d.Changed {
-		changedKeys = append(changedKeys, k)
-	}
-	sort.Strings(changedKeys)
-	for _, digest := range changedKeys {
-		fmt.Fprintf(w, "~ %s  %s -> %s\n", digest, d.Changed[digest].From, d.Changed[digest].To)
-	}
-	return nil
+	return out
 }

@@ -222,7 +222,7 @@ func TestExpectedSeedDigest_SeedFile(t *testing.T) {
 	dir := t.TempDir()
 
 	t.Run("valid seed", func(t *testing.T) {
-		seed := []byte(`{"version":"1","digests":{"sha256:` + strings.Repeat("ab", 32) + `":"example/image"}}`)
+		seed := []byte(`{"schema":"c8s.allowlist/v1","digests":{"sha256:` + strings.Repeat("ab", 32) + `":"example/image"}}`)
 		path := filepath.Join(dir, "seed.json")
 		if err := os.WriteFile(path, seed, 0o600); err != nil {
 			t.Fatal(err)

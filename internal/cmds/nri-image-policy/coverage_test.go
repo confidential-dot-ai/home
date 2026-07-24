@@ -13,27 +13,38 @@ import (
 	"github.com/containerd/nri/pkg/api"
 
 	"github.com/confidential-dot-ai/c8s/internal/audit"
-	"github.com/confidential-dot-ai/c8s/internal/cache"
 	ctrdresolver "github.com/confidential-dot-ai/c8s/internal/containerd"
 	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
+	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
-// newCachedPlugin builds a plugin whose policy cache holds wl. The resolver is
-// a zero-value placeholder; tests must only exercise digest-bearing image
-// references so resolver.Resolve is never reached (no real containerd socket).
-func newCachedPlugin(cfg *config, wl *allowlist.Allowlist) (*plugin, *cache.PolicyCache) {
+// mustDigest parses a digest string or fails the test.
+func mustDigest(t *testing.T, s string) types.Digest {
+	t.Helper()
+	d, err := types.ParseDigest(s)
+	if err != nil {
+		t.Fatalf("ParseDigest(%q): %v", s, err)
+	}
+	return d
+}
+
+// newCachedPlugin builds a plugin whose policy store admits wl (applied as a
+// version-1 pull over an empty floor). The resolver is a zero-value placeholder;
+// tests must only exercise digest-bearing image references so resolver.Resolve
+// is never reached (no real containerd socket).
+func newCachedPlugin(cfg *config, wl *allowlist.Allowlist) (*plugin, *policyStore) {
 	if err := validateLabelRules(cfg.Policy.LabelRules); err != nil {
 		panic(err)
 	}
-	c := cache.NewPolicyCache()
-	c.SetAllowlist(wl)
+	store := newPolicyStore(floorAllowlist(map[string]string{}))
+	store.apply(wl, 1)
 	return &plugin{
 		cfg:      cfg,
 		resolver: &ctrdresolver.Resolver{},
-		cache:    c,
+		policy:   store,
 		audit:    audit.NewLogger(),
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}, c
+	}, store
 }
 
 // --- checkImage: digest-bearing references (no resolver needed) ---
@@ -43,7 +54,7 @@ func TestCheckImage_DigestInAllowlist_Allows(t *testing.T) {
 	p, _ := newCachedPlugin(&config{Policy: policyConfig{Mode: ModeFailClosed}},
 		&allowlist.Allowlist{Digests: map[string]string{pushDigestA: "image-a"}})
 
-	verdict, reason := p.checkImage(context.Background(), p.cfg, "default", "pod", "ctr", imageRef)
+	verdict, reason := p.checkImage(context.Background(), p.cfg, "default", "pod", "ctr", imageRef, nil)
 	if verdict != verdictAllow {
 		t.Fatalf("expected verdictAllow, got %d (reason=%q)", verdict, reason)
 	}
@@ -57,7 +68,7 @@ func TestCheckImage_DigestNotInAllowlist_Denies(t *testing.T) {
 	p, _ := newCachedPlugin(&config{Policy: policyConfig{Mode: ModeFailClosed}},
 		&allowlist.Allowlist{Digests: map[string]string{pushDigestA: "image-a"}})
 
-	verdict, reason := p.checkImage(context.Background(), p.cfg, "default", "pod", "ctr", imageRef)
+	verdict, reason := p.checkImage(context.Background(), p.cfg, "default", "pod", "ctr", imageRef, nil)
 	if verdict != verdictDeny {
 		t.Fatalf("expected verdictDeny, got %d", verdict)
 	}
@@ -66,15 +77,15 @@ func TestCheckImage_DigestNotInAllowlist_Denies(t *testing.T) {
 	}
 }
 
-func TestCheckImage_NilAllowlist_Denies(t *testing.T) {
+func TestCheckImage_NoPolicyLoaded_Denies(t *testing.T) {
 	imageRef := "registry/repo@" + pushDigestA
-	p, c := newCachedPlugin(&config{Policy: policyConfig{Mode: ModeFailClosed}},
+	p, s := newCachedPlugin(&config{Policy: policyConfig{Mode: ModeFailClosed}},
 		&allowlist.Allowlist{Digests: map[string]string{pushDigestA: "image-a"}})
-	c.Clear() // GetAllowlist now returns nil
+	s.snap.Store(nil) // no admission snapshot loaded
 
-	verdict, reason := p.checkImage(context.Background(), p.cfg, "default", "pod", "ctr", imageRef)
+	verdict, reason := p.checkImage(context.Background(), p.cfg, "default", "pod", "ctr", imageRef, nil)
 	if verdict != verdictDeny {
-		t.Fatalf("expected verdictDeny when allowlist is nil, got %d", verdict)
+		t.Fatalf("expected verdictDeny when no policy is loaded, got %d", verdict)
 	}
 	if reason == "" {
 		t.Fatal("expected non-empty reason when no allowlist is available")
@@ -88,9 +99,82 @@ func TestCheckImage_ExemptNamespace_WithImage_Skips(t *testing.T) {
 		ExemptNamespaces: []string{"kube-system"},
 	}}, &allowlist.Allowlist{Digests: map[string]string{pushDigestA: "image-a"}})
 
-	verdict, _ := p.checkImage(context.Background(), p.cfg, "kube-system", "pod", "ctr", imageRef)
+	verdict, _ := p.checkImage(context.Background(), p.cfg, "kube-system", "pod", "ctr", imageRef, nil)
 	if verdict != verdictSkip {
 		t.Fatalf("expected verdictSkip for exempt namespace, got %d", verdict)
+	}
+}
+
+// --- workload argv policy: floor admits any argv, workload gates on argv ---
+
+// workloadAllowlist builds an allowlist with one workload container pinning the
+// given digest to an exact entrypoint. The floor holds floorDigest (digest-only).
+func workloadAllowlist(t *testing.T, floorDigest, wlDigest string, entrypoint []string) *allowlist.Allowlist {
+	t.Helper()
+	return &allowlist.Allowlist{
+		Schema:  allowlist.Schema,
+		Digests: map[string]string{floorDigest: "floor-image"},
+		Workloads: map[string]allowlist.Workload{
+			"w": {Containers: []allowlist.Container{{
+				Digest:  mustDigest(t, wlDigest),
+				Command: allowlist.ArgvPolicy{Policy: allowlist.PolicyExact, Argv: entrypoint},
+				Args:    allowlist.ArgvPolicy{Policy: allowlist.PolicyAny},
+			}}},
+		},
+	}
+}
+
+func TestCheckImage_FloorDigest_AdmitsAnyArgv(t *testing.T) {
+	// A floor digest is admitted regardless of the effective argv.
+	p, _ := newCachedPlugin(&config{Policy: policyConfig{Mode: ModeFailClosed}},
+		workloadAllowlist(t, pushDigestA, pushDigestB, []string{"/bin/app"}))
+
+	verdict, reason := p.checkImage(context.Background(), p.cfg, "default", "pod", "ctr",
+		"registry/repo@"+pushDigestA, []string{"/anything", "--wild"})
+	if verdict != verdictAllow {
+		t.Fatalf("floor digest should admit any argv, got %d (reason=%q)", verdict, reason)
+	}
+}
+
+func TestCheckImage_WorkloadDigest_ArgvMatchAdmits(t *testing.T) {
+	p, _ := newCachedPlugin(&config{Policy: policyConfig{Mode: ModeFailClosed}},
+		workloadAllowlist(t, pushDigestA, pushDigestB, []string{"/bin/app"}))
+
+	verdict, reason := p.checkImage(context.Background(), p.cfg, "default", "pod", "ctr",
+		"registry/repo@"+pushDigestB, []string{"/bin/app", "--serve"})
+	if verdict != verdictAllow {
+		t.Fatalf("matching argv should admit workload digest, got %d (reason=%q)", verdict, reason)
+	}
+}
+
+func TestCheckImage_WorkloadDigest_ArgvMismatchDenies(t *testing.T) {
+	p, _ := newCachedPlugin(&config{Policy: policyConfig{Mode: ModeFailClosed}},
+		workloadAllowlist(t, pushDigestA, pushDigestB, []string{"/bin/app"}))
+
+	verdict, _ := p.checkImage(context.Background(), p.cfg, "default", "pod", "ctr",
+		"registry/repo@"+pushDigestB, []string{"/bin/evil"})
+	if verdict != verdictDeny {
+		t.Fatalf("non-matching argv should deny workload digest, got %d", verdict)
+	}
+}
+
+func TestCreateContainer_WorkloadArgv_MatchAndMismatch(t *testing.T) {
+	p, _ := newCachedPlugin(&config{
+		Allowlist: allowlistConfig{AlwaysAllow: map[string]string{pushDigestA: "floor-image"}},
+		Policy:    policyConfig{Mode: ModeFailClosed},
+	}, workloadAllowlist(t, pushDigestA, pushDigestB, []string{"/bin/app"}))
+	p.SetReady()
+
+	pod := makePod("default", "mypod")
+
+	match := makeCtrWithImageArgs(pod.Id, "match", "registry/repo@"+pushDigestB, []string{"/bin/app", "--serve"})
+	if _, _, err := p.CreateContainer(context.Background(), pod, match); err != nil {
+		t.Fatalf("matching argv should be admitted, got: %v", err)
+	}
+
+	mismatch := makeCtrWithImageArgs(pod.Id, "mismatch", "registry/repo@"+pushDigestB, []string{"/bin/evil"})
+	if _, _, err := p.CreateContainer(context.Background(), pod, mismatch); err == nil {
+		t.Fatal("non-matching argv should be denied")
 	}
 }
 
@@ -103,6 +187,14 @@ func makeCtrWithImage(podSandboxID, name, image string) *api.Container {
 		Name:         name,
 		Annotations:  map[string]string{annotationImageName: image},
 	}
+}
+
+// makeCtrWithImageArgs is makeCtrWithImage plus the container's effective argv
+// (NRI folds the OCI process.args into api.Container.Args).
+func makeCtrWithImageArgs(podSandboxID, name, image string, args []string) *api.Container {
+	ctr := makeCtrWithImage(podSandboxID, name, image)
+	ctr.Args = args
+	return ctr
 }
 
 func TestCreateContainer_DigestNotInAllowlist_FailClosed(t *testing.T) {

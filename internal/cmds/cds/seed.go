@@ -51,6 +51,14 @@ func seedStore(store *allowlist.Store, path string) ([]byte, error) {
 		return nil, fmt.Errorf("seed allowlist store: %w", err)
 	}
 
-	slog.Info("allowlist seeded", "added", added, "in_seed", len(seed.Digests), "already_present", len(seed.Digests)-added, "seed_digest", fmt.Sprintf("%x", seedDigest))
+	wlAdded, err := store.SeedWorkloads(seed.Workloads)
+	if err != nil {
+		return nil, fmt.Errorf("seed allowlist workloads: %w", err)
+	}
+
+	slog.Info("allowlist seeded",
+		"digests_added", added, "digests_in_seed", len(seed.Digests),
+		"workloads_added", wlAdded, "workloads_in_seed", len(seed.Workloads),
+		"seed_digest", fmt.Sprintf("%x", seedDigest))
 	return seedDigest, nil
 }

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/internal/earclaims"
+	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -66,6 +67,9 @@ func snapshotFromCA(ca *CA) func() (CASnapshot, bool) {
 			AllowlistVersion: "17",
 			Allowlist: map[types.Digest]string{
 				handoffTestDigest(): "registry.example/dynamic:latest",
+			},
+			Workloads: map[string]allowlist.Workload{
+				"web": {Containers: []allowlist.Container{{Digest: handoffTestDigest()}}},
 			},
 		}, true
 	}
@@ -130,6 +134,9 @@ func TestAttestedHandoffTransfersCAKeyToAllowedReplica(t *testing.T) {
 	}
 	if material.AllowlistVersion != "17" || material.Allowlist[handoffTestDigest()] != "registry.example/dynamic:latest" {
 		t.Fatalf("handoff allowlist snapshot = version %q, digests %#v", material.AllowlistVersion, material.Allowlist)
+	}
+	if w, ok := material.Workloads["web"]; !ok || len(w.Containers) != 1 || w.Containers[0].Digest != handoffTestDigest() {
+		t.Fatalf("handoff workloads snapshot = %#v", material.Workloads)
 	}
 }
 

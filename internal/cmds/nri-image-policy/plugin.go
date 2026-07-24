@@ -15,8 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/confidential-dot-ai/c8s/internal/audit"
-	"github.com/confidential-dot-ai/c8s/internal/cache"
 	ctrdresolver "github.com/confidential-dot-ai/c8s/internal/containerd"
+	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
 )
 
 const (
@@ -36,12 +36,66 @@ const (
 	verdictSkip // exempt namespace, etc.
 )
 
+// policySnapshot is an immutable admission view: an Index built from the
+// always_allow floor unioned with the last-applied CDS pull, tagged with that
+// pull's version (the ETag counter). Swapped as a unit.
+type policySnapshot struct {
+	index   *allowlist.Index
+	version uint64
+}
+
+// policyStore holds the current admission snapshot. A single writer (the pull
+// loop) swaps it via apply; CreateContainer reads it concurrently via current.
+// The always_allow floor is unioned into every snapshot, so a failed or
+// withheld pull never drops it.
+type policyStore struct {
+	bootstrap *allowlist.Allowlist // static floor, unioned into every snapshot
+	snap      atomic.Pointer[policySnapshot]
+}
+
+// newPolicyStore seeds the store with the floor alone (version 0) so admission
+// enforces the floor before the first pull lands and after any pull failure.
+func newPolicyStore(bootstrap *allowlist.Allowlist) *policyStore {
+	s := &policyStore{bootstrap: bootstrap}
+	s.snap.Store(&policySnapshot{index: mergeAllowlists(bootstrap, nil).BuildIndex()})
+	return s
+}
+
+func (s *policyStore) current() *policySnapshot {
+	if s == nil {
+		return nil
+	}
+	return s.snap.Load()
+}
+
+// apply installs floor ∪ pulled at version, unless version is below the applied
+// one — an epoch rollback a withheld/rolled-back CDS must not use to loosen a
+// tightened policy. Reports whether it applied. Single-writer: only the pull
+// loop calls it, so the read-compare-store needs no lock against other writers.
+//
+// The applied version is process-local (newPolicyStore starts at 0), so
+// rollback is only rejected within a process lifetime: after a restart the first
+// pull is trusted, whatever its version, and state re-syncs from CDS. Surviving a
+// restart would need a monotonic counter the host cannot reset — out of scope; on
+// the untrusted host a persisted file is itself host-controlled. See
+// docs/allowlist-and-capabilities.md.
+func (s *policyStore) apply(pulled *allowlist.Allowlist, version uint64) bool {
+	if cur := s.snap.Load(); cur != nil && version < cur.version {
+		return false
+	}
+	s.snap.Store(&policySnapshot{
+		index:   mergeAllowlists(s.bootstrap, pulled).BuildIndex(),
+		version: version,
+	})
+	return true
+}
+
 // plugin implements the NRI plugin interface for image policy enforcement.
 type plugin struct {
 	stub     stub.Stub
 	cfg      *config
 	resolver *ctrdresolver.Resolver
-	cache    *cache.PolicyCache
+	policy   *policyStore
 	audit    *audit.Logger
 	logger   *slog.Logger
 	ready    atomic.Bool
@@ -59,14 +113,14 @@ type plugin struct {
 func newPlugin(
 	cfg *config,
 	resolver *ctrdresolver.Resolver,
-	policyCache *cache.PolicyCache,
+	store *policyStore,
 	auditLogger *audit.Logger,
 	logger *slog.Logger,
 ) (*plugin, error) {
 	p := &plugin{
 		cfg:      cfg,
 		resolver: resolver,
-		cache:    policyCache,
+		policy:   store,
 		audit:    auditLogger,
 		logger:   logger,
 	}
@@ -212,9 +266,11 @@ func (p *plugin) checkLabels(cfg *config, namespace, podName, containerName stri
 	return verdictAllow, ""
 }
 
-// checkImage validates a container's image against the allowlist.
-// Returns the verdict and an error string (empty if none).
-func (p *plugin) checkImage(ctx context.Context, cfg *config, namespace, podName, containerName, imageRef string) (imageVerdict, string) {
+// checkImage validates a container's image against the allowlist. argv is the
+// container's effective OCI process.args (NRI api.Container.Args): floor digests
+// are admitted regardless of it, workload digests only when it satisfies an
+// entry's entrypoint/cmd policy. Returns the verdict and an error string.
+func (p *plugin) checkImage(ctx context.Context, cfg *config, namespace, podName, containerName, imageRef string, argv []string) (imageVerdict, string) {
 	log := p.logger.With(
 		"namespace", namespace,
 		"pod", podName,
@@ -282,9 +338,9 @@ func (p *plugin) checkImage(ctx context.Context, cfg *config, namespace, podName
 		log.Debug("resolved tag to digest via containerd", "digest", digest)
 	}
 
-	wl := p.cache.GetAllowlist()
-	if wl == nil {
-		log.Error("no cached allowlist; denying")
+	snap := p.policy.current()
+	if snap == nil || snap.index == nil {
+		log.Error("no allowlist loaded; denying")
 		p.audit.Log(audit.Event{
 			Action:    "deny",
 			Reason:    "no_allowlist_available",
@@ -296,9 +352,10 @@ func (p *plugin) checkImage(ctx context.Context, cfg *config, namespace, podName
 		return verdictDeny, fmt.Sprintf("no allowlist available for %s", imageRef)
 	}
 
-	// Check digest against allowlist
-	if !wl.Contains(digest) {
-		log.Warn("image not in allowlist", "digest", digest)
+	// Floor digests admit regardless of argv; workload digests require the
+	// effective argv to satisfy some entry's entrypoint/cmd policy.
+	if !snap.index.AdmitsContainer(digest, argv) {
+		log.Warn("image not admitted by allowlist", "digest", digest, "argv", argv)
 		p.audit.Log(audit.Event{
 			Action:    "deny",
 			Reason:    "not_in_allowlist",
@@ -387,7 +444,7 @@ func (p *plugin) checkExisting(ctx context.Context, cfg *config, pods []*api.Pod
 
 		if !denied && cfg.AllowlistEnabled() {
 			imageRef := ctr.GetAnnotations()[annotationImageName]
-			imgVerdict, _ := p.checkImage(ctx, cfg, pod.GetNamespace(), pod.GetName(), ctr.GetName(), imageRef)
+			imgVerdict, _ := p.checkImage(ctx, cfg, pod.GetNamespace(), pod.GetName(), ctr.GetName(), imageRef, ctr.GetArgs())
 			if imgVerdict == verdictDeny {
 				denied = true
 			} else {
@@ -499,7 +556,9 @@ func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *
 			imageRef = podAnnotations[annotationImageName]
 		}
 
-		verdict, reason := p.checkImage(ctx, cfg, pod.GetNamespace(), pod.GetName(), ctr.GetName(), imageRef)
+		// Effective argv (ctr.Args): NRI folds the OCI process.args here, so the
+		// full merged entrypoint+cmd the container runs is available at this hook.
+		verdict, reason := p.checkImage(ctx, cfg, pod.GetNamespace(), pod.GetName(), ctr.GetName(), imageRef, ctr.GetArgs())
 		if verdict == verdictDeny {
 			if cfg.Policy.Mode == ModeAudit {
 				return nil, nil, nil

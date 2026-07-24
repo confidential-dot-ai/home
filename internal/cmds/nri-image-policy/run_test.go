@@ -14,7 +14,6 @@ import (
 	"github.com/containerd/nri/pkg/stub"
 
 	"github.com/confidential-dot-ai/c8s/internal/audit"
-	"github.com/confidential-dot-ai/c8s/internal/cache"
 	ctrdresolver "github.com/confidential-dot-ai/c8s/internal/containerd"
 	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
 )
@@ -180,7 +179,7 @@ func TestNewPlugin_External_DefaultProcRoot(t *testing.T) {
 		Policy:         policyConfig{Mode: ModeFailClosed},
 		WorkloadClaims: workloadClaimsConfig{SocketDir: t.TempDir()},
 	}
-	p, err := newPlugin(cfg, &ctrdresolver.Resolver{}, cache.NewPolicyCache(), audit.NewLogger(), discardLogger())
+	p, err := newPlugin(cfg, &ctrdresolver.Resolver{}, newPolicyStore(floorAllowlist(map[string]string{})), audit.NewLogger(), discardLogger())
 	if err != nil {
 		t.Fatalf("newPlugin: %v", err)
 	}
@@ -203,7 +202,7 @@ func TestNewPlugin_PreInstalledEnv(t *testing.T) {
 		Policy:         policyConfig{Mode: ModeFailClosed},
 		WorkloadClaims: workloadClaimsConfig{SocketDir: t.TempDir(), ProcRoot: "/custom/proc"},
 	}
-	p, err := newPlugin(cfg, &ctrdresolver.Resolver{}, cache.NewPolicyCache(), audit.NewLogger(), discardLogger())
+	p, err := newPlugin(cfg, &ctrdresolver.Resolver{}, newPolicyStore(floorAllowlist(map[string]string{})), audit.NewLogger(), discardLogger())
 	if err != nil {
 		t.Fatalf("newPlugin: %v", err)
 	}
@@ -304,7 +303,7 @@ func TestCheckImage_ResolveFails_Denies(t *testing.T) {
 	// failure path is exercised without a multi-second wait.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	verdict, reason := p.checkImage(ctx, p.cfg, "default", "pod", "ctr", "registry/repo:latest")
+	verdict, reason := p.checkImage(ctx, p.cfg, "default", "pod", "ctr", "registry/repo:latest", nil)
 	if verdict != verdictDeny {
 		t.Fatalf("expected verdictDeny when digest resolution fails, got %d", verdict)
 	}
