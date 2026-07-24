@@ -68,6 +68,16 @@ type config struct {
 	WorkloadInitContainers []string
 }
 
+// brokerEndpoint returns the compiled workload-claims broker endpoint. It is a
+// package variable only so tests can point it at a temporary Unix socket; the
+// production value is always workloadclaims.BrokerEndpoint (a baked path the
+// control plane cannot redirect).
+var brokerEndpoint = workloadclaims.BrokerEndpoint
+
+// procRoot is the procfs mount findNginxMasterPID scans. It is a package
+// variable only so tests can substitute a fake /proc tree.
+var procRoot = "/proc"
+
 var (
 	errInvalidDiscoveryPublicTLSMode             = errors.New("invalid discovery public TLS mode")
 	errInvalidReloadWatchInterval                = errors.New("invalid reload watch interval")
@@ -341,7 +351,7 @@ func workloadClaims(ctx context.Context, cfg config) (workloadClaimsResult, erro
 	if !cfg.WorkloadClaimsBroker {
 		return workloadClaimsResult{}, nil
 	}
-	containers, err := workloadclaims.Fetch(ctx, workloadclaims.BrokerEndpoint(), cfg.WorkloadClaimsTimeout)
+	containers, err := workloadclaims.Fetch(ctx, brokerEndpoint(), cfg.WorkloadClaimsTimeout)
 	if err != nil {
 		return workloadClaimsResult{}, fmt.Errorf("fetch workload claims: %w", err)
 	}
@@ -393,9 +403,9 @@ func reloadNginx() error {
 // findNginxMasterPID scans /proc for the nginx master process.
 // Match: /proc/<pid>/comm == "nginx" AND cmdline contains "master".
 func findNginxMasterPID() (int, error) {
-	entries, err := os.ReadDir("/proc")
+	entries, err := os.ReadDir(procRoot)
 	if err != nil {
-		return 0, fmt.Errorf("read /proc: %w", err)
+		return 0, fmt.Errorf("read %s: %w", procRoot, err)
 	}
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -405,11 +415,11 @@ func findNginxMasterPID() (int, error) {
 		if err != nil {
 			continue
 		}
-		comm, err := os.ReadFile("/proc/" + e.Name() + "/comm")
+		comm, err := os.ReadFile(procRoot + "/" + e.Name() + "/comm")
 		if err != nil || strings.TrimSpace(string(comm)) != "nginx" {
 			continue
 		}
-		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+		cmdline, err := os.ReadFile(procRoot + "/" + e.Name() + "/cmdline")
 		if err != nil {
 			continue
 		}

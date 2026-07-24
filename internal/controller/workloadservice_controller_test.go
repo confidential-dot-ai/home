@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha2 "github.com/confidential-dot-ai/c8s/api/v1alpha2"
 	"github.com/confidential-dot-ai/c8s/internal/webhook"
@@ -286,6 +288,150 @@ func TestSetupWithManagerRejectsUnsupportedKind(t *testing.T) {
 func TestPodTemplateReturnsNilForUnknownObject(t *testing.T) {
 	if tmpl := podTemplate(&corev1.Pod{}); tmpl != nil {
 		t.Fatalf("podTemplate(*Pod) = %#v, want nil", tmpl)
+	}
+}
+
+// reconcilerWithClient wraps a prebuilt client in a Deployment reconciler.
+func reconcilerWithClient(c client.Client) *WorkloadServiceReconciler {
+	return &WorkloadServiceReconciler{
+		Client:   c,
+		Scheme:   scheme,
+		Recorder: events.NewFakeRecorder(8),
+		Kind:     v1alpha2.WorkloadKindDeployment,
+	}
+}
+
+// staleManagedService builds a managed Service controlled by the given
+// Deployment under a name the reconciler no longer desires.
+func staleManagedService(name string, dep *appsv1.Deployment) *corev1.Service {
+	controller := true
+	return &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:      name,
+		Namespace: dep.Namespace,
+		Labels:    map[string]string{managedByLabel: managedByValue},
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "Deployment",
+			Name: dep.Name, UID: dep.UID, Controller: &controller,
+		}},
+	}}
+}
+
+func TestWorkloadServiceMissingWorkloadIsNoOp(t *testing.T) {
+	r := reconcilerFor(v1alpha2.WorkloadKindDeployment, nil)
+	// Must not error: the Service is GC'd via ownerReference.
+	reconcile(t, r, "tenant", "gone")
+}
+
+func TestWorkloadServiceGetErrorSurfaces(t *testing.T) {
+	injected := apierrors.NewInternalError(errors.New("boom"))
+	c := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			return injected
+		},
+	}).Build()
+	r := reconcilerWithClient(c)
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant", Name: "api"},
+	})
+	// The reconciler returns the Get failure unwrapped (only NotFound is
+	// swallowed), so the exact injected error must surface.
+	if !errors.Is(err, injected) {
+		t.Fatalf("Reconcile err = %v, want the injected internal error", err)
+	}
+	if !apierrors.IsInternalError(err) || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("Reconcile err = %v, want an internal-error wrap of \"boom\"", err)
+	}
+}
+
+func TestWorkloadServiceListErrorSurfaces(t *testing.T) {
+	dep := cwDeployment("tenant", "api", "api")
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dep).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+				return apierrors.NewInternalError(errors.New("boom"))
+			},
+		}).Build()
+	r := reconcilerWithClient(c)
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant", Name: "api"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "list managed Services") {
+		t.Fatalf("err = %v, want list managed Services failure", err)
+	}
+}
+
+func TestWorkloadServiceDeleteStaleErrorSurfaces(t *testing.T) {
+	dep := cwDeployment("tenant", "api", "api")
+	stale := staleManagedService("c8s-old", dep)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dep, stale).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error {
+				return apierrors.NewInternalError(errors.New("boom"))
+			},
+		}).Build()
+	r := reconcilerWithClient(c)
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant", Name: "api"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "delete stale Service") {
+		t.Fatalf("err = %v, want delete stale Service failure", err)
+	}
+}
+
+func TestWorkloadServiceDeleteStaleIgnoresNotFound(t *testing.T) {
+	dep := cwDeployment("tenant", "api", "api")
+	stale := staleManagedService("c8s-old", dep)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dep, stale).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
+				if obj.GetName() == "c8s-old" {
+					return apierrors.NewNotFound(corev1.Resource("services"), obj.GetName())
+				}
+				return nil
+			},
+		}).Build()
+	r := reconcilerWithClient(c)
+	reconcile(t, r, "tenant", "api")
+	// The desired Service must still be provisioned.
+	getService(t, c, "tenant", "c8s-api")
+}
+
+func TestWorkloadServiceCreateErrorSurfaces(t *testing.T) {
+	dep := cwDeployment("tenant", "api", "api")
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dep).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+				return apierrors.NewInternalError(errors.New("boom"))
+			},
+		}).Build()
+	r := reconcilerWithClient(c)
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant", Name: "api"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "ensure headless Service") {
+		t.Fatalf("err = %v, want ensure headless Service failure", err)
+	}
+}
+
+func TestWorkloadServiceAlreadyExistsRequeues(t *testing.T) {
+	// The label-scoped cache view of a collision: no Service visible, but
+	// Create races with a foreign object and gets AlreadyExists.
+	dep := cwDeployment("tenant", "api", "api")
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dep).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
+				return apierrors.NewAlreadyExists(corev1.Resource("services"), obj.GetName())
+			},
+		}).Build()
+	r := reconcilerWithClient(c)
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "tenant", Name: "api"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != collisionRequeue {
+		t.Fatalf("requeue = %v, want %v", res.RequeueAfter, collisionRequeue)
 	}
 }
 

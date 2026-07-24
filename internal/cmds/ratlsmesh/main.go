@@ -42,6 +42,21 @@ func Run(args []string) error {
 	return cmd.ExecuteContext(ctx)
 }
 
+// newKubeClientset builds the Kubernetes client used by the proxy and the
+// iptables-sync sidecar. Package var so tests can substitute a fake clientset;
+// production always uses the in-cluster config.
+var newKubeClientset = func() (kubernetes.Interface, error) {
+	restCfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("k8s in-cluster config: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return nil, fmt.Errorf("k8s clientset: %w", err)
+	}
+	return clientset, nil
+}
+
 func newRatlsMeshCommand() *cobra.Command {
 	var cfg proxyConfig
 	cmd := &cobra.Command{
@@ -170,13 +185,9 @@ func runProxy(ctx context.Context, c *proxyConfig) error {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
 
-	restCfg, err := rest.InClusterConfig()
+	clientset, err := newKubeClientset()
 	if err != nil {
-		return fmt.Errorf("k8s in-cluster config: %w", err)
-	}
-	clientset, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return fmt.Errorf("k8s clientset: %w", err)
+		return err
 	}
 	resolver, err := newK8sResolver(ctx, clientset, c.nodeIP, c.localCIDRBootTimeout, logger)
 	if err != nil {

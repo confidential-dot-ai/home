@@ -140,6 +140,8 @@ func (s *Store) ListAll() (string, map[types.Digest]string, error) {
 			d, err := types.ParseDigest(r.digestStr.String)
 			if err != nil {
 				// Data was validated on insert; skip corrupt rows
+				slog.Warn("allowlist: skipping corrupt row",
+					"digest", r.digestStr.String, "image", r.image.String, "err", err)
 				continue
 			}
 			digests[d] = r.image.String

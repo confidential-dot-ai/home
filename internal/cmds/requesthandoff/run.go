@@ -30,6 +30,11 @@ const (
 	maxErrorBodyBytes = 8 << 10
 )
 
+// newVerifyingHTTPClient builds the RA-TLS-verifying peer client. It is a
+// package variable only so tests can substitute a plain TLS client for an
+// httptest peer; production always uses ratls.NewVerifyingHTTPClient.
+var newVerifyingHTTPClient = ratls.NewVerifyingHTTPClient
+
 type config struct {
 	peerURL           string
 	attestationApiURL string
@@ -132,7 +137,7 @@ func run(ctx context.Context, cfg config, out, errOut io.Writer) int {
 		allowed[hex.EncodeToString(m)] = true
 	}
 
-	httpClient, err := ratls.NewVerifyingHTTPClient(pinned, cfg.attestationApiURL)
+	httpClient, err := newVerifyingHTTPClient(pinned, cfg.attestationApiURL)
 	if err != nil {
 		errorf(errOut, "%v", err)
 		return exitUsage

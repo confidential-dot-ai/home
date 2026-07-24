@@ -22,8 +22,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
@@ -94,13 +92,9 @@ func runIptablesSync(ctx context.Context, cfg *iptablesSyncConfig) error {
 	if err := resetReadyFile(cfg.readyFile); err != nil {
 		return err
 	}
-	config, err := rest.InClusterConfig()
+	clientset, err := newKubeClientset()
 	if err != nil {
-		return fmt.Errorf("k8s in-cluster config: %w", err)
-	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return fmt.Errorf("k8s clientset: %w", err)
+		return err
 	}
 	excludedSourceNamespaces := parseExcludedNamespaces(cfg.excludeSourceNamespaces)
 

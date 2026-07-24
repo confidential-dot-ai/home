@@ -719,3 +719,83 @@ func TestAllowlistListStaleIfNoneMatchReturns200WithNewETag(t *testing.T) {
 		t.Fatalf("ETag = %q, want W/\"2\"", got)
 	}
 }
+
+// TestAllowlistWritesRejectedWithoutAuthorizer pins the fail-closed default:
+// a Handler wired without a WriteAuthorizer refuses every mutation.
+func TestAllowlistWritesRejectedWithoutAuthorizer(t *testing.T) {
+	store, err := allowlist.OpenInMemory()
+	if err != nil {
+		t.Fatalf("open in-memory store: %v", err)
+	}
+	h := allowlist.Handler{Store: &store}
+
+	body := fmt.Sprintf(`{"digest":"%s","image":"img"}`, digestA)
+	rec := httptest.NewRecorder()
+	h.HandleAddDigest(rec, httptest.NewRequest(http.MethodPost, "/allowlist", strings.NewReader(body)))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("POST without authorizer: got status %d, want 401", rec.Code)
+	}
+}
+
+// TestAllowlistMutationsRejectMalformedBody covers the decode guards on every
+// mutation: syntactically invalid JSON and unknown fields both 422.
+func TestAllowlistMutationsRejectMalformedBody(t *testing.T) {
+	h, _ := guardTestHandler(t)
+
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		method  string
+		body    string
+	}{
+		{"add invalid json", h.HandleAddDigest, http.MethodPost, `{`},
+		{"add unknown field", h.HandleAddDigest, http.MethodPost, `{"digest":"` + digestA + `","bogus":1}`},
+		{"delete invalid json", h.HandleDeleteDigests, http.MethodDelete, `{`},
+		{"delete unknown field", h.HandleDeleteDigests, http.MethodDelete, `{"digests":["` + digestA + `"],"bogus":1}`},
+		{"replace invalid json", h.HandleReplaceAll, http.MethodPut, `{`},
+		{"replace unknown field", h.HandleReplaceAll, http.MethodPut, `{"digests":{},"bogus":1}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			tc.handler(rec, httptest.NewRequest(tc.method, "/allowlist", strings.NewReader(tc.body)))
+			if rec.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("got status %d, want 422", rec.Code)
+			}
+		})
+	}
+}
+
+// TestAllowlistHandlersReturn500OnStoreFailure drives every handler against a
+// store whose DB is closed, so the storage layer errors surface as 500s.
+func TestAllowlistHandlersReturn500OnStoreFailure(t *testing.T) {
+	store, err := allowlist.OpenInMemory()
+	if err != nil {
+		t.Fatalf("open in-memory store: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	h := allowlist.Handler{Store: &store, WriteAuthorizer: func(*http.Request, []byte) error { return nil }}
+
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		method  string
+		body    string
+	}{
+		{"list", h.HandleList, http.MethodGet, ""},
+		{"add", h.HandleAddDigest, http.MethodPost, fmt.Sprintf(`{"digest":"%s","image":"img"}`, digestA)},
+		{"delete", h.HandleDeleteDigests, http.MethodDelete, fmt.Sprintf(`{"digests":["%s"]}`, digestA)},
+		{"replace", h.HandleReplaceAll, http.MethodPut, fmt.Sprintf(`{"schema":"c8s.allowlist/v1","digests":{"%s":"img"}}`, digestA)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			tc.handler(rec, httptest.NewRequest(tc.method, "/allowlist", strings.NewReader(tc.body)))
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("got status %d, want 500", rec.Code)
+			}
+		})
+	}
+}

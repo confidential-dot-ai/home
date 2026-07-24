@@ -19,12 +19,14 @@ import (
 // reads this file rather than mounting the ISO itself — mounting fails under
 // the unit's systemd hardening, and the initrd is the single, measured reader
 // of the disk anyway.
-const operatorPubkeyPath = "/etc/confai/operator-pubkey"
+// Var (not const) so tests can point it at a temp file.
+var operatorPubkeyPath = "/etc/confai/operator-pubkey"
 
 // rtmr3SysfsPath is the TDX runtime-measurement register the initrd extended
 // with the operator key digest before switch_root. Reading it back lets the
 // service confirm the on-disk operator pubkey is the one that was measured.
-const rtmr3SysfsPath = "/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384"
+// Var (not const) so tests can point it at a temp file.
+var rtmr3SysfsPath = "/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384"
 
 // expectedRTMR3ForKey computes the RTMR[3] value a guest reports after the
 // initrd extends the zeroed register once with SHA-384(pubkey):

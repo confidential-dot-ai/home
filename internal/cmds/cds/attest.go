@@ -371,6 +371,8 @@ func (h AttestHandler) caChainPEM() []byte {
 // the attestation-api returns for malformed/unacceptable evidence — is the
 // caller's fault and must not be reported as attestation_api_unreachable.
 // Only a transport failure or a 5xx/garbage upstream response is a real outage.
+// Upstream 408 (timeout) and 429 (rate-limited) are retryable availability
+// conditions, not evidence rejections, so they classify as unreachable too.
 func classifyVerifyError(err error) (int, string, string) {
 	switch {
 	case errors.Is(err, attestationclient.ErrSignatureInvalid):
@@ -379,7 +381,8 @@ func classifyVerifyError(err error) (int, string, string) {
 		return http.StatusUnauthorized, types.ErrorCodeVerificationFailed, "challenge mismatch in attestation evidence"
 	}
 	var apiErr *attestationclient.APIError
-	if errors.As(err, &apiErr) && apiErr.Status >= 400 && apiErr.Status < 500 {
+	if errors.As(err, &apiErr) && apiErr.Status >= 400 && apiErr.Status < 500 &&
+		apiErr.Status != http.StatusRequestTimeout && apiErr.Status != http.StatusTooManyRequests {
 		return http.StatusUnprocessableEntity, types.ErrorCodeVerificationFailed, "attestation evidence rejected by attestation-api"
 	}
 	return http.StatusBadGateway, types.ErrorCodeAttestationApiUnreachable,

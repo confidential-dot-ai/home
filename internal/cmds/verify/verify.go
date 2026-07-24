@@ -241,14 +241,20 @@ type operatorKeysReport struct {
 }
 
 // gatherOperatorKeys fetches the CDS-pinned operator key fingerprints for
-// kind=cds network targets. The fetch is bound to the attested serving cert
+// kind=cds network targets. For any other kind (including the default auto)
+// the cross-check is skipped, and the skip is announced via a note so the
+// rendered verdict never silently omits it. The fetch is bound to the attested
+// serving cert
 // (see fetchOperatorKeyFingerprints). A failed fetch degrades to a note for
 // claims-free targets, but records fetchErr so applyClaimsPolicy can fail the
 // verdict when the evidence binds config-claims: the served-vs-attested key
 // cross-check is mandatory there, and an endpoint erroring on /operator-keys
 // must not dodge it.
 func gatherOperatorKeys(ctx context.Context, cfg config, ev *evidence) operatorKeysReport {
-	if cfg.kind != "cds" || cfg.url == "" {
+	if cfg.kind != "cds" {
+		return operatorKeysReport{note: "operator-keys cross-check skipped: target kind is not cds (use --kind cds to enable)"}
+	}
+	if cfg.url == "" {
 		return operatorKeysReport{}
 	}
 	if ev.certSHA256 == "" {

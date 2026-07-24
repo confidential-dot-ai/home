@@ -121,7 +121,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // parseCSR decodes a PEM CERTIFICATE REQUEST. The CSR's public key is what the
 // issued cert binds to; the operator holds the matching private key. The CSR
-// self-signature is checked at sign time.
+// self-signature is verified here so a tampered CSR is a client fault (400),
+// not a signing failure.
 func parseCSR(pemBytes []byte) (*x509.CertificateRequest, error) {
 	block, _ := pem.Decode(pemBytes)
 	if block == nil || block.Type != "CERTIFICATE REQUEST" {
@@ -137,6 +138,9 @@ func parseCSR(pemBytes []byte) (*x509.CertificateRequest, error) {
 	if _, ok := csr.PublicKey.(*ecdsa.PublicKey); !ok {
 		// Not fatal for correctness, but v1 keeps it ECDSA for symmetry.
 		return nil, fmt.Errorf("CSR public key is %T, want ECDSA", csr.PublicKey)
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return nil, fmt.Errorf("CSR self-signature invalid: %w", err)
 	}
 	return csr, nil
 }
