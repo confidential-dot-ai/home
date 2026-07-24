@@ -1092,3 +1092,236 @@ func TestHandleInjectsDespitePresetInjectedMarker(t *testing.T) {
 		t.Fatalf("initContainers patch = %+v, want injected c8s-cert + c8s-cert-wait despite the preset marker", inits)
 	}
 }
+
+// handleAdmission runs a pod through Handle with the given config.
+func handleAdmission(t *testing.T, cfg Config, pod *corev1.Pod) admission.Response {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	m := &podMutator{decoder: admission.NewDecoder(scheme), cfg: cfg}
+	raw, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{Namespace: "default", Object: runtime.RawExtension{Raw: raw}},
+	})
+}
+
+// luksHandlePod is an opted-in pod with one pvc= LUKS volume, valid for Handle.
+func luksHandlePod() *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			AnnotationWorkload:              "api",
+			AnnotationSecretsInject:         "true",
+			secretAnnotationPrefix + "data": "secret/data/api/luks#passphrase",
+			luksAnnotationPrefix + "data":   "pvc=api-data,mount=/data,secret=secret/data/api/luks#passphrase",
+		}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+}
+
+// Any reserved injected container name is denied in the regular and ephemeral
+// lists, and in the init list when this admission does not rebuild it — a
+// container under a digest-excluded name would be hidden from attestation.
+func TestHandleRejectsReservedInjectedContainerNames(t *testing.T) {
+	cfg := secretsTestConfig()
+	for _, name := range reservedInjectedContainerNames() {
+		t.Run("regular "+name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}, {Name: name}}},
+			}
+			if resp := handleAdmission(t, cfg, pod); resp.Allowed {
+				t.Fatalf("admitted a pod with reserved regular container %q", name)
+			}
+		})
+		t.Run("ephemeral "+name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+				Spec: corev1.PodSpec{
+					Containers:          []corev1.Container{{Name: "app"}},
+					EphemeralContainers: []corev1.EphemeralContainer{{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: name}}},
+				},
+			}
+			if resp := handleAdmission(t, cfg, pod); resp.Allowed {
+				t.Fatalf("admitted a pod with reserved ephemeral container %q", name)
+			}
+		})
+	}
+
+	// Init container under a secrets name on a pod with no secrets injection:
+	// nothing rebuilds it, so it must be rejected.
+	t.Run("init not rebuilt", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+			Spec: corev1.PodSpec{
+				Containers:     []corev1.Container{{Name: "app"}},
+				InitContainers: []corev1.Container{{Name: secretsAgentContainerName, Image: "attacker/img"}},
+			},
+		}
+		resp := handleAdmission(t, cfg, pod)
+		if resp.Allowed {
+			t.Fatal("admitted a pod with a reserved init container that this admission does not rebuild")
+		}
+		if resp.Result == nil || !strings.Contains(resp.Result.Message, "reserved") {
+			t.Fatalf("denial message = %+v, want it to mention the reserved name", resp.Result)
+		}
+	})
+
+	// Init container under a name this admission rebuilds (reinvocation shape):
+	// the injector drops and rebuilds it, so admission converges.
+	t.Run("init rebuilt converges", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+			Spec: corev1.PodSpec{
+				Containers:     []corev1.Container{{Name: "app"}},
+				InitContainers: []corev1.Container{{Name: reservedCertContainerName, Image: cfg.GetCertImage}},
+			},
+		}
+		if resp := handleAdmission(t, cfg, pod); !resp.Allowed {
+			t.Fatalf("denied a reinvocation-shaped pod: %+v", resp.Result)
+		}
+	})
+}
+
+// The reserved secrets volumes must be memory-backed emptyDirs: ensureVolume
+// keeps a pre-declared same-named volume, so any other shape would land the
+// templated secrets on host-visible storage.
+func TestHandleRejectsReservedSecretsVolumes(t *testing.T) {
+	cfg := secretsTestConfig()
+	newPod := func(vol corev1.Volume) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				AnnotationWorkload:            "api",
+				AnnotationSecretsInject:       "true",
+				secretAnnotationPrefix + "db": "secret/data/api/db#password",
+			}},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app"}},
+				Volumes:    []corev1.Volume{vol},
+			},
+		}
+	}
+	for _, name := range []string{secretsDataVolume, secretsConfigVolume} {
+		t.Run("rejects disk emptyDir "+name, func(t *testing.T) {
+			resp := handleAdmission(t, cfg, newPod(corev1.Volume{
+				Name:         name,
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}))
+			if resp.Allowed {
+				t.Fatalf("admitted a pod shadowing %q with a disk-backed emptyDir", name)
+			}
+		})
+		t.Run("rejects hostPath "+name, func(t *testing.T) {
+			resp := handleAdmission(t, cfg, newPod(corev1.Volume{
+				Name:         name,
+				VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/tmp/leak"}},
+			}))
+			if resp.Allowed {
+				t.Fatalf("admitted a pod shadowing %q with a hostPath", name)
+			}
+		})
+		t.Run("accepts injected shape "+name, func(t *testing.T) {
+			resp := handleAdmission(t, cfg, newPod(memoryVolume(name)))
+			if !resp.Allowed {
+				t.Fatalf("denied a pod pre-declaring %q in the exact injected shape: %+v", name, resp.Result)
+			}
+		})
+	}
+}
+
+// The reserved LUKS volumes must match the injected shapes exactly.
+func TestHandleRejectsReservedLUKSVolumes(t *testing.T) {
+	cfg := luksTestConfig()
+	withVolume := func(vol corev1.Volume) *corev1.Pod {
+		pod := luksHandlePod()
+		pod.Spec.Volumes = []corev1.Volume{vol}
+		return pod
+	}
+
+	t.Run("rejects wrong claim in c8s-luks-pvc volume", func(t *testing.T) {
+		resp := handleAdmission(t, cfg, withVolume(corev1.Volume{
+			Name: "c8s-luks-pvc-data",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "other-claim"},
+			},
+		}))
+		if resp.Allowed {
+			t.Fatal("admitted a pod redirecting the LUKS PVC volume to another claim")
+		}
+	})
+	t.Run("rejects memory c8s-luks-data", func(t *testing.T) {
+		resp := handleAdmission(t, cfg, withVolume(memoryVolume(luksDataVolume)))
+		if resp.Allowed {
+			t.Fatal("admitted a pod shadowing c8s-luks-data with a non-injected shape")
+		}
+	})
+	t.Run("accepts injected shapes", func(t *testing.T) {
+		pod := luksHandlePod()
+		pod.Spec.Volumes = []corev1.Volume{
+			{Name: luksDataVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			{Name: "c8s-luks-pvc-data", VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "api-data"},
+			}},
+		}
+		if resp := handleAdmission(t, cfg, pod); !resp.Allowed {
+			t.Fatalf("denied a pod pre-declaring the exact injected LUKS shapes: %+v", resp.Result)
+		}
+	})
+}
+
+// host-dev is reserved for dev= pods: only a hostPath at exactly /dev passes.
+func TestHandleRejectsReservedHostDevVolume(t *testing.T) {
+	// dev= handle pods need the device allowlist once it exists; keep this test
+	// on the mutatePod-level guard inputs instead: build the reserved list for a
+	// dev= injection directly.
+	eff := injection{
+		WorkloadID: "api",
+		Cert:       certSpec{Volume: "c8s-certs"},
+		Secrets:    &secretsInjection{Entries: []secretEntry{{Name: "data", Path: "secret/data/api/luks"}}},
+		LUKS:       []luksVolume{{Name: "data", Dev: "/dev/vdb", Mount: "/data", SecretName: "data", FSType: "ext4", Mode: "open"}},
+	}
+	reserved := reservedVolumesFor(eff, luksTestConfig(), true)
+
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+		Name:         hostDevVolume,
+		VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/etc"}},
+	}}}}
+	if err := rejectReservedVolumes(pod, reserved); err == nil {
+		t.Fatal("host-dev pointing at /etc must be rejected")
+	}
+
+	pod.Spec.Volumes[0].HostPath.Path = "/dev"
+	if err := rejectReservedVolumes(pod, reserved); err != nil {
+		t.Fatalf("host-dev in the exact injected shape must pass: %v", err)
+	}
+}
+
+// c8s-workload-claims is reserved whenever the node-CVM broker dir is set: a
+// pod may not point it anywhere but the operator-configured host directory.
+func TestHandleRejectsReservedWorkloadClaimsVolume(t *testing.T) {
+	cfg := secretsTestConfig()
+	cfg.WorkloadClaimsHostDir = "/var/run/nri-image-policy"
+	hpDir := corev1.HostPathDirectory
+	newPod := func(path string, typ *corev1.HostPathType) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationWorkload: "api"}},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app"}},
+				Volumes: []corev1.Volume{{
+					Name:         workloadClaimsVolumeName,
+					VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: path, Type: typ}},
+				}},
+			},
+		}
+	}
+	if resp := handleAdmission(t, cfg, newPod("/etc", &hpDir)); resp.Allowed {
+		t.Fatal("admitted a pod redirecting c8s-workload-claims to /etc")
+	}
+	if resp := handleAdmission(t, cfg, newPod("/var/run/nri-image-policy", &hpDir)); !resp.Allowed {
+		t.Fatal("denied a pod pre-declaring c8s-workload-claims in the exact injected shape")
+	}
+}

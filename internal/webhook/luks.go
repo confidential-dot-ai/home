@@ -194,10 +194,12 @@ func hasLUKSAnnotations(annotations map[string]string) bool {
 	return false
 }
 
-// In-pod paths for the LUKS-open init container.
+// In-pod names and paths for the LUKS-open init container.
 const (
-	luksDataVolume = "c8s-luks-data" // holds mount-target dirs shared with the app
-	luksDataDir    = "/c8s-luks"     // parent dir; per-volume dirs at /c8s-luks/<name>
+	luksOpenContainerName = "c8s-luks-open"
+	luksDataVolume        = "c8s-luks-data" // holds mount-target dirs shared with the app
+	luksDataDir           = "/c8s-luks"     // parent dir; per-volume dirs at /c8s-luks/<name>
+	hostDevVolume         = "host-dev"      // host /dev, dev= (local) volumes only
 )
 
 // hasLocalLUKSVolume reports whether any LUKS volume is delivered as a host
@@ -257,7 +259,7 @@ func injectLUKS(pod *corev1.Pod, eff injection, cfg Config) {
 	}
 
 	pod.Spec.InitContainers = insertAfterContainer(pod.Spec.InitContainers,
-		"c8s-secrets-agent-init", []corev1.Container{luksOpenContainer(cfg, eff)})
+		secretsAgentInitContainerName, []corev1.Container{luksOpenContainer(cfg, eff)})
 }
 
 // luksOpenContainer runs `c8s luks-open` — one process, all requested
@@ -283,10 +285,10 @@ func luksOpenContainer(cfg Config, eff injection) corev1.Container {
 	// host /dev only for local (dev=) volumes — it would clobber a pvc=
 	// volumeDevice (see hasLocalLUKSVolume).
 	if hasLocalLUKSVolume(eff.LUKS) {
-		mounts = append(mounts, corev1.VolumeMount{Name: "host-dev", MountPath: "/dev"})
+		mounts = append(mounts, corev1.VolumeMount{Name: hostDevVolume, MountPath: "/dev"})
 	}
 	return corev1.Container{
-		Name:            "c8s-luks-open",
+		Name:            luksOpenContainerName,
 		Image:           cfg.LUKSOpenImage,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Args:            args,
@@ -319,7 +321,7 @@ func ensureLUKSVolumes(pod *corev1.Pod, vols []luksVolume) {
 		return
 	}
 	ensureVolume(pod, corev1.Volume{
-		Name: "host-dev",
+		Name: hostDevVolume,
 		VolumeSource: corev1.VolumeSource{
 			HostPath: &corev1.HostPathVolumeSource{Path: "/dev"},
 		},

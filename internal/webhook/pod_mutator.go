@@ -594,25 +594,20 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 		return admission.Allowed("no c8s annotation — passthrough")
 	}
 
-	// Only the webhook may place a container under the reserved c8s-cert name.
-	// The init sidecar is rebuilt below (injectInitContainers), but a
-	// regular/ephemeral collision cannot be, so reject it. See docs/pitfalls.md —
-	// "get-cert injection integrity is name-based".
+	// Only the webhook may use the reserved injected container and volume
+	// names (rejectReservedContainers, rejectReservedVolumes). See
+	// docs/pitfalls.md — "get-cert injection integrity is name-based".
 	if inj != nil {
-		if err := rejectReservedCertContainer(pod); err != nil {
+		eff := inj.withDefaults(m.cfg)
+		if err := rejectReservedContainers(pod, injectedThisAdmission(eff, m.cfg, getCertNeeded)); err != nil {
+			return admission.Errored(http.StatusBadRequest, err)
+		}
+		if err := rejectReservedVolumes(pod, reservedVolumesFor(eff, m.cfg, getCertNeeded)); err != nil {
 			return admission.Errored(http.StatusBadRequest, err)
 		}
 	}
 
 	if getCertNeeded {
-		// ensureVolume keeps a pre-declared same-named volume rather than
-		// overwriting it, so a pod that declares the reserved cert volume as a
-		// hostPath/PVC/disk-backed emptyDir would have its private keys written
-		// to persistent, host-visible storage outside the TEE memory boundary.
-		// Reject anything but the expected memory-backed emptyDir.
-		if err := rejectReservedCertVolume(pod, inj.withDefaults(m.cfg).Cert.Volume); err != nil {
-			return admission.Errored(http.StatusBadRequest, err)
-		}
 		l.Info("injecting c8s get-cert containers", "workload", inj.WorkloadID)
 		mutatePod(pod, inj, m.cfg)
 	}
@@ -1193,48 +1188,175 @@ func injectInitContainers(existing []corev1.Container, injected ...corev1.Contai
 	return out
 }
 
-// rejectReservedCertContainer denies an opted-in pod that parks a container
-// under the reserved c8s-cert name outside the init-container slot the webhook
-// rebuilds. Such a container would survive injection and collide with the
-// injected init sidecar (names are unique across all three lists), so it can
-// only be an attempt to shed or impersonate it; init-container collisions are
-// handled by injectInitContainers instead.
-func rejectReservedCertContainer(pod *corev1.Pod) error {
+// reservedInjectedContainerNames are every container name the webhook can
+// inject. Brokers exclude these names from the workload digest
+// (workloadclaims.ReservedInjectedNames), so a pod-declared container under
+// one would be hidden from attestation; the webhook refuses them all.
+func reservedInjectedContainerNames() []string {
+	return []string{
+		reservedCertContainerName,
+		reservedCertWaitContainerName,
+		secretsConfigContainerName,
+		secretsAgentInitContainerName,
+		secretsAgentContainerName,
+		luksOpenContainerName,
+	}
+}
+
+// injectedThisAdmission is the set of container names this admission will
+// (re)build, mirroring mutatePod's injection gates. Init containers under
+// these names are dropped and reinjected (injectInitContainers,
+// insertAfterContainer), so a webhook reinvocation converges.
+func injectedThisAdmission(eff injection, cfg Config, getCertNeeded bool) map[string]struct{} {
+	rebuilt := map[string]struct{}{}
+	if !getCertNeeded {
+		return rebuilt
+	}
+	rebuilt[reservedCertContainerName] = struct{}{}
+	rebuilt[reservedCertWaitContainerName] = struct{}{}
+	if eff.Secrets != nil && cfg.SecretAgentImage != "" {
+		rebuilt[secretsConfigContainerName] = struct{}{}
+		rebuilt[secretsAgentInitContainerName] = struct{}{}
+		if eff.Secrets.Renew {
+			rebuilt[secretsAgentContainerName] = struct{}{}
+		}
+	}
+	if len(eff.LUKS) > 0 && cfg.LUKSOpenImage != "" {
+		rebuilt[luksOpenContainerName] = struct{}{}
+	}
+	return rebuilt
+}
+
+// rejectReservedContainers denies an opted-in pod that declares its own
+// container under any reserved injected name. Regular and ephemeral containers
+// may never carry one (the webhook only injects init containers). An init
+// container may carry one only when this admission rebuilds that exact
+// container — the injectors drop-and-rebuild collisions, so a reinvocation
+// converges — otherwise a digest-excluded name would hide a workload image
+// from attestation.
+func rejectReservedContainers(pod *corev1.Pod, rebuilt map[string]struct{}) error {
+	reserved := make(map[string]struct{}, len(reservedInjectedContainerNames()))
+	for _, n := range reservedInjectedContainerNames() {
+		reserved[n] = struct{}{}
+	}
+	check := func(kind, name string) error {
+		if _, ok := reserved[name]; ok {
+			return fmt.Errorf("%w: %s name %q is reserved for c8s-injected containers",
+				errInvalidInjectionAnnotation, kind, name)
+		}
+		return nil
+	}
 	for _, c := range pod.Spec.Containers {
-		if isReservedCertName(c.Name) {
-			return fmt.Errorf("%w: container name %q is reserved for the injected c8s cert containers",
-				errInvalidInjectionAnnotation, c.Name)
+		if err := check("container", c.Name); err != nil {
+			return err
 		}
 	}
 	for _, c := range pod.Spec.EphemeralContainers {
-		if isReservedCertName(c.Name) {
-			return fmt.Errorf("%w: ephemeral container name %q is reserved for the injected c8s cert containers",
-				errInvalidInjectionAnnotation, c.Name)
+		if err := check("ephemeral container", c.Name); err != nil {
+			return err
+		}
+	}
+	for _, c := range pod.Spec.InitContainers {
+		if _, ok := rebuilt[c.Name]; ok {
+			continue
+		}
+		if err := check("init container", c.Name); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func isReservedCertName(name string) bool {
-	return name == reservedCertContainerName || name == reservedCertWaitContainerName
+// reservedVolume pairs a reserved injected volume name with the predicate its
+// pre-declared shape must satisfy. ensureVolume keeps a same-named pod volume
+// rather than overwriting it, so anything but the exact injected shape could
+// redirect injected data — cert private keys, secrets, decrypted mounts — to
+// persistent, host-visible storage outside the TEE memory boundary.
+type reservedVolume struct {
+	name string
+	ok   func(v corev1.Volume) bool
+	want string
 }
 
-// rejectReservedCertVolume denies a pod that pre-declares the reserved cert
-// volume as anything other than the expected memory-backed emptyDir (see
-// certsVolume). ensureVolume keeps an existing same-named volume instead of
-// overwriting it, so without this guard an author could point the cert volume
-// at a hostPath, PVC, or disk-backed emptyDir and have the injected sidecar
-// write private keys to persistent, host-visible storage outside the TEE
-// memory boundary. Omitting the volume is fine — the webhook injects it.
-func rejectReservedCertVolume(pod *corev1.Pod, volName string) error {
-	for i := range pod.Spec.Volumes {
-		v := &pod.Spec.Volumes[i]
-		if v.Name != volName {
-			continue
+func memoryEmptyDirOK(v corev1.Volume) bool {
+	return v.EmptyDir != nil && v.EmptyDir.Medium == corev1.StorageMediumMemory
+}
+
+func plainEmptyDirOK(v corev1.Volume) bool {
+	return v.EmptyDir != nil && v.EmptyDir.Medium == corev1.StorageMediumDefault
+}
+
+// reservedVolumesFor lists the reserved volumes of every injection this
+// admission will perform, mirroring mutatePod's injection gates.
+func reservedVolumesFor(eff injection, cfg Config, getCertNeeded bool) []reservedVolume {
+	if !getCertNeeded {
+		return nil
+	}
+	const memoryEmptyDir = "a memory-backed emptyDir (medium: Memory)"
+	reserved := []reservedVolume{
+		{name: eff.Cert.Volume, ok: memoryEmptyDirOK, want: memoryEmptyDir},
+	}
+	if dir := cfg.WorkloadClaimsHostDir; dir != "" {
+		reserved = append(reserved, reservedVolume{
+			name: workloadClaimsVolumeName,
+			ok: func(v corev1.Volume) bool {
+				return v.HostPath != nil && v.HostPath.Path == dir &&
+					v.HostPath.Type != nil && *v.HostPath.Type == corev1.HostPathDirectory
+			},
+			want: fmt.Sprintf("a hostPath directory at %s", dir),
+		})
+	}
+	if eff.Secrets != nil && cfg.SecretAgentImage != "" {
+		reserved = append(reserved,
+			reservedVolume{name: secretsConfigVolume, ok: memoryEmptyDirOK, want: memoryEmptyDir},
+			reservedVolume{name: secretsDataVolume, ok: memoryEmptyDirOK, want: memoryEmptyDir},
+		)
+	}
+	if len(eff.LUKS) > 0 && cfg.LUKSOpenImage != "" {
+		reserved = append(reserved, reservedVolume{name: luksDataVolume, ok: plainEmptyDirOK, want: "a plain emptyDir"})
+		if hasLocalLUKSVolume(eff.LUKS) {
+			reserved = append(reserved, reservedVolume{
+				name: hostDevVolume,
+				ok: func(v corev1.Volume) bool {
+					return v.HostPath != nil && v.HostPath.Path == "/dev" &&
+						(v.HostPath.Type == nil || *v.HostPath.Type == corev1.HostPathUnset)
+				},
+				want: "a hostPath at /dev",
+			})
 		}
-		if v.EmptyDir == nil || v.EmptyDir.Medium != corev1.StorageMediumMemory {
-			return fmt.Errorf("%w: volume %q is reserved for the injected in-memory cert store; it must be a memory-backed emptyDir (medium: Memory) or omitted",
-				errInvalidInjectionAnnotation, volName)
+		for _, lv := range eff.LUKS {
+			if lv.PVC == "" {
+				continue
+			}
+			claim := lv.PVC
+			reserved = append(reserved, reservedVolume{
+				name: lv.pvcVolumeName(),
+				ok: func(v corev1.Volume) bool {
+					return v.PersistentVolumeClaim != nil &&
+						v.PersistentVolumeClaim.ClaimName == claim &&
+						!v.PersistentVolumeClaim.ReadOnly
+				},
+				want: fmt.Sprintf("a persistentVolumeClaim for %s", claim),
+			})
+		}
+	}
+	return reserved
+}
+
+// rejectReservedVolumes denies a pod that pre-declares a reserved injected
+// volume in any shape other than the one the webhook injects. Omitting the
+// volume is fine — the webhook injects it; the exact injected shape passes so
+// a webhook reinvocation converges.
+func rejectReservedVolumes(pod *corev1.Pod, reserved []reservedVolume) error {
+	for _, v := range pod.Spec.Volumes {
+		for _, r := range reserved {
+			if v.Name != r.name {
+				continue
+			}
+			if !r.ok(v) {
+				return fmt.Errorf("%w: volume %q is reserved for c8s injection and must be %s, or omitted",
+					errInvalidInjectionAnnotation, v.Name, r.want)
+			}
 		}
 	}
 	return nil

@@ -31,6 +31,13 @@ const (
 	defaultSecretsDir   = "/vault/secrets"
 )
 
+// Injected secrets container names (reserved — see rejectReservedContainers).
+const (
+	secretsConfigContainerName    = "c8s-secrets-config"
+	secretsAgentInitContainerName = "c8s-secrets-agent-init"
+	secretsAgentContainerName     = "c8s-secrets-agent"
+)
+
 type secretEntry struct {
 	Name  string
 	Path  string
@@ -133,10 +140,10 @@ func injectSecrets(pod *corev1.Pod, eff injection, cfg Config) {
 
 	inits := []corev1.Container{
 		agentConfigContainer(cfg, eff, secretsDir),
-		agentContainer("c8s-secrets-agent-init", cfg, eff, secretsDir, true),
+		agentContainer(secretsAgentInitContainerName, cfg, eff, secretsDir, true),
 	}
 	if si.Renew {
-		inits = append(inits, agentContainer("c8s-secrets-agent", cfg, eff, secretsDir, false))
+		inits = append(inits, agentContainer(secretsAgentContainerName, cfg, eff, secretsDir, false))
 	}
 	pod.Spec.InitContainers = insertAfterContainer(pod.Spec.InitContainers, reservedCertWaitContainerName, inits)
 }
@@ -163,7 +170,7 @@ func agentConfigContainer(cfg Config, eff injection, secretsDir string) corev1.C
 		args = append(args, "--secret="+spec)
 	}
 	return corev1.Container{
-		Name:            "c8s-secrets-config",
+		Name:            secretsConfigContainerName,
 		Image:           cfg.GetCertImage,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Args:            args,
