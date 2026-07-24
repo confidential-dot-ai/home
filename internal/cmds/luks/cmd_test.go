@@ -271,6 +271,36 @@ func TestPutPassphraseCASConflict(t *testing.T) {
 	}
 }
 
+// The openbao token and passphrases transit this connection, so client()
+// must refuse anything but https unless --allow-insecure-store is explicit.
+func TestBaoFlagsClientSchemeGate(t *testing.T) {
+	for _, tc := range []struct {
+		addr     string
+		insecure bool
+		wantErr  string
+	}{
+		{"https://bao.example:8200", false, ""},
+		{"http://bao.example:8200", false, "refusing plaintext http"},
+		{"http://bao.example:8200", true, ""},
+		{"ftp://bao.example", false, "scheme must be https"},
+		{"ftp://bao.example", true, "scheme must be https"},
+		{"", false, "not a valid URL"},
+		{"bao.example:8200", false, "not a valid URL"},
+	} {
+		f := baoFlags{Addr: tc.addr, Token: "root", AllowInsecure: tc.insecure}
+		_, err := f.client()
+		if tc.wantErr == "" {
+			if err != nil {
+				t.Errorf("addr=%q insecure=%v: unexpected error %v", tc.addr, tc.insecure, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("addr=%q insecure=%v: err = %v, want substring %q", tc.addr, tc.insecure, err, tc.wantErr)
+		}
+	}
+}
+
 func TestReadTokenFile(t *testing.T) {
 	// Empty path = empty token, no error.
 	if got, err := readTokenFile(""); err != nil || got != "" {

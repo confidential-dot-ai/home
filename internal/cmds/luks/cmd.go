@@ -14,6 +14,11 @@
 package luks
 
 import (
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+
 	"github.com/spf13/cobra"
 )
 
@@ -36,9 +41,10 @@ func NewCmd() *cobra.Command {
 
 // baoFlags holds the openbao endpoint + auth flags every subcommand shares.
 type baoFlags struct {
-	Addr      string
-	Token     string
-	TokenFile string
+	Addr          string
+	Token         string
+	TokenFile     string
+	AllowInsecure bool
 }
 
 func (f *baoFlags) bind(cmd *cobra.Command) {
@@ -48,9 +54,27 @@ func (f *baoFlags) bind(cmd *cobra.Command) {
 		"openbao token; SUPPLY VIA --openbao-token-file WHENEVER POSSIBLE (this flag lands in shell history)")
 	cmd.Flags().StringVar(&f.TokenFile, "openbao-token-file", "",
 		"file containing the openbao token")
+	cmd.Flags().BoolVar(&f.AllowInsecure, "allow-insecure-store", false,
+		"permit a plaintext http:// --openbao-addr (dev/test only; token and passphrases transit cleartext)")
 }
 
+// client refuses plaintext http unless --allow-insecure-store: the token and
+// passphrase transit this connection (cf. internal/cmds/allowlist).
 func (f *baoFlags) client() (*bao, error) {
+	u, err := url.Parse(f.Addr)
+	if err != nil || u.Host == "" {
+		return nil, fmt.Errorf("--openbao-addr %q is not a valid URL (need https://host:port)", f.Addr)
+	}
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if !f.AllowInsecure {
+			return nil, errors.New("refusing plaintext http:// for --openbao-addr (token and passphrases would transit cleartext): use https://, or pass --allow-insecure-store for a dev/test endpoint")
+		}
+		fmt.Fprintln(os.Stderr, "warning: --openbao-addr is http:// with --allow-insecure-store; the openbao token and passphrases transit CLEARTEXT (dev/test only)")
+	default:
+		return nil, fmt.Errorf("--openbao-addr %q: scheme must be https (or http with --allow-insecure-store)", f.Addr)
+	}
 	tok := f.Token
 	if tok == "" {
 		fromFile, err := readTokenFile(f.TokenFile)
