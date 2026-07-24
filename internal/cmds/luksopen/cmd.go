@@ -21,6 +21,8 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+
+	"github.com/confidential-dot-ai/c8s/internal/luksfs"
 )
 
 // podUIDEnv carries the pod UID (downward API, injected by the webhook) the
@@ -108,6 +110,10 @@ func ParseVolumeSpecs(specs []string) ([]Volume, error) {
 		}
 		if v.Mode != "open" && v.Mode != "format-if-empty" {
 			return nil, fmt.Errorf("--volume=%q: mode must be open or format-if-empty", s)
+		}
+		// Defense in depth — the webhook already rejects these at admission.
+		if !luksfs.Allowed(v.FSType) {
+			return nil, fmt.Errorf("--volume=%q: unsupported fstype %q", s, v.FSType)
 		}
 		out = append(out, v)
 	}

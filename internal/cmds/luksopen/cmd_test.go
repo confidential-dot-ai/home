@@ -37,6 +37,8 @@ func TestParseVolumeSpecsErrors(t *testing.T) {
 		{"data=/dev/vdb", "want 4 colon-separated fields"},
 		{"data=/dev/vdb:sec:ext4:wat", "mode must be open or format-if-empty"},
 		{"data=:sec:ext4:open", "dev/secretName/fstype must be non-empty"},
+		{"data=/dev/vdb:sec:btrfs:open", "unsupported fstype"},
+		{"data=/dev/vdb:sec:vfat:open", "unsupported fstype"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.spec, func(t *testing.T) {

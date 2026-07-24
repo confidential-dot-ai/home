@@ -8,6 +8,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
+
+	"github.com/confidential-dot-ai/c8s/internal/luksfs"
 )
 
 // LUKS-injection annotations. A pod attaches one openbao-gated encrypted
@@ -142,6 +144,10 @@ func parseLUKSValue(name, value string) (luksVolume, error) {
 			lv.Mount = val
 		case "fstype":
 			if val != "" {
+				if !luksfs.Allowed(val) {
+					return luksVolume{}, fmt.Errorf("%w: luks-%s: unsupported fstype %q (want ext4 or xfs)",
+						errInvalidInjectionAnnotation, name, val)
+				}
 				lv.FSType = val
 			}
 		case "mode":

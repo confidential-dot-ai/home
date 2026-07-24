@@ -49,6 +49,7 @@ func TestParseLUKSValueErrors(t *testing.T) {
 		{"missing mount", "dev=/dev/vdb", "mount= must be an absolute path"},
 		{"relative mount", "dev=/dev/vdb,mount=data", "mount= must be an absolute path"},
 		{"dropped secret knob", "dev=/dev/vdb,mount=/data,secret=secret/data/x#p", `unknown key "secret"`},
+		{"unsupported fstype", "dev=/dev/vdb,mount=/data,fstype=btrfs", "unsupported fstype"},
 		{"unknown key", "dev=/dev/vdb,mount=/data,zzz=abc", `unknown key "zzz"`},
 		{"unknown mode", "dev=/dev/vdb,mount=/data,mode=maybe", "unknown mode"},
 		{"not kv pair", "dev=/dev/vdb,justaword,mount=/data", "is not a key=value pair"},
