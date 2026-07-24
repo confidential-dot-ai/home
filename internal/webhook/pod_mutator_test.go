@@ -1117,7 +1117,7 @@ func luksHandlePod() *corev1.Pod {
 			AnnotationWorkload:              "api",
 			AnnotationSecretsInject:         "true",
 			secretAnnotationPrefix + "data": "secret/data/api/luks#passphrase",
-			luksAnnotationPrefix + "data":   "pvc=api-data,mount=/data,secret=secret/data/api/luks#passphrase",
+			luksAnnotationPrefix + "data":   "pvc=api-data,mount=/data",
 		}},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
 	}

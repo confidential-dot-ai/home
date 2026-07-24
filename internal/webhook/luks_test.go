@@ -9,7 +9,7 @@ import (
 )
 
 func TestParseLUKSValueDefaults(t *testing.T) {
-	lv, err := parseLUKSValue("data", "dev=/dev/vdb,mount=/data,secret=secret/data/api/luks#passphrase")
+	lv, err := parseLUKSValue("data", "dev=/dev/vdb,mount=/data")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,9 +20,6 @@ func TestParseLUKSValueDefaults(t *testing.T) {
 	if lv.Dev != "/dev/vdb" || lv.Mount != "/data" {
 		t.Errorf("dev/mount = %q/%q", lv.Dev, lv.Mount)
 	}
-	if lv.SecretPath != "secret/data/api/luks" || lv.SecretKey != "passphrase" {
-		t.Errorf("secretPath/secretKey = %q/%q", lv.SecretPath, lv.SecretKey)
-	}
 	// defaults
 	if lv.FSType != "ext4" || lv.Mode != "open" {
 		t.Errorf("fstype/mode defaults = %q/%q, want ext4/open", lv.FSType, lv.Mode)
@@ -31,19 +28,12 @@ func TestParseLUKSValueDefaults(t *testing.T) {
 
 func TestParseLUKSValueOverrides(t *testing.T) {
 	lv, err := parseLUKSValue("scratch",
-		"dev=/dev/vdc,mount=/scratch,secret=secret/data/api/scratch,fstype=xfs,mode=format-if-empty")
+		"dev=/dev/vdc,mount=/scratch,fstype=xfs,mode=format-if-empty")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if lv.FSType != "xfs" || lv.Mode != "format-if-empty" {
 		t.Errorf("overrides not applied: fstype=%q mode=%q", lv.FSType, lv.Mode)
-	}
-	// secret without #field: SecretKey empty (agent templates whole KV JSON — but
-	// luks-open just wants the passphrase string, so an empty field is legal
-	// here only if the caller knows what they're doing; validation happens at
-	// c8s luks-open runtime, not at admission).
-	if lv.SecretKey != "" {
-		t.Errorf("expected empty SecretKey when no #field, got %q", lv.SecretKey)
 	}
 }
 
@@ -53,16 +43,15 @@ func TestParseLUKSValueErrors(t *testing.T) {
 		value string
 		want  string
 	}{
-		{"missing dev", "mount=/data,secret=secret/data/api/luks#p", "one of dev= or pvc= is required"},
-		{"dev and pvc together", "dev=/dev/vdb,pvc=my-claim,mount=/data,secret=secret/data/api/luks#p", "mutually exclusive"},
-		{"bad pvc name", "pvc=Not_A_Claim,mount=/data,secret=secret/data/api/luks#p", "pvc= must be a valid claim name"},
-		{"missing mount", "dev=/dev/vdb,secret=secret/data/api/luks#p", "mount= must be an absolute path"},
-		{"relative mount", "dev=/dev/vdb,mount=data,secret=secret/data/api/luks#p", "mount= must be an absolute path"},
-		{"missing secret", "dev=/dev/vdb,mount=/data", "secret= is required"},
-		{"empty secret path", "dev=/dev/vdb,mount=/data,secret=#p", "secret= has an empty path"},
-		{"unknown key", "dev=/dev/vdb,mount=/data,secret=secret/data/x,zzz=abc", `unknown key "zzz"`},
-		{"unknown mode", "dev=/dev/vdb,mount=/data,secret=secret/data/x,mode=maybe", "unknown mode"},
-		{"not kv pair", "dev=/dev/vdb,justaword,mount=/data,secret=secret/data/x", "is not a key=value pair"},
+		{"missing dev", "mount=/data", "one of dev= or pvc= is required"},
+		{"dev and pvc together", "dev=/dev/vdb,pvc=my-claim,mount=/data", "mutually exclusive"},
+		{"bad pvc name", "pvc=Not_A_Claim,mount=/data", "pvc= must be a valid claim name"},
+		{"missing mount", "dev=/dev/vdb", "mount= must be an absolute path"},
+		{"relative mount", "dev=/dev/vdb,mount=data", "mount= must be an absolute path"},
+		{"dropped secret knob", "dev=/dev/vdb,mount=/data,secret=secret/data/x#p", `unknown key "secret"`},
+		{"unknown key", "dev=/dev/vdb,mount=/data,zzz=abc", `unknown key "zzz"`},
+		{"unknown mode", "dev=/dev/vdb,mount=/data,mode=maybe", "unknown mode"},
+		{"not kv pair", "dev=/dev/vdb,justaword,mount=/data", "is not a key=value pair"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -78,7 +67,7 @@ func TestParseLUKSValueErrors(t *testing.T) {
 }
 
 func TestParseLUKSValueInvalidName(t *testing.T) {
-	if _, err := parseLUKSValue("Bad_Name", "dev=/dev/vdb,mount=/data,secret=secret/data/api/luks"); err == nil {
+	if _, err := parseLUKSValue("Bad_Name", "dev=/dev/vdb,mount=/data"); err == nil {
 		t.Error("expected DNS-1123 name error")
 	}
 }
@@ -92,7 +81,7 @@ func TestParseLUKSVolumesNilWhenAbsent(t *testing.T) {
 
 func TestParseLUKSVolumesRequiresSecretsInject(t *testing.T) {
 	_, err := parseLUKSVolumes(map[string]string{
-		luksAnnotationPrefix + "data": "dev=/dev/vdb,mount=/data,secret=secret/data/api/luks#p",
+		luksAnnotationPrefix + "data": "dev=/dev/vdb,mount=/data",
 	}, nil)
 	if err == nil || !strings.Contains(err.Error(), AnnotationSecretsInject) {
 		t.Errorf("want error mentioning secrets-inject, got %v", err)
@@ -102,7 +91,7 @@ func TestParseLUKSVolumesRequiresSecretsInject(t *testing.T) {
 func TestParseLUKSVolumesRequiresMatchingSecretsEntry(t *testing.T) {
 	secrets := &secretsInjection{Entries: []secretEntry{{Name: "other", Path: "secret/data/x"}}}
 	_, err := parseLUKSVolumes(map[string]string{
-		luksAnnotationPrefix + "data": "dev=/dev/vdb,mount=/data,secret=secret/data/api/luks#p",
+		luksAnnotationPrefix + "data": "dev=/dev/vdb,mount=/data",
 	}, secrets)
 	if err == nil || !strings.Contains(err.Error(), "not declared by a matching") {
 		t.Errorf("want error about missing matching secret entry, got %v", err)
@@ -114,8 +103,8 @@ func TestParseLUKSVolumesSortsByName(t *testing.T) {
 		{Name: "alpha", Path: "secret/data/x"}, {Name: "zulu", Path: "secret/data/y"},
 	}}
 	vols, err := parseLUKSVolumes(map[string]string{
-		luksAnnotationPrefix + "zulu":  "dev=/dev/vdc,mount=/z,secret=secret/data/y#p",
-		luksAnnotationPrefix + "alpha": "dev=/dev/vdb,mount=/a,secret=secret/data/x#p",
+		luksAnnotationPrefix + "zulu":  "dev=/dev/vdc,mount=/z",
+		luksAnnotationPrefix + "alpha": "dev=/dev/vdb,mount=/a",
 	}, secrets)
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +163,7 @@ func TestValidateLUKSDevice(t *testing.T) {
 func TestHandleEnforcesLUKSDeviceAllowlist(t *testing.T) {
 	devPod := func() *corev1.Pod {
 		pod := luksHandlePod()
-		pod.Annotations[luksAnnotationPrefix+"data"] = "dev=/dev/vdb,mount=/data,secret=secret/data/api/luks#passphrase"
+		pod.Annotations[luksAnnotationPrefix+"data"] = "dev=/dev/vdb,mount=/data"
 		return pod
 	}
 
@@ -222,7 +211,7 @@ func TestMutatePodInjectsLUKSContainer(t *testing.T) {
 		},
 		LUKS: []luksVolume{{
 			Name: "data", Dev: "/dev/vdb", Mount: "/data",
-			SecretName: "data", SecretPath: "secret/data/api/luks", SecretKey: "passphrase",
+			SecretName: "data",
 			FSType: "ext4", Mode: "open",
 		}},
 	}
@@ -303,7 +292,7 @@ func TestMutatePodInjectsPVCLUKSVolume(t *testing.T) {
 		},
 		LUKS: []luksVolume{{
 			Name: "data", PVC: "c8s-luks-api-data", Mount: "/data",
-			SecretName: "data", SecretPath: "secret/data/api/luks-data", SecretKey: "passphrase",
+			SecretName: "data",
 			FSType: "ext4", Mode: "format-if-empty",
 		}},
 	}
@@ -366,8 +355,8 @@ func TestParseLUKSRejectsMixedDevAndPVC(t *testing.T) {
 		{Name: "claim", Path: "secret/data/api/c", Field: "passphrase"},
 	}}
 	anns := map[string]string{
-		luksAnnotationPrefix + "local": "dev=/dev/vdb,mount=/a,secret=secret/data/api/l#passphrase",
-		luksAnnotationPrefix + "claim": "pvc=c8s-luks-api-c,mount=/b,secret=secret/data/api/c#passphrase",
+		luksAnnotationPrefix + "local": "dev=/dev/vdb,mount=/a",
+		luksAnnotationPrefix + "claim": "pvc=c8s-luks-api-c,mount=/b",
 	}
 	_, err := parseLUKSVolumes(anns, secrets)
 	if err == nil || !strings.Contains(err.Error(), "may not mix dev= (local) and pvc=") {
@@ -390,10 +379,8 @@ func TestMutatePodInjectsMultipleLUKSVolumes(t *testing.T) {
 			{Name: "zulu", Path: "secret/data/api/z", Field: "p"},
 		}},
 		LUKS: []luksVolume{
-			{Name: "alpha", Dev: "/dev/vdb", Mount: "/a", SecretName: "alpha",
-				SecretPath: "secret/data/api/a", SecretKey: "p", FSType: "ext4", Mode: "open"},
-			{Name: "zulu", Dev: "/dev/vdc", Mount: "/z", SecretName: "zulu",
-				SecretPath: "secret/data/api/z", SecretKey: "p", FSType: "ext4", Mode: "open"},
+			{Name: "alpha", Dev: "/dev/vdb", Mount: "/a", SecretName: "alpha", FSType: "ext4", Mode: "open"},
+			{Name: "zulu", Dev: "/dev/vdc", Mount: "/z", SecretName: "zulu", FSType: "ext4", Mode: "open"},
 		},
 	}
 	mutatePod(pod, inj, luksTestConfig())

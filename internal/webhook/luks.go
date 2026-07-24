@@ -20,9 +20,11 @@ import (
 //	dev=<block-device>          (XOR pvc=) node block device to luksOpen
 //	pvc=<claim-name>            (XOR dev=) raw-block PVC attached by the webhook
 //	mount=<path>                (required) mount point inside the app container
-//	secret=<vault-path>[#field] (required) KV path holding the passphrase
 //	fstype=<fs>                 (optional, default ext4) filesystem inside the volume
 //	mode=open|format-if-empty   (optional, default open)
+//
+// The passphrase comes from the matching confidential.ai/secret-<name>
+// annotation (its KV path/field), templated to /vault/secrets/<name>.
 const (
 	luksAnnotationPrefix = "confidential.ai/luks-"
 )
@@ -34,8 +36,6 @@ type luksVolume struct {
 	PVC        string // raw-block claim name; webhook wires it as a volumeDevice
 	Mount      string // absolute in-container path where the decrypted fs is mounted
 	SecretName string // matches secretsInjection.Entries[].Name — the passphrase file name
-	SecretPath string // KV path (fed into the secrets agent so the file exists)
-	SecretKey  string // KV field ("password" etc.); empty = whole KV data JSON
 	FSType     string // "ext4" default
 	Mode       string // "open" (default) or "format-if-empty"
 }
@@ -140,14 +140,6 @@ func parseLUKSValue(name, value string) (luksVolume, error) {
 			lv.PVC = val
 		case "mount":
 			lv.Mount = val
-		case "secret":
-			path, field, _ := strings.Cut(val, "#")
-			if path == "" {
-				return luksVolume{}, fmt.Errorf("%w: luks-%s: secret= has an empty path",
-					errInvalidInjectionAnnotation, name)
-			}
-			lv.SecretPath = path
-			lv.SecretKey = field
 		case "fstype":
 			if val != "" {
 				lv.FSType = val
@@ -177,10 +169,6 @@ func parseLUKSValue(name, value string) (luksVolume, error) {
 	}
 	if !strings.HasPrefix(lv.Mount, "/") {
 		return luksVolume{}, fmt.Errorf("%w: luks-%s: mount= must be an absolute path",
-			errInvalidInjectionAnnotation, name)
-	}
-	if lv.SecretPath == "" {
-		return luksVolume{}, fmt.Errorf("%w: luks-%s: secret= is required",
 			errInvalidInjectionAnnotation, name)
 	}
 	return lv, nil
