@@ -10,6 +10,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/attestation"
 	"github.com/confidential-dot-ai/c8s/internal/ear"
 	"github.com/confidential-dot-ai/c8s/internal/issuer"
+	"github.com/confidential-dot-ai/c8s/internal/secretspolicy"
 	"github.com/confidential-dot-ai/c8s/internal/server"
 )
 
@@ -19,14 +20,17 @@ type dependencies struct {
 	AttestKeyHandler attestation.Handler
 	SignCSRHandler   SignCSRHandler
 	AllowlistHandler allowlist.Handler
-	HandoffHandler   *issuer.HandoffHandler // nil disables /handoff (no --handoff-measurements)
-	ReadyFn          attestation.ReadinessFunc
-	EarIssuer        ear.Issuer
-	JWKSFunc         func() []byte
-	CACertPEM        []byte
-	OperatorKeysPEM  []byte                // pinned operator public keys; empty = /operator-keys 404s
-	RateLimiter      *issuer.IPRateLimiter // per-source-IP limiter for attestation endpoints
-	MaxRequestSize   int64                 // applied to write endpoints; must be > 0
+	// SecretsPolicyHandler serves the secrets release policy (workload digest ->
+	// KV paths). nil disables the /secrets-policy endpoints (no --secrets-policy-db).
+	SecretsPolicyHandler *secretspolicy.Handler
+	HandoffHandler       *issuer.HandoffHandler // nil disables /handoff (no --handoff-measurements)
+	ReadyFn              attestation.ReadinessFunc
+	EarIssuer            ear.Issuer
+	JWKSFunc             func() []byte
+	CACertPEM            []byte
+	OperatorKeysPEM      []byte                // pinned operator public keys; empty = /operator-keys 404s
+	RateLimiter          *issuer.IPRateLimiter // per-source-IP limiter for attestation endpoints
+	MaxRequestSize       int64                 // applied to write endpoints; must be > 0
 }
 
 func newRouter(deps dependencies) http.Handler {
@@ -61,6 +65,15 @@ func newRouter(deps dependencies) http.Handler {
 	r.Method(http.MethodPost, "/allowlist", deps.protected(http.HandlerFunc(deps.AllowlistHandler.HandleAdd)))
 	r.Method(http.MethodPut, "/allowlist", deps.protected(http.HandlerFunc(deps.AllowlistHandler.HandleReplace)))
 	r.Method(http.MethodDelete, "/allowlist", deps.protected(http.HandlerFunc(deps.AllowlistHandler.HandleDelete)))
+
+	// Secrets policy: same shape as /allowlist (read open, writes operator-key
+	// authorized), mounted only when a store is configured.
+	if sp := deps.SecretsPolicyHandler; sp != nil {
+		r.Get("/secrets-policy", sp.HandleList)
+		r.Method(http.MethodPost, "/secrets-policy", deps.protected(http.HandlerFunc(sp.HandlePut)))
+		r.Method(http.MethodPut, "/secrets-policy", deps.protected(http.HandlerFunc(sp.HandleReplace)))
+		r.Method(http.MethodDelete, "/secrets-policy", deps.protected(http.HandlerFunc(sp.HandleDelete)))
+	}
 
 	r.Get("/ca", handleCA(deps.CACertPEM))
 	r.Get("/operator-keys", handleOperatorKeys(deps.OperatorKeysPEM))

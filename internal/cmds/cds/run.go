@@ -21,6 +21,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/ear"
 	"github.com/confidential-dot-ai/c8s/internal/issuer"
 	"github.com/confidential-dot-ai/c8s/internal/readiness"
+	"github.com/confidential-dot-ai/c8s/internal/secretspolicy"
 	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
 	"github.com/confidential-dot-ai/c8s/pkg/attestclient"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
@@ -91,6 +92,22 @@ func run(cfg config) error {
 		return fmt.Errorf("open allowlist database: %w", err)
 	}
 	defer allowlistStore.Close()
+
+	// The secrets policy (workload digest -> KV paths) is served only when a DB
+	// path is configured; it shares the allowlist's operator-key write gate.
+	var secretsPolicyHandler *secretspolicy.Handler
+	if cfg.secretsPolicyDB != "" {
+		spStore, err := secretspolicy.OpenStore(cfg.secretsPolicyDB)
+		if err != nil {
+			return fmt.Errorf("open secrets-policy database: %w", err)
+		}
+		defer spStore.Close()
+		secretsPolicyHandler = &secretspolicy.Handler{
+			Store:           &spStore,
+			WriteAuthorizer: secretspolicy.WriteAuthorizer(writeAuthorizer),
+		}
+		slog.Info("secrets-policy endpoints enabled", "db", cfg.secretsPolicyDB)
+	}
 
 	// CDS obtains its mesh CA in process; the private key never touches a
 	// Kubernetes Secret. With no --handoff-peer-url it generates a fresh
@@ -250,15 +267,16 @@ func run(cfg config) error {
 			Store:           &allowlistStore,
 			WriteAuthorizer: writeAuthorizer,
 		},
-		AttestKeyHandler: attestKeyHandler,
-		HandoffHandler:   handoffHandler,
-		ReadyFn:          readinessFn(checker.Ready, mesh.Cert, cfg.minCAValidity),
-		EarIssuer:        earIssuer,
-		JWKSFunc:         rotator.JWKSetJSON,
-		CACertPEM:        caChainPEM,
-		OperatorKeysPEM:  operatorKeysPEM,
-		RateLimiter:      rateLimiter,
-		MaxRequestSize:   cfg.maxRequestSize,
+		SecretsPolicyHandler: secretsPolicyHandler,
+		AttestKeyHandler:     attestKeyHandler,
+		HandoffHandler:       handoffHandler,
+		ReadyFn:              readinessFn(checker.Ready, mesh.Cert, cfg.minCAValidity),
+		EarIssuer:            earIssuer,
+		JWKSFunc:             rotator.JWKSetJSON,
+		CACertPEM:            caChainPEM,
+		OperatorKeysPEM:      operatorKeysPEM,
+		RateLimiter:          rateLimiter,
+		MaxRequestSize:       cfg.maxRequestSize,
 	}
 	if cfg.rotationInterval > 0 {
 		go rotator.Run(ctx)
