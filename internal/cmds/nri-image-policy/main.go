@@ -15,12 +15,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/internal/audit"
-	"github.com/confidential-dot-ai/c8s/internal/cache"
 	"github.com/confidential-dot-ai/c8s/internal/cmds/cmdsutil"
 	ctrdresolver "github.com/confidential-dot-ai/c8s/internal/containerd"
 	"github.com/confidential-dot-ai/c8s/internal/version"
@@ -101,8 +101,10 @@ func Run(args []string) error {
 	}
 	defer resolver.Close()
 
-	policyCache := cache.NewPolicyCache()
 	auditLogger := audit.NewLogger()
+
+	bootstrap := alwaysAllowAllowlist(cfg.Allowlist.AlwaysAllow)
+	store := newPolicyStore(bootstrap)
 
 	var wlClient allowlistclient.Client
 	if cfg.PullEnabled() {
@@ -114,7 +116,7 @@ func Run(args []string) error {
 		wlClient = allowlistclient.NewClientWithHTTP(cfg.Allowlist.Pull.URL, httpClient)
 	}
 
-	plugin, err := newPlugin(cfg, resolver, policyCache, auditLogger, logger)
+	plugin, err := newPlugin(cfg, resolver, store, auditLogger, logger)
 	if err != nil {
 		return fmt.Errorf("create plugin: %w", err)
 	}
@@ -130,10 +132,7 @@ func Run(args []string) error {
 		cancel()
 	}()
 
-	bootstrap := alwaysAllowAllowlist(cfg.Allowlist.AlwaysAllow)
-
-	policyCache.SetAllowlist(bootstrap)
-	logger.Info("cache seeded", "always_allow_entries", entriesOf(bootstrap))
+	logger.Info("policy store seeded", "always_allow_entries", entriesOf(bootstrap))
 
 	addr := *healthAddr
 	if cfg.Plugin.HealthAddr != "" {
@@ -165,8 +164,7 @@ func Run(args []string) error {
 	if cfg.PullEnabled() {
 		initialETag, err = pullInitial(ctx, pullArgs{
 			client:      wlClient,
-			cache:       policyCache,
-			bootstrap:   bootstrap,
+			store:       store,
 			timeout:     cfg.Allowlist.Pull.Timeout,
 			pluginErrCh: pluginErrCh,
 			logger:      logger,
@@ -195,13 +193,12 @@ func Run(args []string) error {
 
 	if cfg.PullEnabled() {
 		go runPullLoop(ctx, pullLoopArgs{
-			client:    wlClient,
-			cache:     policyCache,
-			bootstrap: bootstrap,
-			interval:  cfg.Allowlist.Pull.Interval,
-			timeout:   cfg.Allowlist.Pull.Timeout,
-			etag:      initialETag,
-			logger:    logger,
+			client:   wlClient,
+			store:    store,
+			interval: cfg.Allowlist.Pull.Interval,
+			timeout:  cfg.Allowlist.Pull.Timeout,
+			etag:     initialETag,
+			logger:   logger,
 		})
 	}
 
@@ -240,11 +237,14 @@ func allowlistPullHTTPClient(cfg pullConfig) (*http.Client, error) {
 	return client, nil
 }
 
-// alwaysAllowAllowlist builds an in-memory Allowlist from the config's
-// AlwaysAllow map. Used to seed the cache at startup with chart-managed
-// entries (typically the installer image so chart upgrades can roll).
+// alwaysAllowAllowlist builds the static floor from the config's AlwaysAllow
+// map: chart-managed digests (typically the installer image so chart upgrades
+// can roll) admitted by digest alone.
 func alwaysAllowAllowlist(entries map[string]string) *allowlist.Allowlist {
-	wl := &allowlist.Allowlist{Digests: make(map[string]string, len(entries))}
+	wl := &allowlist.Allowlist{
+		Schema:  allowlist.Schema,
+		Digests: make(map[string]string, len(entries)),
+	}
 	for d, image := range entries {
 		wl.Digests[d] = image
 	}
@@ -258,23 +258,31 @@ func entriesOf(wl *allowlist.Allowlist) int {
 	return len(wl.Digests)
 }
 
-// mergeAllowlists overlays b onto a. Entries in b win on conflict; b's
-// version is preferred when set. Either argument may be nil. Bootstrap
-// entries (a) cannot be removed by overlay — they're the static floor.
+// mergeAllowlists unions the floor (a) with a pulled document (b): b's floor
+// digests and workloads overlay a's. Either may be nil. Floor entries in a
+// cannot be removed by b — they are the static always_allow floor. The result
+// feeds BuildIndex, so a's digests stay digest-only-admissible while b's
+// workloads carry their argv policy.
 func mergeAllowlists(a, b *allowlist.Allowlist) *allowlist.Allowlist {
-	out := &allowlist.Allowlist{Digests: map[string]string{}}
+	out := &allowlist.Allowlist{
+		Schema:    allowlist.Schema,
+		Digests:   map[string]string{},
+		Workloads: map[string]allowlist.Workload{},
+	}
 	if a != nil {
-		out.Version = a.Version
 		for k, v := range a.Digests {
 			out.Digests[k] = v
 		}
+		for k, v := range a.Workloads {
+			out.Workloads[k] = v
+		}
 	}
 	if b != nil {
-		if b.Version != "" {
-			out.Version = b.Version
-		}
 		for k, v := range b.Digests {
 			out.Digests[k] = v
+		}
+		for k, v := range b.Workloads {
+			out.Workloads[k] = v
 		}
 	}
 	return out
@@ -282,8 +290,7 @@ func mergeAllowlists(a, b *allowlist.Allowlist) *allowlist.Allowlist {
 
 type pullArgs struct {
 	client      allowlistclient.Client
-	cache       *cache.PolicyCache
-	bootstrap   *allowlist.Allowlist
+	store       *policyStore
 	timeout     time.Duration
 	pluginErrCh <-chan error
 	logger      *slog.Logger
@@ -292,7 +299,7 @@ type pullArgs struct {
 // pullInitial fetches the startup allowlist with bounded retries and
 // returns the response ETag for the steady-state poll loop.
 //
-// INVARIANT: a nil error return means args.cache holds bootstrap ∪ pulled.
+// INVARIANT: a nil error return means args.store holds floor ∪ pulled.
 // Context cancellation surfaces as ctx.Err(); callers must not mark the
 // plugin ready on that path.
 func pullInitial(ctx context.Context, args pullArgs) (string, error) {
@@ -309,7 +316,7 @@ func pullInitial(ctx context.Context, args pullArgs) (string, error) {
 
 		reqCtx, reqCancel := context.WithTimeout(ctx, args.timeout)
 		args.logger.Info("fetching initial allowlist from CDS", "attempt", attempt)
-		wl, etag, notModified, err := args.client.FetchAllowlistConditional(reqCtx, "")
+		wl, etag, notModified, err := args.client.Fetch(reqCtx, "")
 		reqCancel()
 		if err == nil {
 			if notModified {
@@ -317,11 +324,12 @@ func pullInitial(ctx context.Context, args pullArgs) (string, error) {
 			} else if wl == nil {
 				err = errInitialAllowlistNil
 			} else {
-				merged := mergeAllowlists(args.bootstrap, wl)
-				args.cache.SetAllowlist(merged)
+				version := parseVersion(etag)
+				args.store.apply(wl, version)
 				args.logger.Info("initial allowlist pulled from CDS",
-					"pulled_entries", len(wl.Digests),
-					"merged_entries", len(merged.Digests),
+					"floor_entries", len(wl.Digests),
+					"workloads", len(wl.Workloads),
+					"version", version,
 					"etag", etag,
 				)
 				return etag, nil
@@ -344,17 +352,18 @@ func pullInitial(ctx context.Context, args pullArgs) (string, error) {
 }
 
 type pullLoopArgs struct {
-	client    allowlistclient.Client
-	cache     *cache.PolicyCache
-	bootstrap *allowlist.Allowlist
-	interval  time.Duration
-	timeout   time.Duration
-	etag      string
-	logger    *slog.Logger
+	client   allowlistclient.Client
+	store    *policyStore
+	interval time.Duration
+	timeout  time.Duration
+	etag     string
+	logger   *slog.Logger
 }
 
-// runPullLoop polls CDS with If-None-Match. 200 swaps the cache to
-// bootstrap ∪ pulled; 304 and errors leave it untouched.
+// runPullLoop polls CDS with If-None-Match. 200 rebuilds the index as floor ∪
+// pulled and advances the ETag — unless the pulled version is below the applied
+// one (epoch rollback), which is ignored so the ETag keeps re-fetching until a
+// forward version arrives. 304 and errors leave the index untouched.
 func runPullLoop(ctx context.Context, args pullLoopArgs) {
 	ticker := time.NewTicker(args.interval)
 	defer ticker.Stop()
@@ -368,7 +377,7 @@ func runPullLoop(ctx context.Context, args pullLoopArgs) {
 		}
 
 		reqCtx, cancel := context.WithTimeout(ctx, args.timeout)
-		wl, newETag, notModified, err := args.client.FetchAllowlistConditional(reqCtx, etag)
+		wl, newETag, notModified, err := args.client.Fetch(reqCtx, etag)
 		cancel()
 		if err != nil {
 			args.logger.Warn("pull loop fetch failed", "error", err)
@@ -382,15 +391,33 @@ func runPullLoop(ctx context.Context, args pullLoopArgs) {
 			args.logger.Warn("pull loop fetch returned nil allowlist")
 			continue
 		}
-		merged := mergeAllowlists(args.bootstrap, wl)
-		args.cache.SetAllowlist(merged)
+		version := parseVersion(newETag)
+		if !args.store.apply(wl, version) {
+			args.logger.Warn("pull loop: ignoring rolled-back allowlist; keeping current index",
+				"pulled_version", version, "etag", newETag)
+			continue
+		}
 		etag = newETag
 		args.logger.Info("pull loop: allowlist refreshed",
-			"pulled_entries", len(wl.Digests),
-			"merged_entries", len(merged.Digests),
+			"floor_entries", len(wl.Digests),
+			"workloads", len(wl.Workloads),
+			"version", version,
 			"etag", etag,
 		)
 	}
+}
+
+// parseVersion extracts the monotone counter N from a weak ETag W/"N" — the CDS
+// mutation counter used for epoch anti-rollback. An unparseable ETag yields 0,
+// which can only be rejected as a rollback once a real version has been applied.
+func parseVersion(etag string) uint64 {
+	v := strings.TrimPrefix(etag, "W/")
+	v = strings.Trim(v, `"`)
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 type healthServerConfig struct {

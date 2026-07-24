@@ -1,3 +1,9 @@
+// Package allowlistclient is the HTTP client for the CDS allowlist API.
+//
+// Reads (List, Fetch) are unauthenticated; the attested RA-TLS channel to CDS
+// provides their integrity. Writes bind an operator credential to the exact
+// method, path, and body via Authorizer, so a captured token cannot be replayed
+// against a different payload.
 package allowlistclient
 
 import (
@@ -8,6 +14,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
@@ -22,47 +29,12 @@ type Client struct {
 
 // NewClient creates a new allowlist client.
 func NewClient(baseURL string) Client {
-	return Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		httpClient: http.DefaultClient,
-	}
+	return Client{baseURL: strings.TrimRight(baseURL, "/"), httpClient: http.DefaultClient}
 }
 
 // NewClientWithHTTP creates a new allowlist client with a custom HTTP client.
 func NewClientWithHTTP(baseURL string, httpClient *http.Client) Client {
-	return Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		httpClient: httpClient,
-	}
-}
-
-// List returns all allowlisted image digests.
-func (c Client) List(ctx context.Context) (types.AllowlistListResponse, error) {
-	url := c.baseURL + "/allowlist"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return types.AllowlistListResponse{}, fmt.Errorf("create request: %w", err)
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return types.AllowlistListResponse{}, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return types.AllowlistListResponse{}, &StatusError{Status: resp.StatusCode, Body: strings.TrimSpace(string(msg))}
-	}
-
-	body, err := readCapped(resp.Body, maxAllowlistResponseBytes)
-	if err != nil {
-		return types.AllowlistListResponse{}, err
-	}
-	var result types.AllowlistListResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return types.AllowlistListResponse{}, err
-	}
-	return result, nil
+	return Client{baseURL: strings.TrimRight(baseURL, "/"), httpClient: httpClient}
 }
 
 // Authorizer produces the HTTP Authorization header value for a mutation,
@@ -72,85 +44,28 @@ type Authorizer interface {
 	Authorization(method, path string, body []byte) (string, error)
 }
 
-// Add adds an image digest to the allowlist. The write is authorized by auth
-// (an operator credential); auth is invoked with the exact request body so the
-// resulting token binds to it.
-func (c Client) Add(ctx context.Context, digest types.Digest, image string, auth Authorizer) error {
-	data, err := json.Marshal(types.AllowlistAddRequest{Digest: digest, Image: image})
+// List returns the current allowlist and its version (the ETag counter).
+func (c Client) List(ctx context.Context) (*allowlist.Allowlist, string, error) {
+	al, etag, notModified, err := c.fetch(ctx, "")
 	if err != nil {
-		return err
+		return nil, "", err
 	}
-	return c.mutate(ctx, http.MethodPost, data, auth)
+	if notModified {
+		// Unreachable without an If-None-Match, but treat as an empty response.
+		return nil, "", fmt.Errorf("unexpected 304 without If-None-Match")
+	}
+	return al, versionFromETag(etag), nil
 }
 
-// Delete removes image digests from the allowlist. Returns an error with 404
-// status if any digest does not exist.
-func (c Client) Delete(ctx context.Context, digests []types.Digest, auth Authorizer) error {
-	data, err := json.Marshal(types.AllowlistDeleteRequest{Digests: digests})
-	if err != nil {
-		return err
-	}
-	return c.mutate(ctx, http.MethodDelete, data, auth)
+// Fetch issues GET /allowlist with If-None-Match. notModified is true on a 304
+// (allowlist nil, etag ""); on 200 the parsed allowlist and new ETag are
+// returned. Used by enforcers polling for changes.
+func (c Client) Fetch(ctx context.Context, ifNoneMatch string) (*allowlist.Allowlist, string, bool, error) {
+	return c.fetch(ctx, ifNoneMatch)
 }
 
-// Replace atomically swaps the entire allowlist for digests. CDS assigns the
-// new version, so the caller passes no version.
-func (c Client) Replace(ctx context.Context, digests map[types.Digest]string, auth Authorizer) error {
-	data, err := json.Marshal(types.AllowlistReplaceRequest{Digests: digests})
-	if err != nil {
-		return err
-	}
-	return c.mutate(ctx, http.MethodPut, data, auth)
-}
-
-// mutate sends a body-bound, authorized write to /allowlist. auth is called
-// with the exact method, path, and bytes sent, guaranteeing the token's
-// bindings match what the server receives.
-func (c Client) mutate(ctx context.Context, method string, body []byte, auth Authorizer) error {
-	if auth == nil {
-		return fmt.Errorf("allowlistclient: nil Authorizer")
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+"/allowlist", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	authz, err := auth.Authorization(method, req.URL.Path, body)
-	if err != nil {
-		return fmt.Errorf("authorize request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authz)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return &StatusError{Status: resp.StatusCode, Body: strings.TrimSpace(string(msg))}
-	}
-	io.Copy(io.Discard, resp.Body)
-	return nil
-}
-
-// maxAllowlistResponseBytes caps CDS response bodies. Generous for a
-// realistic fleet (a sha256 entry + image ref is ~150 bytes; 4 MiB ≈ 27k
-// entries) but bounded so a compromised or buggy CDS can't OOM the
-// plugin process on every worker node.
-const maxAllowlistResponseBytes = 4 * 1024 * 1024
-
-// errAllowlistResponseTooLarge is returned when CDS exceeds the body cap.
-var errAllowlistResponseTooLarge = fmt.Errorf("allowlist response exceeds %d bytes", maxAllowlistResponseBytes)
-
-// FetchAllowlistConditional issues GET /allowlist with If-None-Match.
-// notModified is true on a 304 (allowlist nil, etag ""); on 200 the
-// parsed allowlist is returned with the new ETag (which may be empty).
-func (c Client) FetchAllowlistConditional(ctx context.Context, ifNoneMatch string) (*allowlist.Allowlist, string, bool, error) {
-	url := c.baseURL + "/allowlist"
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func (c Client) fetch(ctx context.Context, ifNoneMatch string) (*allowlist.Allowlist, string, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/allowlist", nil)
 	if err != nil {
 		return nil, "", false, fmt.Errorf("create request: %w", err)
 	}
@@ -168,12 +83,10 @@ func (c Client) FetchAllowlistConditional(ctx context.Context, ifNoneMatch strin
 		io.Copy(io.Discard, resp.Body)
 		return nil, "", true, nil
 	}
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := readCapped(resp.Body, maxAllowlistResponseBytes)
-		return nil, "", false, &StatusError{Status: resp.StatusCode, Body: string(body)}
+		return nil, "", false, &StatusError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
-
 	if ct := resp.Header.Get("Content-Type"); !isJSONContentType(ct) {
 		return nil, "", false, fmt.Errorf("fetch allowlist: unexpected content type: %s", ct)
 	}
@@ -182,21 +95,113 @@ func (c Client) FetchAllowlistConditional(ctx context.Context, ifNoneMatch strin
 	if err != nil {
 		return nil, "", false, err
 	}
-
-	wl, err := allowlist.ParseJSON(body)
+	al, err := allowlist.ParseJSON(body)
 	if err != nil {
 		return nil, "", false, err
 	}
-	return wl, resp.Header.Get("ETag"), false, nil
+	return al, resp.Header.Get("ETag"), false, nil
 }
+
+// AddDigest adds a floor digest.
+func (c Client) AddDigest(ctx context.Context, digest types.Digest, image string, auth Authorizer) error {
+	data, err := json.Marshal(types.DigestAddRequest{Digest: digest, Image: image})
+	if err != nil {
+		return err
+	}
+	return c.mutate(ctx, http.MethodPost, "/allowlist/digests", data, auth)
+}
+
+// DeleteDigests removes floor digests. Returns a 404 StatusError if any is absent.
+func (c Client) DeleteDigests(ctx context.Context, digests []types.Digest, auth Authorizer) error {
+	data, err := json.Marshal(types.DigestDeleteRequest{Digests: digests})
+	if err != nil {
+		return err
+	}
+	return c.mutate(ctx, http.MethodDelete, "/allowlist/digests", data, auth)
+}
+
+// ReplaceAll atomically replaces the entire allowlist (floor and workloads).
+// CDS assigns the new version.
+func (c Client) ReplaceAll(ctx context.Context, al *allowlist.Allowlist, auth Authorizer) error {
+	data, err := al.Canonical()
+	if err != nil {
+		return err
+	}
+	return c.mutate(ctx, http.MethodPut, "/allowlist", data, auth)
+}
+
+// PutWorkload creates or replaces one named workload entry.
+func (c Client) PutWorkload(ctx context.Context, name string, w allowlist.Workload, auth Authorizer) error {
+	data, err := json.Marshal(w)
+	if err != nil {
+		return err
+	}
+	return c.mutate(ctx, http.MethodPut, "/allowlist/workloads/"+url.PathEscape(name), data, auth)
+}
+
+// DeleteWorkload removes one named workload entry. Returns a 404 StatusError if
+// it is absent.
+func (c Client) DeleteWorkload(ctx context.Context, name string, auth Authorizer) error {
+	return c.mutate(ctx, http.MethodDelete, "/allowlist/workloads/"+url.PathEscape(name), nil, auth)
+}
+
+// mutate sends a body-bound, authorized write. auth is called with the exact
+// method, path, and bytes sent, so the token's bindings match what CDS receives.
+func (c Client) mutate(ctx context.Context, method, path string, body []byte, auth Authorizer) error {
+	if auth == nil {
+		return fmt.Errorf("allowlistclient: nil Authorizer")
+	}
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
+	if err != nil {
+		return err
+	}
+	authz, err := auth.Authorization(method, req.URL.Path, body)
+	if err != nil {
+		return fmt.Errorf("authorize request: %w", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", authz)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return &StatusError{Status: resp.StatusCode, Body: strings.TrimSpace(string(msg))}
+	}
+	io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// versionFromETag extracts N from a weak ETag of the form W/"N", or "" if the
+// header is missing or malformed.
+func versionFromETag(etag string) string {
+	v := strings.TrimPrefix(etag, "W/")
+	v = strings.TrimPrefix(v, `"`)
+	v = strings.TrimSuffix(v, `"`)
+	return v
+}
+
+// maxAllowlistResponseBytes caps CDS response bodies. Generous for a realistic
+// fleet but bounded so a compromised or buggy CDS can't OOM the plugin process.
+const maxAllowlistResponseBytes = 4 * 1024 * 1024
+
+var errAllowlistResponseTooLarge = fmt.Errorf("allowlist response exceeds %d bytes", maxAllowlistResponseBytes)
 
 func isJSONContentType(ct string) bool {
 	mediaType, _, err := mime.ParseMediaType(ct)
 	return err == nil && strings.EqualFold(mediaType, "application/json")
 }
 
-// readCapped reads up to maxBytes from r and returns errAllowlistResponseTooLarge
-// if the source produced more.
 func readCapped(r io.Reader, maxBytes int64) ([]byte, error) {
 	body, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
 	if err != nil {

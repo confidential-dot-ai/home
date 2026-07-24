@@ -27,6 +27,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/earsigner"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
+	"github.com/confidential-dot-ai/c8s/pkg/types"
 	"golang.org/x/time/rate"
 )
 
@@ -247,8 +248,9 @@ func run(cfg config) error {
 			SANValidation:  cfg.sanValidation,
 		},
 		AllowlistHandler: allowlist.Handler{
-			Store:           &allowlistStore,
-			WriteAuthorizer: writeAuthorizer,
+			Store:             &allowlistStore,
+			WriteAuthorizer:   writeAuthorizer,
+			MaxWriteBodyBytes: allowlistWriteBodyCap,
 		},
 		AttestKeyHandler: attestKeyHandler,
 		HandoffHandler:   handoffHandler,
@@ -341,16 +343,26 @@ func buildHandoffHandler(ctx context.Context, cfg config, mesh *issuer.CA, allow
 		Signer:              boot.Signer(),
 		EARSource:           boot.EARSource(),
 		Snapshot: func() (issuer.CASnapshot, bool) {
-			version, digests, err := allowlistStore.ListAll()
+			doc, version, err := allowlistStore.LoadAll()
 			if err != nil {
 				slog.Error("snapshot allowlist for handoff", "error", err)
 				return issuer.CASnapshot{}, false
+			}
+			floor := make(map[types.Digest]string, len(doc.Digests))
+			for d, img := range doc.Digests {
+				pd, err := types.ParseDigest(d)
+				if err != nil {
+					slog.Error("snapshot allowlist digest parse", "digest", d, "error", err)
+					return issuer.CASnapshot{}, false
+				}
+				floor[pd] = img
 			}
 			return issuer.CASnapshot{
 				Cert:             mesh.Cert,
 				Key:              mesh.Key,
 				AllowlistVersion: version,
-				Allowlist:        digests,
+				Allowlist:        floor,
+				Workloads:        doc.Workloads,
 			}, true
 		},
 	})

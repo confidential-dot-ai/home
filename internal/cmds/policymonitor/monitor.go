@@ -46,10 +46,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 
+	allowlistpkg "github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/workloadclaims"
 )
@@ -83,6 +85,7 @@ func runMonitor(ctx context.Context, cfg *Config) error {
 		cfg:       cfg,
 		logger:    logger,
 		allowlist: a,
+		overlay:   &policyOverlay{},
 		killer:    newCgroupKiller(cfg.CgroupRoot),
 		// configReadDeadline is the budget for re-reading config.json
 		// after the initial CREATE event. kata-agent's setup_bundle
@@ -110,7 +113,7 @@ func runMonitor(ctx context.Context, cfg *Config) error {
 	// *allowlist with m, whose merge is mutex-guarded. No CDS URL →
 	// baked-seed-only and the network is never touched.
 	if cfg.CDSURL != "" {
-		go runAllowlistRefresh(ctx, logger, cfg, a)
+		go runAllowlistRefresh(ctx, logger, cfg, a, m.overlay)
 	} else {
 		logger.Info("allowlist refresh disabled (no CDS URL); enforcing baked seed only", "entries", a.Size())
 	}
@@ -125,12 +128,60 @@ func runMonitor(ctx context.Context, cfg *Config) error {
 type monitor struct {
 	cfg                *Config
 	logger             *slog.Logger
-	allowlist          *allowlist
+	allowlist          *allowlist     // baked floor: additive digest set, never shrinks
+	overlay            *policyOverlay // latest CDS pull's workload argv policy
 	killer             containerKiller
 	broker             *workloadBroker // serves the workload-claims flow (docs/ratls.md)
 	configReadDeadline time.Duration
 	configReadInterval time.Duration
 	revalidateInterval time.Duration
+}
+
+// policyOverlay holds the Index of the latest CDS pull that advanced the epoch.
+// The baked floor stays authoritative for digest-only admission; the overlay
+// adds the pulled document's workload argv policy. Read by per-container
+// decision goroutines, replaced by the single refresh goroutine.
+type policyOverlay struct {
+	mu      sync.RWMutex
+	idx     *allowlistpkg.Index
+	version uint64
+}
+
+func (o *policyOverlay) index() *allowlistpkg.Index {
+	if o == nil {
+		return nil
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.idx
+}
+
+// apply installs al's Index when version advances past the last applied — epoch
+// anti-rollback; a lower or equal version is ignored. The first apply always
+// installs. Reports whether it applied.
+func (o *policyOverlay) apply(al *allowlistpkg.Allowlist, version uint64) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.idx != nil && version <= o.version {
+		return false
+	}
+	o.idx = al.BuildIndex()
+	o.version = version
+	return true
+}
+
+// admits reports whether a container may run. The baked floor (additive digest
+// set) admits by digest alone; otherwise the pulled overlay's Index decides on
+// digest + effective argv. With no overlay (CDS refresh disabled, or no
+// successful pull yet) only the baked floor admits — behavior from t=0.
+func (m *monitor) admits(digest string, argv []string) bool {
+	if m.allowlist.Contains(digest) {
+		return true
+	}
+	if idx := m.overlay.index(); idx != nil {
+		return idx.AdmitsContainer(digest, argv)
+	}
+	return false
 }
 
 func (m *monitor) run(ctx context.Context) error {
@@ -381,14 +432,20 @@ func (m *monitor) handleNewContainer(ctx context.Context, dir string) {
 		return
 	}
 
-	if m.allowlist.Contains(digest) {
+	// Effective argv (OCI process.args): the merged entrypoint+cmd the container
+	// runs. Floor digests ignore it; workload digests are gated on it.
+	var argv []string
+	if spec.Process != nil {
+		argv = spec.Process.Args
+	}
+	if m.admits(digest, argv) {
 		m.logger.Info("allow container", "cid", cid, "digest", digest)
 		if m.broker != nil {
 			m.broker.record(cid, containerName(spec.Annotations), digest)
 		}
 		return
 	}
-	m.logger.Warn("deny container: digest not allowlisted", "cid", cid, "digest", digest)
+	m.logger.Warn("deny container: digest/argv not allowlisted", "cid", cid, "digest", digest, "argv", argv)
 	m.kill(cid)
 }
 
@@ -442,12 +499,19 @@ func (m *monitor) readConfigJSON(ctx context.Context, path string) (*ociSpec, er
 	}
 }
 
-// ociSpec is the subset of the OCI Runtime Spec we care about: the
-// annotations map. We don't pull in opencontainers/runtime-spec
-// because we only need this one field, and json.Unmarshal will
-// silently drop everything else.
+// ociSpec is the subset of the OCI Runtime Spec we enforce on: the annotations
+// (carrying the image digest) and the process.args (the effective argv). We
+// don't pull in opencontainers/runtime-spec — json.Unmarshal silently drops
+// everything else.
 type ociSpec struct {
 	Annotations map[string]string `json:"annotations"`
+	Process     *ociProcess       `json:"process"`
+}
+
+// ociProcess is the process block's argv: the merged image-config + pod-spec
+// command the container actually runs, evaluated against workload argv policy.
+type ociProcess struct {
+	Args []string `json:"args"`
 }
 
 func readOCISpec(path string) (*ociSpec, error) {

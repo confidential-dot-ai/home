@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/internal/earclaims"
+	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/issuerapi"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
@@ -116,10 +117,11 @@ type CASnapshot struct {
 	Cert       *x509.Certificate
 	Key        *ecdsa.PrivateKey
 	ParentCert *x509.Certificate // nil for a self-signed root CA
-	// AllowlistVersion and Allowlist are copied into the encrypted payload so
-	// a rolling adoption preserves runtime operator additions.
+	// AllowlistVersion, Allowlist (floor) and Workloads are copied into the
+	// encrypted payload so a rolling adoption preserves runtime operator state.
 	AllowlistVersion string
 	Allowlist        map[types.Digest]string
+	Workloads        map[string]allowlist.Workload
 }
 
 func (s CASnapshot) hasCAKeyPair() bool {
@@ -170,12 +172,13 @@ func NewHandoffHandler(deps HandoffDeps) (*HandoffHandler, error) {
 func (hh *HandoffHandler) IssuerEARSource() HandoffEARSource { return hh.earSource }
 
 type handoffPayload struct {
-	CAKey             string                  `json:"ca_key"`
-	CACertificate     string                  `json:"ca_certificate"`
-	CABundle          string                  `json:"ca_bundle"`
-	ParentCertificate string                  `json:"parent_certificate,omitempty"`
-	AllowlistVersion  string                  `json:"allowlist_version"`
-	Allowlist         map[types.Digest]string `json:"allowlist"`
+	CAKey             string                        `json:"ca_key"`
+	CACertificate     string                        `json:"ca_certificate"`
+	CABundle          string                        `json:"ca_bundle"`
+	ParentCertificate string                        `json:"parent_certificate,omitempty"`
+	AllowlistVersion  string                        `json:"allowlist_version"`
+	Allowlist         map[types.Digest]string       `json:"allowlist"`
+	Workloads         map[string]allowlist.Workload `json:"workloads,omitempty"`
 }
 
 // HandoffMaterial is the unwrapped result of a successful handoff.
@@ -186,6 +189,7 @@ type HandoffMaterial struct {
 	Bundle           []*x509.Certificate
 	AllowlistVersion string
 	Allowlist        map[types.Digest]string
+	Workloads        map[string]allowlist.Workload
 }
 
 // HandoffClientDeps carries the EAR verification context the requester needs to
@@ -318,6 +322,7 @@ func (hh *HandoffHandler) wrap(req HandoffRequest, snap CASnapshot, issuerEAR st
 		CABundle:         string(bundlePEM),
 		AllowlistVersion: snap.AllowlistVersion,
 		Allowlist:        snap.Allowlist,
+		Workloads:        snap.Workloads,
 	}
 	if err := validateAllowlistSnapshot(payload.AllowlistVersion, payload.Allowlist); err != nil {
 		return HandoffResponse{}, err
@@ -576,6 +581,7 @@ func ParseHandoffPayload(plain []byte) (*HandoffMaterial, error) {
 		Bundle:           certs,
 		AllowlistVersion: payload.AllowlistVersion,
 		Allowlist:        payload.Allowlist,
+		Workloads:        payload.Workloads,
 	}, nil
 }
 

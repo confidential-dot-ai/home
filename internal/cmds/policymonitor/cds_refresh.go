@@ -19,6 +19,7 @@ package policymonitor
 import (
 	"context"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,7 +32,7 @@ import (
 // until ctx is cancelled. Construction failures (bad measurements, RA-TLS
 // setup) disable refresh but never crash the monitor — the baked seed
 // still enforces.
-func runAllowlistRefresh(ctx context.Context, logger *slog.Logger, cfg *Config, a *allowlist) {
+func runAllowlistRefresh(ctx context.Context, logger *slog.Logger, cfg *Config, a *allowlist, overlay *policyOverlay) {
 	measurements, err := ratls.ParseHexMeasurementsList(splitCSV(cfg.CDSMeasurements))
 	if err != nil {
 		logger.Error("allowlist refresh disabled: invalid C8S_CDS_MEASUREMENTS", "error", err)
@@ -63,7 +64,7 @@ func runAllowlistRefresh(ctx context.Context, logger *slog.Logger, cfg *Config, 
 	ticker := time.NewTicker(cfg.RefreshInterval)
 	defer ticker.Stop()
 	for {
-		refreshOnce(ctx, logger, client, a, callTimeout)
+		refreshOnce(ctx, logger, client, a, overlay, callTimeout)
 		select {
 		case <-ctx.Done():
 			return
@@ -77,27 +78,36 @@ func runAllowlistRefresh(ctx context.Context, logger *slog.Logger, cfg *Config, 
 // outlive the next tick.
 const refreshCallTimeoutMax = 15 * time.Second
 
-// refreshOnce pulls the current CDS allowlist and merges it into a. A
-// failed pull is logged and skipped — the existing allowlist (at minimum
-// the baked seed) keeps enforcing, so a CDS outage degrades to "stale but
-// no smaller", never "open".
-func refreshOnce(ctx context.Context, logger *slog.Logger, client allowlistclient.Client, a *allowlist, callTimeout time.Duration) {
+// refreshOnce pulls the current CDS allowlist. Two layers update: the baked
+// floor grows additively with the pulled floor digests (never shrinks — a CDS
+// outage or rollback can't loosen digest-only admission), and the workload argv
+// policy overlay is replaced only when the pulled version advances the epoch.
+// A failed pull is logged and skipped — the existing allowlist and overlay keep
+// enforcing, so a CDS outage degrades to "stale but no smaller", never "open".
+func refreshOnce(ctx context.Context, logger *slog.Logger, client allowlistclient.Client, a *allowlist, overlay *policyOverlay, callTimeout time.Duration) {
 	callCtx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	resp, err := client.List(callCtx)
+	resp, version, err := client.List(callCtx)
 	if err != nil {
 		logger.Warn("allowlist refresh from CDS failed (keeping current allowlist)", "error", err)
 		return
 	}
+
 	pulled := make([]string, 0, len(resp.Digests))
 	for d := range resp.Digests {
-		pulled = append(pulled, d.String())
+		pulled = append(pulled, d)
 	}
 	added := a.MergePulled(pulled)
-	if added > 0 {
-		logger.Info("allowlist refreshed from CDS", "version", resp.Version, "pulled", len(pulled), "added", added, "total", a.Size())
+
+	v, verr := strconv.ParseUint(version, 10, 64)
+	if verr != nil {
+		logger.Warn("allowlist refresh: unparseable CDS version; keeping current overlay", "version", version, "error", verr)
+		return
+	}
+	if overlay.apply(resp, v) {
+		logger.Info("allowlist refreshed from CDS", "version", v, "workloads", len(resp.Workloads), "floor_added", added, "floor_total", a.Size())
 	} else {
-		logger.Debug("allowlist refresh from CDS: no new digests", "version", resp.Version, "pulled", len(pulled), "total", a.Size())
+		logger.Warn("allowlist refresh: ignoring rolled-back CDS version; keeping current overlay", "version", v, "floor_added", added, "floor_total", a.Size())
 	}
 }
 

@@ -897,6 +897,19 @@ nriImagePolicy:
     deriveComponents: false
     digests: {}
     # sha256:abc123...: "ghcr.io/confidential-dot-ai/cds:v0.1.0"
+    # workloads: named workload entries folded into the served seed alongside
+    # the floor. Each entry pins an init/main container set with per-container
+    # argv (entrypoint/cmd) and paths policy; policy is matched by container
+    # digest. Standalone/injected component images stay digest-only in `digests`
+    # above. Keys are the pkg/allowlist Workload JSON fields (initContainers,
+    # containers, digest, entrypoint, cmd, paths). Default empty.
+    workloads: {}
+    #   infer:
+    #     containers:
+    #       - digest: sha256:...
+    #         entrypoint: {policy: exact, argv: ["/bin/vllm"]}
+    #         cmd: {policy: any}
+    #         paths: {policy: deny}
 
   # --- Uninstall hook ---
   # Pre-delete DaemonSet that reverts the containerd config patch and removes

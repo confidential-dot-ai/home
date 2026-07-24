@@ -18,6 +18,7 @@ import (
 
 	"github.com/confidential-dot-ai/c8s/internal/attestation"
 	"github.com/confidential-dot-ai/c8s/internal/issuer"
+	pkgallowlist "github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
@@ -58,16 +59,19 @@ type AttestHandler struct {
 	SANValidation bool
 
 	// AllowlistStore, when set, is consulted to gate workload-digest claims:
-	// every container digest a requester commits to must be allowlisted
-	// (docs/ratls.md). nil disables workload-claims verification —
-	// a request carrying claims is then rejected, since they cannot be checked.
-	AllowlistStore workloadDigestChecker
+	// every container digest a requester commits to must be allowlisted, and a
+	// claim touching workload (non-floor) images must match one entry's set
+	// (docs/ratls.md). nil disables workload-claims verification — a request
+	// carrying claims is then rejected, since they cannot be checked.
+	AllowlistStore allowlistGate
 }
 
-// workloadDigestChecker reports whether an image digest is currently
-// allowlisted. Satisfied by *internal/allowlist.Store.
-type workloadDigestChecker interface {
+// allowlistGate answers the two attest-time questions: per-digest membership
+// (floor OR workload) and the full document for the combination check.
+// Satisfied by *internal/allowlist.Store.
+type allowlistGate interface {
 	Contains(digest types.Digest) (bool, error)
+	LoadAll() (*pkgallowlist.Allowlist, string, error)
 }
 
 func (h AttestHandler) HandleAttest(w http.ResponseWriter, r *http.Request) {
@@ -256,10 +260,12 @@ func csrRATLSExtensionValue(csr *x509.CertificateRequest) []byte {
 	return nil
 }
 
-// verifyWorkloadClaims checks that the requester's container-digest list
-// matches the attested workload digest and that every listed image is
-// allowlisted (docs/ratls.md). claimsDER nil ⇒ nothing to verify.
-// It fails closed if claims are present but no allowlist store is wired.
+// verifyWorkloadClaims checks that the requester's container-digest list matches
+// the attested workload digest, that every listed image is allowlisted, and —
+// when any listed image is a workload (non-floor) image — that the claimed
+// init/main set exactly matches one workload entry, so containers from different
+// entries cannot be mixed into an unauthorized pod (docs/ratls.md). claimsDER
+// nil ⇒ nothing to verify; it fails closed if claims are present with no store.
 func (h AttestHandler) verifyWorkloadClaims(claimsDER []byte, initDigests, mainDigests []string) error {
 	if len(claimsDER) == 0 {
 		return nil
@@ -283,7 +289,71 @@ func (h AttestHandler) verifyWorkloadClaims(claimsDER []byte, initDigests, mainD
 			return fmt.Errorf("container image %s is not allowlisted", digest)
 		}
 	}
-	return nil
+	doc, _, err := h.AllowlistStore.LoadAll()
+	if err != nil {
+		return fmt.Errorf("load allowlist: %w", err)
+	}
+	return enforceWorkloadCombination(doc, initDigests, mainDigests)
+}
+
+// enforceWorkloadCombination requires the non-floor portion of the claimed
+// init/main sets to equal one workload entry's non-floor init/main sets.
+//
+// Floor digests are excluded from both sides: they are admitted alone and carry
+// no combination policy. Injected c8s containers (get-cert) are floor entries,
+// so their measured digest drops out here — that floor pin is the exclusion
+// (name-based exclusion happens upstream at the broker, before CDS sees only
+// digests).
+func enforceWorkloadCombination(doc *pkgallowlist.Allowlist, initDigests, mainDigests []string) error {
+	floor := doc.Digests
+	claimInit := nonFloorSet(initDigests, floor)
+	claimMain := nonFloorSet(mainDigests, floor)
+	if len(claimInit) == 0 && len(claimMain) == 0 {
+		return nil
+	}
+	for _, w := range doc.Workloads {
+		if setsEqual(claimInit, nonFloorSet(digestStrings(w.InitContainers), floor)) &&
+			setsEqual(claimMain, nonFloorSet(digestStrings(w.Containers), floor)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("claimed container set matches no single workload entry")
+}
+
+// nonFloorSet is the canonical digests in ds that are not floor entries.
+func nonFloorSet(ds []string, floor map[string]string) map[string]struct{} {
+	set := make(map[string]struct{}, len(ds))
+	for _, d := range ds {
+		parsed, err := types.ParseDigest(d)
+		if err != nil {
+			continue
+		}
+		if _, isFloor := floor[parsed.String()]; isFloor {
+			continue
+		}
+		set[parsed.String()] = struct{}{}
+	}
+	return set
+}
+
+func digestStrings(cs []pkgallowlist.Container) []string {
+	out := make([]string, len(cs))
+	for i, c := range cs {
+		out[i] = c.Digest.String()
+	}
+	return out
+}
+
+func setsEqual(a, b map[string]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (h AttestHandler) caChainPEM() []byte {

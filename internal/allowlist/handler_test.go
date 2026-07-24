@@ -5,7 +5,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -15,9 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/confidential-dot-ai/c8s/internal/allowlist"
 	"github.com/confidential-dot-ai/c8s/internal/attestation"
 	"github.com/confidential-dot-ai/c8s/internal/readiness"
+	pkgallowlist "github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/attestationclient"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
@@ -47,12 +49,12 @@ func testOperatorCredential(t *testing.T) (*operatorauth.Signer, *ecdsa.PublicKe
 	return signer, &key.PublicKey
 }
 
-// authHeader mints an operator token bound to method + /allowlist + body and
-// returns it as a Bearer header value. Callers MUST pass the exact method and
-// bytes the server will receive — any difference breaks the token's bindings.
-func authHeader(t *testing.T, signer *operatorauth.Signer, method string, body []byte) string {
+// authHeader mints an operator token bound to method + path + body and returns
+// it as an Authorization header value. Callers MUST pass the exact method, path,
+// and bytes the server will receive — any difference breaks the token's bindings.
+func authHeader(t *testing.T, signer *operatorauth.Signer, method, path string, body []byte) string {
 	t.Helper()
-	header, err := signer.Authorization(method, "/allowlist", body)
+	header, err := signer.Authorization(method, path, body)
 	if err != nil {
 		t.Fatalf("mint operator token: %v", err)
 	}
@@ -81,17 +83,41 @@ func testAllowlistApp(t *testing.T) (http.Handler, *readiness.Checker, *operator
 	return allowlistTestRouter(wh, checker.Ready), &checker, signer
 }
 
-// allowlistTestRouter mounts only the routes the allowlist tests exercise, so
-// these unit tests don't depend on the full server router.
+// allowlistTestRouter mounts the allowlist routes on a chi router so the
+// workload path parameter resolves the same way the cds router serves it.
 func allowlistTestRouter(wh allowlist.Handler, ready attestation.ReadinessFunc) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	mux.HandleFunc("GET /readyz", attestation.HandleReadyz(ready))
-	mux.HandleFunc("GET /allowlist", wh.HandleList)
-	mux.HandleFunc("POST /allowlist", wh.HandleAdd)
-	mux.HandleFunc("PUT /allowlist", wh.HandleReplace)
-	mux.HandleFunc("DELETE /allowlist", wh.HandleDelete)
-	return mux
+	r := chi.NewRouter()
+	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	r.Get("/readyz", attestation.HandleReadyz(ready))
+	r.Get("/allowlist", wh.HandleList)
+	r.Put("/allowlist", wh.HandleReplaceAll)
+	r.Post("/allowlist/digests", wh.HandleAddDigest)
+	r.Delete("/allowlist/digests", wh.HandleDeleteDigests)
+	r.Put("/allowlist/workloads/{name}", wh.HandlePutWorkload)
+	r.Delete("/allowlist/workloads/{name}", wh.HandleDeleteWorkload)
+	return r
+}
+
+// getAllowlist fetches and parses the served document.
+func getAllowlist(t *testing.T, srvURL string) *pkgallowlist.Allowlist {
+	t.Helper()
+	resp, err := http.Get(srvURL + "/allowlist")
+	if err != nil {
+		t.Fatalf("get allowlist: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get allowlist: status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read allowlist: %v", err)
+	}
+	al, err := pkgallowlist.ParseJSON(body)
+	if err != nil {
+		t.Fatalf("parse served allowlist: %v; body=%s", err, body)
+	}
+	return al
 }
 
 func TestHealthzReturnsOK(t *testing.T) {
@@ -131,40 +157,15 @@ func TestAllowlistListEmpty(t *testing.T) {
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/allowlist")
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
+	al := getAllowlist(t, srv.URL)
+	if al.Schema != pkgallowlist.Schema {
+		t.Fatalf("schema = %q, want %q", al.Schema, pkgallowlist.Schema)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	if len(al.Digests) != 0 {
+		t.Fatalf("expected empty floor, got %d entries", len(al.Digests))
 	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	var version string
-	if err := json.Unmarshal(raw["version"], &version); err != nil {
-		t.Fatalf("unmarshal version: %v", err)
-	}
-	if version != "1" {
-		t.Fatalf("version = %q, want 1", version)
-	}
-
-	var digests map[string]string
-	if err := json.Unmarshal(raw["digests"], &digests); err != nil {
-		t.Fatalf("unmarshal digests: %v", err)
-	}
-	if len(digests) != 0 {
-		t.Fatalf("expected empty digests, got %d entries", len(digests))
+	if len(al.Workloads) != 0 {
+		t.Fatalf("expected empty workloads, got %d entries", len(al.Workloads))
 	}
 }
 
@@ -173,7 +174,7 @@ func TestAllowlistReplaceRequiresAuth(t *testing.T) {
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
-	body := fmt.Sprintf(`{"digests":{"%s":"test-image"}}`, digestA)
+	body := fmt.Sprintf(`{"schema":%q,"digests":{"%s":"test-image"}}`, pkgallowlist.Schema, digestA)
 	req, err := http.NewRequest(http.MethodPut, srv.URL+"/allowlist", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
@@ -192,31 +193,18 @@ func TestAllowlistReplaceRequiresAuth(t *testing.T) {
 }
 
 // TestAllowlistReplaceSwapsSet verifies PUT is a full replace: an entry present
-// before the replace and absent from the new set is gone afterward.
+// before the replace and absent from the new document is gone afterward.
 func TestAllowlistReplaceSwapsSet(t *testing.T) {
 	app, _, signer := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
-	// Seed digestA via POST.
-	addBody := fmt.Sprintf(`{"digest":"%s","image":"old-image"}`, digestA)
-	addReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/allowlist", strings.NewReader(addBody))
-	addReq.Header.Set("Content-Type", "application/json")
-	addReq.Header.Set("Authorization", authHeader(t, signer, http.MethodPost, []byte(addBody)))
-	addResp, err := http.DefaultClient.Do(addReq)
-	if err != nil {
-		t.Fatalf("add request: %v", err)
-	}
-	addResp.Body.Close()
-	if addResp.StatusCode != http.StatusNoContent {
-		t.Fatalf("add: got %d, want 204", addResp.StatusCode)
-	}
+	addDigest(t, srv.URL, signer, digestA, "old-image")
 
-	// Replace with a set containing only digestMissing.
-	putBody := fmt.Sprintf(`{"digests":{"%s":"new-image"}}`, digestMissing)
+	putBody := fmt.Sprintf(`{"schema":%q,"digests":{"%s":"new-image"}}`, pkgallowlist.Schema, digestMissing)
 	putReq, _ := http.NewRequest(http.MethodPut, srv.URL+"/allowlist", strings.NewReader(putBody))
 	putReq.Header.Set("Content-Type", "application/json")
-	putReq.Header.Set("Authorization", authHeader(t, signer, http.MethodPut, []byte(putBody)))
+	putReq.Header.Set("Authorization", authHeader(t, signer, http.MethodPut, "/allowlist", []byte(putBody)))
 	putResp, err := http.DefaultClient.Do(putReq)
 	if err != nil {
 		t.Fatalf("put request: %v", err)
@@ -226,25 +214,14 @@ func TestAllowlistReplaceSwapsSet(t *testing.T) {
 		t.Fatalf("put: got %d, want 204", putResp.StatusCode)
 	}
 
-	// GET and confirm the set is exactly {digestMissing}.
-	resp, err := http.Get(srv.URL + "/allowlist")
-	if err != nil {
-		t.Fatalf("get request: %v", err)
+	al := getAllowlist(t, srv.URL)
+	if len(al.Digests) != 1 {
+		t.Fatalf("expected exactly 1 floor digest after replace, got %d", len(al.Digests))
 	}
-	defer resp.Body.Close()
-	var listed types.AllowlistListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&listed); err != nil {
-		t.Fatalf("decode list: %v", err)
+	if al.Digests[digestMissing] != "new-image" {
+		t.Fatalf("replaced set missing new entry: %#v", al.Digests)
 	}
-	if len(listed.Digests) != 1 {
-		t.Fatalf("expected exactly 1 digest after replace, got %d", len(listed.Digests))
-	}
-	newDigest, _ := types.ParseDigest(digestMissing)
-	if listed.Digests[newDigest] != "new-image" {
-		t.Fatalf("replaced set missing new entry: %#v", listed.Digests)
-	}
-	oldDigest, _ := types.ParseDigest(digestA)
-	if _, ok := listed.Digests[oldDigest]; ok {
+	if _, ok := al.Digests[digestA]; ok {
 		t.Fatal("old entry survived a full replace")
 	}
 }
@@ -261,10 +238,10 @@ func guardTestHandler(t *testing.T) (allowlist.Handler, *allowlist.Store) {
 	return h, &store
 }
 
-// TestAllowlistReplaceRejectsNilDigests pins the wipe guard: a body whose
-// digests decode to a nil map (absent or null) must 422 without touching the
-// store, since clearing the allowlist denies every image on every node.
-func TestAllowlistReplaceRejectsNilDigests(t *testing.T) {
+// TestAllowlistReplaceRejectsInvalidDoc pins that PUT validates via ParseJSON:
+// a body without the schema field (or otherwise malformed) is 422 and does not
+// touch the store.
+func TestAllowlistReplaceRejectsInvalidDoc(t *testing.T) {
 	h, store := guardTestHandler(t)
 	d, _ := types.ParseDigest(digestA)
 	if err := store.Add(d, "img"); err != nil {
@@ -272,10 +249,10 @@ func TestAllowlistReplaceRejectsNilDigests(t *testing.T) {
 	}
 	versionBefore, _, _ := store.ListAll()
 
-	for _, body := range []string{`{}`, `{"digests":null}`} {
+	for _, body := range []string{`{}`, `{"digests":{}}`, `{"schema":"other","digests":{}}`} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPut, "/allowlist", strings.NewReader(body))
-		h.HandleReplace(rec, req)
+		h.HandleReplaceAll(rec, req)
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Fatalf("PUT %s: got status %d, want 422", body, rec.Code)
 		}
@@ -286,13 +263,13 @@ func TestAllowlistReplaceRejectsNilDigests(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 	if len(digests) != 1 || version != versionBefore {
-		t.Fatalf("nil-digests PUT must not change the allowlist: %d entries, version %s -> %s",
+		t.Fatalf("invalid PUT must not change the allowlist: %d entries, version %s -> %s",
 			len(digests), versionBefore, version)
 	}
 }
 
-// TestAllowlistReplaceExplicitEmptyClears verifies the deliberate wipe path
-// stays open: a non-nil empty set clears the allowlist.
+// TestAllowlistReplaceExplicitEmptyClears verifies a valid empty document clears
+// the allowlist.
 func TestAllowlistReplaceExplicitEmptyClears(t *testing.T) {
 	h, store := guardTestHandler(t)
 	d, _ := types.ParseDigest(digestA)
@@ -301,8 +278,9 @@ func TestAllowlistReplaceExplicitEmptyClears(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPut, "/allowlist", strings.NewReader(`{"digests":{}}`))
-	h.HandleReplace(rec, req)
+	body := fmt.Sprintf(`{"schema":%q,"digests":{}}`, pkgallowlist.Schema)
+	req := httptest.NewRequest(http.MethodPut, "/allowlist", strings.NewReader(body))
+	h.HandleReplaceAll(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("got status %d, want 204", rec.Code)
 	}
@@ -318,22 +296,20 @@ func TestAllowlistReplaceExplicitEmptyClears(t *testing.T) {
 
 // TestAllowlistAddRejectsMissingDigest pins the zero-digest guard: an absent
 // digest field skips Digest's validating UnmarshalJSON, and the row it would
-// insert is invisible to ListAll and unaddressable by Delete.
+// insert is invisible to LoadAll and unaddressable by Delete.
 func TestAllowlistAddRejectsMissingDigest(t *testing.T) {
 	h, store := guardTestHandler(t)
 	versionBefore, _, _ := store.ListAll()
 
 	for _, body := range []string{`{}`, `{"image":"ghost"}`} {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/allowlist", strings.NewReader(body))
-		h.HandleAdd(rec, req)
+		req := httptest.NewRequest(http.MethodPost, "/allowlist/digests", strings.NewReader(body))
+		h.HandleAddDigest(rec, req)
 		if rec.Code != http.StatusUnprocessableEntity {
 			t.Fatalf("POST %s: got status %d, want 422", body, rec.Code)
 		}
 	}
 
-	// The version pins the no-insert invariant: ListAll hides a zero-digest
-	// row, but inserting one would still have bumped the version.
 	version, _, err := store.ListAll()
 	if err != nil {
 		t.Fatalf("list: %v", err)
@@ -349,7 +325,7 @@ func TestAllowlistAddRequiresAuth(t *testing.T) {
 	defer srv.Close()
 
 	body := fmt.Sprintf(`{"digest":"%s","image":"test-image"}`, digestA)
-	resp, err := http.Post(srv.URL+"/allowlist", "application/json", strings.NewReader(body))
+	resp, err := http.Post(srv.URL+"/allowlist/digests", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -369,12 +345,12 @@ func TestAllowlistAddRejectsUnpinnedOperatorKey(t *testing.T) {
 
 	otherSigner, _ := testOperatorCredential(t) // not the pinned key
 	body := fmt.Sprintf(`{"digest":"%s","image":"test-image"}`, digestA)
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist/digests", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authHeader(t, otherSigner, http.MethodPost, []byte(body)))
+	req.Header.Set("Authorization", authHeader(t, otherSigner, http.MethodPost, "/allowlist/digests", []byte(body)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -390,12 +366,12 @@ func TestAllowlistAddRejectsUnpinnedOperatorKey(t *testing.T) {
 func addDigest(t *testing.T, srvURL string, signer *operatorauth.Signer, digest, image string) {
 	t.Helper()
 	body := fmt.Sprintf(`{"digest":"%s","image":"%s"}`, digest, image)
-	req, err := http.NewRequest(http.MethodPost, srvURL+"/allowlist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srvURL+"/allowlist/digests", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authHeader(t, signer, http.MethodPost, []byte(body)))
+	req.Header.Set("Authorization", authHeader(t, signer, http.MethodPost, "/allowlist/digests", []byte(body)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -415,33 +391,9 @@ func TestAllowlistAddAndListRoundtrip(t *testing.T) {
 
 	addDigest(t, srv.URL, signer, digestA, "test-image")
 
-	resp, err := http.Get(srv.URL + "/allowlist")
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("got status %d, want 200", resp.StatusCode)
-	}
-
-	var result types.AllowlistListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-
-	expectedDigest, _ := types.ParseDigest(digestA)
-	img, ok := result.Digests[expectedDigest]
-	if !ok {
-		t.Fatal("digest not found in allowlist")
-	}
-	if img != "test-image" {
-		t.Fatalf("image = %q, want test-image", img)
-	}
-
-	// version should have been incremented from "1" to "2"
-	if result.Version != "2" {
-		t.Fatalf("version = %q, want 2", result.Version)
+	al := getAllowlist(t, srv.URL)
+	if al.Digests[digestA] != "test-image" {
+		t.Fatalf("floor digest = %q, want test-image", al.Digests[digestA])
 	}
 }
 
@@ -453,12 +405,12 @@ func TestAllowlistDeleteExistingReturnsNoContent(t *testing.T) {
 	addDigest(t, srv.URL, signer, digestA, "test-image")
 
 	body := fmt.Sprintf(`{"digests":["%s"]}`, digestA)
-	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/allowlist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/allowlist/digests", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authHeader(t, signer, http.MethodDelete, []byte(body)))
+	req.Header.Set("Authorization", authHeader(t, signer, http.MethodDelete, "/allowlist/digests", []byte(body)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -470,19 +422,9 @@ func TestAllowlistDeleteExistingReturnsNoContent(t *testing.T) {
 		t.Fatalf("got status %d, want 204", resp.StatusCode)
 	}
 
-	// verify empty
-	listResp, err := http.Get(srv.URL + "/allowlist")
-	if err != nil {
-		t.Fatalf("list request failed: %v", err)
-	}
-	defer listResp.Body.Close()
-
-	var result types.AllowlistListResponse
-	if err := json.NewDecoder(listResp.Body).Decode(&result); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(result.Digests) != 0 {
-		t.Fatalf("expected empty digests, got %d", len(result.Digests))
+	al := getAllowlist(t, srv.URL)
+	if len(al.Digests) != 0 {
+		t.Fatalf("expected empty floor, got %d", len(al.Digests))
 	}
 }
 
@@ -492,12 +434,12 @@ func TestAllowlistDeleteNonexistentReturnsNotFound(t *testing.T) {
 	defer srv.Close()
 
 	body := fmt.Sprintf(`{"digests":["%s"]}`, digestMissing)
-	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/allowlist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/allowlist/digests", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authHeader(t, signer, http.MethodDelete, []byte(body)))
+	req.Header.Set("Authorization", authHeader(t, signer, http.MethodDelete, "/allowlist/digests", []byte(body)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -516,12 +458,11 @@ func TestAllowlistDeleteRequiresAuth(t *testing.T) {
 	defer srv.Close()
 
 	body := fmt.Sprintf(`{"digests":["%s"]}`, digestA)
-	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/allowlist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/allowlist/digests", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	// no auth header
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -540,12 +481,12 @@ func TestAllowlistAddRejectsInvalidDigest(t *testing.T) {
 	defer srv.Close()
 
 	body := `{"digest":"sha256:abc","image":"test-image"}`
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist/digests", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authHeader(t, signer, http.MethodPost, []byte(body)))
+	req.Header.Set("Authorization", authHeader(t, signer, http.MethodPost, "/allowlist/digests", []byte(body)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -558,21 +499,18 @@ func TestAllowlistAddRejectsInvalidDigest(t *testing.T) {
 	}
 }
 
-// TestAllowlistAddRejectsReplayWithDifferentBody is the H2 regression test:
-// a captured operator token for one body MUST NOT authorize a different body
-// within the token's TTL.
+// TestAllowlistAddRejectsReplayWithDifferentBody: a captured operator token for
+// one body MUST NOT authorize a different body within the token's TTL.
 func TestAllowlistAddRejectsReplayWithDifferentBody(t *testing.T) {
 	app, _, signer := testAllowlistApp(t)
 	srv := httptest.NewServer(app)
 	defer srv.Close()
 
-	// Token is bound to the legitimate digestA body.
 	originalBody := fmt.Sprintf(`{"digest":"%s","image":"trusted-image"}`, digestA)
-	header := authHeader(t, signer, http.MethodPost, []byte(originalBody))
+	header := authHeader(t, signer, http.MethodPost, "/allowlist/digests", []byte(originalBody))
 
-	// Attacker replays the same token but ships a different digest.
 	attackerBody := fmt.Sprintf(`{"digest":"%s","image":"attacker-image"}`, digestMissing)
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist", strings.NewReader(attackerBody))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist/digests", strings.NewReader(attackerBody))
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
@@ -590,10 +528,8 @@ func TestAllowlistAddRejectsReplayWithDifferentBody(t *testing.T) {
 	}
 }
 
-// TestAllowlistAddRejectsBodyOverConfiguredCap confirms the per-Handler cap
-// is honoured: an over-cap body returns 413 *before* the auth check runs
-// (so the handler doesn't burn CPU hashing megabytes a malicious caller
-// supplied).
+// TestAllowlistAddRejectsBodyOverConfiguredCap confirms the per-Handler cap is
+// honoured: an over-cap body returns 413 before the auth check runs.
 func TestAllowlistAddRejectsBodyOverConfiguredCap(t *testing.T) {
 	store, err := allowlist.OpenInMemory()
 	if err != nil {
@@ -611,12 +547,12 @@ func TestAllowlistAddRejectsBodyOverConfiguredCap(t *testing.T) {
 	defer srv.Close()
 
 	body := strings.Repeat("x", 1024)
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/allowlist/digests", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", authHeader(t, signer, http.MethodPost, []byte(body)))
+	req.Header.Set("Authorization", authHeader(t, signer, http.MethodPost, "/allowlist/digests", []byte(body)))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -625,6 +561,89 @@ func TestAllowlistAddRejectsBodyOverConfiguredCap(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("over-cap body got status %d, want 413", resp.StatusCode)
+	}
+}
+
+// TestWorkloadPutDeleteRoundtrip exercises the workload routes end to end,
+// including the {name} path parameter and the 404 on a repeated delete.
+func TestWorkloadPutDeleteRoundtrip(t *testing.T) {
+	app, _, signer := testAllowlistApp(t)
+	srv := httptest.NewServer(app)
+	defer srv.Close()
+
+	path := "/allowlist/workloads/web"
+	body := fmt.Sprintf(`{"label":"web","containers":[{"digest":"%s"}]}`, digestA)
+	putReq, _ := http.NewRequest(http.MethodPut, srv.URL+path, strings.NewReader(body))
+	putReq.Header.Set("Content-Type", "application/json")
+	putReq.Header.Set("Authorization", authHeader(t, signer, http.MethodPut, path, []byte(body)))
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	putResp.Body.Close()
+	if putResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("put: got %d, want 204", putResp.StatusCode)
+	}
+
+	al := getAllowlist(t, srv.URL)
+	w, ok := al.Workloads["web"]
+	if !ok || len(w.Containers) != 1 || w.Containers[0].Digest.String() != digestA {
+		t.Fatalf("served workload = %#v", al.Workloads)
+	}
+
+	del := func() int {
+		req, _ := http.NewRequest(http.MethodDelete, srv.URL+path, nil)
+		req.Header.Set("Authorization", authHeader(t, signer, http.MethodDelete, path, nil))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := del(); code != http.StatusNoContent {
+		t.Fatalf("first delete: got %d, want 204", code)
+	}
+	if code := del(); code != http.StatusNotFound {
+		t.Fatalf("second delete: got %d, want 404", code)
+	}
+}
+
+func TestWorkloadPutRejectsInvalidBody(t *testing.T) {
+	app, _, signer := testAllowlistApp(t)
+	srv := httptest.NewServer(app)
+	defer srv.Close()
+
+	path := "/allowlist/workloads/web"
+	body := `{"containers":[{"digest":"sha256:bad"}]}`
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", authHeader(t, signer, http.MethodPut, path, []byte(body)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid workload body: got %d, want 422", resp.StatusCode)
+	}
+}
+
+func TestWorkloadPutRequiresAuth(t *testing.T) {
+	app, _, _ := testAllowlistApp(t)
+	srv := httptest.NewServer(app)
+	defer srv.Close()
+
+	body := fmt.Sprintf(`{"containers":[{"digest":"%s"}]}`, digestA)
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/allowlist/workloads/web", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauth workload put: got %d, want 401", resp.StatusCode)
 	}
 }
 

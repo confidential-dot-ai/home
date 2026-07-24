@@ -1,14 +1,25 @@
 package allowlist
 
 import (
+	"errors"
 	"strconv"
 	"testing"
 
+	pkgallowlist "github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
 const digestA = "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 const digestB = "sha256:b1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+const digestC = "sha256:c1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+
+// oneContainerWorkload builds a minimally-specified entry (policies default to
+// deny) with one main container at digest.
+func oneContainerWorkload(digest types.Digest) pkgallowlist.Workload {
+	return pkgallowlist.Workload{
+		Containers: []pkgallowlist.Container{{Digest: digest}},
+	}
+}
 
 func mustParseDigest(t *testing.T, s string) types.Digest {
 	t.Helper()
@@ -388,7 +399,10 @@ func TestRestoreSnapshotReplacesStateAndPreservesVersion(t *testing.T) {
 	if err := store.Add(oldDigest, "old/image"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RestoreSnapshot("42", map[types.Digest]string{newDigest: "new/image"}); err != nil {
+	if err := store.RestoreSnapshot("42", &pkgallowlist.Allowlist{
+		Schema:  pkgallowlist.Schema,
+		Digests: map[string]string{newDigest.String(): "new/image"},
+	}); err != nil {
 		t.Fatalf("RestoreSnapshot: %v", err)
 	}
 
@@ -415,12 +429,154 @@ func TestRestoreSnapshotRejectsInvalidState(t *testing.T) {
 	defer store.Close()
 
 	for _, version := range []string{"", "0", "-1", "not-a-version"} {
-		if err := store.RestoreSnapshot(version, map[types.Digest]string{}); err == nil {
+		if err := store.RestoreSnapshot(version, &pkgallowlist.Allowlist{Schema: pkgallowlist.Schema, Digests: map[string]string{}}); err == nil {
 			t.Fatalf("RestoreSnapshot accepted version %q", version)
 		}
 	}
 	if err := store.RestoreSnapshot("1", nil); err == nil {
-		t.Fatal("RestoreSnapshot accepted nil digests")
+		t.Fatal("RestoreSnapshot accepted nil allowlist")
+	}
+}
+
+func TestPutAndDeleteWorkloadRoundtrip(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	dA := mustParseDigest(t, digestA)
+	if err := store.PutWorkload("web", oneContainerWorkload(dA)); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	doc, version, err := store.LoadAll()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if version != "2" {
+		t.Fatalf("version after put: got %q, want 2", version)
+	}
+	w, ok := doc.Workloads["web"]
+	if !ok || len(w.Containers) != 1 || w.Containers[0].Digest != dA {
+		t.Fatalf("stored workload = %#v", doc.Workloads)
+	}
+	// Absent policies must have normalized to deny on the way in.
+	if w.Containers[0].Entrypoint.Policy != pkgallowlist.PolicyDeny {
+		t.Fatalf("entrypoint policy = %q, want deny", w.Containers[0].Entrypoint.Policy)
+	}
+
+	// The container digest is now admitted via the workload index.
+	if ok, err := store.Contains(dA); err != nil || !ok {
+		t.Fatalf("Contains(workload digest) = %t, %v; want true, nil", ok, err)
+	}
+
+	found, err := store.DeleteWorkload("web")
+	if err != nil || !found {
+		t.Fatalf("delete: found=%t err=%v", found, err)
+	}
+	if ok, err := store.Contains(dA); err != nil || ok {
+		t.Fatalf("Contains after delete = %t, %v; want false, nil", ok, err)
+	}
+	if found, err := store.DeleteWorkload("web"); err != nil || found {
+		t.Fatalf("re-delete: found=%t err=%v; want false, nil", found, err)
+	}
+}
+
+func TestPutWorkloadRejectsBadName(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	err = store.PutWorkload("bad/name", oneContainerWorkload(mustParseDigest(t, digestA)))
+	if err == nil {
+		t.Fatal("PutWorkload accepted a name with a slash")
+	}
+	if !errors.Is(err, ErrInvalidWorkload) {
+		t.Fatalf("error should wrap ErrInvalidWorkload, got %v", err)
+	}
+}
+
+func TestSeedWorkloadsIsAdditiveAndIdempotent(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	seed := map[string]pkgallowlist.Workload{
+		"web": oneContainerWorkload(mustParseDigest(t, digestA)),
+		"db":  oneContainerWorkload(mustParseDigest(t, digestB)),
+	}
+	added, err := store.SeedWorkloads(seed)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if added != 2 {
+		t.Fatalf("added: got %d, want 2", added)
+	}
+	v1, _, _ := store.ListAll()
+	if v1 != "2" {
+		t.Fatalf("version after seed: got %q, want 2 (one bump)", v1)
+	}
+
+	// Re-seeding the same set adds nothing and does not bump.
+	added, err = store.SeedWorkloads(seed)
+	if err != nil {
+		t.Fatalf("re-seed: %v", err)
+	}
+	if added != 0 {
+		t.Fatalf("re-seed added: got %d, want 0", added)
+	}
+	v2, _, _ := store.ListAll()
+	if v1 != v2 {
+		t.Fatalf("version bumped on no-op re-seed: %q -> %q", v1, v2)
+	}
+}
+
+func TestReplaceAllSwapsFloorAndWorkloads(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.Add(mustParseDigest(t, digestA), "old"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := store.PutWorkload("old-wl", oneContainerWorkload(mustParseDigest(t, digestB))); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	replacement := &pkgallowlist.Allowlist{
+		Schema:  pkgallowlist.Schema,
+		Digests: map[string]string{digestC: "floor-c"},
+		Workloads: map[string]pkgallowlist.Workload{
+			"new-wl": oneContainerWorkload(mustParseDigest(t, digestA)),
+		},
+	}
+	if err := store.ReplaceAll(replacement); err != nil {
+		t.Fatalf("replace all: %v", err)
+	}
+
+	doc, _, err := store.LoadAll()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(doc.Digests) != 1 || doc.Digests[digestC] != "floor-c" {
+		t.Fatalf("floor after replace = %#v", doc.Digests)
+	}
+	if _, ok := doc.Workloads["old-wl"]; ok {
+		t.Fatal("pre-replace workload survived ReplaceAll")
+	}
+	if _, ok := doc.Workloads["new-wl"]; !ok {
+		t.Fatalf("replacement workload missing = %#v", doc.Workloads)
+	}
+	// The old workload's container digest is no longer admitted.
+	if ok, _ := store.Contains(mustParseDigest(t, digestB)); ok {
+		t.Fatal("old workload digest still admitted after ReplaceAll")
 	}
 }
 
