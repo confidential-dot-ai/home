@@ -180,11 +180,14 @@ fix) · **Accepted** (deliberate non-goal, §7).
 `--evidence-fixture` (cds-attest serves fixed `report_data`, DEV ONLY), the `-debug`
 guest variant (host `Exec`/`ReadStream`/`WriteStream` RPCs allowed), `--ratls-platform
 ""` (plaintext CDS), attestation-service `allow_debug=true` and empty `api_keys`
-(unauthenticated `/verify`,`/attest`), and the c8s-verify client downgrades
-(`requireFreshness=false`, empty `measurements`, missing `meshCaPem`). Each is warned
-but not gated out of release builds; the browser downgrades return `ok:true` with
-`warnings[]`, so **the embedding app must inspect `warnings[]`** or the guarantee is
-void.
+(unauthenticated `/verify`,`/attest`), the `c8s luks` hatches
+(`--allow-insecure-store` — cleartext token + passphrases in transit;
+`--allow-host-format` — host-side `luksFormat` exposes the passphrase and the
+dm-crypt master key to that host, outside any TEE), and the c8s-verify client
+downgrades (`requireFreshness=false`, empty `measurements`, missing `meshCaPem`).
+Each is warned but not gated out of release builds; the browser downgrades
+return `ok:true` with `warnings[]`, so **the embedding app must inspect
+`warnings[]`** or the guarantee is void.
 
 ---
 
@@ -207,15 +210,22 @@ If any of these is false, the corresponding guarantee does not hold.
    sufficient for cluster authentication in the default PQ mode: its attestation
    binds the session key and nonce, but not the separately fetched mesh identity
    (§5 Addressable).
+6. **The OpenBao holding LUKS passphrases (`c8s luks`) is as confidential as the
+   volumes it keys.** Postures: an attested store (broker
+   `--openbao-attested=true`), an external customer-run store (the broker is the
+   documented edge of the trust boundary), or the `--kms` chart dev store
+   (unattested, dev-grade — a host reading its memory recovers every
+   passphrase). A volume's confidentiality inherits whichever applies
+   (`docs/luks.md`).
 
 **Supply-chain and external trust roots (load-bearing here):**
-6. **Hardware root of trust** (AMD/Intel/NVIDIA) is sound — if the manufacturer is
+7. **Hardware root of trust** (AMD/Intel/NVIDIA) is sound — if the manufacturer is
    compromised the guarantees fail (not zero-trust). `attestation-{go,rs}` bundle the
    AMD ARK/ASK roots at build time; rotating a root means rebuilding every verifier
    (incl. the browser WASM).
-7. **AMD KDS / Intel PCS** are reachable and authentic; stale-cache windows and the
+8. **AMD KDS / Intel PCS** are reachable and authentic; stale-cache windows and the
    CRL fail-open default (§5 Addressable) are the residual.
-8. **Kata reference measurements are operator-supplied, not signed or published by
+9. **Kata reference measurements are operator-supplied, not signed or published by
    the build.** The shipped path is measured direct-kernel boot: confos compiles the
    bare `vmlinuz`, Kata osbuilder produces the dm-verity rootfs, and the launch digest
    covers OVMF + kernel + the exact Kata command line (including the verity root hash)
@@ -234,12 +244,12 @@ If any of these is false, the corresponding guarantee does not hold.
    verity root hash and launch digest — provided the rebuild uses the same
    e2fsprogs/cryptsetup versions (recorded in `manifest.json`
    `relay_toolchain`). Build and pinning mechanics: `docs/kata-guest-base.md`.
-9. **Host provisioning is correct and is not verified by c8s** — SNP enabled in
+10. **Host provisioning is correct and is not verified by c8s** — SNP enabled in
    BIOS/firmware, GPU CC mode on, vfio-pci binding clean, node labels honest
    (`--hardware-platform` is trusted, not probed). The node-level kata/containerd
    install (kata-deploy, sandbox-device-plugin) is privileged host-root and is
    **not** in the measured TCB — it is trusted operationally.
-10. **CI and the fleet GitOps repo are trusted** to produce and distribute the guest
+11. **CI and the fleet GitOps repo are trusted** to produce and distribute the guest
     artifacts, allowlists, image digests, and operator-supplied measurement pins that
     make attestation meaningful (§5 Open). The pinned upstream Kata runtime, its
     selected OVMF, and the confidential org's runners are supply-chain dependencies
@@ -270,7 +280,7 @@ If any of these is false, the corresponding guarantee does not hold.
 - **Physical attacks** — memory-bus interposers, DIMM substitution, JTAG (TEE.Fail
   2025, Battering RAM 2025, BadRAM 2024). Covered by the physical-host trust
   assumption in §2.
-- **A compromised hardware manufacturer** — see §6(6).
+- **A compromised hardware manufacturer** — see §6(7).
 
 ---
 

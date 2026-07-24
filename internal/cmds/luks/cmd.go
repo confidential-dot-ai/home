@@ -4,9 +4,8 @@
 // Volumes are backed by:
 //
 //   - openbao KV v2 at secret/data/<workload>/luks-<name>, {passphrase: <hex>}
-//   - one of the pluggable "drivers": `local` (hostPath-loop-file, dev
-//     clusters only) or `pvc` (raw-block PersistentVolumeClaim via kubectl);
-//     `csi` is not yet implemented.
+//   - one of the drivers: `local` (hostPath-loop-file, dev clusters only) or
+//     `pvc` (raw-block PersistentVolumeClaim via kubectl)
 //
 // The command emits pod annotations (confidential.ai/luks-<name> +
 // confidential.ai/secret-<name>) consumed by the c8s webhook. It does NOT
@@ -15,10 +14,12 @@
 package luks
 
 import (
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -45,6 +46,8 @@ type baoFlags struct {
 	Addr          string
 	Token         string
 	TokenFile     string
+	CACert        string
+	Timeout       time.Duration
 	AllowInsecure bool
 }
 
@@ -52,9 +55,13 @@ func (f *baoFlags) bind(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&f.Addr, "openbao-addr", "",
 		"openbao/Vault base URL, e.g. https://c8s-openbao.c8s-system.svc:8200 (required)")
 	cmd.Flags().StringVar(&f.Token, "openbao-token", "",
-		"openbao token; SUPPLY VIA --openbao-token-file WHENEVER POSSIBLE (this flag lands in shell history)")
+		"openbao token; SUPPLY VIA --openbao-token-file WHENEVER POSSIBLE (this flag lands in shell history and /proc/<pid>/cmdline, readable by any local user)")
 	cmd.Flags().StringVar(&f.TokenFile, "openbao-token-file", "",
 		"file containing the openbao token")
+	cmd.Flags().StringVar(&f.CACert, "openbao-ca-cert", "",
+		"PEM file with the CA that signs openbao's TLS cert (e.g. an internal cluster CA)")
+	cmd.Flags().DurationVar(&f.Timeout, "openbao-timeout", 15*time.Second,
+		"timeout for each openbao API call")
 	cmd.Flags().BoolVar(&f.AllowInsecure, "allow-insecure-store", false,
 		"permit a plaintext http:// --openbao-addr (dev/test only; token and passphrases transit cleartext)")
 }
@@ -84,5 +91,19 @@ func (f *baoFlags) client() (*bao, error) {
 		}
 		tok = fromFile
 	}
-	return newBao(f.Addr, tok), nil
+	if tok == "" {
+		return nil, errors.New("an openbao token is required (--openbao-token-file or --openbao-token)")
+	}
+	var pool *x509.CertPool
+	if f.CACert != "" {
+		pem, err := os.ReadFile(f.CACert)
+		if err != nil {
+			return nil, fmt.Errorf("read --openbao-ca-cert %q: %w", f.CACert, err)
+		}
+		pool = x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("--openbao-ca-cert %q contains no PEM certificates", f.CACert)
+		}
+	}
+	return newBao(f.Addr, tok, pool, f.Timeout), nil
 }

@@ -26,6 +26,17 @@ func zero(b []byte) {
 
 func trimNewline(s string) string { return strings.TrimRight(s, "\r\n") }
 
+// sanitize strips ASCII control characters from untrusted text (openbao error
+// bodies, kubectl output) so it cannot forge log lines or terminal escapes.
+func sanitize(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
 func cutColon(s string) (a, b string, ok bool) {
 	i := strings.Index(s, ":")
 	if i < 0 {

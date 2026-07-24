@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
+	"regexp"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -24,6 +24,7 @@ func newCreateCmd() *cobra.Command {
 		fstype            string
 		mount             string
 		deferFormat       bool
+		allowHostFormat   bool
 		passphraseEntropy int
 		output            string
 		localBackingDir   string
@@ -46,6 +47,7 @@ func newCreateCmd() *cobra.Command {
 				fstype:          fstype,
 				mount:           mount,
 				deferFormat:     deferFormat,
+				allowHostFormat: allowHostFormat,
 				entropyBytes:    passphraseEntropy,
 				output:          output,
 				localBackingDir: localBackingDir,
@@ -64,10 +66,11 @@ func newCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&workload, "workload", "", "confidential.ai/cw workload id the volume belongs to (required)")
 	cmd.Flags().StringVar(&name, "name", "", "volume name; forms the KV suffix (luks-<name>) and pod annotation (required)")
 	cmd.Flags().StringVar(&sizeStr, "size", "", "volume size as a k8s quantity, e.g. 10Gi (required)")
-	cmd.Flags().StringVar(&driver, "driver", "local", "backing driver: local (loop-file on this host, dev clusters only) | pvc (raw-block PersistentVolumeClaim via kubectl — no node access needed, implies mode=format-if-empty) | csi (not yet implemented)")
+	cmd.Flags().StringVar(&driver, "driver", "local", "backing driver: local (loop-file on this host, dev clusters only) | pvc (raw-block PersistentVolumeClaim via kubectl — no node access needed, implies mode=format-if-empty)")
 	cmd.Flags().StringVar(&fstype, "fstype", "ext4", "filesystem to create inside the LUKS container")
 	cmd.Flags().StringVar(&mount, "mount", "/data", "in-container mountpoint for the app")
 	cmd.Flags().BoolVar(&deferFormat, "defer-format", false, "skip luksFormat + mkfs; emit annotation with mode=format-if-empty so the pod formats on first boot")
+	cmd.Flags().BoolVar(&allowHostFormat, "allow-host-format", false, "permit host-side luksFormat with --driver local: the passphrase and dm-crypt volume key are exposed to THIS host, outside any TEE (dev only, never tenant data)")
 	cmd.Flags().IntVar(&passphraseEntropy, "passphrase-entropy", 32, "raw random bytes before hex encoding (16-128)")
 	cmd.Flags().StringVar(&output, "output", "yaml", "output format: yaml | json")
 	cmd.Flags().StringVar(&localBackingDir, "local-dir", "/var/lib/c8s/luks",
@@ -87,6 +90,7 @@ type createConfig struct {
 	fstype          string
 	mount           string
 	deferFormat     bool
+	allowHostFormat bool
 	entropyBytes    int
 	output          string
 	localBackingDir string
@@ -106,7 +110,6 @@ type createResult struct {
 	KVPath      string            `json:"kv_path"                  yaml:"kv_path"`
 	Annotations map[string]string `json:"annotations"              yaml:"annotations"`
 	Volume      any               `json:"volume,omitempty"         yaml:"volume,omitempty"`
-	VolumeMount any               `json:"volume_mount,omitempty"   yaml:"volume_mount,omitempty"`
 	Notes       []string          `json:"notes,omitempty"          yaml:"notes,omitempty"`
 }
 
@@ -122,12 +125,14 @@ type provisioned struct {
 	mode      string // "open" | "format-if-empty"
 	notes     []string
 	volume    any
-	mount     any
 }
 
 func runCreate(ctx context.Context, bf *baoFlags, cfg createConfig) error {
 	if err := validateCreate(cfg); err != nil {
 		return err
+	}
+	if cfg.driver == "local" && !cfg.deferFormat {
+		fmt.Fprintln(os.Stderr, "warning: --driver local formats the volume on this host — the passphrase and dm-crypt volume key are exposed here, outside any TEE (dev only, never tenant data)")
 	}
 
 	// 1. Passphrase — before touching anything, so we fail early on bad entropy.
@@ -151,7 +156,7 @@ func runCreate(ctx context.Context, bf *baoFlags, cfg createConfig) error {
 	}
 
 	// 3. Provision the backing device.
-	prov, err := provision(ctx, cfg, passphrase)
+	prov, err := provisionFn(ctx, cfg, passphrase)
 	if err != nil {
 		// The KV write above was create-only (cas=0), so this entry is one this
 		// call just created — roll it back so a retry gets a fresh passphrase.
@@ -165,35 +170,45 @@ func runCreate(ctx context.Context, bf *baoFlags, cfg createConfig) error {
 	}
 
 	// 4. Emit the annotations + snippet.
-	kvSubpath := fmt.Sprintf("%s/luks-%s", cfg.workload, cfg.name)
-	kvFullPath := "secret/data/" + kvSubpath
-	annoValue := fmt.Sprintf("%s,mount=%s,secret=%s#passphrase,fstype=%s,mode=%s",
-		prov.devToken, cfg.mount, kvFullPath, cfg.fstype, prov.mode)
+	kvFullPath := "secret/data/" + cfg.workload + "/luks-" + cfg.name
 	result := createResult{
-		Workload:  cfg.workload,
-		Name:      cfg.name,
-		Size:      cfg.size.String(),
-		Driver:    cfg.driver,
-		Device:    prov.device,
-		Claim:     prov.claim,
-		Namespace: prov.namespace,
-		KVPath:    kvFullPath,
-		Annotations: map[string]string{
-			"confidential.ai/luks-" + cfg.name:   annoValue,
-			"confidential.ai/secret-" + cfg.name: kvFullPath + "#passphrase",
-		},
+		Workload:    cfg.workload,
+		Name:        cfg.name,
+		Size:        cfg.size.String(),
+		Driver:      cfg.driver,
+		Device:      prov.device,
+		Claim:       prov.claim,
+		Namespace:   prov.namespace,
+		KVPath:      kvFullPath,
+		Annotations: luksAnnotations(cfg, prov, kvFullPath),
 		Volume:      prov.volume,
-		VolumeMount: prov.mount,
 		Notes:       prov.notes,
 	}
-	// Always remind the operator secrets-inject is required — it isn't part of
-	// the CLI's mint but the Stage 5 admission guard demands it.
+	// The webhook rejects luks-<name> without secrets-inject, and the broker
+	// releases the passphrase only to a policy-granted attested identity.
 	result.Notes = append(result.Notes,
-		`Also set confidential.ai/secrets-inject: "true" on the workload pod`,
-		"(Stage 5 admission rejects luks-<name> without this).")
+		`Also set confidential.ai/secrets-inject: "true" on the workload pod.`,
+		"Grant the workload's identity read access in secretBroker.releasePolicy.rules or the pod cannot boot:",
+		fmt.Sprintf(`{"workloadId": "c8s-%s.%s.svc", "allow": ["%s#passphrase"]}`, cfg.workload, cfg.namespace, kvFullPath),
+		"Passphrase confidentiality is bounded by your openbao's: the chart --kms store is dev-grade (see docs/luks.md).")
 
 	return writeResult(cfg.output, result)
 }
+
+// luksAnnotations builds the pod annotation pair the webhook consumes. Pinned
+// by a golden test: the sibling parser matches this byte-level contract.
+func luksAnnotations(cfg createConfig, prov provisioned, kvFullPath string) map[string]string {
+	annoValue := fmt.Sprintf("%s,mount=%s,secret=%s#passphrase,fstype=%s,mode=%s",
+		prov.devToken, cfg.mount, kvFullPath, cfg.fstype, prov.mode)
+	return map[string]string{
+		"confidential.ai/luks-" + cfg.name:   annoValue,
+		"confidential.ai/secret-" + cfg.name: kvFullPath + "#passphrase",
+	}
+}
+
+// mountPathRe is the annotation-contract charset for --mount: no separators,
+// no whitespace, nothing shell-active.
+var mountPathRe = regexp.MustCompile(`^/[A-Za-z0-9/._-]+$`)
 
 func validateCreate(cfg createConfig) error {
 	if err := validateWorkloadName(cfg.workload, cfg.name); err != nil {
@@ -202,20 +217,20 @@ func validateCreate(cfg createConfig) error {
 	if cfg.size.Sign() <= 0 {
 		return errors.New("--size must be a positive quantity, e.g. 10Gi")
 	}
-	if cfg.mount == "" || cfg.mount[0] != '/' {
-		return errors.New("--mount must be an absolute path")
-	}
-	// The annotation value splits on these, so they must never appear in mount.
-	if strings.ContainsAny(cfg.mount, ",=#\n\r") {
-		return fmt.Errorf("--mount %q must not contain ',', '=', '#', or newlines", cfg.mount)
+	if !mountPathRe.MatchString(cfg.mount) {
+		return fmt.Errorf("--mount %q must be an absolute path using only [A-Za-z0-9/._-] (the annotation contract admits no separators or shell-active characters)", cfg.mount)
 	}
 	if !luksfs.Allowed(cfg.fstype) {
 		return fmt.Errorf("--fstype %q: want ext4 or xfs", cfg.fstype)
 	}
 	switch cfg.driver {
-	case "local", "pvc", "csi":
+	case "local":
+		if !cfg.deferFormat && !cfg.allowHostFormat {
+			return errors.New("--driver local without --defer-format luksFormats on this host, exposing the passphrase and volume key outside any TEE — pass --allow-host-format to confirm (dev only), or --defer-format to format inside the guest")
+		}
+	case "pvc":
 	default:
-		return fmt.Errorf("--driver %q: want local | pvc | csi", cfg.driver)
+		return fmt.Errorf("--driver %q: want local | pvc", cfg.driver)
 	}
 	if err := validateNamespace(cfg.namespace); err != nil {
 		return err
@@ -233,17 +248,20 @@ func luksMode(deferFormat bool) string {
 	return "open"
 }
 
-// provision routes to the selected driver.
+// provisionFn routes to the selected driver. A package var so tests can stub
+// provisioning (same pattern as kubectlRun).
+var provisionFn = provision
+
 func provision(ctx context.Context, cfg createConfig, passphrase []byte) (provisioned, error) {
 	switch cfg.driver {
 	case "local":
-		device, notes, volume, mount, err := provisionLocal(cfg, passphrase)
+		device, notes, volume, err := provisionLocal(cfg, passphrase)
 		if err != nil {
 			return provisioned{}, err
 		}
 		return provisioned{
 			device: device, devToken: "dev=" + device,
-			mode: luksMode(cfg.deferFormat), notes: notes, volume: volume, mount: mount,
+			mode: luksMode(cfg.deferFormat), notes: notes, volume: volume,
 		}, nil
 	case "pvc":
 		claim, notes, err := provisionPVC(ctx, cfg)
@@ -256,82 +274,81 @@ func provision(ctx context.Context, cfg createConfig, passphrase []byte) (provis
 			claim: claim, namespace: cfg.namespace, devToken: "pvc=" + claim,
 			mode: "format-if-empty", notes: notes,
 		}, nil
-	case "csi":
-		return provisioned{}, errors.New("--driver csi: not yet implemented")
 	default:
-		return provisioned{}, fmt.Errorf("--driver %q: want local | pvc | csi", cfg.driver)
+		return provisioned{}, fmt.Errorf("--driver %q: want local | pvc", cfg.driver)
 	}
 }
 
 // provisionLocal creates a loop-file backed device on the host, luksFormats
 // (unless --defer-format), mkfs, and luksCloses so the emitted annotation
 // can be consumed by the workload's kata guest reopening the device.
-func provisionLocal(cfg createConfig, passphrase []byte) (device string, notes []string, volume any, mount any, err error) {
+func provisionLocal(cfg createConfig, passphrase []byte) (device string, notes []string, volume any, err error) {
 	imgPath, err := localImgPath(cfg.localBackingDir, cfg.workload, cfg.name)
 	if err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, err
 	}
 	if err := os.MkdirAll(cfg.localBackingDir, 0o700); err != nil {
-		return "", nil, nil, nil, fmt.Errorf("mkdir %s: %w", cfg.localBackingDir, err)
+		return "", nil, nil, fmt.Errorf("mkdir %s: %w", cfg.localBackingDir, err)
 	}
 	if _, err := os.Stat(imgPath); err == nil {
-		return "", nil, nil, nil, fmt.Errorf("backing file %s already exists — delete it first or use `c8s luks destroy`", imgPath)
+		return "", nil, nil, fmt.Errorf("backing file %s already exists — delete it first or use `c8s luks destroy`", imgPath)
 	}
 	sizeBytes := cfg.size.Value()
 	f, err := os.OpenFile(imgPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return "", nil, nil, nil, fmt.Errorf("create %s: %w", imgPath, err)
+		return "", nil, nil, fmt.Errorf("create %s: %w", imgPath, err)
 	}
 	if err := f.Truncate(sizeBytes); err != nil {
 		f.Close()
 		_ = os.Remove(imgPath)
-		return "", nil, nil, nil, fmt.Errorf("truncate %s to %d: %w", imgPath, sizeBytes, err)
+		return "", nil, nil, fmt.Errorf("truncate %s to %d: %w", imgPath, sizeBytes, err)
 	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(imgPath)
-		return "", nil, nil, nil, err
+		return "", nil, nil, err
 	}
 
 	loopDev, err := losetupFind(imgPath)
 	if err != nil {
 		_ = os.Remove(imgPath)
-		return "", nil, nil, nil, err
+		return "", nil, nil, err
 	}
 
 	if !cfg.deferFormat {
 		if err := luksFormat(loopDev, passphrase); err != nil {
 			_ = losetupDetach(loopDev)
 			_ = os.Remove(imgPath)
-			return "", nil, nil, nil, err
+			return "", nil, nil, err
 		}
 		// luksOpen + mkfs + luksClose so the emitted volume is ready to mount.
 		mapper := "c8s-luks-" + cfg.workload + "-" + cfg.name
 		if err := luksOpen(loopDev, mapper, passphrase); err != nil {
 			_ = losetupDetach(loopDev)
 			_ = os.Remove(imgPath)
-			return "", nil, nil, nil, err
+			return "", nil, nil, err
 		}
 		mapperPath := "/dev/mapper/" + mapper
 		if err := mkfs(cfg.fstype, mapperPath); err != nil {
 			_ = luksClose(mapper)
 			_ = losetupDetach(loopDev)
 			_ = os.Remove(imgPath)
-			return "", nil, nil, nil, err
+			return "", nil, nil, err
 		}
 		if err := luksClose(mapper); err != nil {
 			_ = losetupDetach(loopDev)
 			_ = os.Remove(imgPath)
-			return "", nil, nil, nil, err
+			return "", nil, nil, err
 		}
 	}
 
 	notes = []string{
 		"local driver — the loop device only exists on the host that ran `c8s luks create`.",
 		"For a multi-node cluster the workload pod must be nodeSelector-pinned to this host.",
+		"dev=/dev/loopN is volatile: loop numbers do not survive a node reboot (reattach and update the annotation).",
 	}
-	// The workload PodSpec needs a hostPath volume for the backing file, and
-	// the pod's runtime (kata) must attach the loop device inside the guest.
-	// We emit the volume snippet so the operator can drop it in.
+	// The workload PodSpec needs a hostPath volume for the loop device, and
+	// the pod's runtime (kata) must attach it inside the guest. We emit the
+	// volume snippet so the operator can drop it in.
 	volume = map[string]any{
 		"name": "c8s-luks-" + cfg.name,
 		"hostPath": map[string]string{
@@ -339,7 +356,7 @@ func provisionLocal(cfg createConfig, passphrase []byte) (device string, notes [
 			"type": "BlockDevice",
 		},
 	}
-	return loopDev, notes, volume, nil, nil
+	return loopDev, notes, volume, nil
 }
 
 func writeResult(format string, r createResult) error {

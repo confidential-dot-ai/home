@@ -656,3 +656,20 @@ are not regular files), so the RO mount still prevents a socket-file swap
 without blocking the connect. The same-process broker unit tests cannot catch
 this (listener and client share a UID); `TestListenUnixSetsModeAndGroup` and
 `TestWorkloadClaims_InjectsBrokerSupplementalGroup` guard the two halves.
+
+## Loop in-use detection: sysfs holders and detach-EBUSY are both blind to the guest
+
+`internal/cmds/luks/destroy.go` (`loopUsers`, `fdHolders`)
+
+`/sys/block/loopN/holders` lists only *kernel* stackers (dm/md) that claim the
+device via `bd_link_disk_holder`. The designed consumer of a `c8s luks` local
+volume — a kata VMM with `/dev/loopN` open as a raw host device — is a plain
+userspace fd and appears **nowhere** in sysfs. And since kernel 3.7,
+`LOOP_CLR_FD` on a busy loop doesn't fail: it sets autoclear and detaches
+lazily on last close, so `losetup -d` can't be used as an in-use probe either.
+A destroy guarded by holders alone therefore shreds the KV passphrase under a
+live guest and exits 0. The only honest signal is scanning `/proc/*/fd` for
+the device path (`fdHolders`); keep both checks (holders still catch a
+host-side `cryptsetup open`), and refuse when neither the loop attachment nor
+the backing file exists on this host — that is a wrong-node (or wrong-driver)
+destroy, not an unattached volume.

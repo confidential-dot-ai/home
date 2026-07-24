@@ -131,8 +131,8 @@ func TestProvisionRoutesPVCFormatIfEmpty(t *testing.T) {
 	if prov.devToken != "pvc=c8s-luks-api-data" {
 		t.Errorf("devToken = %q, want pvc=c8s-luks-api-data", prov.devToken)
 	}
-	if prov.volume != nil || prov.mount != nil {
-		t.Errorf("pvc driver must emit no PodSpec extras (webhook attaches the claim), got volume=%v mount=%v", prov.volume, prov.mount)
+	if prov.volume != nil {
+		t.Errorf("pvc driver must emit no PodSpec extras (webhook attaches the claim), got volume=%v", prov.volume)
 	}
 }
 
@@ -201,7 +201,7 @@ func TestRunDestroyPVCInUse(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
-	c := newBao(srv.URL, "root")
+	c := testBao(srv.URL, "root")
 
 	cfg := destroyCfg{workload: "api", name: "data", driver: "pvc", namespace: "default"}
 

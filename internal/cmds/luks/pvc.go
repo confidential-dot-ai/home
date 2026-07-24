@@ -22,7 +22,8 @@ var kubectlRun = func(ctx context.Context, stdin string, args ...string) (string
 	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("kubectl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		// kubectl's stderr carries API-server Status messages — untrusted.
+		return "", fmt.Errorf("kubectl %s: %w: %s", strings.Join(args, " "), err, sanitize(strings.TrimSpace(string(out))))
 	}
 	return string(out), nil
 }
@@ -37,8 +38,8 @@ func claimName(workload, name string) string {
 // namespace via kubectl. Nothing is formatted here — an unbound claim has no
 // device to luksFormat — so the emitted annotation always carries
 // mode=format-if-empty: the pod's c8s-luks-open init container formats the
-// empty device on first boot, inside the TEE boundary, and the passphrase is
-// only ever used by the workload that owns the volume.
+// device on first boot, inside the TEE boundary, and the passphrase is only
+// ever used by the workload that owns the volume.
 func provisionPVC(ctx context.Context, cfg createConfig) (claim string, notes []string, err error) {
 	claim = claimName(cfg.workload, cfg.name)
 
@@ -81,7 +82,8 @@ func provisionPVC(ctx context.Context, cfg createConfig) (claim string, notes []
 
 	notes = []string{
 		"pvc driver — the webhook attaches the claim to the pod (raw volumeDevice on c8s-luks-open); no volume snippet or nodeSelector needed.",
-		"mode=format-if-empty: the pod luksFormats + mkfs the empty device on first boot, so no node access is ever required.",
+		"--namespace must be the workload pod's namespace: the claim is referenced from the pod's namespace.",
+		"mode=format-if-empty formats on first boot whenever no LUKS header is detected — a host presenting a swapped or zeroed device causes a silent reformat (the volume's data is then unreachable, not readable).",
 		"A WaitForFirstConsumer StorageClass leaves the PVC Pending until the first pod schedules — that is normal.",
 	}
 	return claim, notes, nil
@@ -116,7 +118,7 @@ func pvcConsumers(ctx context.Context, claim, namespace string) ([]string, error
 	for _, p := range list.Items {
 		for _, v := range p.Spec.Volumes {
 			if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim {
-				users = append(users, p.Metadata.Name)
+				users = append(users, sanitize(p.Metadata.Name))
 			}
 		}
 	}

@@ -1,6 +1,6 @@
 // Package luksfs is the single allowlist of filesystems c8s will create inside a
-// LUKS mapper. Grow it only alongside the mkfs tooling installed in
-// cmd/luks-open/Dockerfile.
+// LUKS mapper. Any addition must also exist in the mkfs tooling of the image
+// that runs luks-open.
 package luksfs
 
 // Allowed reports whether fstype is one c8s may mkfs and mount.

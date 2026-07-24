@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,23 +18,26 @@ import (
 	"time"
 )
 
-// bao is the minimal openbao/Vault HTTP client the luks CLI needs: KV v2 read,
-// write, delete + list. Kept package-private and dependency-free to match the
-// broker's own minimal client (internal/cmds/secretbroker/openbao.go); reusing
-// the broker's client would drag in its config surface, and this CLI does not
-// need the broker's RA-TLS / AppRole path.
+// bao is the minimal openbao/Vault KV v2 client the luks CLI needs (read,
+// write, delete, list). The broker's client has a disjoint surface (AppRole,
+// RA-TLS), so they deliberately don't share one.
 type bao struct {
 	addr  string
 	token string
 	http  *http.Client
 }
 
-func newBao(addr, token string) *bao {
+func newBao(addr, token string, pool *x509.CertPool, timeout time.Duration) *bao {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if pool != nil {
+		transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
 	return &bao{
 		addr:  strings.TrimRight(addr, "/"),
 		token: token,
 		http: &http.Client{
-			Timeout: 15 * time.Second,
+			Timeout:   timeout,
+			Transport: transport,
 			// KV v2 never needs redirects; following one would replay
 			// X-Vault-Token to whatever host the response names.
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -49,9 +54,8 @@ const (
 	maxErrBodyBytes = 8 << 10
 )
 
-// kvMount is the KV v2 mount the CLI targets. Openbao's default is "secret",
-// same as Vault's; the release-policy examples in
-// internal/cmds/secretbroker/README.md all use this mount.
+// kvMount is the KV v2 mount the CLI targets (openbao's default, same as
+// Vault's).
 const kvMount = "secret"
 
 // kvPath maps a (workload, name) tuple to the openbao path our schema uses:
@@ -81,19 +85,28 @@ func (b *bao) putPassphrase(ctx context.Context, workload, name string, passphra
 			return fmt.Errorf("passphrase contains a JSON-unsafe byte (0x%02x)", c)
 		}
 	}
-	// cas=0 makes this a create-only write: KV v2 rejects it if any version
-	// already exists at the path, so `create` never overwrites (and later
-	// destroys, via rollback) a passphrase it did not just create.
+	// cas=0: create-only — KV v2 rejects the write if any version exists.
 	body := make([]byte, 0, len(passphrase)+64)
 	body = append(body, `{"data":{"passphrase":"`...)
 	body = append(body, passphrase...)
 	body = append(body, `"},"options":{"cas":0}}`...)
 	defer zero(body)
-	if err := b.do(ctx, http.MethodPost, kvPath(workload, name), body, nil); err != nil {
+	var written struct {
+		Data struct {
+			Version int `json:"version"`
+		} `json:"data"`
+	}
+	if err := b.do(ctx, http.MethodPost, kvPath(workload, name), body, &written); err != nil {
 		if isCASConflict(err) {
 			return errVolumeExists
 		}
 		return err
+	}
+	// A KV v1 mount accepts the same POST at the literal data/... path with a
+	// bodiless 204 — and ignores cas, making create-only an overwrite and
+	// destroy's metadata delete a no-op. Fail loudly instead.
+	if written.Data.Version < 1 {
+		return fmt.Errorf("openbao answered the write without data.version — %q does not look like a KV v2 mount (the cas=0 create-only and crypto-shred semantics require v2)", kvMount)
 	}
 	return nil
 }
@@ -198,16 +211,10 @@ type httpError struct {
 	body   string
 }
 
-// Error embeds the untrusted body with control characters stripped so a
-// hostile response cannot forge log lines or terminal escapes.
+// Error embeds the untrusted body sanitized so a hostile response cannot
+// forge log lines or terminal escapes.
 func (e *httpError) Error() string {
-	body := strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return ' '
-		}
-		return r
-	}, e.body)
-	return fmt.Sprintf("openbao HTTP %d: %s", e.status, body)
+	return fmt.Sprintf("openbao HTTP %d: %s", e.status, sanitize(e.body))
 }
 
 func isNotFound(err error) bool {
@@ -237,6 +244,13 @@ func generatePassphrase(bytesN int) ([]byte, error) {
 func readTokenFile(pathToFile string) (string, error) {
 	if pathToFile == "" {
 		return "", nil
+	}
+	fi, err := os.Stat(pathToFile)
+	if err != nil {
+		return "", fmt.Errorf("stat openbao token file %q: %w", pathToFile, err)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		fmt.Fprintf(os.Stderr, "warning: openbao token file %s is group/world-readable (mode %04o); chmod 0600 it\n", pathToFile, fi.Mode().Perm())
 	}
 	b, err := os.ReadFile(pathToFile)
 	if err != nil {
