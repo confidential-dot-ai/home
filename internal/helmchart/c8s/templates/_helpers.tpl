@@ -611,13 +611,14 @@ cache_max_entries = 1024
 {{- end -}}
 
 {{/*
-  c8s.allowlistSeedJSON renders c8s.imageAllowlist as the JSON shape CDS's
-  --allowlist-seed expects ({"version","digests"}). CDS seeds its served
-  /allowlist from it so the first worker pull returns a real list rather than
-  an empty set.
+  c8s.allowlistSeedJSON renders the allowlist document CDS's --allowlist-seed
+  expects: the c8s.imageAllowlist floor under "digests", plus any
+  bootstrapAllowlist.workloads under "workloads" ({} by default). CDS seeds its
+  served /allowlist from it so the first worker pull returns a real list rather
+  than an empty set. The document validates against pkg/allowlist.ParseJSON.
 */}}
 {{- define "c8s.allowlistSeedJSON" -}}
-{{ dict "version" "1" "digests" (include "c8s.imageAllowlist" . | fromJson) | toJson }}
+{{ dict "schema" "c8s.allowlist/v1" "digests" (include "c8s.imageAllowlist" . | fromJson) "workloads" (.Values.nriImagePolicy.bootstrapAllowlist.workloads | default dict) | toJson }}
 {{- end -}}
 
 {{/*

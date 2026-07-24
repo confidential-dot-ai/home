@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	pkgallowlist "github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 	"github.com/confidential-dot-ai/c8s/pkg/workloadclaims"
@@ -24,10 +25,51 @@ const (
 	wlDigestB = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 )
 
-// fakeStore is a workloadDigestChecker over a fixed allowed set.
-type fakeStore map[string]bool
+// fakeStore is an allowlistGate over a floor set and named workload entries.
+type fakeStore struct {
+	floor     map[string]bool
+	workloads map[string]pkgallowlist.Workload
+}
 
-func (s fakeStore) Contains(d types.Digest) (bool, error) { return s[d.String()], nil }
+// floorStore admits the given digests as floor entries (no combination policy).
+func floorStore(digests ...string) fakeStore {
+	f := make(map[string]bool, len(digests))
+	for _, d := range digests {
+		f[d] = true
+	}
+	return fakeStore{floor: f}
+}
+
+func (s fakeStore) Contains(d types.Digest) (bool, error) {
+	if s.floor[d.String()] {
+		return true, nil
+	}
+	for _, w := range s.workloads {
+		for _, cd := range w.Digests() {
+			if cd.String() == d.String() {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (s fakeStore) LoadAll() (*pkgallowlist.Allowlist, string, error) {
+	digs := map[string]string{}
+	for d := range s.floor {
+		digs[d] = ""
+	}
+	return &pkgallowlist.Allowlist{Schema: pkgallowlist.Schema, Digests: digs, Workloads: s.workloads}, "1", nil
+}
+
+func wlDigest(t *testing.T, s string) types.Digest {
+	t.Helper()
+	d, err := types.ParseDigest(s)
+	if err != nil {
+		t.Fatalf("parse digest %q: %v", s, err)
+	}
+	return d
+}
 
 func claimsDERFor(t *testing.T, initDigests, mainDigests []string) []byte {
 	t.Helper()
@@ -101,7 +143,7 @@ func postAttestClaimsWithCSR(t *testing.T, h AttestHandler, challenge, csrPEM st
 func TestAttest_WorkloadClaims_EmbedsExtensionWhenAllowlisted(t *testing.T) {
 	mock := newMockAttestationApi(t, "deadbeef")
 	h := newTestAttestHandler(t, mock.URL, nil)
-	h.AllowlistStore = fakeStore{wlDigestA: true, wlDigestB: true}
+	h.AllowlistStore = floorStore(wlDigestA, wlDigestB)
 
 	digests := []string{wlDigestA, wlDigestB}
 	claimsDER := claimsDERFor(t, nil, digests)
@@ -126,7 +168,7 @@ func TestAttest_WorkloadClaims_EmbedsExtensionWhenAllowlisted(t *testing.T) {
 func TestAttest_WorkloadClaims_RejectsMissingRATLSExtension(t *testing.T) {
 	mock := newMockAttestationApi(t, "deadbeef")
 	h := newTestAttestHandler(t, mock.URL, nil)
-	h.AllowlistStore = fakeStore{wlDigestA: true}
+	h.AllowlistStore = floorStore(wlDigestA)
 
 	digests := []string{wlDigestA}
 	w := postAttestClaimsWithCSR(t, h, issueChallenge(t, h), mustCSR(t), claimsDERFor(t, nil, digests), nil, digests)
@@ -141,7 +183,7 @@ func TestAttest_WorkloadClaims_RejectsMissingRATLSExtension(t *testing.T) {
 func TestAttest_WorkloadClaims_RejectsMismatchedEmbeddedBinding(t *testing.T) {
 	mock := newMockAttestationApi(t, "deadbeef")
 	h := newTestAttestHandler(t, mock.URL, nil)
-	h.AllowlistStore = fakeStore{wlDigestA: true, wlDigestB: true}
+	h.AllowlistStore = floorStore(wlDigestA, wlDigestB)
 
 	sent := claimsDERFor(t, nil, []string{wlDigestA})
 	otherBinding := claimsDERFor(t, nil, []string{wlDigestB}) // CSR binds a different claim
@@ -154,7 +196,7 @@ func TestAttest_WorkloadClaims_RejectsMismatchedEmbeddedBinding(t *testing.T) {
 func TestAttest_WorkloadClaims_RejectsUnallowlistedImage(t *testing.T) {
 	mock := newMockAttestationApi(t, "deadbeef")
 	h := newTestAttestHandler(t, mock.URL, nil)
-	h.AllowlistStore = fakeStore{wlDigestA: true} // B not allowed
+	h.AllowlistStore = floorStore(wlDigestA) // B not allowed
 
 	digests := []string{wlDigestA, wlDigestB}
 	w := postAttestClaims(t, h, issueChallenge(t, h), claimsDERFor(t, nil, digests), nil, digests)
@@ -169,7 +211,7 @@ func TestAttest_WorkloadClaims_RejectsUnallowlistedImage(t *testing.T) {
 func TestAttest_WorkloadClaims_RejectsListNotMatchingClaim(t *testing.T) {
 	mock := newMockAttestationApi(t, "deadbeef")
 	h := newTestAttestHandler(t, mock.URL, nil)
-	h.AllowlistStore = fakeStore{wlDigestA: true, wlDigestB: true}
+	h.AllowlistStore = floorStore(wlDigestA, wlDigestB)
 
 	claimsDER := claimsDERFor(t, nil, []string{wlDigestA}) // claim commits to main A only
 	w := postAttestClaims(t, h, issueChallenge(t, h), claimsDER, nil, []string{wlDigestA, wlDigestB})
@@ -194,7 +236,7 @@ func TestAttest_WorkloadClaims_RejectsWhenNoStoreWired(t *testing.T) {
 func TestAttest_WorkloadClaims_RejectsForgedGovernanceFields(t *testing.T) {
 	mock := newMockAttestationApi(t, "deadbeef")
 	h := newTestAttestHandler(t, mock.URL, nil)
-	h.AllowlistStore = fakeStore{wlDigestA: true}
+	h.AllowlistStore = floorStore(wlDigestA)
 
 	digests := []string{wlDigestA}
 	wd, err := workloadclaims.Digest(nil, digests)
@@ -224,13 +266,42 @@ func TestAttest_WorkloadClaims_RejectsForgedGovernanceFields(t *testing.T) {
 func TestAttest_WorkloadClaims_RejectsSwappedRoleSplit(t *testing.T) {
 	mock := newMockAttestationApi(t, "deadbeef")
 	h := newTestAttestHandler(t, mock.URL, nil)
-	h.AllowlistStore = fakeStore{wlDigestA: true, wlDigestB: true}
+	h.AllowlistStore = floorStore(wlDigestA, wlDigestB)
 
 	claimsDER := claimsDERFor(t, []string{wlDigestA}, []string{wlDigestB}) // init:A, main:B
 	// Lists sent with the roles swapped.
 	w := postAttestClaims(t, h, issueChallenge(t, h), claimsDER, []string{wlDigestB}, []string{wlDigestA})
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status %d (want 403), body=%s", w.Code, w.Body.String())
+	}
+}
+
+// The combination gate: with A and B as workload (non-floor) images pinned by a
+// single entry {init:[A], main:[B]}, the exact claimed set is admitted, but a
+// pod mixing them into one role — a set no single entry authorizes — is denied,
+// even though each image is individually allowlisted.
+func TestAttest_WorkloadClaims_CombinationGate(t *testing.T) {
+	mock := newMockAttestationApi(t, "deadbeef")
+	base := newTestAttestHandler(t, mock.URL, nil)
+	store := fakeStore{workloads: map[string]pkgallowlist.Workload{
+		"web": {
+			InitContainers: []pkgallowlist.Container{{Digest: wlDigest(t, wlDigestA)}},
+			Containers:     []pkgallowlist.Container{{Digest: wlDigest(t, wlDigestB)}},
+		},
+	}}
+
+	exact := base
+	exact.AllowlistStore = store
+	claimsDER := claimsDERFor(t, []string{wlDigestA}, []string{wlDigestB})
+	if w := postAttestClaims(t, exact, issueChallenge(t, exact), claimsDER, []string{wlDigestA}, []string{wlDigestB}); w.Code != http.StatusOK {
+		t.Fatalf("exact set match: status %d, body=%s", w.Code, w.Body.String())
+	}
+
+	mixed := base
+	mixed.AllowlistStore = store
+	mixDER := claimsDERFor(t, nil, []string{wlDigestA, wlDigestB})
+	if w := postAttestClaims(t, mixed, issueChallenge(t, mixed), mixDER, nil, []string{wlDigestA, wlDigestB}); w.Code != http.StatusForbidden {
+		t.Fatalf("mixed set (matches no entry): status %d (want 403), body=%s", w.Code, w.Body.String())
 	}
 }
 

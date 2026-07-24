@@ -2,7 +2,6 @@ package nriimagepolicy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -13,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/confidential-dot-ai/c8s/internal/cache"
 	"github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/allowlistclient"
 )
@@ -21,40 +19,52 @@ import (
 const (
 	pushDigestA = "sha256:0000000000000000000000000000000000000000000000000000000000000001"
 	pushDigestB = "sha256:0000000000000000000000000000000000000000000000000000000000000002"
+	pushDigestC = "sha256:0000000000000000000000000000000000000000000000000000000000000003"
 )
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// floorAllowlist builds a floor-only allowlist (digest -> image label).
+func floorAllowlist(digests map[string]string) *allowlist.Allowlist {
+	return &allowlist.Allowlist{Schema: allowlist.Schema, Digests: digests}
+}
+
+// canonicalBody renders an allowlist as the CDS /allowlist wire body.
+func canonicalBody(t *testing.T, al *allowlist.Allowlist) []byte {
+	t.Helper()
+	b, err := al.Canonical()
+	if err != nil {
+		t.Fatalf("canonical: %v", err)
+	}
+	return b
+}
+
+func admitsDigest(store *policyStore, digest string) bool {
+	snap := store.current()
+	return snap != nil && snap.index != nil && snap.index.AdmitsDigest(digest)
+}
+
+// --- mergeAllowlists ---
+
 func TestMergeAllowlistsOverlay(t *testing.T) {
-	a := &allowlist.Allowlist{Version: "a", Digests: map[string]string{
-		pushDigestA: "image-a",
-	}}
-	b := &allowlist.Allowlist{Version: "b", Digests: map[string]string{
-		pushDigestB: "image-b",
-	}}
+	a := floorAllowlist(map[string]string{pushDigestA: "image-a"})
+	b := floorAllowlist(map[string]string{pushDigestB: "image-b"})
 
 	merged := mergeAllowlists(a, b)
 
-	if got := merged.Version; got != "b" {
-		t.Fatalf("version = %q, want b", got)
-	}
 	if got, ok := merged.Digests[pushDigestA]; !ok || got != "image-a" {
-		t.Fatalf("bootstrap entry missing: %q ok=%v", got, ok)
+		t.Fatalf("floor entry missing: %q ok=%v", got, ok)
 	}
 	if got, ok := merged.Digests[pushDigestB]; !ok || got != "image-b" {
-		t.Fatalf("pushed entry missing: %q ok=%v", got, ok)
+		t.Fatalf("pulled entry missing: %q ok=%v", got, ok)
 	}
 }
 
 func TestMergeAllowlistsOverlayOverrides(t *testing.T) {
-	a := &allowlist.Allowlist{Digests: map[string]string{
-		pushDigestA: "old-image",
-	}}
-	b := &allowlist.Allowlist{Digests: map[string]string{
-		pushDigestA: "new-image",
-	}}
+	a := floorAllowlist(map[string]string{pushDigestA: "old-image"})
+	b := floorAllowlist(map[string]string{pushDigestA: "new-image"})
 
 	merged := mergeAllowlists(a, b)
 	if got := merged.Digests[pushDigestA]; got != "new-image" {
@@ -62,12 +72,26 @@ func TestMergeAllowlistsOverlayOverrides(t *testing.T) {
 	}
 }
 
+func TestMergeAllowlistsCarriesWorkloads(t *testing.T) {
+	a := floorAllowlist(map[string]string{pushDigestA: "floor"})
+	b := &allowlist.Allowlist{
+		Schema:    allowlist.Schema,
+		Workloads: map[string]allowlist.Workload{"w": {Containers: []allowlist.Container{{Digest: mustDigest(t, pushDigestB), Command: allowlist.ArgvPolicy{Policy: allowlist.PolicyAny}, Args: allowlist.ArgvPolicy{Policy: allowlist.PolicyAny}}}}},
+	}
+	merged := mergeAllowlists(a, b)
+	idx := merged.BuildIndex()
+	if !idx.AdmitsDigest(pushDigestA) {
+		t.Fatal("floor digest not admitted after merge")
+	}
+	if !idx.AdmitsContainer(pushDigestB, []string{"anything"}) {
+		t.Fatal("workload digest not admitted after merge")
+	}
+}
+
 func TestMergeAllowlistsNilOverlay(t *testing.T) {
-	a := &allowlist.Allowlist{Version: "a", Digests: map[string]string{
-		pushDigestA: "image-a",
-	}}
+	a := floorAllowlist(map[string]string{pushDigestA: "image-a"})
 	merged := mergeAllowlists(a, nil)
-	if merged.Digests[pushDigestA] != "image-a" || merged.Version != "a" {
+	if merged.Digests[pushDigestA] != "image-a" {
 		t.Fatalf("nil overlay should return a copy of a, got %+v", merged)
 	}
 	// Caller mutating the result must not bleed into a.
@@ -127,18 +151,71 @@ func TestStartupSourceMode(t *testing.T) {
 	}
 }
 
+// --- policyStore epoch anti-rollback ---
+
+func TestPolicyStoreEpochAntiRollback(t *testing.T) {
+	store := newPolicyStore(floorAllowlist(map[string]string{}))
+
+	if !store.apply(floorAllowlist(map[string]string{pushDigestB: "v5"}), 5) {
+		t.Fatal("apply of version 5 rejected")
+	}
+	if store.current().version != 5 {
+		t.Fatalf("version = %d, want 5", store.current().version)
+	}
+
+	// A lower version (rolled-back / withheld CDS) must be ignored.
+	if store.apply(floorAllowlist(map[string]string{pushDigestC: "v3"}), 3) {
+		t.Fatal("rolled-back version 3 was applied")
+	}
+	if store.current().version != 5 {
+		t.Fatalf("version after rollback = %d, want 5 (unchanged)", store.current().version)
+	}
+	if admitsDigest(store, pushDigestC) {
+		t.Fatal("rolled-back digest admitted")
+	}
+	if !admitsDigest(store, pushDigestB) {
+		t.Fatal("version-5 digest dropped by rollback attempt")
+	}
+
+	// A forward version applies.
+	if !store.apply(floorAllowlist(map[string]string{pushDigestC: "v6"}), 6) {
+		t.Fatal("forward version 6 rejected")
+	}
+	if !admitsDigest(store, pushDigestC) {
+		t.Fatal("forward digest not admitted")
+	}
+}
+
+// After a restart the store is fresh (version 0), so it trusts the first pull it
+// sees whatever its version — even one below what a prior process had applied.
+// Rollback protection is per-process-lifetime; state re-syncs from CDS.
+func TestPolicyStoreTrustsFirstVersionAfterRestart(t *testing.T) {
+	// A prior process reached version 9.
+	prior := newPolicyStore(floorAllowlist(map[string]string{}))
+	prior.apply(floorAllowlist(map[string]string{pushDigestB: "v9"}), 9)
+
+	// A restart is a brand-new store; its first apply is trusted regardless of value.
+	fresh := newPolicyStore(floorAllowlist(map[string]string{}))
+	if !fresh.apply(floorAllowlist(map[string]string{pushDigestC: "v3"}), 3) {
+		t.Fatal("fresh store must trust the first version seen after a restart")
+	}
+	if fresh.current().version != 3 {
+		t.Fatalf("version = %d, want 3", fresh.current().version)
+	}
+}
+
 // --- pull loop ---
 
-// flippingHandler counts ETag-conditional hits and answers 200 or 304
-// based on the configured cycle.
+// flippingHandler serves a canonical allowlist body per version with a weak
+// ETag, honoring If-None-Match with a 304. idx advances after each 200 so a
+// test can script a version sequence.
 type flippingHandler struct {
 	mu         sync.Mutex
-	versions   []string // sequence of versions to serve; index advances after each 200
-	idx        int
-	hits       atomic.Int32
-	digestByV  map[string]string
-	imageByV   map[string]string
-	statusCode int // overrides 200/304 logic when non-zero
+	versions   []string          // sequence of versions to serve
+	idx        int               // current position in versions
+	hits       atomic.Int32      // total requests seen
+	bodyByV    map[string][]byte // canonical allowlist body per version
+	statusCode int               // overrides normal logic when non-zero
 }
 
 func (f *flippingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -160,28 +237,24 @@ func (f *flippingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Content-Type", "application/json")
-	out := map[string]any{
-		"version": version,
-		"digests": map[string]string{f.digestByV[version]: f.imageByV[version]},
-	}
-	_ = json.NewEncoder(w).Encode(out)
+	_, _ = w.Write(f.bodyByV[version])
 	if f.idx < len(f.versions)-1 {
 		f.idx++
 	}
 }
 
-func TestPullLoopOnly200UpdatesCacheAndETag(t *testing.T) {
+func TestPullLoopOnly200UpdatesIndexAndETag(t *testing.T) {
 	srv := httptest.NewServer(&flippingHandler{
-		versions:  []string{"1", "2"},
-		digestByV: map[string]string{"1": pushDigestA, "2": pushDigestB},
-		imageByV:  map[string]string{"1": "image-1", "2": "image-2"},
+		versions: []string{"1", "2"},
+		bodyByV: map[string][]byte{
+			"1": canonicalBody(t, floorAllowlist(map[string]string{pushDigestA: "image-1"})),
+			"2": canonicalBody(t, floorAllowlist(map[string]string{pushDigestB: "image-2"})),
+		},
 	})
 	defer srv.Close()
 
 	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
-	c := cache.NewPolicyCache()
-	bootstrap := &allowlist.Allowlist{Digests: map[string]string{}}
-	c.SetAllowlist(bootstrap)
+	store := newPolicyStore(floorAllowlist(map[string]string{}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -189,47 +262,42 @@ func TestPullLoopOnly200UpdatesCacheAndETag(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runPullLoop(ctx, pullLoopArgs{
-			client:    client,
-			cache:     c,
-			bootstrap: bootstrap,
-			interval:  20 * time.Millisecond,
-			timeout:   time.Second,
-			etag:      "",
-			logger:    discardLogger(),
+			client:   client,
+			store:    store,
+			interval: 20 * time.Millisecond,
+			timeout:  time.Second,
+			etag:     "",
+			logger:   discardLogger(),
 		})
 		close(done)
 	}()
 
-	// Wait until the cache has reflected both 200 responses.
 	deadline := time.Now().Add(2 * time.Second)
-	for {
-		wl := c.GetAllowlist()
-		if wl != nil && wl.Digests[pushDigestB] != "" {
-			break
-		}
+	for !admitsDigest(store, pushDigestB) {
 		if time.Now().After(deadline) {
-			t.Fatalf("pull loop did not pick up the second update; cache=%+v", wl.Digests)
+			t.Fatalf("pull loop did not pick up the second update; version=%d", store.current().version)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if store.current().version != 2 {
+		t.Fatalf("applied version = %d, want 2", store.current().version)
 	}
 
 	cancel()
 	<-done
 }
 
-func TestPullLoop304LeavesCacheUntouched(t *testing.T) {
+func TestPullLoop304LeavesIndexUntouched(t *testing.T) {
 	srv := httptest.NewServer(&flippingHandler{
-		versions:  []string{"1"},
-		digestByV: map[string]string{"1": pushDigestA},
-		imageByV:  map[string]string{"1": "image-1"},
+		versions: []string{"1"},
+		bodyByV:  map[string][]byte{"1": canonicalBody(t, floorAllowlist(map[string]string{pushDigestA: "image-1"}))},
 	})
 	defer srv.Close()
 
 	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
-	c := cache.NewPolicyCache()
-	preload := &allowlist.Allowlist{Digests: map[string]string{pushDigestA: "image-1"}}
-	c.SetAllowlist(preload)
-	bootstrap := &allowlist.Allowlist{Digests: map[string]string{}}
+	store := newPolicyStore(floorAllowlist(map[string]string{}))
+	store.apply(floorAllowlist(map[string]string{pushDigestA: "image-1"}), 1)
+	before := store.current()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -238,37 +306,34 @@ func TestPullLoop304LeavesCacheUntouched(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runPullLoop(ctx, pullLoopArgs{
-			client:    client,
-			cache:     c,
-			bootstrap: bootstrap,
-			interval:  10 * time.Millisecond,
-			timeout:   time.Second,
-			etag:      `W/"1"`,
-			logger:    discardLogger(),
+			client:   client,
+			store:    store,
+			interval: 10 * time.Millisecond,
+			timeout:  time.Second,
+			etag:     `W/"1"`,
+			logger:   discardLogger(),
 		})
 		close(done)
 	}()
 
-	// Give the loop time to run a few ticks; verify cache is unchanged
-	// (i.e. still references preload, not a merge with empty bootstrap).
+	// A few 304 ticks must not swap the snapshot.
 	time.Sleep(100 * time.Millisecond)
-	wl := c.GetAllowlist()
-	if wl != preload {
-		t.Fatalf("304 ticks should leave cache pointer unchanged; got=%p want=%p", wl, preload)
+	if store.current() != before {
+		t.Fatal("304 ticks should leave the snapshot pointer unchanged")
 	}
 
 	cancel()
 	<-done
 }
 
-func TestPullLoop5xxLeavesCacheAndETagUntouched(t *testing.T) {
+func TestPullLoop5xxLeavesIndexUntouched(t *testing.T) {
 	srv := httptest.NewServer(&flippingHandler{statusCode: http.StatusInternalServerError})
 	defer srv.Close()
 
 	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
-	c := cache.NewPolicyCache()
-	preload := &allowlist.Allowlist{Digests: map[string]string{pushDigestA: "image-1"}}
-	c.SetAllowlist(preload)
+	store := newPolicyStore(floorAllowlist(map[string]string{}))
+	store.apply(floorAllowlist(map[string]string{pushDigestA: "image-1"}), 5)
+	before := store.current()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -276,20 +341,19 @@ func TestPullLoop5xxLeavesCacheAndETagUntouched(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runPullLoop(ctx, pullLoopArgs{
-			client:    client,
-			cache:     c,
-			bootstrap: &allowlist.Allowlist{Digests: map[string]string{}},
-			interval:  10 * time.Millisecond,
-			timeout:   time.Second,
-			etag:      `W/"5"`,
-			logger:    discardLogger(),
+			client:   client,
+			store:    store,
+			interval: 10 * time.Millisecond,
+			timeout:  time.Second,
+			etag:     `W/"5"`,
+			logger:   discardLogger(),
 		})
 		close(done)
 	}()
 
 	time.Sleep(80 * time.Millisecond)
-	if c.GetAllowlist() != preload {
-		t.Fatal("5xx ticks should leave cache pointer unchanged")
+	if store.current() != before {
+		t.Fatal("5xx ticks should leave the snapshot pointer unchanged")
 	}
 
 	cancel()
@@ -298,18 +362,13 @@ func TestPullLoop5xxLeavesCacheAndETagUntouched(t *testing.T) {
 
 func TestPullLoopMergesBootstrapWithPulled(t *testing.T) {
 	srv := httptest.NewServer(&flippingHandler{
-		versions:  []string{"1"},
-		digestByV: map[string]string{"1": pushDigestB},
-		imageByV:  map[string]string{"1": "pulled-image"},
+		versions: []string{"1"},
+		bodyByV:  map[string][]byte{"1": canonicalBody(t, floorAllowlist(map[string]string{pushDigestB: "pulled-image"}))},
 	})
 	defer srv.Close()
 
 	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
-	bootstrap := &allowlist.Allowlist{Digests: map[string]string{
-		pushDigestA: "bootstrap-image",
-	}}
-	c := cache.NewPolicyCache()
-	c.SetAllowlist(bootstrap)
+	store := newPolicyStore(floorAllowlist(map[string]string{pushDigestA: "bootstrap-image"}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -317,30 +376,78 @@ func TestPullLoopMergesBootstrapWithPulled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runPullLoop(ctx, pullLoopArgs{
-			client:    client,
-			cache:     c,
-			bootstrap: bootstrap,
-			interval:  10 * time.Millisecond,
-			timeout:   time.Second,
-			etag:      "",
-			logger:    discardLogger(),
+			client:   client,
+			store:    store,
+			interval: 10 * time.Millisecond,
+			timeout:  time.Second,
+			etag:     "",
+			logger:   discardLogger(),
 		})
 		close(done)
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for {
-		wl := c.GetAllowlist()
-		if wl != nil && wl.Digests[pushDigestB] != "" {
-			if wl.Digests[pushDigestA] != "bootstrap-image" {
-				t.Fatalf("bootstrap entry lost after pull; cache=%+v", wl.Digests)
-			}
-			break
-		}
+	for !admitsDigest(store, pushDigestB) {
 		if time.Now().After(deadline) {
-			t.Fatalf("pull loop never delivered the pulled entry; cache=%+v", wl)
+			t.Fatal("pull loop never delivered the pulled entry")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if !admitsDigest(store, pushDigestA) {
+		t.Fatal("bootstrap floor entry lost after pull")
+	}
+
+	cancel()
+	<-done
+}
+
+// TestPullLoopIgnoresRolledBackFetch drives the anti-rollback guard through the
+// fetch path: CDS serves version 5, then a withheld/rolled-back version 3. The
+// loop must keep version 5 and never admit the rolled-back digest.
+func TestPullLoopIgnoresRolledBackFetch(t *testing.T) {
+	srv := httptest.NewServer(&flippingHandler{
+		versions: []string{"5", "3"},
+		bodyByV: map[string][]byte{
+			"5": canonicalBody(t, floorAllowlist(map[string]string{pushDigestB: "v5"})),
+			"3": canonicalBody(t, floorAllowlist(map[string]string{pushDigestC: "v3"})),
+		},
+	})
+	defer srv.Close()
+
+	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
+	store := newPolicyStore(floorAllowlist(map[string]string{}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		runPullLoop(ctx, pullLoopArgs{
+			client:   client,
+			store:    store,
+			interval: 15 * time.Millisecond,
+			timeout:  time.Second,
+			etag:     "",
+			logger:   discardLogger(),
+		})
+		close(done)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !admitsDigest(store, pushDigestB) {
+		if time.Now().After(deadline) {
+			t.Fatal("pull loop never applied version 5")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Let the loop fetch the rolled-back version 3 several times.
+	time.Sleep(150 * time.Millisecond)
+	if admitsDigest(store, pushDigestC) {
+		t.Fatal("rolled-back version 3 digest was admitted")
+	}
+	if store.current().version != 5 {
+		t.Fatalf("version = %d, want 5 (rollback ignored)", store.current().version)
 	}
 
 	cancel()
@@ -352,27 +459,21 @@ func TestPullInitialSucceedsAfterTransientFailures(t *testing.T) {
 	allowlistApiInitialDelay = time.Millisecond
 	defer func() { allowlistApiInitialDelay = orig }()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer srv.Close()
-
-	// We can't easily inject a mock Client (concrete type), so spin up
-	// an httptest server that fails the first two requests then returns
-	// 200 with valid JSON. Reuse the existing allowlistclient.Client.
+	body := canonicalBody(t, floorAllowlist(map[string]string{pushDigestB: "pulled-image"}))
 	var n atomic.Int32
-	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if n.Add(1) <= 2 {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
 		w.Header().Set("ETag", `W/"1"`)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"version":"1","digests":{"` + pushDigestB + `":"pulled-image"}}`))
-	})
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
 
 	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 2 * time.Second})
-	c := cache.NewPolicyCache()
-	bootstrap := &allowlist.Allowlist{Digests: map[string]string{pushDigestA: "bootstrap-image"}}
-	c.SetAllowlist(bootstrap)
+	store := newPolicyStore(floorAllowlist(map[string]string{pushDigestA: "bootstrap-image"}))
 
 	pluginErrCh := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -380,8 +481,7 @@ func TestPullInitialSucceedsAfterTransientFailures(t *testing.T) {
 
 	etag, err := pullInitial(ctx, pullArgs{
 		client:      client,
-		cache:       c,
-		bootstrap:   bootstrap,
+		store:       store,
 		timeout:     time.Second,
 		pluginErrCh: pluginErrCh,
 		logger:      discardLogger(),
@@ -392,8 +492,11 @@ func TestPullInitialSucceedsAfterTransientFailures(t *testing.T) {
 	if etag != `W/"1"` {
 		t.Fatalf("etag = %q, want W/\"1\"", etag)
 	}
-	if got := c.GetAllowlist().Digests[pushDigestB]; got != "pulled-image" {
-		t.Fatalf("cache missing pulled entry: %+v", c.GetAllowlist().Digests)
+	if !admitsDigest(store, pushDigestB) {
+		t.Fatal("store missing pulled entry")
+	}
+	if !admitsDigest(store, pushDigestA) {
+		t.Fatal("store missing bootstrap floor entry")
 	}
 }
 
@@ -408,15 +511,14 @@ func TestPullInitialFailsAfterMaxRetries(t *testing.T) {
 	defer srv.Close()
 
 	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 200 * time.Millisecond})
-	c := cache.NewPolicyCache()
+	store := newPolicyStore(floorAllowlist(map[string]string{pushDigestA: "bootstrap-image"}))
 	pluginErrCh := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	_, err := pullInitial(ctx, pullArgs{
 		client:      client,
-		cache:       c,
-		bootstrap:   &allowlist.Allowlist{Digests: map[string]string{}},
+		store:       store,
 		timeout:     200 * time.Millisecond,
 		pluginErrCh: pluginErrCh,
 		logger:      discardLogger(),
@@ -429,6 +531,10 @@ func TestPullInitialFailsAfterMaxRetries(t *testing.T) {
 	if errors.Is(err, errPluginDied) {
 		t.Fatalf("fetch failure misclassified as errPluginDied: %v", err)
 	}
+	// The seeded floor still enforces after the failure.
+	if !admitsDigest(store, pushDigestA) {
+		t.Fatal("bootstrap floor lost after failed initial pull")
+	}
 }
 
 // A plugin-half death during init wraps errPluginDied so run() can treat it as
@@ -438,8 +544,7 @@ func TestPullInitialPluginDeathWrapsErrPluginDied(t *testing.T) {
 	pluginErrCh <- errors.New("nri socket closed")
 	_, err := pullInitial(context.Background(), pullArgs{
 		client:      allowlistclient.NewClientWithHTTP("https://unused", &http.Client{}),
-		cache:       cache.NewPolicyCache(),
-		bootstrap:   &allowlist.Allowlist{Digests: map[string]string{}},
+		store:       newPolicyStore(floorAllowlist(map[string]string{})),
 		timeout:     time.Second,
 		pluginErrCh: pluginErrCh,
 		logger:      discardLogger(),
@@ -465,29 +570,27 @@ func TestPullInitialNotModifiedDoesNotDereferenceNilAllowlist(t *testing.T) {
 	defer srv.Close()
 
 	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 200 * time.Millisecond})
-	c := cache.NewPolicyCache()
-	bootstrap := &allowlist.Allowlist{Digests: map[string]string{pushDigestA: "bootstrap-image"}}
-	c.SetAllowlist(bootstrap)
+	store := newPolicyStore(floorAllowlist(map[string]string{pushDigestA: "bootstrap-image"}))
+	before := store.current()
 	pluginErrCh := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	_, err := pullInitial(ctx, pullArgs{
 		client:      client,
-		cache:       c,
-		bootstrap:   bootstrap,
+		store:       store,
 		timeout:     200 * time.Millisecond,
 		pluginErrCh: pluginErrCh,
 		logger:      discardLogger(),
 	})
 	if err == nil {
-		t.Fatal("expected error for initial 304 without cached CDS allowlist")
+		t.Fatal("expected error for initial 304 without a pulled allowlist")
 	}
 	if !errors.Is(err, errInitialAllowlistNotModified) {
 		t.Fatalf("expected errInitialAllowlistNotModified, got %v", err)
 	}
-	if c.GetAllowlist() != bootstrap {
-		t.Fatal("initial 304 should leave cache pointer unchanged")
+	if store.current() != before {
+		t.Fatal("initial 304 should leave the snapshot pointer unchanged")
 	}
 }
 
@@ -498,7 +601,7 @@ func TestPullInitialCancelledMidRetry(t *testing.T) {
 	defer srv.Close()
 
 	client := allowlistclient.NewClientWithHTTP(srv.URL, &http.Client{Timeout: 200 * time.Millisecond})
-	c := cache.NewPolicyCache()
+	store := newPolicyStore(floorAllowlist(map[string]string{}))
 	pluginErrCh := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -510,8 +613,7 @@ func TestPullInitialCancelledMidRetry(t *testing.T) {
 
 	etag, err := pullInitial(ctx, pullArgs{
 		client:      client,
-		cache:       c,
-		bootstrap:   &allowlist.Allowlist{Digests: map[string]string{}},
+		store:       store,
 		timeout:     200 * time.Millisecond,
 		pluginErrCh: pluginErrCh,
 		logger:      discardLogger(),
@@ -521,5 +623,23 @@ func TestPullInitialCancelledMidRetry(t *testing.T) {
 	}
 	if etag != "" {
 		t.Fatalf("cancellation should return empty etag, got %q", etag)
+	}
+}
+
+// TestParseVersion covers the ETag counter extraction used for anti-rollback.
+func TestParseVersion(t *testing.T) {
+	for _, tc := range []struct {
+		etag string
+		want uint64
+	}{
+		{`W/"5"`, 5},
+		{`"7"`, 7},
+		{"12", 12},
+		{"", 0},
+		{`W/"not-a-number"`, 0},
+	} {
+		if got := parseVersion(tc.etag); got != tc.want {
+			t.Errorf("parseVersion(%q) = %d, want %d", tc.etag, got, tc.want)
+		}
 	}
 }

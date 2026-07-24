@@ -13,16 +13,29 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
+	pkgallowlist "github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
 const (
 	digA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	digB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	digC = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	digD = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 )
+
+func mustDigest(t *testing.T, s string) types.Digest {
+	t.Helper()
+	d, err := types.ParseDigest(s)
+	if err != nil {
+		t.Fatalf("parse digest %q: %v", s, err)
+	}
+	return d
+}
 
 // coreImages names every default-required component so an allowlist built from
 // it passes the core-component gate.
@@ -37,10 +50,12 @@ func coreImages() map[string]string {
 	return m
 }
 
+// writeAllowlistFile writes a valid canonical allowlist document (schema + a
+// floor digest map) and returns its path.
 func writeAllowlistFile(t *testing.T, dir string, digests map[string]string) string {
 	t.Helper()
 	path := filepath.Join(dir, "allowlist.json")
-	data, err := json.Marshal(map[string]any{"version": "1", "digests": digests})
+	data, err := json.Marshal(map[string]any{"schema": pkgallowlist.Schema, "digests": digests})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -66,9 +81,18 @@ func writeOperatorKey(t *testing.T, dir string) (keyPath string) {
 }
 
 // recordingCDS is an httptest server that records the HTTP methods it saw and
-// serves an empty allowlist on GET.
+// serves an empty (but valid) canonical allowlist on GET.
 func recordingCDS(t *testing.T) (url string, methods *[]string) {
 	t.Helper()
+	empty := pkgallowlist.Allowlist{
+		Schema:    pkgallowlist.Schema,
+		Digests:   map[string]string{},
+		Workloads: map[string]pkgallowlist.Workload{},
+	}
+	body, err := empty.Canonical()
+	if err != nil {
+		t.Fatalf("canonical: %v", err)
+	}
 	var mu sync.Mutex
 	seen := []string{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -76,7 +100,9 @@ func recordingCDS(t *testing.T) (url string, methods *[]string) {
 		seen = append(seen, r.Method)
 		mu.Unlock()
 		if r.Method == http.MethodGet {
-			_ = json.NewEncoder(w).Encode(types.AllowlistListResponse{Version: "1", Digests: map[types.Digest]string{}})
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("ETag", `W/"1"`)
+			w.Write(body)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -146,6 +172,36 @@ func TestMissingComponentsMatchesRealChartImages(t *testing.T) {
 	got := missingComponents(chartImages, defaultRequiredComponents)
 	if len(got) != 1 || got[0] != "nginx" {
 		t.Fatalf("dropping the nginx image should report exactly [nginx], got %v", got)
+	}
+}
+
+// TestUploadImageLabelsScansWorkloads proves the upload component guard scans
+// workload container images, not just the floor: an allowlist with an empty
+// floor but component images on its workload containers satisfies every
+// required component.
+func TestUploadImageLabelsScansWorkloads(t *testing.T) {
+	digits := "0123456789abcdef"
+	var ctrs []pkgallowlist.Container
+	for i, comp := range defaultRequiredComponents {
+		d := "sha256:" + string(digits[i]) + "000000000000000000000000000000000000000000000000000000000000000"
+		ctrs = append(ctrs, pkgallowlist.Container{
+			Digest: mustDigest(t, d),
+			Image:  "ghcr.io/confidential-dot-ai/" + comp + "@" + d,
+		})
+	}
+	al := &pkgallowlist.Allowlist{
+		Schema:    pkgallowlist.Schema,
+		Digests:   map[string]string{},
+		Workloads: map[string]pkgallowlist.Workload{"core": {Containers: ctrs}},
+	}
+	if got := missingComponents(uploadImageLabels(al), defaultRequiredComponents); len(got) != 0 {
+		t.Fatalf("workload container images should satisfy the guard, missing: %v", got)
+	}
+
+	// An allowlist with neither floor nor workload component images reports all.
+	empty := &pkgallowlist.Allowlist{Schema: pkgallowlist.Schema}
+	if got := missingComponents(uploadImageLabels(empty), defaultRequiredComponents); len(got) != len(defaultRequiredComponents) {
+		t.Fatalf("empty allowlist should be missing every component, got %v", got)
 	}
 }
 
@@ -221,6 +277,31 @@ func TestHTTPRefusedWithoutInsecure(t *testing.T) {
 	}
 }
 
+func TestDiffExitCodeNonZeroOnDifference(t *testing.T) {
+	dir := t.TempDir()
+	file := writeAllowlistFile(t, dir, coreImages())
+	url, _ := recordingCDS(t) // serves an empty live allowlist
+
+	_, _, err := runCmd("diff", file, "--url", url, "--insecure", "--exit-code")
+	if err == nil {
+		t.Fatal("expected --exit-code to fail when the file differs from live")
+	}
+}
+
+func TestDiffNoChanges(t *testing.T) {
+	dir := t.TempDir()
+	file := writeAllowlistFile(t, dir, map[string]string{}) // empty, matches empty live
+	url, _ := recordingCDS(t)
+
+	out, _, err := runCmd("diff", file, "--url", url, "--insecure", "--exit-code")
+	if err != nil {
+		t.Fatalf("no-change diff should exit zero, got %v", err)
+	}
+	if !strings.Contains(out, "no changes") {
+		t.Fatalf("expected 'no changes', got:\n%s", out)
+	}
+}
+
 func TestAddDryRunMakesNoCall(t *testing.T) {
 	url, methods := recordingCDS(t)
 	_, _, err := runCmd("add", digA, "registry/app@"+digA, "--url", url, "--dry-run")
@@ -232,11 +313,18 @@ func TestAddDryRunMakesNoCall(t *testing.T) {
 	}
 }
 
+func TestAddRejectsWildcardImage(t *testing.T) {
+	url, _ := recordingCDS(t)
+	if _, _, err := runCmd("add", digA, "*", "--url", url, "--insecure", "--dry-run"); err == nil {
+		t.Fatal("expected a bare-wildcard image to be rejected")
+	}
+}
+
 func TestWriteRequiresOperatorCredential(t *testing.T) {
 	url, _ := recordingCDS(t)
 	// No key and no env: a real (non-dry-run) add must fail before writing.
 	t.Setenv(envOperatorKey, "")
-	_, _, err := runCmd("add", digA, "registry/app@"+digA, "--url", url)
+	_, _, err := runCmd("add", digA, "registry/app@"+digA, "--url", url, "--insecure")
 	if err == nil {
 		t.Fatal("expected add without an operator key to fail")
 	}
@@ -275,7 +363,7 @@ func repeat(s string, n int) string {
 // guard against accidental duplicate flag registration panics.
 func TestNewCmdWiring(t *testing.T) {
 	cmd := NewCmd()
-	want := []string{"list", "export", "diff", "add", "remove", "upload"}
+	want := []string{"list", "export", "diff", "add", "remove", "upload", "workload", "lint", "inspect-image"}
 	for _, name := range want {
 		found := false
 		for _, c := range cmd.Commands() {
@@ -289,4 +377,29 @@ func TestNewCmdWiring(t *testing.T) {
 		}
 	}
 	_ = fmt.Sprint(cmd.Use)
+}
+
+// TestWorkloadCmdWiring pins the workload subcommand tree.
+func TestWorkloadCmdWiring(t *testing.T) {
+	cmd := NewCmd()
+	for _, c := range cmd.Commands() {
+		if c.Name() != "workload" {
+			continue
+		}
+		want := []string{"list", "get", "apply", "edit", "delete"}
+		for _, name := range want {
+			found := false
+			for _, sc := range c.Commands() {
+				if sc.Name() == name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("workload subcommand %q not registered", name)
+			}
+		}
+		return
+	}
+	t.Fatal("workload command not registered")
 }

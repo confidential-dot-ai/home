@@ -23,9 +23,9 @@ import (
 
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 
-	internalallowlist "github.com/confidential-dot-ai/c8s/internal/allowlist"
 	"github.com/confidential-dot-ai/c8s/internal/lbdiscovery"
 	"github.com/confidential-dot-ai/c8s/internal/localverify"
+	pkgallowlist "github.com/confidential-dot-ai/c8s/pkg/allowlist"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
@@ -71,7 +71,7 @@ func tlsLBServer(t *testing.T, measurementChallenge []byte) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(doc)
 	})
-	mux.HandleFunc("GET /allowlist", seededAllowlistHandler(t).HandleList)
+	mux.HandleFunc("GET /allowlist", seededAllowlistHandler(t))
 
 	srv := httptest.NewUnstartedServer(mux)
 	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
@@ -80,23 +80,24 @@ func tlsLBServer(t *testing.T, measurementChallenge []byte) *httptest.Server {
 	return srv
 }
 
-// seededAllowlistHandler returns a CDS allowlist read handler over an
-// in-memory store seeded with digA.
-func seededAllowlistHandler(t *testing.T) internalallowlist.Handler {
+// seededAllowlistHandler serves a canonical allowlist (floor seeded with digA)
+// as CDS's read endpoint would.
+func seededAllowlistHandler(t *testing.T) http.HandlerFunc {
 	t.Helper()
-	store, err := internalallowlist.OpenInMemory()
+	al := pkgallowlist.Allowlist{
+		Schema:    pkgallowlist.Schema,
+		Digests:   map[string]string{digA: "registry/c8s/cds@" + digA},
+		Workloads: map[string]pkgallowlist.Workload{},
+	}
+	body, err := al.Canonical()
 	if err != nil {
-		t.Fatalf("open store: %v", err)
+		t.Fatalf("canonical: %v", err)
 	}
-	t.Cleanup(func() { store.Close() })
-	digest, err := types.ParseDigest(digA)
-	if err != nil {
-		t.Fatal(err)
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `W/"1"`)
+		w.Write(body)
 	}
-	if err := store.Add(digest, "registry/c8s/cds@"+digA); err != nil {
-		t.Fatalf("seed store: %v", err)
-	}
-	return internalallowlist.Handler{Store: &store}
 }
 
 // approvingVerify stubs the verifier: approve, honoring the measurement-pin
@@ -182,7 +183,7 @@ func ratlsCDSServer(t *testing.T) *httptest.Server {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /allowlist", seededAllowlistHandler(t).HandleList)
+	mux.HandleFunc("GET /allowlist", seededAllowlistHandler(t))
 
 	srv := httptest.NewUnstartedServer(mux)
 	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
