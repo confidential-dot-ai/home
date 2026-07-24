@@ -213,7 +213,7 @@ func TestMutatePodInjectsLUKSContainer(t *testing.T) {
 		LUKS: []luksVolume{{
 			Name: "data", Dev: "/dev/vdb", Mount: "/data",
 			SecretName: "data",
-			FSType: "ext4", Mode: "open",
+			FSType:     "ext4", Mode: "open",
 		}},
 	}
 	mutatePod(pod, inj, luksTestConfig())
@@ -294,7 +294,7 @@ func TestMutatePodInjectsPVCLUKSVolume(t *testing.T) {
 		LUKS: []luksVolume{{
 			Name: "data", PVC: "c8s-luks-api-data", Mount: "/data",
 			SecretName: "data",
-			FSType: "ext4", Mode: "format-if-empty",
+			FSType:     "ext4", Mode: "format-if-empty",
 		}},
 	}
 	mutatePod(pod, inj, luksTestConfig())
