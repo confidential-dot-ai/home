@@ -31,9 +31,23 @@ func newBao(addr, token string) *bao {
 	return &bao{
 		addr:  strings.TrimRight(addr, "/"),
 		token: token,
-		http:  &http.Client{Timeout: 15 * time.Second},
+		http: &http.Client{
+			Timeout: 15 * time.Second,
+			// KV v2 never needs redirects; following one would replay
+			// X-Vault-Token to whatever host the response names.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return errors.New("openbao returned a redirect; refusing to follow it with the token")
+			},
+		},
 	}
 }
+
+// maxRespBytes caps decoded response bodies (KV JSON is small);
+// maxErrBodyBytes caps error bodies embedded in messages.
+const (
+	maxRespBytes    = 1 << 20
+	maxErrBodyBytes = 8 << 10
+)
 
 // kvMount is the KV v2 mount the CLI targets. Openbao's default is "secret",
 // same as Vault's; the release-policy examples in
@@ -161,13 +175,13 @@ func (b *bao) do(ctx context.Context, method, urlPath string, body []byte, out a
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		msg, _ := io.ReadAll(resp.Body)
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBodyBytes))
 		return &httpError{status: resp.StatusCode, body: string(msg)}
 	}
 	if resp.StatusCode == http.StatusNoContent || out == nil {
 		return nil
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return json.NewDecoder(io.LimitReader(resp.Body, maxRespBytes)).Decode(out)
 }
 
 type httpError struct {
@@ -175,7 +189,17 @@ type httpError struct {
 	body   string
 }
 
-func (e *httpError) Error() string { return fmt.Sprintf("openbao HTTP %d: %s", e.status, e.body) }
+// Error embeds the untrusted body with control characters stripped so a
+// hostile response cannot forge log lines or terminal escapes.
+func (e *httpError) Error() string {
+	body := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, e.body)
+	return fmt.Sprintf("openbao HTTP %d: %s", e.status, body)
+}
 
 func isNotFound(err error) bool {
 	var he *httpError

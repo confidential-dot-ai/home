@@ -1,6 +1,7 @@
 package luks
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -268,6 +269,64 @@ func TestPutPassphraseCASConflict(t *testing.T) {
 	err := newBao(srv.URL, "root").putPassphrase(context.Background(), "api", "data", []byte("s3cr3t"))
 	if !errors.Is(err, errVolumeExists) {
 		t.Fatalf("cas conflict: got %v, want errVolumeExists", err)
+	}
+}
+
+// A redirecting openbao must not have the request (and X-Vault-Token)
+// replayed to the redirect target.
+func TestBaoRefusesRedirect(t *testing.T) {
+	var targetHit bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHit = true
+	}))
+	defer target.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	_, err := newBao(redirector.URL, "root").readMetadata(context.Background(), "api", "data")
+	if err == nil || !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("err = %v, want redirect refusal", err)
+	}
+	if targetHit {
+		t.Fatal("redirect target was contacted; token would have been replayed")
+	}
+}
+
+// Error and success bodies come from an untrusted endpoint: reads must be
+// capped, and error text must not carry control characters into logs.
+func TestBaoResponseReadsCapped(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/secret/metadata/api/luks-err", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("bad\r\nfake-log-line\x1b[31m "))
+		_, _ = w.Write(bytes.Repeat([]byte("A"), 64<<10))
+	})
+	mux.HandleFunc("/v1/secret/metadata/api/luks-big", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"blob":"`))
+		_, _ = w.Write(bytes.Repeat([]byte("A"), 2<<20))
+		_, _ = w.Write([]byte(`"}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := newBao(srv.URL, "root")
+
+	_, err := c.readMetadata(context.Background(), "api", "err")
+	var he *httpError
+	if !errors.As(err, &he) {
+		t.Fatalf("err = %v, want *httpError", err)
+	}
+	if len(he.body) > 8<<10 {
+		t.Errorf("error body not capped: %d bytes", len(he.body))
+	}
+	if s := he.Error(); strings.ContainsAny(s, "\r\n\x1b") {
+		t.Errorf("Error() leaks control characters: %q", s[:64])
+	}
+
+	// A >1MiB success body must fail decoding, not be read unboundedly.
+	if _, err := c.readMetadata(context.Background(), "api", "big"); err == nil {
+		t.Error("oversized response body: want decode error")
 	}
 }
 
