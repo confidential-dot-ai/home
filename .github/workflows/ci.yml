@@ -13,6 +13,7 @@ on:
       - "Makefile"
       - ".golangci.yml"
       - "internal/helmchart/c8s/**"
+      - "scripts/coverage-gate.sh"
       - ".github/workflows/ci.yml"
   pull_request:
     branches: [main, "feat/**"]
@@ -65,3 +66,46 @@ jobs:
 
       - name: Test
         run: make test
+
+  coverage:
+    name: Coverage gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/setup-go-c8s
+
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+        with:
+          version: v3.14.4
+
+      - name: Measure coverage
+        run: ./scripts/coverage-gate.sh run head.out
+
+      - name: Enforce 80% floor on internal/ packages
+        run: ./scripts/coverage-gate.sh check head.out
+
+      - name: Checkout base branch
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.base_ref }}
+          path: base
+
+      - name: Measure base coverage
+        if: github.event_name == 'pull_request'
+        working-directory: base
+        run: go test ./... -count=1 -coverprofile=../base.out -coverpkg=./...
+
+      - name: Enforce non-decreasing total coverage
+        if: github.event_name == 'pull_request'
+        run: |
+          head=$(./scripts/coverage-gate.sh total head.out)
+          base=$(./scripts/coverage-gate.sh total base.out)
+          echo "total coverage: base=${base}% head=${head}%"
+          awk -v h="$head" -v b="$base" 'BEGIN {
+            if (h + 0.05 < b) {
+              printf "coverage gate: total coverage decreased (%.1f%% -> %.1f%%)\n", b, h
+              exit 1
+            }
+          }'

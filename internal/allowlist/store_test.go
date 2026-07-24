@@ -1,6 +1,7 @@
 package allowlist
 
 import (
+	"path/filepath"
 	"strconv"
 	"testing"
 
@@ -442,5 +443,129 @@ func TestContains(t *testing.T) {
 	}
 	if ok, err := store.Contains(absent); err != nil || ok {
 		t.Fatalf("Contains(absent) = %t, %v; want false, nil", ok, err)
+	}
+}
+
+func TestOpenStoreCreatesAndReopens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "allowlist.db")
+
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("open new store: %v", err)
+	}
+	dA := mustParseDigest(t, digestA)
+	if err := store.Add(dA, "nginx:latest"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Reopening the same path must find the existing schema and data.
+	reopened, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer reopened.Close()
+
+	version, digests, err := reopened.ListAll()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if version != "2" {
+		t.Fatalf("version: got %q, want %q", version, "2")
+	}
+	if digests[dA] != "nginx:latest" {
+		t.Fatalf("digest missing after reopen: %#v", digests)
+	}
+}
+
+func TestOpenStoreFailsOnUnusablePath(t *testing.T) {
+	// A directory is stat-able but not a SQLite database, so schema init fails.
+	store, err := OpenStore(t.TempDir())
+	if err == nil {
+		store.Close()
+		t.Fatal("OpenStore on a directory succeeded, want schema init error")
+	}
+}
+
+func TestCloseNilDBIsNoop(t *testing.T) {
+	var s Store
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close on zero Store: %v", err)
+	}
+}
+
+// TestListAllSkipsCorruptRows pins the defensive skip: a row whose digest no
+// longer parses (only reachable by out-of-band DB tampering) is dropped from
+// ListAll instead of failing the whole listing.
+func TestListAllSkipsCorruptRows(t *testing.T) {
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	dA := mustParseDigest(t, digestA)
+	if err := store.Add(dA, "good:v1"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	// Bypass the validating API and plant a corrupt row directly.
+	if _, err := store.db.Exec(
+		"INSERT INTO allowlist (digest, image) VALUES (?, ?)", "not-a-digest", "bad:v1",
+	); err != nil {
+		t.Fatalf("plant corrupt row: %v", err)
+	}
+
+	_, digests, err := store.ListAll()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(digests) != 1 {
+		t.Fatalf("expected corrupt row to be skipped, got %d entries: %#v", len(digests), digests)
+	}
+	if digests[dA] != "good:v1" {
+		t.Fatalf("valid row lost: %#v", digests)
+	}
+}
+
+// closedStore returns a store whose underlying DB is already closed, so every
+// query and transaction against it fails.
+func closedStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	return &store
+}
+
+func TestStoreMethodsSurfaceDBErrors(t *testing.T) {
+	dA := mustParseDigest(t, digestA)
+	store := closedStore(t)
+
+	if _, _, err := store.ListAll(); err == nil {
+		t.Error("ListAll on closed db: want error")
+	}
+	if _, err := store.Contains(dA); err == nil {
+		t.Error("Contains on closed db: want error")
+	}
+	if err := store.Add(dA, "img"); err == nil {
+		t.Error("Add on closed db: want error")
+	}
+	if _, err := store.SeedDigests(map[types.Digest]string{dA: "img"}); err == nil {
+		t.Error("SeedDigests on closed db: want error")
+	}
+	if err := store.Replace(map[types.Digest]string{dA: "img"}); err == nil {
+		t.Error("Replace on closed db: want error")
+	}
+	if err := store.RestoreSnapshot("2", map[types.Digest]string{dA: "img"}); err == nil {
+		t.Error("RestoreSnapshot on closed db: want error")
+	}
+	if _, err := store.Delete([]types.Digest{dA}); err == nil {
+		t.Error("Delete on closed db: want error")
 	}
 }

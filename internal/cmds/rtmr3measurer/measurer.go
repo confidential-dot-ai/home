@@ -29,9 +29,12 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/rtmr3"
 )
 
+// rtmr3Sysfs is the kernel TSM node backing extendSysfs/readRegisterSysfs.
+// A var (not const) only so tests can point it at a temp file.
+var rtmr3Sysfs = "/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384"
+
 const (
-	watchDir   = "/run/kata-containers"
-	rtmr3Sysfs = "/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384"
+	watchDir = "/run/kata-containers"
 	// statePath is the measured-digest log. /run is tmpfs: it survives a
 	// process restart and is wiped with the VM — the same lifetime as
 	// RTMR[3] itself. The /run/c8s dir is created by tmpfiles.d/c8s.conf.

@@ -2,15 +2,18 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sort"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/confidential-dot-ai/c8s/internal/webhook"
 )
@@ -94,6 +97,47 @@ func TestNeedsReinject(t *testing.T) {
 				t.Fatalf("needsReinject = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestReinjectSweepListError(t *testing.T) {
+	c := fake.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return apierrors.NewInternalError(errors.New("boom"))
+		},
+	}).Build()
+	if err := reinjectSweep(context.Background(), c, nil); err == nil {
+		t.Fatal("reinjectSweep = nil, want list error")
+	}
+}
+
+func TestReinjectSweepIgnoresDeleteNotFound(t *testing.T) {
+	// The pod vanished between List and Delete (e.g. its owner replaced it):
+	// NotFound must be swallowed, not surfaced.
+	cw := map[string]string{webhook.AnnotationWorkload: "wl"}
+	c := fake.NewClientBuilder().
+		WithObjects(pod("gone", "tenant", "ReplicaSet", cw)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
+				return apierrors.NewNotFound(corev1.Resource("pods"), obj.GetName())
+			},
+		}).Build()
+	if err := reinjectSweep(context.Background(), c, nil); err != nil {
+		t.Fatalf("reinjectSweep: %v", err)
+	}
+}
+
+func TestReinjectSweepDeleteErrorSurfaces(t *testing.T) {
+	cw := map[string]string{webhook.AnnotationWorkload: "wl"}
+	c := fake.NewClientBuilder().
+		WithObjects(pod("stuck", "tenant", "ReplicaSet", cw)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error {
+				return apierrors.NewInternalError(errors.New("boom"))
+			},
+		}).Build()
+	if err := reinjectSweep(context.Background(), c, nil); err == nil {
+		t.Fatal("reinjectSweep = nil, want delete error")
 	}
 }
 

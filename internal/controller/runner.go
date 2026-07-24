@@ -94,6 +94,18 @@ type Options struct {
 
 var scheme = runtime.NewScheme()
 
+// newDirectClient builds a cache-bypassing client from the manager's REST
+// config + scheme (the manager cache is either not started yet, or must not
+// grow informers for one-shot work). A package var so tests can substitute a
+// fake client.
+var newDirectClient = func(mgr manager.Manager) (client.Client, error) {
+	return client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme()})
+}
+
+// webhookCertDir is where the webhook serving certs are written —
+// controller-runtime's default in production, overridable in tests.
+var webhookCertDir = webhook.DefaultCertDir
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(v1alpha2.AddToScheme(scheme))
@@ -105,7 +117,41 @@ func Run(ctx context.Context, opts Options) error {
 	logger := ctrl.Log.WithName("c8s-operator")
 
 	config := ctrl.GetConfigOrDie()
-	mgr, err := ctrl.NewManager(config, ctrl.Options{
+	mgr, err := ctrl.NewManager(config, managerOptions(opts))
+	if err != nil {
+		return fmt.Errorf("create manager: %w", err)
+	}
+
+	// The discovery client is only needed (and only fails Run) when the
+	// status-mirror controller is enabled.
+	var dc serverResourcesForGroupVersion
+	if !opts.DisableStatusMirror {
+		d, err := discovery.NewDiscoveryClientForConfig(config)
+		if err != nil {
+			return fmt.Errorf("create discovery client: %w", err)
+		}
+		dc = d
+	}
+
+	if err := setupManager(ctx, mgr, dc, opts, logger); err != nil {
+		return err
+	}
+
+	logger.Info("starting manager",
+		"metrics", opts.MetricsAddr,
+		"health", opts.HealthAddr,
+		"leaderElection", opts.LeaderElection)
+
+	if err := mgr.Start(ctx); err != nil {
+		return fmt.Errorf("manager exited: %w", err)
+	}
+	return nil
+}
+
+// managerOptions is the single source of the manager configuration Run uses;
+// factored out so tests can build a manager with the same cache/label scoping.
+func managerOptions(opts Options) ctrl.Options {
+	return ctrl.Options{
 		Scheme:                  scheme,
 		Metrics:                 metricsserver.Options{BindAddress: opts.MetricsAddr},
 		HealthProbeBindAddress:  opts.HealthAddr,
@@ -127,18 +173,15 @@ func Run(ctx context.Context, opts Options) error {
 				},
 			},
 		},
-	})
-	if err != nil {
-		return fmt.Errorf("create manager: %w", err)
 	}
+}
 
+// setupManager wires all controllers, the webhook, and the startup runnables
+// onto mgr. dc may be nil when opts.DisableStatusMirror is set.
+func setupManager(ctx context.Context, mgr manager.Manager, dc serverResourcesForGroupVersion, opts Options, logger logr.Logger) error {
 	if opts.DisableStatusMirror {
 		logger.Info("status-mirror controller disabled by configuration")
 	} else {
-		dc, err := discovery.NewDiscoveryClientForConfig(config)
-		if err != nil {
-			return fmt.Errorf("create discovery client: %w", err)
-		}
 		available, err := confidentialWorkloadCRDAvailable(dc)
 		if err != nil {
 			return fmt.Errorf("discover ConfidentialWorkload CRD: %w", err)
@@ -216,7 +259,7 @@ func Run(ctx context.Context, opts Options) error {
 		// Deletes at startup must not pin a cluster-wide pod informer for the
 		// operator's lifetime.
 		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-			c, err := client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme()})
+			c, err := newDirectClient(mgr)
 			if err != nil {
 				return fmt.Errorf("build sweep client: %w", err)
 			}
@@ -231,15 +274,6 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		return fmt.Errorf("add readyz: %w", err)
-	}
-
-	logger.Info("starting manager",
-		"metrics", opts.MetricsAddr,
-		"health", opts.HealthAddr,
-		"leaderElection", opts.LeaderElection)
-
-	if err := mgr.Start(ctx); err != nil {
-		return fmt.Errorf("manager exited: %w", err)
 	}
 	return nil
 }
@@ -299,14 +333,14 @@ func bootstrapWebhookPKI(ctx context.Context, mgr ctrl.Manager, opts Options) er
 	if err != nil {
 		return fmt.Errorf("mint webhook CA: %w", err)
 	}
-	if err := webhook.BootstrapServingCert(ca, hostnames, webhook.DefaultCertDir); err != nil {
+	if err := webhook.BootstrapServingCert(ca, hostnames, webhookCertDir); err != nil {
 		return err
 	}
 
 	// Manager's cache hasn't started yet, so we can't use mgr.GetClient().
 	// A direct client tied to the manager's REST config + scheme is the
 	// right primitive here — one Update, no informers needed.
-	c, err := client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme()})
+	c, err := newDirectClient(mgr)
 	if err != nil {
 		return fmt.Errorf("build bootstrap client: %w", err)
 	}
@@ -317,7 +351,7 @@ func bootstrapWebhookPKI(ctx context.Context, mgr ctrl.Manager, opts Options) er
 
 	// Keep the leaf fresh in-process. The CA is stable, so the patched bundle
 	// keeps validating rotated leaves without a re-patch.
-	rotator := webhookCertRotator(ca, hostnames, webhook.DefaultCertDir, webhook.ServingTLSTTL,
+	rotator := webhookCertRotator(ca, hostnames, webhookCertDir, webhook.ServingTLSTTL,
 		mgr.GetLogger().WithName("webhook-cert-rotator"))
 	if err := mgr.Add(manager.RunnableFunc(rotator)); err != nil {
 		return fmt.Errorf("add webhook cert rotator: %w", err)
