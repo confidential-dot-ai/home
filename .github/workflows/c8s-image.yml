@@ -1,0 +1,251 @@
+# Build + publish the c8s confidential node image (TDX-measured RKE2 + NRI +
+# attestation-api + NVIDIA stack in the verity rootfs). confos is the build
+# tree (pinned CONFOS_REF); the trigger, baked commit, and publish live here.
+# Output: ghcr.io/confidential-dot-ai/c8s-base, tags :rke2-cdi / :rke2-cdi-<sha>
+# (CDI image) + :rke2 / :rke2-<sha> (oras artifact). dev=true -> :rke2-dev-*.
+
+on:
+  # After Docker: build-c8s resolves cds:<sha> / nri-image-policy:<sha>, which
+  # docker.yml publishes. Gate on it so those digests exist.
+  workflow_run:
+    workflows: ["Docker"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      dev:
+        description: "Build the rke2-dev variant (serial root autologin, different measurement). Never ship."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # Per triggering commit, not per ref (workflow_run's ref is always main).
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # confos build tree (kernel, rootfs, #82 firmware, measurement logic). Full
+  # SHA (checkout fetches it as a ref). Pinned, not main: bumping it changes
+  # the image's TDX measurement, so it's a reviewed PR + a --measurements
+  # refresh. Must be on confos origin/main.
+  CONFOS_REF: "f7cbadcf179f580d465fa28753a9821655dd60f3" # confos main (#68)
+
+jobs:
+  build-and-push:
+    name: Build c8s node image
+    # Auto path: Docker succeeded on main (its PR runs don't publish components).
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       (github.event.workflow_run.event == 'push' ||
+        github.event.workflow_run.event == 'workflow_dispatch') &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      # Layout: ./c8s ./attestation-rs ./confidential-os-builder (sibling repos).
+      - name: Checkout c8s
+        # head_sha, not the default (workflow_run's ref is main).
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          path: c8s
+
+      - name: Checkout attestation-rs (for the gpu-attest binary)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: confidential-dot-ai/attestation-rs
+          ref: main
+          path: attestation-rs
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout confidential-os-builder (build tree)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: confidential-dot-ai/confidential-os-builder
+          ref: ${{ env.CONFOS_REF }}
+          path: confidential-os-builder
+
+      - name: Set image ref and variant
+        # VARIANT drives C8S_NAME (-> output/$VARIANT/) and the push tags.
+        run: |
+          echo "IMAGE=${REGISTRY}/confidential-dot-ai/c8s-base" >> "$GITHUB_ENV"
+          if [ "${{ github.event.inputs.dev }}" = "true" ]; then
+            echo "VARIANT=rke2-dev" >> "$GITHUB_ENV"
+            echo "C8S_DEV=1" >> "$GITHUB_ENV"
+          else
+            echo "VARIANT=rke2" >> "$GITHUB_ENV"
+            echo "C8S_DEV=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Free up disk space
+        # kernel + NVIDIA userspace + rke2 airgap + ~6G disk.raw on a 14G runner.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.12.0
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@b75a909f75acd358c2196fb9a5f1299a9a8868a4 # v6.7.0
+
+      - name: Setup mkosi
+        uses: systemd/mkosi@84af20892b61c8e177e391f997ded8b4cb5514f2 # v26
+
+      - name: Install build deps
+        # No ovmf-inteltdx: #82 TDX firmware is vendored (firmware/OVMF.inteltdx.fd);
+        # base ovmf is for the SNP path.
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y systemd-container ovmf cpio acpica-tools
+
+      # Caches: confos c8s.yml's keys/paths, scoped to the confos checkout dir.
+      - name: Cache kernel tools
+        uses: actions/cache@v5
+        with:
+          path: confidential-os-builder/mkosi/kernel-builder/mkosi.tools
+          key: ${{ runner.os }}-tools-${{ hashFiles('confidential-os-builder/mkosi/kernel-builder/mkosi.conf') }}
+
+      - name: Cache kernel
+        # Every input of confos's kernel fingerprint, or the cache is rejected
+        # and rebuilt (hashFiles has no brace expansion).
+        uses: actions/cache@v5
+        with:
+          path: confidential-os-builder/output/kernel
+          key: ${{ runner.os }}-kernel-${{ env.VARIANT }}-${{ hashFiles('confidential-os-builder/mkosi/kernel-builder/mkosi.conf','confidential-os-builder/kernel/c8s.config','confidential-os-builder/kernel/c8s-dev.config','confidential-os-builder/kernel/required.config','confidential-os-builder/kernel/hardening.config','confidential-os-builder/kernel/confidential.config','confidential-os-builder/kernel/config-x86_64.snapshot','confidential-os-builder/kernel/version','confidential-os-builder/bin/build-c8s') }}
+
+      - name: Cache base image tools
+        uses: actions/cache@v5
+        with:
+          path: |
+            confidential-os-builder/mkosi/base/mkosi.tools
+            confidential-os-builder/mkosi/base/mkosi.tools.manifest
+          key: ${{ runner.os }}-c8s-tools-${{ hashFiles('confidential-os-builder/mkosi/base/mkosi.conf.d/tools.conf','confidential-os-builder/mkosi/base/mkosi.profiles/*/mkosi.conf') }}
+
+      - name: Cache c8s artifact downloads
+        # ~3.5G rke2 tarball + airgap bundles, sha256-verified on reuse.
+        uses: actions/cache@v5
+        with:
+          path: confidential-os-builder/mkosi/base/mkosi.pkgcache/c8s
+          key: ${{ runner.os }}-c8s-artifacts-${{ hashFiles('confidential-os-builder/mkosi/base/mkosi.profiles/c8s/mkosi.sync') }}
+          restore-keys: |
+            ${{ runner.os }}-c8s-artifacts-
+
+      - name: Cache NVIDIA driver downloads
+        # ~500MB, sha-verified; keyed on the script that carries the pins.
+        uses: actions/cache@v5
+        with:
+          path: confidential-os-builder/output/gpu/cache
+          key: ${{ runner.os }}-gpu-artifacts-${{ hashFiles('confidential-os-builder/bin/steep-fetch-gpu') }}
+
+      # attest-gpu: build-c8s runs steep-fetch-attest-gpu, which needs a
+      # prebuilt ATTEST_GPU_BIN + LIBNVAT. Vendor libnvat (Apache-2.0, digest-
+      # pinned) and build the binary with NVAT_USE_SYSTEM_LIB=1.
+      - name: Setup ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login "$REGISTRY" \
+            -u "${{ github.actor }}" --password-stdin
+
+      - name: Fetch vendored libnvat (Apache-2.0)
+        env:
+          # Digest-pinned; oras verifies layers. Plus independent sha256s.
+          LIBNVAT_REF: ghcr.io/confidential-dot-ai/libnvat@sha256:4b3c396dbe906b2f60042558ed0f2dc4791a96f840ba0970a6d358027c572819
+          LIBNVAT_SO_SHA256: 1dd6c5429632c8c9ae59aa687cf96593f01c5597afe342f72ec3d8d5ddb0bbae
+          NVAT_H_SHA256: c6c9f32538611c5dfca2a103bfba5a258156a5e7b035ef9f0b7e21f20151314b
+        run: |
+          set -euo pipefail
+          mkdir -p vendor/libnvat
+          oras pull "$LIBNVAT_REF" -o vendor/libnvat
+          echo "$LIBNVAT_SO_SHA256  vendor/libnvat/libnvat.so.1.2.0" | sha256sum -c -
+          echo "$NVAT_H_SHA256  vendor/libnvat/nvat.h" | sha256sum -c -
+          sudo install -m0755 vendor/libnvat/libnvat.so.1.2.0 \
+            /usr/lib/x86_64-linux-gnu/libnvat.so.1.2.0
+          sudo ln -sf libnvat.so.1.2.0 /usr/lib/x86_64-linux-gnu/libnvat.so.1
+          sudo ln -sf libnvat.so.1     /usr/lib/x86_64-linux-gnu/libnvat.so
+          sudo install -m0644 vendor/libnvat/nvat.h /usr/include/nvat.h
+          sudo ldconfig
+
+      - name: Build attestation-api (nvidia-gpu-attest)
+        env:
+          NVAT_USE_SYSTEM_LIB: "1"
+        working-directory: attestation-rs
+        run: |
+          # libclang-dev/clang: bindgen from nvat.h. libtss2-dev: tss-esapi-sys.
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev clang libtss2-dev
+          cargo build -p attestation-api --release \
+            --features nvidia-gpu-attest --bin attestation-api
+          # Must actually link libnvat (not a silent fallback).
+          ldd target/release/attestation-api | grep -q libnvat
+
+      - name: Build c8s image
+        working-directory: confidential-os-builder
+        env:
+          ATTEST_GPU_BIN: ${{ github.workspace }}/attestation-rs/target/release/attestation-api
+          LIBNVAT: /usr/lib/x86_64-linux-gnu/libnvat.so.1.2.0
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          # Short SHA matches docker.yml's component tags. build-c8s hands
+          # C8S_REF to mkosi.sync via a file (can't cross mkosi's sandbox).
+          export C8S_REF="${HEAD_SHA::7}"
+          C8S_NAME="$VARIANT" bin/build-c8s
+
+      - name: Check whether the rootfs changed
+        # Skip the multi-GB push when the roothash matches what's published.
+        id: changed
+        working-directory: confidential-os-builder
+        run: |
+          set -uo pipefail
+          new=$(cat "output/${VARIANT}/roothash" 2>/dev/null || echo new)
+          digest=$(oras manifest fetch "${IMAGE}:${VARIANT}" 2>/dev/null \
+                     | jq -r '.layers[] | select(.annotations["org.opencontainers.image.title"] == "roothash") | .digest' \
+                     || true)
+          pub=none
+          if [ -n "$digest" ]; then
+            pub=$(oras blob fetch --output - "${IMAGE}@${digest}" 2>/dev/null || echo none)
+          fi
+          echo "new=$new published=$pub"
+          if [ "$new" = "$pub" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "rootfs roothash unchanged ($new) — skipping publish."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push to GHCR
+        if: steps.changed.outputs.skip != 'true'
+        working-directory: confidential-os-builder
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -eux
+          SHORT_SHA="${HEAD_SHA::7}"
+          # CDI first, oras artifact last: the change-check reads the oras tag,
+          # so a partial failure re-publishes everything next run.
+          bin/confos push "output/${VARIANT}" --cdi \
+            --registry "$IMAGE" \
+            --tag "${VARIANT}-cdi,${VARIANT}-cdi-${SHORT_SHA}"
+          bin/confos push "output/${VARIANT}" \
+            --registry "$IMAGE" \
+            --tag "${VARIANT},${VARIANT}-${SHORT_SHA}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${VARIANT} confidential node image"
+            echo "- CDI image: \`${IMAGE}:${VARIANT}-cdi\`"
+            echo "- artifact: \`${IMAGE}:${VARIANT}\`"
+            echo "- confos ref: \`${CONFOS_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
