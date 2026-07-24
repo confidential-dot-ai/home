@@ -421,3 +421,54 @@ func TestMutatePodInjectsMultipleLUKSVolumes(t *testing.T) {
 		t.Errorf("c8s-luks-open containers after two injections = %d, want 1", open)
 	}
 }
+
+// Under --kata-enforce, a LUKS pod must end up under kata: the injected
+// luks-open container is privileged, tolerable only inside a VM boundary.
+func TestHandleRequiresKataForLUKS(t *testing.T) {
+	kataCfg := func() Config {
+		cfg := luksTestConfig()
+		cfg.KataEnforce = true
+		return cfg
+	}
+
+	t.Run("denied with a non-kata runtimeClassName", func(t *testing.T) {
+		pod := luksHandlePod()
+		rc := "gvisor"
+		pod.Spec.RuntimeClassName = &rc
+		resp := handleAdmission(t, kataCfg(), pod)
+		if resp.Allowed {
+			t.Fatal("LUKS pod admitted under a non-kata runtime class with kata enforcement on")
+		}
+		if resp.Result == nil || !strings.Contains(resp.Result.Message, "kata") {
+			t.Fatalf("denial message = %+v, want it to mention kata", resp.Result)
+		}
+	})
+	t.Run("denied with a host namespace", func(t *testing.T) {
+		pod := luksHandlePod()
+		pod.Spec.HostPID = true // kata cannot honor host namespaces, so no class is injected
+		if resp := handleAdmission(t, kataCfg(), pod); resp.Allowed {
+			t.Fatal("LUKS pod with hostPID admitted despite being kata-incompatible")
+		}
+	})
+	t.Run("allowed when the webhook injects the kata class", func(t *testing.T) {
+		if resp := handleAdmission(t, kataCfg(), luksHandlePod()); !resp.Allowed {
+			t.Fatalf("LUKS pod denied despite kata injection: %+v", resp.Result)
+		}
+	})
+	t.Run("allowed with a pod-set kata class", func(t *testing.T) {
+		pod := luksHandlePod()
+		rc := kataSnpRuntimeClass
+		pod.Spec.RuntimeClassName = &rc
+		if resp := handleAdmission(t, kataCfg(), pod); !resp.Allowed {
+			t.Fatalf("LUKS pod denied despite an explicit kata class: %+v", resp.Result)
+		}
+	})
+	t.Run("no check when enforcement is off", func(t *testing.T) {
+		pod := luksHandlePod()
+		rc := "gvisor"
+		pod.Spec.RuntimeClassName = &rc
+		if resp := handleAdmission(t, luksTestConfig(), pod); !resp.Allowed {
+			t.Fatalf("kata check must be inert without --kata-enforce (baremetal is the chart's guard): %+v", resp.Result)
+		}
+	})
+}

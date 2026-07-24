@@ -582,6 +582,21 @@ func (m *podMutator) Handle(ctx context.Context, req admission.Request) admissio
 			}
 		}
 	}
+	// The injected luks-open container is privileged, which is only tolerable
+	// under kata (see injectLUKS). With kata enforcement on, refuse a LUKS pod
+	// that would not end up under a kata class. With enforcement off the
+	// deployment-level guard is the chart's luks_plain_baremetal validation.
+	if inj != nil && len(inj.LUKS) > 0 && m.cfg.KataEnforce {
+		podClass := ""
+		if pod.Spec.RuntimeClassName != nil {
+			podClass = *pod.Spec.RuntimeClassName
+		}
+		if kataRuntimeClassFor(pod, m.cfg) == "" && !isKataClass(podClass) {
+			return admission.Errored(http.StatusBadRequest, fmt.Errorf(
+				"%w: pod requests LUKS injection but would not run under kata (the privileged luks-open container requires kata confinement); set a kata runtimeClassName or drop host namespaces",
+				errInvalidInjectionAnnotation))
+		}
+	}
 	// The injected agent + luks-open dial the broker with the get-cert mesh
 	// cert, and injection only runs when GetCertImage is set (getCertNeeded
 	// below). Without it the pod would be admitted unmutated — its app starting
@@ -765,6 +780,16 @@ func kataRuntimeClassFor(pod *corev1.Pod, cfg Config) string {
 		return kataSnpRuntimeClass
 	}
 	return kataRuntimeClass
+}
+
+// isKataClass reports whether name is one of the fixed kata RuntimeClasses
+// the chart installs (the same set the kata-enforcement VAP allows).
+func isKataClass(name string) bool {
+	switch name {
+	case kataRuntimeClass, kataSnpRuntimeClass, kataSnpGpuRuntimeClass, kataTdxRuntimeClass, kataTdxGpuRuntimeClass:
+		return true
+	}
+	return false
 }
 
 // podRequestsNvidiaGpu reports whether any container (regular or init) asks
