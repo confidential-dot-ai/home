@@ -11,7 +11,6 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 func newCreateCmd() *cobra.Command {
@@ -190,14 +189,8 @@ func runCreate(ctx context.Context, bf *baoFlags, cfg createConfig) error {
 }
 
 func validateCreate(cfg createConfig) error {
-	if cfg.workload == "" || cfg.name == "" {
-		return errors.New("--workload and --name are required")
-	}
-	if errs := validation.IsDNS1123Label(cfg.workload); len(errs) > 0 {
-		return fmt.Errorf("--workload %q must be a DNS-1123 label: %v", cfg.workload, errs)
-	}
-	if errs := validation.IsDNS1123Label(cfg.name); len(errs) > 0 {
-		return fmt.Errorf("--name %q must be a DNS-1123 label: %v", cfg.name, errs)
+	if err := validateWorkloadName(cfg.workload, cfg.name); err != nil {
+		return err
 	}
 	if cfg.size.Sign() <= 0 {
 		return errors.New("--size must be a positive quantity, e.g. 10Gi")
@@ -210,10 +203,8 @@ func validateCreate(cfg createConfig) error {
 	default:
 		return fmt.Errorf("--driver %q: want local | pvc | csi", cfg.driver)
 	}
-	if cfg.driver == "pvc" {
-		if errs := validation.IsDNS1123Label(cfg.namespace); len(errs) > 0 {
-			return fmt.Errorf("--namespace %q must be a DNS-1123 label: %v", cfg.namespace, errs)
-		}
+	if err := validateNamespace(cfg.namespace); err != nil {
+		return err
 	}
 	if cfg.output != "yaml" && cfg.output != "json" {
 		return fmt.Errorf("--output %q: must be yaml or json", cfg.output)

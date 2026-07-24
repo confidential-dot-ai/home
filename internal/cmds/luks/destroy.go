@@ -29,9 +29,6 @@ func newDestroyCmd() *cobra.Command {
 			"in use (local: backing file attached to a loop device; pvc: a pod " +
 			"mounts the claim) — the KV entry is left intact on refusal.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if workload == "" || name == "" {
-				return errors.New("--workload and --name are required")
-			}
 			c, err := bf.client()
 			if err != nil {
 				return err
@@ -64,6 +61,14 @@ type destroyCfg struct {
 }
 
 func runDestroy(ctx context.Context, c *bao, cfg destroyCfg) error {
+	// Validate before anything else — workload/name/namespace feed KV paths
+	// and kubectl argv below.
+	if err := validateWorkloadName(cfg.workload, cfg.name); err != nil {
+		return err
+	}
+	if err := validateNamespace(cfg.namespace); err != nil {
+		return err
+	}
 	// Order: driver in-use pre-check FIRST (a refused destroy must leave the
 	// KV entry intact — deleting the passphrase under a live volume orphans
 	// its data at the next open), then the KV delete, then device teardown

@@ -166,6 +166,26 @@ func TestPVCConsumers(t *testing.T) {
 	}
 }
 
+// kubectl argv is built from --workload/--name/--namespace; hostile values
+// (traversal, flag injection) must be rejected before any kubectl invocation.
+func TestRunDestroyRejectsHostileFlagsBeforeKubectl(t *testing.T) {
+	calls := stubKubectl(t, map[string]string{})
+	for _, cfg := range []destroyCfg{
+		{workload: "api", name: "data", driver: "pvc", namespace: "../kube-system"},
+		{workload: "api", name: "data", driver: "pvc", namespace: "--all"},
+		{workload: "api", name: "--all", driver: "pvc", namespace: "default"},
+		{workload: "../../etc", name: "data", driver: "pvc", namespace: "default"},
+	} {
+		err := runDestroy(context.Background(), nil, cfg)
+		if err == nil || !strings.Contains(err.Error(), "DNS-1123") {
+			t.Errorf("cfg %+v: err = %v, want DNS-1123 rejection", cfg, err)
+		}
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("kubectl invoked despite hostile flags: %v", *calls)
+	}
+}
+
 // A refused destroy must leave the KV entry intact: the passphrase is the only
 // way to ever open the volume again.
 func TestRunDestroyPVCInUse(t *testing.T) {

@@ -2,7 +2,6 @@ package luks
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 
@@ -24,9 +23,6 @@ func newShowCmd() *cobra.Command {
 			"confirm a volume was successfully created, or to spot drift " +
 			"between the KV entry and a workload's expectations.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if workload == "" || name == "" {
-				return errors.New("--workload and --name are required")
-			}
 			c, err := bf.client()
 			if err != nil {
 				return err
@@ -42,6 +38,9 @@ func newShowCmd() *cobra.Command {
 }
 
 func runShow(ctx context.Context, c *bao, workload, name, output string) error {
+	if err := validateWorkloadName(workload, name); err != nil {
+		return err
+	}
 	meta, err := c.readMetadata(ctx, workload, name)
 	if err != nil {
 		if isNotFound(err) {

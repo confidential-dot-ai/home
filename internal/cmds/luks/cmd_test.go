@@ -52,7 +52,7 @@ func TestKVPathShape(t *testing.T) {
 func TestValidateCreate(t *testing.T) {
 	base := createConfig{
 		workload: "api", name: "data", mount: "/data", driver: "local",
-		output: "yaml", size: resource.MustParse("1Gi"),
+		output: "yaml", size: resource.MustParse("1Gi"), namespace: "default",
 	}
 	if err := validateCreate(base); err != nil {
 		t.Errorf("baseline should be valid: %v", err)
@@ -70,6 +70,9 @@ func TestValidateCreate(t *testing.T) {
 		{"relative mount", func(c *createConfig) { c.mount = "data" }, "absolute"},
 		{"bad output", func(c *createConfig) { c.output = "xml" }, "yaml or json"},
 		{"bad driver", func(c *createConfig) { c.driver = "nfs" }, "local | pvc | csi"},
+		{"bad namespace", func(c *createConfig) { c.namespace = "Bad_NS" }, "DNS-1123"},
+		{"traversal workload", func(c *createConfig) { c.workload = "../etc" }, "DNS-1123"},
+		{"flag-shaped name", func(c *createConfig) { c.name = "--all" }, "DNS-1123"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -83,6 +86,34 @@ func TestValidateCreate(t *testing.T) {
 				t.Errorf("err = %v, want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// Every subcommand builds KV paths and kubectl argv from workload/name, so the
+// shared validators must reject separators, dots, and flag-shaped values.
+func TestValidateWorkloadName(t *testing.T) {
+	if err := validateWorkloadName("api", "data"); err != nil {
+		t.Errorf("valid labels rejected: %v", err)
+	}
+	for _, tc := range []struct{ workload, name string }{
+		{"", "data"},
+		{"api", ""},
+		{"../etc", "data"},
+		{"api", "a/b"},
+		{"api", "data.v2"},
+		{"-leading", "data"},
+		{"api", "--all"},
+		{"api", "data\npwned"},
+	} {
+		if err := validateWorkloadName(tc.workload, tc.name); err == nil {
+			t.Errorf("workload=%q name=%q: want error", tc.workload, tc.name)
+		}
+	}
+	if err := validateWorkload(""); err == nil {
+		t.Error("empty workload: want error")
+	}
+	if err := validateNamespace("kube system"); err == nil {
+		t.Error("namespace with space: want error")
 	}
 }
 

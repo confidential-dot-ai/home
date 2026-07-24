@@ -19,9 +19,6 @@ func newListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List openbao-gated LUKS volumes for a workload",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if workload == "" {
-				return fmt.Errorf("--workload is required")
-			}
 			c, err := bf.client()
 			if err != nil {
 				return err
@@ -36,6 +33,9 @@ func newListCmd() *cobra.Command {
 }
 
 func runList(ctx context.Context, c *bao, workload, output string) error {
+	if err := validateWorkload(workload); err != nil {
+		return err
+	}
 	names, err := c.listVolumes(ctx, workload)
 	if err != nil {
 		return fmt.Errorf("list volumes: %w", err)
